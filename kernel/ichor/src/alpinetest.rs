@@ -134,6 +134,14 @@ const RUNS: &[(&[&str], i32)] = &[
         ],
         0,
     ),
+    (
+        &[
+            "sh",
+            "-c",
+            "cd /tmp && echo one >a && ln a b && [ \"$(stat -c %h a)\" = 2 ] &&              [ \"$(stat -c %i a)\" = \"$(stat -c %i b)\" ] && rm a && [ \"$(cat b)\" = one ] &&              [ \"$(stat -c %h b)\" = 1 ] && mkdir -p d/e d/f && [ \"$(stat -c %h d)\" = 4 ] &&              dd if=/dev/zero of=big bs=1M count=0 seek=100 2>/dev/null &&              [ \"$(stat -c %s big)\" = 104857600 ] && echo x >>big && rm big b && rm -r d &&              echo alpine: hard links, directory link counts, sparse 100 MiB file",
+        ],
+        0,
+    ),
 ];
 
 fn read(vfs: &Vfs, path: &str) -> Vec<u8> {

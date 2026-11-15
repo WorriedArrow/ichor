@@ -777,6 +777,35 @@ pub(super) fn symlink(
     Ok(0)
 }
 
+/// `link` / `linkat(olddirfd, oldpath, newdirfd, newpath, flags)`: a hard
+/// link. The old path's last symlink is not followed unless
+/// `AT_SYMLINK_FOLLOW`; `AT_EMPTY_PATH` links the file `olddirfd` names.
+pub(super) fn link(
+    p: &mut LinuxProcess,
+    odirfd: i64,
+    oaddr: u64,
+    ndirfd: i64,
+    naddr: u64,
+    flags: u64,
+) -> Result<u64, i64> {
+    const AT_SYMLINK_FOLLOW: u64 = 0x400;
+    if flags & !(AT_SYMLINK_FOLLOW | AT_EMPTY_PATH) != 0 {
+        return Err(EINVAL);
+    }
+    // inode_at follows unless AT_SYMLINK_NOFOLLOW; link's default is not to.
+    let follow = if flags & AT_SYMLINK_FOLLOW != 0 {
+        0
+    } else {
+        AT_SYMLINK_NOFOLLOW
+    };
+    let ino = inode_at(p, odirfd, oaddr, (flags & AT_EMPTY_PATH) | follow)?;
+    let (start, path) = path_at(p, ndirfd, naddr)?;
+    let mut fs = p.vfs.lock();
+    let (dir, name) = fs.resolve_parent(start, &path)?;
+    fs.link(ino, dir, &name)?;
+    Ok(0)
+}
+
 pub(super) fn readlink(
     p: &mut LinuxProcess,
     dirfd: i64,

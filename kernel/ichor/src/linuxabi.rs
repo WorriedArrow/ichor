@@ -76,6 +76,7 @@ mod nr {
     pub(super) const MKDIR: u64 = 83;
     pub(super) const RMDIR: u64 = 84;
     pub(super) const CREAT: u64 = 85;
+    pub(super) const LINK: u64 = 86;
     pub(super) const UNLINK: u64 = 87;
     pub(super) const SYMLINK: u64 = 88;
     pub(super) const READLINK: u64 = 89;
@@ -123,6 +124,7 @@ mod nr {
     pub(super) const FCHOWNAT: u64 = 260; // partial: recorded; every process is uid 0 (no checks yet)
     pub(super) const NEWFSTATAT: u64 = 262;
     pub(super) const UNLINKAT: u64 = 263;
+    pub(super) const LINKAT: u64 = 265;
     pub(super) const FUTIMESAT: u64 = 261;
     pub(super) const RENAMEAT: u64 = 264;
     pub(super) const SYMLINKAT: u64 = 266;
@@ -200,6 +202,8 @@ pub(crate) fn dispatch(p: &mut LinuxProcess, ctx: &mut frame::user::UserContext)
         nr::MKDIRAT => fs::mkdir(p, i(a[0]), a[1], a[2]),
         nr::RMDIR => fs::unlink(p, AT_FDCWD, a[0], 0x200),
         nr::UNLINK => fs::unlink(p, AT_FDCWD, a[0], 0),
+        nr::LINK => fs::link(p, AT_FDCWD, a[0], AT_FDCWD, a[1], 0),
+        nr::LINKAT => fs::link(p, i(a[0]), a[1], i(a[2]), a[3], a[4]),
         nr::UNLINKAT => fs::unlink(p, i(a[0]), a[1], a[2]),
         nr::RENAME => fs::rename(p, AT_FDCWD, a[0], AT_FDCWD, a[1], 0),
         nr::RENAMEAT => fs::rename(p, i(a[0]), a[1], i(a[2]), a[3], 0),

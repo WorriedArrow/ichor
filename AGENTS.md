@@ -165,6 +165,11 @@ Milestones 0-3 are done.
   the *verified* chunk hash, so identical chunks share a page across disks
   and a bad device byte is EIO. The whole-disk buffer is gone. Not yet:
   cache pages charged to cells; exec/mmap mapping cached pages.
+- M4 upper layer (Phase C, step 2): upper files are paged and sparse (a
+  page map, the byte budget counts pages; MAX_FILE 1 TiB of offsets), copy-up
+  goes page by page, directories report 2 + subdirectories, and
+  `Overlay::link` plus link/linkat give hard links (lower files link
+  without copy-up).
 - M4 extended state (Phase B, ADR-0008): every CPU loads one XCR0 (x87,
   SSE, AVX, AVX-512 if whole) and threads keep a boxed standard-format
   XSAVE area, restored eagerly before ring 3 and saved with XSAVEOPT

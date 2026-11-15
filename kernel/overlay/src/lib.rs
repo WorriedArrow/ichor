@@ -22,6 +22,7 @@
 
 extern crate alloc;
 
+use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -30,6 +31,7 @@ use image::{ChunkSource, Image, Node};
 
 /// Linux errno values.
 pub mod errno {
+    pub const EPERM: i64 = 1;
     pub const ENOENT: i64 = 2;
     pub const EIO: i64 = 5;
     pub const EEXIST: i64 = 17;
@@ -41,6 +43,7 @@ pub mod errno {
     pub const ENAMETOOLONG: i64 = 36;
     pub const ENOTEMPTY: i64 = 39;
     pub const ELOOP: i64 = 40;
+    pub const EMLINK: i64 = 31;
 }
 use errno::*;
 
@@ -53,8 +56,13 @@ pub const ROOT: Ino = 0;
 pub const PATH_MAX: usize = 4096;
 /// Longest name accepted.
 pub const NAME_MAX: usize = 255;
-/// Largest file the upper layer holds.
-pub const MAX_FILE: usize = 64 << 20;
+/// Largest file the upper layer holds (files are paged and sparse, so this
+/// bounds offsets, not memory: the layer's byte budget does that).
+pub const MAX_FILE: usize = 1 << 40;
+/// Most hard links to one inode.
+pub const LINK_MAX: u32 = 65_000;
+/// Upper-layer file pages.
+const PAGE: usize = 4096;
 /// Most symlinks followed while resolving one path.
 const MAX_SYMLINK_HOPS: u32 = 40;
 
@@ -110,10 +118,89 @@ struct Dir<'a> {
     parent: Ino,
 }
 
+/// An upper-layer file's bytes: pages by index, absent pages read as zero
+/// (files are sparse). The layer's budget counts allocated pages.
+#[derive(Debug, Default)]
+struct FileData {
+    size: u64,
+    pages: BTreeMap<u64, Box<[u8; PAGE]>>,
+}
+
+impl FileData {
+    /// Bytes of memory the file holds.
+    fn bytes(&self) -> usize {
+        self.pages.len() * PAGE
+    }
+
+    fn read(&self, offset: u64, out: &mut [u8]) -> usize {
+        if offset >= self.size {
+            return 0;
+        }
+        let end = self.size.min(offset + out.len() as u64);
+        let mut pos = offset;
+        while pos < end {
+            let (idx, at) = (pos / PAGE as u64, (pos % PAGE as u64) as usize);
+            let n = ((end - pos) as usize).min(PAGE - at);
+            let dst = &mut out[(pos - offset) as usize..(pos - offset) as usize + n];
+            match self.pages.get(&idx) {
+                Some(p) => dst.copy_from_slice(&p[at..at + n]),
+                None => dst.fill(0),
+            }
+            pos += n as u64;
+        }
+        (end - offset) as usize
+    }
+
+    /// Pages a write of `len` bytes at `offset` would add.
+    fn new_pages(&self, offset: u64, len: usize) -> usize {
+        if len == 0 {
+            return 0;
+        }
+        let first = offset / PAGE as u64;
+        let last = (offset + len as u64 - 1) / PAGE as u64;
+        (first..=last)
+            .filter(|i| !self.pages.contains_key(i))
+            .count()
+    }
+
+    fn write(&mut self, offset: u64, data: &[u8]) {
+        let mut pos = offset;
+        let end = offset + data.len() as u64;
+        while pos < end {
+            let (idx, at) = (pos / PAGE as u64, (pos % PAGE as u64) as usize);
+            let n = ((end - pos) as usize).min(PAGE - at);
+            let page = self
+                .pages
+                .entry(idx)
+                .or_insert_with(|| Box::new([0u8; PAGE]));
+            let src = (pos - offset) as usize;
+            page[at..at + n].copy_from_slice(&data[src..src + n]);
+            pos += n as u64;
+        }
+        self.size = self.size.max(end);
+    }
+
+    /// Sets the length; pages past it are freed and the tail of the last
+    /// page is zeroed, so growing again reads zeros.
+    fn truncate(&mut self, len: u64) {
+        if len < self.size {
+            let keep = len.div_ceil(PAGE as u64);
+            self.pages.retain(|&i, _| i < keep);
+            let at = (len % PAGE as u64) as usize;
+            if at != 0
+                && let Some(p) = self.pages.get_mut(&(len / PAGE as u64))
+            {
+                p[at..].fill(0);
+            }
+        }
+        self.size = len;
+    }
+}
+
 #[derive(Debug)]
 enum Data<'a> {
     LowerFile(Node<'a>),
-    File(Vec<u8>),
+    File(FileData),
     Dir(Dir<'a>),
     Symlink(String),
     Device(u32),
@@ -347,11 +434,11 @@ impl<'a> Overlay<'a> {
         }
         if let Some(slot) = self.inodes.get_mut(ino)
             && let Some(Inode {
-                data: Data::File(v),
+                data: Data::File(f),
                 ..
             }) = slot.take()
         {
-            self.used_bytes -= v.len();
+            self.used_bytes -= f.bytes();
         }
         self.free.push(ino);
     }
@@ -404,7 +491,7 @@ impl<'a> Overlay<'a> {
         let i = self.get(ino)?;
         let size = match &i.data {
             Data::LowerFile(n) => n.size(),
-            Data::File(v) => v.len() as u64,
+            Data::File(f) => f.size,
             Data::Dir(_) => 4096,
             Data::Symlink(t) => t.len() as u64,
             Data::Device(_) => 0,
@@ -419,7 +506,7 @@ impl<'a> Overlay<'a> {
             mode: i.mode,
             size,
             nlink: if i.kind() == Kind::Directory {
-                2
+                2 + self.subdirs(ino)
             } else {
                 i.nlink
             },
@@ -436,12 +523,7 @@ impl<'a> Overlay<'a> {
     pub fn read(&self, ino: Ino, offset: u64, out: &mut [u8]) -> Result<usize, i64> {
         match &self.get(ino)?.data {
             Data::LowerFile(n) => self.read_lower(n, offset, out),
-            Data::File(v) => {
-                let start = usize::try_from(offset).unwrap_or(usize::MAX).min(v.len());
-                let n = out.len().min(v.len() - start);
-                out[..n].copy_from_slice(&v[start..start + n]);
-                Ok(n)
-            }
+            Data::File(f) => Ok(f.read(offset, out)),
             Data::Dir(_) => Err(EISDIR),
             Data::Symlink(_) | Data::Device(_) => Err(EINVAL),
         }
@@ -472,14 +554,25 @@ impl<'a> Overlay<'a> {
         if size > MAX_FILE {
             return Err(EFBIG);
         }
-        if self.used_bytes + size > self.max_bytes {
+        let need = size.div_ceil(PAGE) * PAGE;
+        if self.used_bytes + need > self.max_bytes {
             return Err(ENOSPC);
         }
-        let mut v = alloc::vec![0u8; size];
-        let n = self.read_lower(&node, 0, &mut v)?;
-        v.truncate(n);
-        self.used_bytes += v.len();
-        self.get_mut(ino)?.data = Data::File(v);
+        // Page by page: no buffer the size of the file.
+        let mut f = FileData::default();
+        let mut page = [0u8; PAGE];
+        let mut at = 0u64;
+        while at < size as u64 {
+            let n = self.read_lower(&node, at, &mut page)?;
+            if n == 0 {
+                break;
+            }
+            f.write(at, &page[..n]);
+            at += n as u64;
+        }
+        f.size = at;
+        self.used_bytes += f.bytes();
+        self.get_mut(ino)?.data = Data::File(f);
         Ok(())
     }
 
@@ -494,21 +587,19 @@ impl<'a> Overlay<'a> {
         }
         if len == 0 && matches!(self.get(ino)?.data, Data::LowerFile(_)) {
             // No need to copy bytes that are about to be dropped.
-            self.get_mut(ino)?.data = Data::File(Vec::new());
+            self.get_mut(ino)?.data = Data::File(FileData::default());
+            self.touch(ino);
             return Ok(());
         }
         self.copy_up(ino)?;
-        let used = self.used_bytes;
-        let max = self.max_bytes;
-        let Data::File(v) = &mut self.get_mut(ino)?.data else {
+        let Data::File(f) = &mut self.get_mut(ino)?.data else {
             return Err(EINVAL);
         };
-        if len > v.len() && used + (len - v.len()) > max {
-            return Err(ENOSPC);
-        }
-        let old = v.len();
-        v.resize(len, 0);
-        self.used_bytes = used - old + len;
+        // Growing is sparse (no pages); shrinking frees pages.
+        let before = f.bytes();
+        f.truncate(len as u64);
+        let after = f.bytes();
+        self.used_bytes = self.used_bytes - before + after;
         self.touch(ino);
         Ok(())
     }
@@ -523,17 +614,14 @@ impl<'a> Overlay<'a> {
         }
         let used = self.used_bytes;
         let max = self.max_bytes;
-        let Data::File(v) = &mut self.get_mut(ino)?.data else {
+        let Data::File(f) = &mut self.get_mut(ino)?.data else {
             return Err(EINVAL);
         };
-        let grow = end.saturating_sub(v.len());
+        let grow = f.new_pages(off as u64, data.len()) * PAGE;
         if used + grow > max {
             return Err(ENOSPC);
         }
-        if grow > 0 {
-            v.resize(end, 0);
-        }
-        v[off..end].copy_from_slice(data);
+        f.write(off as u64, data);
         self.used_bytes = used + grow;
         self.touch(ino);
         Ok(data.len())
@@ -572,8 +660,68 @@ impl<'a> Overlay<'a> {
 
     /// Creates an empty file.
     pub fn create(&mut self, dir: Ino, name: &str, mode: u32) -> Result<Ino, i64> {
-        let inode = Inode::fresh(Data::File(Vec::new()), mode & 0o7777, 1, (self.clock)());
+        let inode = Inode::fresh(
+            Data::File(FileData::default()),
+            mode & 0o7777,
+            1,
+            (self.clock)(),
+        );
         self.add(dir, name, inode)
+    }
+
+    /// Adds the name `ndir/nname` for the existing non-directory `ino` (a
+    /// hard link): both names are the same inode, which lives until its
+    /// last name is gone and it is closed.
+    pub fn link(&mut self, ino: Ino, ndir: Ino, nname: &str) -> Result<(), i64> {
+        check_name(nname)?;
+        let i = self.get(ino)?;
+        if i.kind() == Kind::Directory {
+            return Err(EPERM);
+        }
+        if i.nlink == 0 {
+            return Err(ENOENT); // an unlinked, still-open file
+        }
+        if i.nlink >= LINK_MAX {
+            return Err(EMLINK);
+        }
+        self.dir(ndir)?;
+        if self.find(ndir, nname)?.is_some() {
+            return Err(EEXIST);
+        }
+        self.dir_mut(ndir)?
+            .entries
+            .insert(nname.to_string(), Entry::Ino(ino));
+        self.touch(ndir);
+        let now = (self.clock)();
+        let i = self.get_mut(ino)?;
+        i.nlink += 1;
+        i.ctime = now;
+        Ok(())
+    }
+
+    /// The subdirectories of `dir` (for its link count `2 + n`): upper
+    /// entries that are directories, plus lower ones not hidden or replaced.
+    fn subdirs(&self, dir: Ino) -> u32 {
+        let Ok(d) = self.dir(dir) else {
+            return 0;
+        };
+        let mut n = 0u32;
+        for e in d.entries.values() {
+            if let Entry::Ino(i) = e
+                && self.get(*i).is_ok_and(|i| i.kind() == Kind::Directory)
+            {
+                n += 1;
+            }
+        }
+        if !d.complete
+            && let Some(l) = d.lower
+        {
+            n += l
+                .entries()
+                .filter(|c| c.kind() == image::Kind::Directory && !d.entries.contains_key(c.name()))
+                .count() as u32;
+        }
+        n
     }
 
     /// Creates an empty directory.
@@ -917,7 +1065,7 @@ mod tests {
         let motd = fs.resolve(ROOT, "/etc/motd", true).unwrap();
         assert_eq!(fs.write(motd, 0, b"UPPER").unwrap(), 5);
         assert_eq!(read_all(&fs, motd), b"UPPER motd\n");
-        assert_eq!(fs.used_bytes(), 11);
+        assert_eq!(fs.used_bytes(), PAGE); // one page for 11 bytes
         // A second overlay over the same image still sees the original.
         let mut other = Overlay::new(&image, &src, 1 << 20).unwrap();
         let m2 = other.resolve(ROOT, "/etc/motd", true).unwrap();
@@ -927,7 +1075,7 @@ mod tests {
         assert_eq!(read_all(&fs, motd), b"UPPER motd\n\0\0!");
         fs.truncate(motd, 5).unwrap();
         assert_eq!(read_all(&fs, motd), b"UPPER");
-        assert_eq!(fs.used_bytes(), 5);
+        assert_eq!(fs.used_bytes(), PAGE);
     }
 
     #[test]
@@ -963,7 +1111,7 @@ mod tests {
         fs.open(f).unwrap();
         fs.unlink(ROOT, "f").unwrap();
         assert_eq!(read_all(&fs, f), b"data");
-        assert_eq!(fs.used_bytes(), 4);
+        assert_eq!(fs.used_bytes(), PAGE);
         fs.close(f);
         assert_eq!(fs.used_bytes(), 0);
         assert!(fs.stat(f).is_err());
@@ -1065,11 +1213,14 @@ mod tests {
 
     #[test]
     fn budgets() {
-        let mut fs = Overlay::empty(10);
+        // The budget is in pages: one page fits, a second does not.
+        let mut fs = Overlay::empty(PAGE);
         let f = fs.create(ROOT, "f", 0o644).unwrap();
-        assert_eq!(fs.write(f, 0, b"0123456789"), Ok(10));
-        assert_eq!(fs.write(f, 10, b"x"), Err(ENOSPC));
-        assert_eq!(fs.truncate(f, 11), Err(ENOSPC));
+        assert_eq!(fs.write(f, 0, &[7u8; PAGE]), Ok(PAGE));
+        assert_eq!(fs.write(f, 10, b"x"), Ok(1)); // same page
+        assert_eq!(fs.write(f, PAGE as u64, b"x"), Err(ENOSPC));
+        // Growing by truncate is sparse, so it is not refused.
+        assert_eq!(fs.truncate(f, 1 << 30), Ok(()));
         assert_eq!(fs.write(f, MAX_FILE as u64, b"x"), Err(EFBIG));
         fs.truncate(f, 0).unwrap();
         assert_eq!(fs.used_bytes(), 0);
@@ -1096,5 +1247,79 @@ mod tests {
         assert_eq!(fs.path(sub), Err(ENOENT));
         let long = "x".repeat(NAME_MAX + 1);
         assert_eq!(fs.create(ROOT, &long, 0o644), Err(ENAMETOOLONG));
+    }
+
+    #[test]
+    fn files_are_paged_and_sparse() {
+        let mut fs = Overlay::empty(64 * PAGE);
+        let f = fs.create(ROOT, "f", 0o644).unwrap();
+        // A write far out allocates one page; the hole reads as zeros.
+        fs.write(f, 10 * PAGE as u64 + 5, b"xyz").unwrap();
+        assert_eq!(fs.stat(f).unwrap().size, 10 * PAGE as u64 + 8);
+        assert_eq!(fs.used_bytes(), PAGE);
+        let mut buf = [1u8; 16];
+        assert_eq!(fs.read(f, 3 * PAGE as u64, &mut buf).unwrap(), 16);
+        assert_eq!(buf, [0u8; 16]);
+        assert_eq!(fs.read(f, 10 * PAGE as u64 + 4, &mut buf).unwrap(), 4);
+        assert_eq!(&buf[..4], b"\0xyz");
+        // A write across a page boundary.
+        fs.write(f, PAGE as u64 - 2, b"abcd").unwrap();
+        assert_eq!(fs.used_bytes(), 3 * PAGE);
+        assert_eq!(fs.read(f, PAGE as u64 - 2, &mut buf[..4]).unwrap(), 4);
+        assert_eq!(&buf[..4], b"abcd");
+        // Shrinking frees pages and zeroes the tail; growing reads zeros.
+        fs.truncate(f, PAGE as u64 - 1).unwrap();
+        assert_eq!(fs.used_bytes(), PAGE);
+        fs.truncate(f, PAGE as u64 + 10).unwrap();
+        assert_eq!(fs.read(f, PAGE as u64 - 2, &mut buf[..4]).unwrap(), 4);
+        assert_eq!(&buf[..4], b"a\0\0\0");
+        // The budget counts pages.
+        assert_eq!(
+            fs.write(f, 100 * PAGE as u64, &[0u8; 64 * PAGE]),
+            Err(ENOSPC)
+        );
+        fs.unlink(ROOT, "f").unwrap();
+        assert_eq!(fs.used_bytes(), 0);
+    }
+
+    #[test]
+    fn hard_links_share_an_inode() {
+        let img = lower_image();
+        let image = Image::mount(&img).unwrap();
+        let src = image::SliceSource(&img);
+        let mut fs = Overlay::new(&image, &src, 1 << 20).unwrap();
+        let f = fs.create(ROOT, "a", 0o644).unwrap();
+        fs.write(f, 0, b"shared").unwrap();
+        fs.link(f, ROOT, "b").unwrap();
+        assert_eq!(fs.lookup(ROOT, "b").unwrap(), f);
+        assert_eq!(fs.stat(f).unwrap().nlink, 2);
+        assert_eq!(fs.link(f, ROOT, "b"), Err(EEXIST));
+        fs.unlink(ROOT, "a").unwrap();
+        let b = fs.lookup(ROOT, "b").unwrap();
+        assert_eq!(read_all(&fs, b), b"shared");
+        assert_eq!(fs.stat(b).unwrap().nlink, 1);
+        // A lower file can be linked without a copy-up.
+        let etc = fs.lookup(ROOT, "etc").unwrap();
+        let motd = fs.lookup(etc, "motd").unwrap();
+        fs.link(motd, ROOT, "motd2").unwrap();
+        assert_eq!(fs.stat(motd).unwrap().nlink, 2);
+        assert_eq!(fs.used_bytes(), PAGE);
+        // Directories cannot be hard-linked.
+        assert_eq!(fs.link(etc, ROOT, "etc2"), Err(EPERM));
+    }
+
+    #[test]
+    fn directory_link_counts() {
+        let img = lower_image();
+        let image = Image::mount(&img).unwrap();
+        let src = image::SliceSource(&img);
+        let mut fs = Overlay::new(&image, &src, 1 << 20).unwrap();
+        let root_links = fs.stat(ROOT).unwrap().nlink;
+        let d = fs.mkdir(ROOT, "d", 0o755).unwrap();
+        assert_eq!(fs.stat(ROOT).unwrap().nlink, root_links + 1);
+        assert_eq!(fs.stat(d).unwrap().nlink, 2);
+        fs.mkdir(d, "e", 0o755).unwrap();
+        fs.create(d, "f", 0o644).unwrap();
+        assert_eq!(fs.stat(d).unwrap().nlink, 3);
     }
 }
