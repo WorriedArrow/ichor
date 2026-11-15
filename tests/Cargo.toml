@@ -1,0 +1,20 @@
+[package]
+name = "ichor-tests"
+description = "Integration tests that boot the Ichor kernel under QEMU + OVMF"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+path = "lib.rs"
+
+[[test]]
+name = "boot"
+path = "boot.rs"
+
+[dependencies]
+xtask = { path = "../xtask" }
+
+[lints]
+workspace = true

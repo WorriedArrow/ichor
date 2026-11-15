@@ -1,0 +1,13 @@
+# Size budget for the frame crate (the kernel's unsafe TCB).
+#
+# `cargo xtask frame-audit` (and `cargo xtask lint`, run in CI) fails if frame
+# exceeds either number. Raising a budget requires an ADR that justifies the
+# growth; cite it here.
+#
+# code_lines:   non-blank lines in kernel/frame/src that are not pure comments
+# unsafe_sites: `unsafe` keyword occurrences (blocks, fns, impls, externs,
+#               attributes) outside comments and strings
+#
+# Budget: ADR-0001, section 8 ("Frame budget"), milestone 0 row.
+max_code_lines = 900
+max_unsafe_sites = 48

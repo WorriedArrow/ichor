@@ -1,0 +1,8 @@
+# Ichor builds on a pinned *stable* toolchain. No unstable features are used.
+# If a feature ever requires nightly, pin a dated nightly here and record the
+# feature and the reason in AGENTS.md ("Unstable features").
+[toolchain]
+channel = "1.100.0"
+components = ["rustfmt", "clippy", "rust-src"]
+targets = ["x86_64-unknown-uefi"]
+profile = "minimal"

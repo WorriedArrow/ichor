@@ -1,0 +1,4 @@
+# Kernel code may not unwrap/expect/panic (workspace lints). Tests may.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true

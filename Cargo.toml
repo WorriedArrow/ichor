@@ -1,0 +1,50 @@
+[workspace]
+resolver = "3"
+members = [
+    "kernel/frame",
+    "kernel/cmdline",
+    "kernel/ichor",
+    "tests",
+    "xtask",
+]
+# Plain `cargo build` / `cargo test` on the host only touches crates that make
+# sense on the host. The kernel binary and the frame crate are built for
+# x86_64-unknown-uefi by `cargo xtask build`.
+default-members = [
+    "kernel/cmdline",
+    "tests",
+    "xtask",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+frame = { package = "ichor-frame", path = "kernel/frame" }
+cmdline = { package = "ichor-cmdline", path = "kernel/cmdline" }
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "deny"
+multiple_unsafe_ops_per_block = "deny"
+missing_safety_doc = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "warn"
+
+[profile.dev]
+panic = "abort"
+opt-level = 1
+
+[profile.release]
+panic = "abort"
+lto = "fat"
+codegen-units = 1
+debug = "line-tables-only"

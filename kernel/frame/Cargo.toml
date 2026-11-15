@@ -1,0 +1,16 @@
+[package]
+name = "ichor-frame"
+description = "Ichor's trusted computing base: the only kernel crate allowed to contain unsafe code"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "frame"
+
+[dependencies]
+cmdline.workspace = true
+
+[lints]
+workspace = true
