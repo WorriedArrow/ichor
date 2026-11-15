@@ -6,6 +6,7 @@
 //! load. Mappings take [`UFrame`]s only, so a typed (kernel-owned) page can
 //! never reach user space by construction.
 
+use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -26,8 +27,9 @@ pub struct VmSpace {
 
 #[derive(Debug)]
 struct Inner {
-    /// Pages mapped into this space, kept alive until unmapped or teardown.
-    frames: Vec<(u64, UFrame)>,
+    /// Pages mapped into this space by address, kept alive until unmapped
+    /// or teardown (a tree, so range operations need not scan every page).
+    frames: BTreeMap<u64, UFrame>,
 }
 
 fn alloc_table_page() -> Option<PhysAddr> {
@@ -46,7 +48,9 @@ impl VmSpace {
         // `root` is fresh, the kernel root is live and only read.
         unsafe { paging::copy_upper_half(PhysAddr::new(crate::mm::kspace::kernel_root()), root) };
         Some(VmSpace {
-            inner: SpinLock::new(Inner { frames: Vec::new() }),
+            inner: SpinLock::new(Inner {
+                frames: BTreeMap::new(),
+            }),
             root,
         })
     }
@@ -64,7 +68,7 @@ impl VmSpace {
         let r = unsafe { paging::user_map(self.root, va, pa, prot, &mut alloc) };
         match r {
             Ok(()) => {
-                inner.frames.push((va, frame.clone()));
+                inner.frames.insert(va, frame.clone());
                 Ok(())
             }
             Err(e) => {
@@ -79,26 +83,44 @@ impl VmSpace {
     /// after every CPU running this space has forgotten the translation.
     /// Must not be called in atomic mode.
     pub fn unmap(&self, va: u64) {
+        self.unmap_range(va, va.saturating_add(super::PAGE_SIZE));
+    }
+
+    /// Removes every mapping in `[start, end)` with one TLB shootdown (of
+    /// that page, or of the whole space for more than one). The pages are
+    /// released only after every CPU running this space has forgotten
+    /// them. Must not be called in atomic mode.
+    pub fn unmap_range(&self, start: u64, end: u64) {
         let (unmapped, frames) = {
             let mut inner = self.inner.lock();
-            // SAFETY: as in `map`; unmapping only clears a leaf of this space.
-            let unmapped = unsafe { paging::user_unmap(self.root, va) };
-            let mut kept = Vec::new();
-            if unmapped.is_some() {
-                // Keep the `UFrame`s alive until the shootdown is done.
-                let (gone, rest): (Vec<_>, Vec<_>) = core::mem::take(&mut inner.frames)
-                    .into_iter()
-                    .partition(|(v, _)| *v == va);
-                inner.frames = rest;
-                kept = gone;
+            let vas: Vec<u64> = inner.frames.range(start..end).map(|(&v, _)| v).collect();
+            let mut unmapped = Vec::with_capacity(vas.len());
+            // Keep the `UFrame`s alive until the shootdown is done.
+            let mut kept = Vec::with_capacity(vas.len());
+            for va in vas {
+                // SAFETY: as in `map`; unmapping only clears a leaf of this
+                // space.
+                if let Some(pa) = unsafe { paging::user_unmap(self.root, va) } {
+                    unmapped.push((va, pa));
+                }
+                kept.extend(inner.frames.remove(&va));
             }
             (unmapped, kept)
         };
-        if let Some(pa) = unmapped {
-            super::tlb::shootdown(self.root.as_u64(), Some(va));
+        match unmapped.as_slice() {
+            [] => {}
+            [(va, _)] => super::tlb::shootdown(self.root.as_u64(), Some(*va)),
+            _ => super::tlb::shootdown(self.root.as_u64(), None),
+        }
+        for (_, pa) in unmapped {
             frame::drop_untyped(pa);
         }
         drop(frames);
+    }
+
+    /// How many pages are mapped.
+    pub fn mapped_pages(&self) -> usize {
+        self.inner.lock().frames.len()
     }
 
     /// Changes the permissions of the mapping at `va`; on return no CPU
@@ -241,8 +263,8 @@ impl Drop for VmSpace {
     fn drop(&mut self) {
         let mut frames = core::mem::take(&mut self.inner.lock().frames);
         // Clear the page tables, dropping a mapping reference for every page
-        // and freeing the intermediate tables. The `frames` vector holds the
-        // matching `UFrame`s, dropped below.
+        // and freeing the intermediate tables. `frames` holds the matching
+        // `UFrame`s, dropped below.
         let mut leaf = |pa: PhysAddr| frame::drop_untyped(pa);
         let mut table_page = |pa: PhysAddr| page_alloc::free(pa, 0, kind::PAGE_TABLE);
         // SAFETY: a `VmSpace` is dropped only when no task uses it, so it is

@@ -430,11 +430,14 @@ impl Mm {
         }
     }
 
-    /// Frees every page in `[start, end)`.
+    /// Frees every page in `[start, end)` (one TLB shootdown for all).
     fn free_range(&mut self, start: u64, end: u64) {
         let vas: Vec<u64> = self.pages.range(start..end).map(|(&v, _)| v).collect();
+        if vas.is_empty() {
+            return;
+        }
+        self.space.unmap_range(start, end);
         for va in vas {
-            self.space.unmap(va);
             self.pages.remove(&va);
             self.cow.remove(&va);
             self.account.release(1);
