@@ -150,6 +150,14 @@ const RUNS: &[(&[&str], i32)] = &[
         ],
         0,
     ),
+    (
+        &[
+            "sh",
+            "-c",
+            "adduser -D -u 1000 bob && adduser -D -u 1001 carol && [ \"$(su bob -c 'id -u; id -g')\" = \"$(printf '1000\n1000')\" ] &&              ! su bob -c 'cat /etc/shadow' 2>/dev/null &&              ! su bob -c 'touch /root/x' 2>/dev/null &&              su bob -c 'echo hi > ~/f' && [ \"$(stat -c %U ~bob/f)\" = bob ] &&              su bob -c 'touch /tmp/b' && ! su carol -c 'rm /tmp/b' 2>/dev/null && [ -e /tmp/b ] &&              su bob -c 'chmod 600 ~/f' && ! su carol -c 'cat ~bob/f' 2>/dev/null &&              { sleep 30 & sp=$!; ! su bob -c \"kill $sp\" 2>/dev/null; kill $sp; wait $sp; true; } &&              echo alpine: users and permissions are enforced",
+        ],
+        0,
+    ),
 ];
 
 fn read(vfs: &Vfs, path: &str) -> Vec<u8> {

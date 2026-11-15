@@ -114,19 +114,35 @@ fn open_path(
     }
     let umask = p.umask();
     let ino = {
-        let mut fs = p.vfs.lock();
+        let mut fs = p.fs();
+        let mut created = false;
         let ino = if flags & O_CREAT != 0 {
             let (dir, name) = fs.resolve_parent(start, path)?;
             match fs.lookup(dir, &name) {
                 Ok(_) if flags & O_EXCL != 0 => return Err(EEXIST),
                 Ok(_) => fs.resolve(start, path, flags & O_NOFOLLOW == 0)?,
-                Err(ENOENT) => fs.create(dir, &name, mode as u32 & !umask)?,
+                Err(ENOENT) => {
+                    created = true;
+                    fs.create(dir, &name, mode as u32 & !umask)?
+                }
                 Err(e) => return Err(e),
             }
         } else {
             fs.resolve(start, path, flags & O_NOFOLLOW == 0)?
         };
         let st = fs.stat(ino)?;
+        // The file's permission bits, unless this call just created it.
+        if !created && st.kind != Kind::Symlink {
+            let mut want = match acc {
+                0 => overlay::MAY_READ,
+                1 => overlay::MAY_WRITE,
+                _ => overlay::MAY_READ | overlay::MAY_WRITE,
+            };
+            if flags & O_TRUNC != 0 {
+                want |= overlay::MAY_WRITE;
+            }
+            fs.permission(ino, want)?;
+        }
         match st.kind {
             Kind::Directory if acc != 0 => return Err(EISDIR),
             Kind::Symlink => return Err(ELOOP), // O_NOFOLLOW on a symlink
@@ -207,7 +223,7 @@ fn stat_proc(p: &mut LinuxProcess, path: &str, follow: bool, hops: u32) -> Resul
                 return stat_proc(p, &target, true, hops + 1);
             }
             let cwd = p.cwd();
-            let mut fs = p.vfs.lock();
+            let mut fs = p.fs();
             let ino = fs.resolve(cwd, &target, true)?;
             to_stat(&fs.stat(ino)?)
         }
@@ -286,7 +302,7 @@ fn write_file(
             break;
         }
         let r = if append {
-            p.vfs.lock().append(f.ino, &chunk[..got]).map(|end| {
+            p.fs().append(f.ino, &chunk[..got]).map(|end| {
                 pos = end;
                 got
             })
@@ -444,7 +460,7 @@ pub(super) fn lseek(p: &mut LinuxProcess, fd: u64, offset: i64, whence: u64) -> 
     let base = match whence {
         SEEK_SET => 0i64,
         SEEK_CUR => f.offset as i64,
-        SEEK_END => p.vfs.lock().stat(f.ino)?.size as i64,
+        SEEK_END => p.fs().stat(f.ino)?.size as i64,
         _ => return Err(EINVAL),
     };
     let new = base.checked_add(offset).filter(|&n| n >= 0).ok_or(EINVAL)?;
@@ -459,17 +475,18 @@ pub(super) fn ftruncate(p: &mut LinuxProcess, fd: u64, len: u64) -> Result<u64, 
     if f.flags & O_ACCMODE == 0 {
         return Err(EINVAL);
     }
-    p.vfs.lock().truncate(f.ino, len)?;
+    p.fs().truncate(f.ino, len)?;
     Ok(0)
 }
 
 pub(super) fn truncate(p: &mut LinuxProcess, addr: u64, len: u64) -> Result<u64, i64> {
     let (start, path) = path_at(p, AT_FDCWD, addr)?;
-    let mut fs = p.vfs.lock();
+    let mut fs = p.fs();
     let ino = fs.resolve(start, &path, true)?;
     if fs.stat(ino)?.kind == Kind::Directory {
         return Err(EISDIR);
     }
+    fs.permission(ino, overlay::MAY_WRITE)?;
     fs.truncate(ino, len)?;
     Ok(0)
 }
@@ -544,7 +561,7 @@ pub(super) fn fstat(p: &mut LinuxProcess, fd: u64, addr: u64) -> Result<u64, i64
             st[40..48].copy_from_slice(&u64::from(d.rdev()).to_le_bytes()); // st_rdev
             st
         }
-        Fd::File(f) => to_stat(&p.vfs.lock().stat(f.ino)?),
+        Fd::File(f) => to_stat(&p.fs().stat(f.ino)?),
     };
     put_stat(p, addr, &st)
 }
@@ -560,7 +577,7 @@ pub(super) fn fstatat(
     if path.is_empty() && flags & AT_EMPTY_PATH != 0 {
         if dirfd == AT_FDCWD {
             let cwd = p.cwd();
-            let st = to_stat(&p.vfs.lock().stat(cwd)?);
+            let st = to_stat(&p.fs().stat(cwd)?);
             return put_stat(p, out, &st);
         }
         return fstat(p, dirfd as u64, out);
@@ -571,7 +588,7 @@ pub(super) fn fstatat(
     }
     let start = base(p, dirfd, &path)?;
     let st = {
-        let mut fs = p.vfs.lock();
+        let mut fs = p.fs();
         let ino = fs.resolve(start, &path, flags & AT_SYMLINK_NOFOLLOW == 0)?;
         to_stat(&fs.stat(ino)?)
     };
@@ -583,13 +600,31 @@ pub(super) fn stat(p: &mut LinuxProcess, addr: u64, out: u64, follow: bool) -> R
     fstatat(p, AT_FDCWD, addr, out, flags)
 }
 
-pub(super) fn access(p: &mut LinuxProcess, dirfd: i64, addr: u64, _mode: u64) -> Result<u64, i64> {
+pub(super) fn access(
+    p: &mut LinuxProcess,
+    dirfd: i64,
+    addr: u64,
+    mode: u64,
+    flags: u64,
+) -> Result<u64, i64> {
     let (start, path) = path_at(p, dirfd, addr)?;
     if let Some(node) = procfs::lookup(p, &path, true) {
         return node.map(|_| 0);
     }
-    // Everyone is root in the cell for now, so existence is the test.
-    p.vfs.lock().resolve(start, &path, true)?;
+    // Checked with the real ids (AT_EACCESS: effective), as Linux does.
+    const AT_EACCESS: u64 = 0x200;
+    let c = p.group.creds();
+    let cred = if flags & AT_EACCESS != 0 {
+        c.fs()
+    } else {
+        c.real()
+    };
+    let mut fs = p.vfs.lock_as(cred);
+    let ino = fs.resolve(start, &path, true)?;
+    let mask = (mode & 7) as u32;
+    if mask != 0 {
+        fs.permission(ino, mask)?;
+    }
     Ok(0)
 }
 
@@ -640,7 +675,7 @@ pub(super) fn getdents64(
     }
     let f = file(p, fd).map_err(|_| ENOTDIR)?;
     let (me, parent, entries) = {
-        let mut fs = p.vfs.lock();
+        let mut fs = p.fs();
         if fs.stat(f.ino)?.kind != Kind::Directory {
             return Err(ENOTDIR);
         }
@@ -698,7 +733,7 @@ pub(super) fn getdents64(
 pub(super) fn mkdir(p: &mut LinuxProcess, dirfd: i64, addr: u64, mode: u64) -> Result<u64, i64> {
     let (start, path) = path_at(p, dirfd, addr)?;
     let umask = p.umask();
-    let mut fs = p.vfs.lock();
+    let mut fs = p.fs();
     let (dir, name) = fs.resolve_parent(start, &path)?;
     fs.mkdir(dir, &name, mode as u32 & !umask)?;
     Ok(0)
@@ -709,7 +744,7 @@ pub(super) fn unlink(p: &mut LinuxProcess, dirfd: i64, addr: u64, flags: u64) ->
         return Err(EINVAL);
     }
     let (start, path) = path_at(p, dirfd, addr)?;
-    let mut fs = p.vfs.lock();
+    let mut fs = p.fs();
     let (dir, name) = fs.resolve_parent(start, &path)?;
     if flags & AT_REMOVEDIR != 0 {
         fs.rmdir(dir, &name)?;
@@ -733,7 +768,7 @@ pub(super) fn rename(
     }
     let (ostart, opath) = path_at(p, olddirfd, oldaddr)?;
     let (nstart, npath) = path_at(p, newdirfd, newaddr)?;
-    let mut fs = p.vfs.lock();
+    let mut fs = p.fs();
     let (odir, oname) = fs.resolve_parent(ostart, &opath)?;
     let (ndir, nname) = fs.resolve_parent(nstart, &npath)?;
     if flags & RENAME_NOREPLACE != 0 && fs.lookup(ndir, &nname).is_ok() {
@@ -751,7 +786,7 @@ pub(super) fn symlink(
 ) -> Result<u64, i64> {
     let target = user_path(p, target)?;
     let (start, path) = path_at(p, dirfd, addr)?;
-    let mut fs = p.vfs.lock();
+    let mut fs = p.fs();
     let (dir, name) = fs.resolve_parent(start, &path)?;
     fs.symlink(dir, &name, &target)?;
     Ok(0)
@@ -780,7 +815,7 @@ pub(super) fn link(
     };
     let ino = inode_at(p, odirfd, oaddr, (flags & AT_EMPTY_PATH) | follow)?;
     let (start, path) = path_at(p, ndirfd, naddr)?;
-    let mut fs = p.vfs.lock();
+    let mut fs = p.fs();
     let (dir, name) = fs.resolve_parent(start, &path)?;
     fs.link(ino, dir, &name)?;
     Ok(0)
@@ -808,7 +843,7 @@ pub(super) fn readlink(
         return Ok(n as u64);
     }
     let target = {
-        let mut fs = p.vfs.lock();
+        let mut fs = p.fs();
         let ino = fs.resolve(start, &path, false)?;
         fs.readlink(ino)?
     };
@@ -822,7 +857,7 @@ pub(super) fn readlink(
 
 pub(super) fn chmod(p: &mut LinuxProcess, dirfd: i64, addr: u64, mode: u64) -> Result<u64, i64> {
     let (start, path) = path_at(p, dirfd, addr)?;
-    let mut fs = p.vfs.lock();
+    let mut fs = p.fs();
     let ino = fs.resolve(start, &path, true)?;
     fs.chmod(ino, mode as u32)?;
     Ok(0)
@@ -830,18 +865,19 @@ pub(super) fn chmod(p: &mut LinuxProcess, dirfd: i64, addr: u64, mode: u64) -> R
 
 pub(super) fn fchmod(p: &mut LinuxProcess, fd: u64, mode: u64) -> Result<u64, i64> {
     let f = file(p, fd)?;
-    p.vfs.lock().chmod(f.ino, mode as u32)?;
+    p.fs().chmod(f.ino, mode as u32)?;
     Ok(0)
 }
 
 pub(super) fn chdir(p: &mut LinuxProcess, addr: u64) -> Result<u64, i64> {
     let (start, path) = path_at(p, AT_FDCWD, addr)?;
     let ino = {
-        let mut fs = p.vfs.lock();
+        let mut fs = p.fs();
         let ino = fs.resolve(start, &path, true)?;
         if fs.stat(ino)?.kind != Kind::Directory {
             return Err(ENOTDIR);
         }
+        fs.permission(ino, overlay::MAY_EXEC)?;
         ino
     };
     p.set_cwd(ino);
@@ -850,7 +886,7 @@ pub(super) fn chdir(p: &mut LinuxProcess, addr: u64) -> Result<u64, i64> {
 
 pub(super) fn fchdir(p: &mut LinuxProcess, fd: u64) -> Result<u64, i64> {
     let f = file(p, fd)?;
-    if p.vfs.lock().stat(f.ino)?.kind != Kind::Directory {
+    if p.fs().stat(f.ino)?.kind != Kind::Directory {
         return Err(ENOTDIR);
     }
     p.set_cwd(f.ino);
@@ -859,7 +895,7 @@ pub(super) fn fchdir(p: &mut LinuxProcess, fd: u64) -> Result<u64, i64> {
 
 pub(super) fn getcwd(p: &mut LinuxProcess, buf: u64, size: u64) -> Result<u64, i64> {
     let cwd = p.cwd();
-    let mut path = p.vfs.lock().path(cwd)?;
+    let mut path = p.fs().path(cwd)?;
     path.push('\0');
     if (size as usize) < path.len() {
         return Err(ERANGE);
@@ -903,7 +939,7 @@ pub(super) fn sendfile(
     let mut done = 0usize;
     while done < count {
         let want = CHUNK.min(count - done);
-        let n = p.vfs.lock().read(src.ino, offset, &mut buf[..want])?;
+        let n = p.fs().read(src.ino, offset, &mut buf[..want])?;
         if n == 0 {
             break;
         }
@@ -925,11 +961,11 @@ pub(super) fn sendfile(
             }
             Fd::File(o) => {
                 let at = if o.flags & O_APPEND != 0 {
-                    p.vfs.lock().stat(o.ino)?.size
+                    p.fs().stat(o.ino)?.size
                 } else {
                     o.offset
                 };
-                p.vfs.lock().write(o.ino, at, &buf[..n])?;
+                p.fs().write(o.ino, at, &buf[..n])?;
                 p.with_file(out_fd, |of| {
                     of.offset = at + n as u64;
                 });
@@ -1051,7 +1087,7 @@ pub(super) fn statfs(p: &mut LinuxProcess, addr: u64, buf: u64) -> Result<u64, i
             true
         }
         None => {
-            p.vfs.lock().resolve(start, &path, true)?;
+            p.fs().resolve(start, &path, true)?;
             false
         }
     };
@@ -1120,7 +1156,7 @@ pub(super) fn chown(
     let ino = inode_at(p, dirfd, addr, flags)?;
     // -1 (as a 32-bit id) means "leave unchanged".
     let id = |v: u64| (v as u32 != u32::MAX).then_some(v as u32);
-    p.vfs.lock().chown(ino, id(uid), id(gid))?;
+    p.fs().chown(ino, id(uid), id(gid))?;
     Ok(0)
 }
 
@@ -1135,13 +1171,14 @@ fn read_times(
     p: &mut LinuxProcess,
     addr: u64,
     micros: bool,
-) -> Result<[Option<overlay::Time>; 2], i64> {
+) -> Result<([Option<overlay::Time>; 2], bool), i64> {
     const UTIME_NOW: u64 = (1 << 30) - 1;
     const UTIME_OMIT: u64 = (1 << 30) - 2;
     let now = crate::vfs::realtime();
     if addr == 0 {
-        return Ok([Some(now), Some(now)]);
+        return Ok(([Some(now), Some(now)], false));
     }
+    let mut explicit = false;
     let mut b = [0u8; 32];
     if p.copy_from_user(addr, &mut b) != 32 {
         return Err(EFAULT);
@@ -1158,19 +1195,23 @@ fn read_times(
                 sec,
                 nsec: (frac * 1000) as u32,
             });
+            explicit = true;
             continue;
         }
         *slot = match frac {
             UTIME_NOW => Some(now),
             UTIME_OMIT => None,
-            n if n < 1_000_000_000 => Some(overlay::Time {
-                sec,
-                nsec: n as u32,
-            }),
+            n if n < 1_000_000_000 => {
+                explicit = true;
+                Some(overlay::Time {
+                    sec,
+                    nsec: n as u32,
+                })
+            }
             _ => return Err(EINVAL),
         };
     }
-    Ok(out)
+    Ok((out, explicit))
 }
 
 /// `utimensat(dirfd, path, times, flags)`.
@@ -1181,9 +1222,11 @@ pub(super) fn utimensat(
     times: u64,
     flags: u64,
 ) -> Result<u64, i64> {
-    let [a, m] = read_times(p, times, false)?;
+    let ([a, m], explicit) = read_times(p, times, false)?;
     let ino = inode_at(p, dirfd, addr, flags | AT_EMPTY_PATH)?;
-    p.vfs.lock().set_times(ino, a, m)?;
+    let mut fs = p.fs();
+    fs.may_set_times(ino, explicit)?;
+    fs.set_times(ino, a, m)?;
     Ok(0)
 }
 
@@ -1194,9 +1237,11 @@ pub(super) fn futimesat(
     addr: u64,
     times: u64,
 ) -> Result<u64, i64> {
-    let [a, m] = read_times(p, times, true)?;
+    let ([a, m], explicit) = read_times(p, times, true)?;
     let ino = inode_at(p, dirfd, addr, 0)?;
-    p.vfs.lock().set_times(ino, a, m)?;
+    let mut fs = p.fs();
+    fs.may_set_times(ino, explicit)?;
+    fs.set_times(ino, a, m)?;
     Ok(0)
 }
 
@@ -1221,7 +1266,7 @@ pub(super) fn record_lock(
         let Fd::File(of) = &*st else {
             return Err(EBADF);
         };
-        let size = p.vfs.lock().stat(of.ino)?.size;
+        let size = p.fs().stat(of.ino)?.size;
         (
             (alloc::sync::Arc::as_ptr(&p.vfs) as usize, of.ino),
             of.offset,

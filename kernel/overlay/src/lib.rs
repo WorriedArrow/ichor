@@ -32,6 +32,7 @@ use image::{ChunkSource, Image, Node};
 /// Linux errno values.
 pub mod errno {
     pub const EPERM: i64 = 1;
+    pub const EACCES: i64 = 13;
     pub const ENOENT: i64 = 2;
     pub const EIO: i64 = 5;
     pub const EEXIST: i64 = 17;
@@ -46,6 +47,52 @@ pub mod errno {
     pub const EMLINK: i64 = 31;
 }
 use errno::*;
+
+/// Who is asking, for permission checks (ADR-0009): filesystem uid and
+/// gid, supplementary groups, and Linux capability bits ([`cap`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Cred {
+    pub uid: u32,
+    pub gid: u32,
+    pub groups: Vec<u32>,
+    pub caps: u64,
+}
+
+/// Linux capability numbers the file system consults.
+pub mod cap {
+    pub const CHOWN: u32 = 0;
+    pub const DAC_OVERRIDE: u32 = 1;
+    pub const DAC_READ_SEARCH: u32 = 2;
+    pub const FOWNER: u32 = 3;
+    pub const FSETID: u32 = 4;
+}
+
+/// Access wanted, as `access(2)` spells it.
+pub const MAY_READ: u32 = 4;
+pub const MAY_WRITE: u32 = 2;
+pub const MAY_EXEC: u32 = 1;
+
+const S_ISUID: u32 = 0o4000;
+const S_ISGID: u32 = 0o2000;
+const S_ISVTX: u32 = 0o1000;
+
+impl Cred {
+    /// uid 0 with every capability: what a cell's root holds.
+    pub fn root() -> Cred {
+        Cred {
+            caps: u64::MAX,
+            ..Cred::default()
+        }
+    }
+
+    pub fn has(&self, cap: u32) -> bool {
+        self.caps & (1 << cap) != 0
+    }
+
+    pub fn in_group(&self, gid: u32) -> bool {
+        self.gid == gid || self.groups.contains(&gid)
+    }
+}
 
 /// An inode number (index into the overlay's table).
 pub type Ino = usize;
@@ -253,6 +300,9 @@ pub struct Overlay<'a> {
     inodes: Vec<Option<Inode<'a>>>,
     /// Where the lower layer's file data comes from (verified chunks).
     src: Option<&'a (dyn ChunkSource + Sync)>,
+    /// The credentials operations are checked against; `None` (the
+    /// kernel's own use) checks nothing.
+    cred: Option<Cred>,
     /// The clock that stamps changes (the kernel installs its own).
     clock: fn() -> Time,
     free: Vec<Ino>,
@@ -330,11 +380,85 @@ impl<'a> Overlay<'a> {
                 Time::default()
             ))],
             src: None,
+            cred: None,
             free: Vec::new(),
             clock: || Time::default(),
             used_bytes: 0,
             max_bytes,
         }
+    }
+
+    /// Sets the credentials later operations are checked against (`None`:
+    /// unchecked, for the kernel itself).
+    pub fn set_cred(&mut self, cred: Option<Cred>) {
+        self.cred = cred;
+    }
+
+    /// Whether the current credentials may access `ino` as `mask`
+    /// ([`MAY_READ`] | [`MAY_WRITE`] | [`MAY_EXEC`]); EACCES if not.
+    pub fn permission(&self, ino: Ino, mask: u32) -> Result<(), i64> {
+        let Some(c) = &self.cred else {
+            return Ok(());
+        };
+        let i = self.get(ino)?;
+        let mode = i.mode;
+        let bits = if c.uid == i.uid {
+            mode >> 6
+        } else if c.in_group(i.gid) {
+            mode >> 3
+        } else {
+            mode
+        } & 7;
+        if bits & mask == mask {
+            return Ok(());
+        }
+        let dir = i.kind() == Kind::Directory;
+        // Read on anything and search on directories, without the bits.
+        if c.has(cap::DAC_READ_SEARCH) && mask & MAY_WRITE == 0 && (dir || mask & MAY_EXEC == 0) {
+            return Ok(());
+        }
+        // Everything, except executing a file no one may execute.
+        if c.has(cap::DAC_OVERRIDE) && (mask & MAY_EXEC == 0 || dir || mode & 0o111 != 0) {
+            return Ok(());
+        }
+        Err(EACCES)
+    }
+
+    /// Whether the current credentials own `ino` or hold `CAP_FOWNER`.
+    fn owner_or_fowner(&self, ino: Ino) -> Result<bool, i64> {
+        let Some(c) = &self.cred else {
+            return Ok(true);
+        };
+        Ok(c.uid == self.get(ino)?.uid || c.has(cap::FOWNER))
+    }
+
+    /// `utimensat` rules: explicit times need ownership (or `CAP_FOWNER`);
+    /// "now" also allows anyone who may write the file.
+    pub fn may_set_times(&self, ino: Ino, explicit: bool) -> Result<(), i64> {
+        if self.owner_or_fowner(ino)? {
+            return Ok(());
+        }
+        if explicit {
+            return Err(EPERM);
+        }
+        self.permission(ino, MAY_WRITE)
+    }
+
+    /// The sticky-bit rule for removing or replacing `victim` in `dir`.
+    fn may_delete(&self, dir: Ino, victim: Ino) -> Result<(), i64> {
+        self.permission(dir, MAY_WRITE | MAY_EXEC)?;
+        let Some(c) = &self.cred else {
+            return Ok(());
+        };
+        let d = self.get(dir)?;
+        if d.mode & S_ISVTX != 0
+            && c.uid != d.uid
+            && c.uid != self.get(victim)?.uid
+            && !c.has(cap::FOWNER)
+        {
+            return Err(EPERM);
+        }
+        Ok(())
     }
 
     /// Installs the clock that stamps modification and change times.
@@ -353,13 +477,29 @@ impl<'a> Overlay<'a> {
 
     /// Changes the owner (`None` leaves a field as it is), as `chown`.
     pub fn chown(&mut self, ino: Ino, uid: Option<u32>, gid: Option<u32>) -> Result<(), i64> {
+        if let Some(c) = &self.cred {
+            let i = self.get(ino)?;
+            let new_uid = uid.is_some_and(|u| u != i.uid);
+            let new_gid = gid.is_some_and(|g| g != i.gid);
+            // Changing the owner needs CAP_CHOWN; the owner may change the
+            // group to one of their own groups.
+            let allowed = c.has(cap::CHOWN)
+                || (!new_uid && c.uid == i.uid && gid.is_none_or(|g| !new_gid || c.in_group(g)));
+            if !allowed {
+                return Err(EPERM);
+            }
+        }
         let now = (self.clock)();
         let i = self.get_mut(ino)?;
+        let changed = uid.is_some_and(|u| u != i.uid) || gid.is_some_and(|g| g != i.gid);
         if let Some(u) = uid {
             i.uid = u;
         }
         if let Some(g) = gid {
             i.gid = g;
+        }
+        if changed && i.kind() != Kind::Directory {
+            i.mode &= !(S_ISUID | S_ISGID); // as Linux does on chown
         }
         i.ctime = now;
         Ok(())
@@ -623,6 +763,13 @@ impl<'a> Overlay<'a> {
     /// Writes `data` at `offset` (zero-filling any gap); returns its length.
     pub fn write(&mut self, ino: Ino, offset: u64, data: &[u8]) -> Result<usize, i64> {
         self.copy_up(ino)?;
+        // A write by someone without CAP_FSETID drops set-id bits.
+        if self.cred.as_ref().is_some_and(|c| !c.has(cap::FSETID)) {
+            let i = self.get_mut(ino)?;
+            if i.mode & (S_ISUID | S_ISGID) != 0 {
+                i.mode &= !(S_ISUID | S_ISGID);
+            }
+        }
         let off = usize::try_from(offset).map_err(|_| EFBIG)?;
         let end = off.checked_add(data.len()).ok_or(EFBIG)?;
         if end > MAX_FILE {
@@ -653,18 +800,43 @@ impl<'a> Overlay<'a> {
 
     /// Changes permission bits.
     pub fn chmod(&mut self, ino: Ino, mode: u32) -> Result<(), i64> {
+        if !self.owner_or_fowner(ino)? {
+            return Err(EPERM);
+        }
+        let mut mode = mode & 0o7777;
+        // Setting the group-id bit needs membership of the file's group.
+        if let Some(c) = &self.cred
+            && !c.in_group(self.get(ino)?.gid)
+            && !c.has(cap::FSETID)
+        {
+            mode &= !S_ISGID;
+        }
         let now = (self.clock)();
         let i = self.get_mut(ino)?;
-        i.mode = mode & 0o7777;
+        i.mode = mode;
         i.ctime = now;
         Ok(())
     }
 
-    fn add(&mut self, dir: Ino, name: &str, inode: Inode<'a>) -> Result<Ino, i64> {
+    fn add(&mut self, dir: Ino, name: &str, mut inode: Inode<'a>) -> Result<Ino, i64> {
         check_name(name)?;
         self.dir(dir)?;
         if self.find(dir, name)?.is_some() {
             return Err(EEXIST);
+        }
+        self.permission(dir, MAY_WRITE | MAY_EXEC)?;
+        // New inodes belong to the creator; a set-group-id directory
+        // passes its group down (and the bit, to subdirectories).
+        if let Some(c) = &self.cred {
+            inode.uid = c.uid;
+            inode.gid = c.gid;
+        }
+        let d = self.get(dir)?;
+        if d.mode & S_ISGID != 0 {
+            inode.gid = d.gid;
+            if inode.kind() == Kind::Directory {
+                inode.mode |= S_ISGID;
+            }
         }
         let ino = self.alloc(inode);
         self.dir_mut(dir)?
@@ -704,6 +876,7 @@ impl<'a> Overlay<'a> {
         if self.find(ndir, nname)?.is_some() {
             return Err(EEXIST);
         }
+        self.permission(ndir, MAY_WRITE | MAY_EXEC)?;
         self.dir_mut(ndir)?
             .entries
             .insert(nname.to_string(), Entry::Ino(ino));
@@ -792,6 +965,7 @@ impl<'a> Overlay<'a> {
         if self.get(ino)?.kind() == Kind::Directory {
             return Err(EISDIR);
         }
+        self.may_delete(dir, ino)?;
         self.detach(dir, name)?;
         self.drop_link(ino)
     }
@@ -817,6 +991,7 @@ impl<'a> Overlay<'a> {
         if !self.is_empty_dir(ino)? {
             return Err(ENOTEMPTY);
         }
+        self.may_delete(dir, ino)?;
         self.detach(dir, name)?;
         self.drop_link(ino)
     }
@@ -850,10 +1025,16 @@ impl<'a> Overlay<'a> {
         if src_dir && self.is_ancestor(src, ndir) {
             return Err(EINVAL);
         }
+        self.may_delete(odir, src)?;
+        self.permission(ndir, MAY_WRITE | MAY_EXEC)?;
+        if src_dir && odir != ndir {
+            self.permission(src, MAY_WRITE)?; // its ".." changes
+        }
         if let Some(dst) = self.find(ndir, nname)? {
             if dst == src {
                 return Ok(());
             }
+            self.may_delete(ndir, dst)?;
             let dst_dir = self.get(dst)?.kind() == Kind::Directory;
             match (src_dir, dst_dir) {
                 (false, true) => return Err(EISDIR),
@@ -956,6 +1137,7 @@ impl<'a> Overlay<'a> {
             if self.get(cur)?.kind() != Kind::Directory {
                 return Err(ENOTDIR);
             }
+            self.permission(cur, MAY_EXEC)?;
             let child = self.lookup(cur, &comp)?;
             let is_last = pending.is_empty();
             if self.get(child)?.kind() == Kind::Symlink && (follow_last || !is_last) {
@@ -1337,5 +1519,79 @@ mod tests {
         fs.mkdir(d, "e", 0o755).unwrap();
         fs.create(d, "f", 0o644).unwrap();
         assert_eq!(fs.stat(d).unwrap().nlink, 3);
+    }
+
+    fn user(uid: u32, gid: u32) -> Cred {
+        Cred {
+            uid,
+            gid,
+            groups: Vec::new(),
+            caps: 0,
+        }
+    }
+
+    #[test]
+    fn permissions_are_enforced() {
+        let mut fs = Overlay::empty(1 << 20);
+        let home = fs.mkdir(ROOT, "home", 0o755).unwrap();
+        let bob = fs.mkdir(home, "bob", 0o700).unwrap();
+        fs.chown(bob, Some(1000), Some(1000)).unwrap();
+        let secret = fs.create(ROOT, "secret", 0o640).unwrap();
+        fs.chown(secret, None, Some(42)).unwrap();
+        let tmp = fs.mkdir(ROOT, "tmp", 0o1777).unwrap();
+
+        // bob: his home, not root's secret unless in group 42.
+        fs.set_cred(Some(user(1000, 1000)));
+        assert!(fs.resolve(ROOT, "/home/bob", true).is_ok());
+        let f = fs.create(bob, "notes", 0o644).unwrap();
+        assert_eq!(fs.stat(f).unwrap().uid, 1000);
+        assert_eq!(fs.permission(secret, MAY_READ), Err(EACCES));
+        assert_eq!(fs.create(ROOT, "x", 0o644), Err(EACCES));
+        assert_eq!(fs.chmod(secret, 0o777), Err(EPERM));
+        assert_eq!(fs.chown(f, Some(0), None), Err(EPERM));
+        assert_eq!(fs.chown(f, None, Some(42)), Err(EPERM));
+        let mut grp = user(1000, 1000);
+        grp.groups.push(42);
+        fs.set_cred(Some(grp.clone()));
+        assert_eq!(fs.permission(secret, MAY_READ), Ok(()));
+        assert_eq!(fs.permission(secret, MAY_WRITE), Err(EACCES));
+        assert_eq!(fs.chown(f, None, Some(42)), Ok(()));
+
+        // Sticky /tmp: carol cannot remove bob's file.
+        let t = fs.create(tmp, "bobs", 0o666).unwrap();
+        assert_eq!(fs.stat(t).unwrap().uid, 1000);
+        fs.set_cred(Some(user(1001, 1001)));
+        assert_eq!(fs.resolve(ROOT, "/home/bob/notes", true), Err(EACCES));
+        assert_eq!(fs.unlink(tmp, "bobs"), Err(EPERM));
+        assert_eq!(fs.permission(t, MAY_WRITE), Ok(()));
+
+        // root's DAC capabilities bypass the bits (but not exec of 0644).
+        fs.set_cred(Some(Cred::root()));
+        assert!(fs.resolve(ROOT, "/home/bob/notes", true).is_ok());
+        assert_eq!(fs.permission(secret, MAY_READ | MAY_WRITE), Ok(()));
+        assert_eq!(fs.permission(f, MAY_EXEC), Err(EACCES));
+        assert_eq!(fs.unlink(tmp, "bobs"), Ok(()));
+        fs.set_cred(None);
+    }
+
+    #[test]
+    fn set_id_bits_and_setgid_directories() {
+        let mut fs = Overlay::empty(1 << 20);
+        let shared = fs.mkdir(ROOT, "shared", 0o2777).unwrap();
+        fs.chown(shared, None, Some(50)).unwrap();
+        let prog = fs.create(ROOT, "prog", 0o4755).unwrap();
+        fs.chown(prog, Some(1000), None).unwrap(); // chown drops S_ISUID
+        assert_eq!(fs.stat(prog).unwrap().mode, 0o755);
+        fs.chmod(prog, 0o6777).unwrap();
+        fs.set_cred(Some(user(1000, 1000)));
+        // A write without CAP_FSETID drops set-id bits.
+        fs.write(prog, 0, b"x").unwrap();
+        assert_eq!(fs.stat(prog).unwrap().mode, 0o777);
+        // New entries in a set-group-id directory take its group.
+        let f = fs.create(shared, "f", 0o644).unwrap();
+        let d = fs.mkdir(shared, "d", 0o755).unwrap();
+        assert_eq!(fs.stat(f).unwrap().gid, 50);
+        assert_eq!(fs.stat(d).unwrap().mode & 0o2000, 0o2000);
+        fs.set_cred(None);
     }
 }

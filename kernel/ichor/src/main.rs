@@ -14,6 +14,7 @@ mod alpinetest;
 mod blktest;
 mod busytest;
 mod celltest;
+mod cred;
 mod dev;
 mod file;
 mod futex;
@@ -58,6 +59,12 @@ fn kmain(info: BootInfo) -> ! {
     );
     println!("ichor: cmdline: {:?}", info.cmdline());
     let cmdline = cmdline::Cmdline::new(info.cmdline());
+    if let Some(pid) = cmdline.get("trace_pid").and_then(|v| v.parse().ok()) {
+        linuxabi::TRACE_PID.store(pid, core::sync::atomic::Ordering::Relaxed);
+    }
+    if cmdline.flag("trace_errors") {
+        linuxabi::TRACE_ERRORS.store(true, core::sync::atomic::Ordering::Relaxed);
+    }
 
     let image = info.kernel_image();
     println!("ichor: image at {} ({} KiB)", image.base, image.len / 1024);

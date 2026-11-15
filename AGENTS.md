@@ -299,6 +299,8 @@ comment.
 | `memmap` | print the full memory map |
 | `test_panic` | panic after boot (exercises the panic path) |
 | `test_stack_overflow` | recurse until the kernel stack hits its guard page |
+| `trace_errors` | log every failing Linux syscall (pid, number, first arguments, errno) |
+| `trace_pid=N` | log every Linux syscall of pid N with its result |
 
 ## Layout
 

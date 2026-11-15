@@ -80,8 +80,38 @@ impl Vfs {
         (UPPER_BYTES, self.fs.lock().used_bytes())
     }
 
-    /// Locks the tree.
+    /// Locks the tree (unchecked: the kernel's own use).
     pub(crate) fn lock(&self) -> MutexGuard<'_, Overlay<'static>> {
         self.fs.lock()
+    }
+
+    /// Locks the tree with operations checked against `cred`.
+    pub(crate) fn lock_as(&self, cred: overlay::Cred) -> VfsGuard<'_> {
+        let mut g = self.fs.lock();
+        g.set_cred(Some(cred));
+        VfsGuard(g)
+    }
+}
+
+/// The locked tree with credentials installed; they are removed again when
+/// the guard drops, so unchecked users never inherit them.
+pub(crate) struct VfsGuard<'a>(MutexGuard<'a, Overlay<'static>>);
+
+impl<'a> core::ops::Deref for VfsGuard<'a> {
+    type Target = Overlay<'static>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl core::ops::DerefMut for VfsGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for VfsGuard<'_> {
+    fn drop(&mut self) {
+        self.0.set_cred(None);
     }
 }

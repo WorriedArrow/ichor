@@ -44,7 +44,7 @@ mod nr {
     pub(super) const PWRITE64: u64 = 18;
     pub(super) const READV: u64 = 19;
     pub(super) const WRITEV: u64 = 20;
-    pub(super) const ACCESS: u64 = 21; // partial: existence only (every process is root)
+    pub(super) const ACCESS: u64 = 21;
     pub(super) const PIPE: u64 = 22;
     pub(super) const SELECT: u64 = 23;
     pub(super) const SCHED_YIELD: u64 = 24;
@@ -55,6 +55,7 @@ mod nr {
     pub(super) const DUP2: u64 = 33;
     pub(super) const GETPID: u64 = 39;
     pub(super) const SENDFILE: u64 = 40;
+    pub(super) const SOCKET: u64 = 41; // partial: no address families yet (EAFNOSUPPORT), until networking
     pub(super) const CLONE: u64 = 56; // partial: fork, vfork-style and thread clones
     pub(super) const FORK: u64 = 57;
     pub(super) const VFORK: u64 = 58; // partial: the child gets a copy-on-write copy, not the parent's memory
@@ -89,10 +90,22 @@ mod nr {
     pub(super) const GETTIMEOFDAY: u64 = 96; // firmware clock at boot plus monotonic time (no NTP)
     pub(super) const GETRLIMIT: u64 = 97;
     pub(super) const SETRLIMIT: u64 = 160; // partial: NOFILE and STACK enforced, others stored
-    pub(super) const GETUID: u64 = 102; // partial: always 0
-    pub(super) const GETGID: u64 = 104; // partial: always 0
-    pub(super) const GETEUID: u64 = 107; // partial: always 0
-    pub(super) const GETEGID: u64 = 108; // partial: always 0
+    pub(super) const GETUID: u64 = 102;
+    pub(super) const GETGID: u64 = 104;
+    pub(super) const SETUID: u64 = 105; // partial: per-process credentials (libc's semantics)
+    pub(super) const SETGID: u64 = 106; // partial: per-process credentials (libc's semantics)
+    pub(super) const GETEUID: u64 = 107;
+    pub(super) const GETEGID: u64 = 108;
+    pub(super) const SETREUID: u64 = 113; // partial: per-process credentials (libc's semantics)
+    pub(super) const SETREGID: u64 = 114; // partial: per-process credentials (libc's semantics)
+    pub(super) const GETGROUPS: u64 = 115;
+    pub(super) const SETGROUPS: u64 = 116; // partial: per-process credentials (libc's semantics)
+    pub(super) const SETRESUID: u64 = 117; // partial: per-process credentials (libc's semantics)
+    pub(super) const GETRESUID: u64 = 118;
+    pub(super) const SETRESGID: u64 = 119; // partial: per-process credentials (libc's semantics)
+    pub(super) const GETRESGID: u64 = 120;
+    pub(super) const SETFSUID: u64 = 122;
+    pub(super) const SETFSGID: u64 = 123;
     pub(super) const SETPGID: u64 = 109;
     pub(super) const GETPPID: u64 = 110;
     pub(super) const GETPGRP: u64 = 111;
@@ -132,7 +145,8 @@ mod nr {
     pub(super) const FCHMODAT: u64 = 268;
     pub(super) const PSELECT6: u64 = 270;
     pub(super) const PPOLL: u64 = 271;
-    pub(super) const FACCESSAT: u64 = 269; // partial: existence only (every process is root)
+    pub(super) const FACCESSAT: u64 = 269;
+    pub(super) const FACCESSAT2: u64 = 439;
     pub(super) const UTIMENSAT: u64 = 280;
     pub(super) const EPOLL_PWAIT: u64 = 281; // partial: interest list fixed for the wait; nested epoll never ready
     pub(super) const EVENTFD: u64 = 284;
@@ -154,6 +168,13 @@ const EINVAL: i64 = 22;
 const EMFILE: i64 = 24;
 const ENOTTY: i64 = 25;
 const ENOSYS: i64 = 38;
+
+/// `trace_errors` on the command line: log every Linux syscall that fails.
+pub(crate) static TRACE_ERRORS: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// `trace_pid=N`: log every Linux syscall of pid N, and its result.
+pub(crate) static TRACE_PID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// What the kernel should do after a Linux syscall.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -191,8 +212,9 @@ pub(crate) fn dispatch(p: &mut LinuxProcess, ctx: &mut frame::user::UserContext)
         nr::NEWFSTATAT => fs::fstatat(p, i(a[0]), a[1], a[2], a[3]),
         nr::FSTAT => fs::fstat(p, a[0], a[1]),
         nr::LSEEK => fs::lseek(p, a[0], i(a[1]), a[2]),
-        nr::ACCESS => fs::access(p, AT_FDCWD, a[0], a[1]),
-        nr::FACCESSAT => fs::access(p, i(a[0]), a[1], a[2]),
+        nr::ACCESS => fs::access(p, AT_FDCWD, a[0], a[1], 0),
+        nr::FACCESSAT => fs::access(p, i(a[0]), a[1], a[2], 0),
+        nr::FACCESSAT2 => fs::access(p, i(a[0]), a[1], a[2], a[3]),
         nr::TRUNCATE => fs::truncate(p, a[0], a[1]),
         nr::FTRUNCATE => fs::ftruncate(p, a[0], a[1]),
         nr::FSYNC | nr::FDATASYNC => fs::fsync(p, a[0]),
@@ -227,6 +249,9 @@ pub(crate) fn dispatch(p: &mut LinuxProcess, ctx: &mut frame::user::UserContext)
         nr::FUTIMESAT => fs::futimesat(p, i(a[0]), a[1], a[2]),
         nr::UTIMES => fs::futimesat(p, AT_FDCWD, a[0], a[1]),
         nr::MOUNT | nr::UMOUNT2 => Err(EPERM),
+        // No socket families exist yet: the answer Linux gives for one it
+        // was built without (libc's nscd and syslog paths expect it).
+        nr::SOCKET => Err(97), // EAFNOSUPPORT
         nr::FLOCK => fs::flock(p, a[0], a[1]),
         nr::STATFS => fs::statfs(p, a[0], a[1]),
         nr::FSTATFS => fs::fstatfs(p, a[0], a[1]),
@@ -299,7 +324,27 @@ pub(crate) fn dispatch(p: &mut LinuxProcess, ctx: &mut frame::user::UserContext)
         nr::GETPID => Ok(p.group.tgid),
         nr::GETTID => Ok(p.entry.pid),
         nr::GETPPID => Ok(p.entry.ppid()),
-        nr::GETUID | nr::GETGID | nr::GETEUID | nr::GETEGID => Ok(0),
+        nr::GETUID => Ok(u64::from(p.group.creds().ruid)),
+        nr::GETEUID => Ok(u64::from(p.group.creds().euid)),
+        nr::GETGID => Ok(u64::from(p.group.creds().rgid)),
+        nr::GETEGID => Ok(u64::from(p.group.creds().egid)),
+        nr::GETRESUID | nr::GETRESGID => getres(p, nr == nr::GETRESUID, [a[0], a[1], a[2]]),
+        nr::SETUID => p.group.update_creds(|c| c.setuid(a[0])).map(|()| 0),
+        nr::SETGID => p.group.update_creds(|c| c.setgid(a[0])).map(|()| 0),
+        nr::SETREUID => p.group.update_creds(|c| c.setreuid(a[0], a[1])).map(|()| 0),
+        nr::SETREGID => p.group.update_creds(|c| c.setregid(a[0], a[1])).map(|()| 0),
+        nr::SETRESUID => p
+            .group
+            .update_creds(|c| c.setresuid(a[0], a[1], a[2]))
+            .map(|()| 0),
+        nr::SETRESGID => p
+            .group
+            .update_creds(|c| c.setresgid(a[0], a[1], a[2]))
+            .map(|()| 0),
+        nr::SETFSUID => p.group.update_creds(|c| Ok(u64::from(c.setfsuid(a[0])))),
+        nr::SETFSGID => p.group.update_creds(|c| Ok(u64::from(c.setfsgid(a[0])))),
+        nr::GETGROUPS => getgroups(p, a[0], a[1]),
+        nr::SETGROUPS => setgroups(p, a[0], a[1]),
         // Processes.
         nr::FORK => clone(p, ctx, 17, 0, 0, 0, 0), // SIGCHLD
         nr::VFORK => clone(p, ctx, 0x4000 | 0x100 | 17, 0, 0, 0, 0), // CLONE_VFORK | CLONE_VM
@@ -328,6 +373,27 @@ pub(crate) fn dispatch(p: &mut LinuxProcess, ctx: &mut frame::user::UserContext)
             Err(ENOSYS)
         }
     };
+    if TRACE_PID.load(core::sync::atomic::Ordering::Relaxed) == p.entry.pid {
+        frame::println!(
+            "ichor: trace: pid {} syscall {nr}({:#x}, {:#x}, {:#x}) = {result:?}",
+            p.entry.pid,
+            a[0],
+            a[1],
+            a[2]
+        );
+    }
+    if let Err(e) = result
+        && TRACE_ERRORS.load(core::sync::atomic::Ordering::Relaxed)
+        && e != signal::ERESTARTSYS
+    {
+        frame::println!(
+            "ichor: trace: pid {} syscall {nr}({:#x}, {:#x}, {:#x}) = -{e}",
+            p.entry.pid,
+            a[0],
+            a[1],
+            a[2]
+        );
+    }
     ctx.set_return(match result {
         Ok(v) => v,
         Err(e) => (-e) as u64,
@@ -708,6 +774,57 @@ fn gettimeofday(p: &mut LinuxProcess, tv: u64) -> Result<u64, i64> {
     }
     let now = crate::vfs::wall_clock();
     put_pair(p, tv, now.as_secs(), u64::from(now.subsec_micros()))
+}
+
+/// `getresuid` / `getresgid`: three `u32`s (each pointer may be null).
+fn getres(p: &mut LinuxProcess, uids: bool, at: [u64; 3]) -> Result<u64, i64> {
+    let c = p.group.creds();
+    let v = if uids {
+        [c.ruid, c.euid, c.suid]
+    } else {
+        [c.rgid, c.egid, c.sgid]
+    };
+    for (addr, id) in at.iter().zip(v) {
+        if *addr != 0 && p.copy_to_user(*addr, &id.to_le_bytes()) != 4 {
+            return Err(EFAULT);
+        }
+    }
+    Ok(0)
+}
+
+/// `getgroups(size, list)`: the count with `size` 0, else EINVAL if the
+/// list does not fit.
+fn getgroups(p: &mut LinuxProcess, size: u64, list: u64) -> Result<u64, i64> {
+    let g = p.group.creds().groups;
+    if size == 0 {
+        return Ok(g.len() as u64);
+    }
+    if (size as usize) < g.len() {
+        return Err(EINVAL);
+    }
+    let bytes: alloc::vec::Vec<u8> = g.iter().flat_map(|x| x.to_le_bytes()).collect();
+    if p.copy_to_user(list, &bytes) != bytes.len() {
+        return Err(EFAULT);
+    }
+    Ok(g.len() as u64)
+}
+
+fn setgroups(p: &mut LinuxProcess, size: u64, list: u64) -> Result<u64, i64> {
+    let n = usize::try_from(size).map_err(|_| EINVAL)?;
+    if n > crate::cred::NGROUPS_MAX {
+        return Err(EINVAL);
+    }
+    let mut bytes = alloc::vec![0u8; n * 4];
+    if n > 0 && p.copy_from_user(list, &mut bytes) != bytes.len() {
+        return Err(EFAULT);
+    }
+    let groups = bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| u32::from_le_bytes(*b))
+        .collect();
+    p.group.update_creds(|c| c.setgroups(groups)).map(|()| 0)
 }
 
 /// `prlimit64(pid, resource, new, old)`, `getrlimit`, `setrlimit`. Limits

@@ -44,6 +44,9 @@ pub(crate) struct ProcEntry {
     /// Process group and session (meaningful on a process's first entry).
     pgid: AtomicU64,
     sid: AtomicU64,
+    /// The process's real and saved uids (`ruid | suid << 32`), which
+    /// `kill` checks senders against (ADR-0009 §4).
+    uids: AtomicU64,
     /// When the thread was created, in clock ticks (`USER_HZ`, 100/s) since
     /// boot (`/proc/<pid>/stat` starttime).
     pub(crate) started: u64,
@@ -66,6 +69,17 @@ pub(crate) struct ProcEntry {
 impl ProcEntry {
     pub(crate) fn ppid(&self) -> u64 {
         self.ppid.load(Ordering::Acquire)
+    }
+
+    /// The real and saved uids (see `uids`).
+    pub(crate) fn uids(&self) -> (u32, u32) {
+        let v = self.uids.load(Ordering::Acquire);
+        (v as u32, (v >> 32) as u32)
+    }
+
+    pub(crate) fn set_uids(&self, ruid: u32, suid: u32) {
+        self.uids
+            .store(u64::from(ruid) | (u64::from(suid) << 32), Ordering::Release);
     }
 
     /// The process group and session.
@@ -156,8 +170,14 @@ pub(crate) fn setsid(me: &ProcEntry) -> Result<u64, i64> {
 /// `kill(0)`, `kill(-pgid)`, `kill(-1)`: posts `sig` to every process of
 /// the group (or, for `pgid` `None`, every process in the cell except
 /// `me`). ESRCH if there was none.
-pub(crate) fn send_group(me: &ProcEntry, pgid: Option<u64>, sig: u32) -> Result<(), i64> {
-    let targets: alloc::vec::Vec<u64> = {
+pub(crate) fn send_group(
+    me: &ProcEntry,
+    pgid: Option<u64>,
+    sig: u32,
+    allowed: &dyn Fn((u32, u32)) -> bool,
+) -> Result<(), i64> {
+    const EPERM: i64 = 1;
+    let targets: alloc::vec::Vec<(u64, (u32, u32))> = {
         let t = TABLE.lock();
         t.values()
             .filter(|e| e.cell == me.cell && e.pid == e.tgid && e.status.lock().is_none())
@@ -165,16 +185,28 @@ pub(crate) fn send_group(me: &ProcEntry, pgid: Option<u64>, sig: u32) -> Result<
                 Some(g) => e.group().0 == g,
                 None => e.tgid != me.tgid,
             })
-            .map(|e| e.pid)
+            .map(|e| (e.pid, e.uids()))
             .collect()
     };
     if targets.is_empty() {
         return Err(ESRCH);
     }
-    for pid in targets {
-        let _ = send(me.cell, pid, sig);
+    let mut any = false;
+    for (pid, uids) in targets {
+        if allowed(uids) {
+            any = true;
+            let _ = send(me.cell, pid, sig);
+        }
     }
-    Ok(())
+    if any { Ok(()) } else { Err(EPERM) }
+}
+
+/// The real and saved uids of process `pid` in `cell`, if it is live.
+pub(crate) fn uids_of(cell: u64, pid: u64) -> Result<(u32, u32), i64> {
+    let t = TABLE.lock();
+    let e = t.get(&pid).filter(|e| e.cell == cell).ok_or(ESRCH)?;
+    let leader = t.get(&e.tgid).unwrap_or(e);
+    Ok(leader.uids())
 }
 
 static TABLE: SpinLock<BTreeMap<u64, Arc<ProcEntry>>> = SpinLock::new(BTreeMap::new());
@@ -199,6 +231,7 @@ pub(crate) fn register(
         ppid: AtomicU64::new(ppid),
         pgid: AtomicU64::new(pgid),
         sid: AtomicU64::new(sid),
+        uids: AtomicU64::new(0),
         started: (frame::time::now().as_millis() / 10) as u64,
         status: SpinLock::new(None),
         children: WaitQueue::new(),

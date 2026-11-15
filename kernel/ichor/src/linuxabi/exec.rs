@@ -134,6 +134,10 @@ pub(super) fn execve(
     drop(p.replace_mm(mm));
     p.group.actions.lock().exec_reset();
     p.close_on_exec();
+    let _ = p.group.update_creds(|c| {
+        c.exec();
+        Ok(())
+    });
     if let Some(v) = p.group.take_vfork() {
         v.release(); // the vfork parent goes on
     }
@@ -148,12 +152,12 @@ pub(super) fn execve(
 fn read_executable(p: &LinuxProcess, path: &str) -> Result<VfsFile, i64> {
     let cwd = p.cwd();
     let ino = {
-        let mut fs = p.vfs.lock();
+        let mut fs = p.fs();
         let ino = fs.resolve(cwd, path, true)?;
-        let st = fs.stat(ino)?;
-        if st.kind != Kind::File || st.mode & 0o111 == 0 {
+        if fs.stat(ino)?.kind != Kind::File {
             return Err(EACCES);
         }
+        fs.permission(ino, overlay::MAY_EXEC)?;
         ino
     };
     VfsFile::open(&p.vfs, ino).map_err(|_| ENOENT)

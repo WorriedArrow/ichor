@@ -157,6 +157,8 @@ pub(crate) struct Group {
     limits: SpinLock<Limits>,
     /// Set in a `vfork` child: released when it execs or exits.
     vfork: SpinLock<Option<Arc<Vfork>>>,
+    /// Who the process is (ADR-0009).
+    creds: SpinLock<crate::cred::Creds>,
 }
 
 /// A `vfork` parent's wait for its child to exec or exit.
@@ -225,6 +227,24 @@ impl Group {
     /// The program's argv, NUL-separated (`/proc/<pid>/cmdline`).
     pub(crate) fn cmdline(&self) -> Vec<u8> {
         self.exe.lock().1.clone()
+    }
+
+    /// A copy of the process's credentials.
+    pub(crate) fn creds(&self) -> crate::cred::Creds {
+        self.creds.lock().clone()
+    }
+
+    /// Changes the credentials with `f`; on success, publishes the new real
+    /// and saved uids for `kill`'s permission check.
+    pub(crate) fn update_creds<R>(
+        &self,
+        f: impl FnOnce(&mut crate::cred::Creds) -> Result<R, i64>,
+    ) -> Result<R, i64> {
+        let mut c = self.creds.lock().clone();
+        let r = f(&mut c)?;
+        self.leader.set_uids(c.ruid, c.suid);
+        *self.creds.lock() = c;
+        Ok(r)
     }
 
     /// Makes this (new) process a `vfork` child.
@@ -344,6 +364,7 @@ impl LinuxProcess {
             exe: SpinLock::new(Default::default()),
             limits: SpinLock::new(default_limits()),
             vfork: SpinLock::new(None),
+            creds: SpinLock::new(crate::cred::Creds::root()),
         });
         Some(Self {
             entry,
@@ -387,7 +408,10 @@ impl LinuxProcess {
             exe: SpinLock::new(exe),
             limits: SpinLock::new(self.group.limits()),
             vfork: SpinLock::new(None),
+            creds: SpinLock::new(self.group.creds()),
         });
+        let c = group.creds();
+        entry.set_uids(c.ruid, c.suid);
         Some(Self {
             entry,
             group,
@@ -421,6 +445,12 @@ impl LinuxProcess {
     }
 
     /// The process's address space (locked).
+    /// The root, locked and checked against this process's filesystem
+    /// credentials (ADR-0009).
+    pub(crate) fn fs(&self) -> crate::vfs::VfsGuard<'_> {
+        self.vfs.lock_as(self.group.creds().fs())
+    }
+
     pub(crate) fn mm(&self) -> MutexGuard<'_, Mm> {
         self.group.mm.lock()
     }

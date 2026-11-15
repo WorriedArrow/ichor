@@ -347,12 +347,20 @@ pub(crate) fn kill(p: &mut LinuxProcess, pid: i64, sig: u64) -> Result<u64, i64>
         .ok()
         .filter(|&s| s <= NSIG)
         .ok_or(EINVAL)?;
+    const EPERM: i64 = 1;
     let me = p.group.leader.clone();
+    let creds = p.group.creds();
+    let allowed = |target: (u32, u32)| creds.may_signal(target);
     match pid {
-        p if p > 0 => proc::send(me.cell, p as u64, sig)?,
-        0 => proc::send_group(&me, Some(me.group().0), sig)?,
-        -1 => proc::send_group(&me, None, sig)?,
-        p => proc::send_group(&me, Some(p.unsigned_abs()), sig)?,
+        pid if pid > 0 => {
+            if !allowed(proc::uids_of(me.cell, pid as u64)?) {
+                return Err(EPERM);
+            }
+            proc::send(me.cell, pid as u64, sig)?
+        }
+        0 => proc::send_group(&me, Some(me.group().0), sig, &allowed)?,
+        -1 => proc::send_group(&me, None, sig, &allowed)?,
+        g => proc::send_group(&me, Some(g.unsigned_abs()), sig, &allowed)?,
     }
     Ok(0)
 }
