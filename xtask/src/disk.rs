@@ -40,6 +40,11 @@ const ROOT_GUID: gpt::Guid = gpt::guid(
 /// The disk image: `kernel` (`ichor.efi`) booted with `cmdline`, and the
 /// test root image (busybox, motd, the pattern file) as its root.
 pub fn image(kernel: &Path, cmdline: &str) -> Result<Vec<u8>> {
+    image_sized(kernel, cmdline, 0)
+}
+
+/// [`image`], at least `min_bytes` long (clouds want whole GiB).
+pub fn image_sized(kernel: &Path, cmdline: &str, min_bytes: u64) -> Result<Vec<u8>> {
     let efi = fs::read(kernel).map_err(|e| format!("reading {}: {e}", kernel.display()))?;
     let mut esp = Volume::default();
     esp.add("EFI/BOOT/BOOTX64.EFI", &efi)?;
@@ -65,6 +70,7 @@ pub fn image(kernel: &Path, cmdline: &str) -> Result<Vec<u8>> {
                 size: 0,
             },
         ],
+        min_bytes,
     );
     if starts.first() != Some(&u64::from(ESP_START)) {
         return Err("disk: the ESP did not land where its boot sector says".into());

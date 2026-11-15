@@ -244,8 +244,15 @@ pub mod builder {
     /// A whole disk image with `block`-byte logical blocks: protective MBR,
     /// primary header and entries, the partitions (1 MiB aligned, in
     /// order), backup entries and header. Returns the image and each
-    /// partition's first LBA.
-    pub fn disk(disk_guid: Guid, block: usize, parts: &[Part<'_>]) -> (Vec<u8>, Vec<u64>) {
+    /// partition's first LBA. The disk is at least `min_bytes` long (a
+    /// cloud may want whole GiB); the space past the last partition is
+    /// usable but unallocated, and the backup table sits at the true end.
+    pub fn disk(
+        disk_guid: Guid,
+        block: usize,
+        parts: &[Part<'_>],
+        min_bytes: u64,
+    ) -> (Vec<u8>, Vec<u64>) {
         let bs = block as u64;
         let entries_blocks = (ENTRIES * ENTRY_SIZE).div_ceil(block) as u64;
         let mut starts = Vec::new();
@@ -255,8 +262,9 @@ pub mod builder {
             at = (at + p.size.max(p.data.len() as u64)).next_multiple_of(ALIGN);
         }
         let first_usable = 2 + entries_blocks;
-        let last_usable = at / bs - 1;
-        let total = last_usable + 1 + entries_blocks + 1;
+        let tail = entries_blocks + 1; // backup entries and header
+        let total = (at / bs + tail).max(min_bytes.div_ceil(bs));
+        let last_usable = total - tail - 1;
         let mut img = alloc::vec![0u8; (total * bs) as usize];
         // Entries.
         let mut table = alloc::vec![0u8; ENTRIES * ENTRY_SIZE];
@@ -323,6 +331,10 @@ mod tests {
     const DISK: Guid = guid(1, 2, 3, [4, 5, 6, 7, 8, 9, 10, 11]);
 
     fn sample(block: usize) -> (Vec<u8>, Vec<u64>) {
+        sample_sized(block, 0)
+    }
+
+    fn sample_sized(block: usize, min_bytes: u64) -> (Vec<u8>, Vec<u64>) {
         disk(
             DISK,
             block,
@@ -342,7 +354,22 @@ mod tests {
                     size: 0,
                 },
             ],
+            min_bytes,
         )
+    }
+
+    #[test]
+    fn padded_disks_keep_the_backup_at_the_end() {
+        let (img, _) = sample_sized(512, 64 << 20);
+        assert_eq!(img.len(), 64 << 20);
+        let parts = read_back(&img, 512).unwrap();
+        assert_eq!(parts.len(), 2);
+        let last = img.len() / 512 - 1;
+        assert_eq!(&img[last * 512..last * 512 + 8], SIGNATURE);
+        let h = header(&img[512..1024], (img.len() / 512) as u64).unwrap();
+        // The primary header names the true last block as the backup's home.
+        assert_eq!(u64_at(&img[512..1024], 32), last as u64);
+        assert!(h.last_usable < last as u64);
     }
 
     fn read_back(img: &[u8], block: usize) -> Result<Vec<Partition>, Error> {

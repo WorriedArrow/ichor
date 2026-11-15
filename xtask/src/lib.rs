@@ -12,6 +12,7 @@
 pub mod artifact;
 pub mod audit;
 pub mod build;
+pub mod deflate;
 pub mod disk;
 pub mod fat;
 pub mod inflate;

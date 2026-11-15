@@ -24,7 +24,8 @@ Commands:
                machine and programs; prints a Markdown table (CI: --smp 4)
   disk-image   Write target/ichor-disk.img: a bootable GPT disk (FAT32 ESP with
                ichor.efi, Ichor root partition), for cloud import or bare metal;
-               the kernel command line is --cmdline (default: empty)
+               the kernel command line is --cmdline (default: empty);
+               --size-gib N pads it; --gcp also writes target/ichor-gcp.tar.gz
   help         Show this message
 
 Options:
@@ -37,6 +38,8 @@ Options:
   --gdb                  `run`: wait for a debugger on tcp::1234
   --window               `run`: show a QEMU window with the serial console (run dir `window`)
   --name NAME            `run`: run directory under target/qemu/ (default `run`)
+  --disk FILE            `run`: boot this disk image (from `disk-image`) from NVMe, cloud-style
+  --size-gib N, --gcp    `disk-image`: pad to N GiB; also write the GCP import archive
   -- <args>              Extra arguments passed to QEMU (`run`)
 
 Environment:
@@ -56,6 +59,12 @@ struct Opts {
     gdb: bool,
     window: bool,
     name: Option<String>,
+    /// `disk-image`: pad the disk to this many GiB.
+    size_gib: Option<u64>,
+    /// `disk-image`: also write the GCP import archive.
+    gcp: bool,
+    /// `run`: boot this whole-disk image from NVMe instead.
+    disk: Option<std::path::PathBuf>,
     extra: Vec<String>,
 }
 
@@ -70,6 +79,9 @@ fn parse(args: &[String]) -> Result<Opts> {
         gdb: false,
         window: false,
         name: None,
+        size_gib: None,
+        gcp: false,
+        disk: None,
         extra: Vec::new(),
     };
     let mut it = args.iter();
@@ -98,6 +110,15 @@ fn parse(args: &[String]) -> Result<Opts> {
             "--gdb" => o.gdb = true,
             "--window" => o.window = true,
             "--name" => o.name = Some(value("--name")?),
+            "--size-gib" => {
+                o.size_gib = Some(
+                    value("--size-gib")?
+                        .parse()
+                        .map_err(|e| format!("--size-gib: {e}"))?,
+                )
+            }
+            "--gcp" => o.gcp = true,
+            "--disk" => o.disk = Some(value("--disk")?.into()),
             "--" => {
                 o.extra.extend(it.by_ref().cloned());
                 break;
@@ -122,6 +143,7 @@ fn cmd_run(o: &Opts) -> Result<()> {
     cfg.timeout = o.timeout;
     cfg.extra_args = o.extra.clone();
     cfg.window = o.window;
+    cfg.disk_image = o.disk.clone();
     if o.gdb {
         cfg.extra_args.extend(["-s".into(), "-S".into()]);
         eprintln!("xtask: waiting for gdb on tcp::1234");
@@ -216,16 +238,35 @@ fn cmd_disk_image(o: &Opts, args: &[String]) -> Result<()> {
         String::new()
     };
     let kernel = build::kernel(o.profile)?;
-    let img = xtask::disk::image(&kernel, &cmdline)?;
-    let path = xtask::workspace_root()
-        .join("target")
-        .join("ichor-disk.img");
+    // GCP requires a whole number of GiB; cloud volumes are sized in GiB.
+    let gib = o.size_gib.unwrap_or(if o.gcp { 1 } else { 0 });
+    let img = xtask::disk::image_sized(&kernel, &cmdline, gib << 30)?;
+    if o.gcp && !img.len().is_multiple_of(1 << 30) {
+        return Err(format!(
+            "the disk is {} MiB, more than --size-gib {gib}; give a larger size",
+            img.len() >> 20
+        ));
+    }
+    let target = xtask::workspace_root().join("target");
+    let path = target.join("ichor-disk.img");
     std::fs::write(&path, &img).map_err(|e| format!("writing {}: {e}", path.display()))?;
     println!(
         "{} ({} MiB, GPT: EFI system partition + Ichor root; cmdline {cmdline:?})",
         path.display(),
         img.len() >> 20
     );
+    if o.gcp {
+        // GCP imports `disk.raw` from a gzip'd GNU tar.
+        let tgz = xtask::deflate::gzip(&xtask::deflate::tar("disk.raw", &img));
+        let path = target.join("ichor-gcp.tar.gz");
+        std::fs::write(&path, &tgz).map_err(|e| format!("writing {}: {e}", path.display()))?;
+        println!(
+            "{} ({} KiB): upload to a bucket, then `gcloud compute images create ICHOR \
+             --source-uri gs://BUCKET/ichor-gcp.tar.gz --guest-os-features UEFI_COMPATIBLE`",
+            path.display(),
+            tgz.len() >> 10
+        );
+    }
     Ok(())
 }
 

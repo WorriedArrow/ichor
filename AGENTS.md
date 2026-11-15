@@ -314,9 +314,15 @@ bootable GPT disk (FAT32 ESP with `\EFI\BOOT\BOOTX64.EFI` and
 `\ichor\cmdline`, plus an Ichor root partition the kernel finds by type,
 `partition.rs`). `cloud_disk_boots_from_gpt_on_nvme` boots it under OVMF
 from NVMe alone (no vvfat, no other disks) and runs busybox from the root
-partition. Not yet: a network driver (AWS ENA / GCP gVNIC / virtio-net),
-Hyper-V VMBus for Azure, Secure Boot, and the cloud import scripts, which
-need the owner's accounts.
+partition. `cloud_disk_tolerates_blank_volumes_and_small_transfers`
+adds a blank NVMe volume ahead of it and an 8 KiB MDTS. The TSC
+calibrates from CPUID, the hypervisor leaf, the ACPI PM timer or the PIT
+(the boot log names it); NVMe honors MQES and MDTS, probes every
+controller, allows 30 s per command and logs failures. `--size-gib N` pads
+the disk and `--gcp` writes GCP's import archive; `cargo xtask run --disk
+FILE` boots any such image. Runbook for a first real-cloud boot:
+`docs/cloud.md`. Not yet: a network driver (AWS ENA / GCP gVNIC /
+virtio-net), Hyper-V VMBus for Azure, Secure Boot.
 
 ## Commands
 
