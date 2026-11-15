@@ -14,6 +14,7 @@ members = [
     "kernel/image",
     "kernel/block",
     "kernel/vma",
+    "kernel/overlay",
     "kernel/drivers/virtio-blk",
     "kernel/ichor",
     "tests",
@@ -35,6 +36,7 @@ default-members = [
     "kernel/image",
     "kernel/block",
     "kernel/vma",
+    "kernel/overlay",
     "tests",
     "xtask",
 ]
@@ -59,6 +61,7 @@ elf = { package = "ichor-elf", path = "kernel/elf" }
 image = { package = "ichor-image", path = "kernel/image" }
 block = { package = "ichor-block", path = "kernel/block" }
 vma = { package = "ichor-vma", path = "kernel/vma" }
+overlay = { package = "ichor-overlay", path = "kernel/overlay" }
 virtio-blk = { package = "ichor-virtio-blk", path = "kernel/drivers/virtio-blk" }
 
 [workspace.lints.rust]

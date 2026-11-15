@@ -62,6 +62,13 @@ Milestones 0-2 are done.
   segments sharing a page. `linuxabi` also has uname, getdents64, dup*,
   fcntl, ioctl(TIOCGWINSZ), clock_gettime, prlimit64, and signal/futex
   stubs. A process's memory is freed and its charge returned at exit.
+- M3 root file system (ADR-0006): `kernel/overlay` (host-tested) is the
+  image plus a copy-on-write upper layer in memory: lazy inodes, copy-up,
+  whiteouts, rename of lower directories, open-after-unlink, byte budgets,
+  and path resolution. The kernel's `vfs` locks it; `linuxabi/fs.rs` has
+  the file syscalls (create/write/truncate, mkdir/rmdir/unlink/rename,
+  symlink/readlink, chmod, chdir/getcwd, the `*at` forms, pread/pwrite).
+  Processes have a working directory and a umask.
 
 `tests/boot.rs` proves all of this on 1, 4 and 8 vCPUs.
 
@@ -76,7 +83,8 @@ are owed as multi-cell scheduling lands in milestone 4. Boot logs which apply.
 
 Suggested order for milestone 3 (see the brief and ADR-0001 §4.6):
 
-1. The volume-format ADR (ext4 read/write is the candidate).
+1. Done: ADR-0006 (overlay root; ext4 volumes, to be built as
+   `kernel/ext4` when volumes attach).
 2. A safe block layer trait and a virtio-blk driver (safe, over frame's
    `IoMem`/DMA types, which milestone 3 adds to frame per a new budget ADR).
 3. The read-only, content-addressed image format (host-testable crate) and
@@ -153,6 +161,7 @@ kernel/elf       ELF64 parsing into load plans (host-tested)
 kernel/image     read-only content-addressed image format (host-tested)
 kernel/block     block-device trait and helpers (host-tested)
 kernel/vma       user address-space region map for mmap/brk (host-tested)
+kernel/overlay   cell root: image + copy-on-write upper layer (host-tested)
 kernel/drivers/virtio-blk  safe virtio-blk driver over frame's IoMem/DMA
 kernel/ichor     the kernel binary; frame::main!(kmain); kcell/nativeabi tie it together
 xtask/           build/run/test/lint tooling (lib + bin, no dependencies)

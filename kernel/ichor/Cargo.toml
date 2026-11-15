@@ -23,6 +23,7 @@ image = { workspace = true, features = ["builder"] }
 block.workspace = true
 virtio-blk.workspace = true
 vma.workspace = true
+overlay.workspace = true
 
 [lints]
 workspace = true

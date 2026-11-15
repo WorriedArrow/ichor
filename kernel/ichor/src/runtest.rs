@@ -28,11 +28,18 @@ mod sys {
     pub(super) const OPEN: u64 = 2;
     pub(super) const CLOSE: u64 = 3;
     pub(super) const FSTAT: u64 = 5;
+    pub(super) const STAT: u64 = 4;
     pub(super) const MMAP: u64 = 9;
     pub(super) const MPROTECT: u64 = 10;
     pub(super) const MUNMAP: u64 = 11;
     pub(super) const BRK: u64 = 12;
     pub(super) const UNAME: u64 = 63;
+    pub(super) const GETCWD: u64 = 79;
+    pub(super) const CHDIR: u64 = 80;
+    pub(super) const RENAME: u64 = 82;
+    pub(super) const MKDIR: u64 = 83;
+    pub(super) const RMDIR: u64 = 84;
+    pub(super) const UNLINK: u64 = 87;
     pub(super) const GETDENTS64: u64 = 217;
     pub(super) const EXIT_GROUP: u64 = 231;
 }
@@ -288,6 +295,139 @@ fn mem_program() -> Vec<u8> {
     static_elf(&a.finish(BLOB_VADDR).unwrap_or_else(|| fail("assembler")))
 }
 
+/// Exercises the copy-on-write root through the Linux ABI: mkdir, create,
+/// write and read back, copy-up of an image file, rename, chdir/getcwd and a
+/// relative open, unlink, rmdir, and EEXIST. Exits 0 if every check held,
+/// else the number of the first failed check.
+fn fs_program() -> Vec<u8> {
+    let mut a = Asm::new();
+    let tmp = a.data(b"/tmp\0");
+    let f = a.data(b"/tmp/f\0");
+    let g_abs = a.data(b"/tmp/g\0");
+    let g = a.data(b"g\0");
+    let motd = a.data(b"/etc/motd\0");
+    let text = a.data(b"hello upper\n");
+    let shout = a.data(b"HELLO");
+    let ok = a.data(b"fstest ok\n");
+    let bad = a.label();
+    // Fails with code `n` unless rax == imm.
+    let expect = |a: &mut Asm, n: u64, imm: i32| {
+        a.mov_imm(Reg::R15, n);
+        a.cmp_imm(Reg::Rax, imm);
+        a.jne(bad);
+    };
+    // rbp = scratch buffer below the stack pointer.
+    a.mov(Reg::Rbp, Reg::Rsp);
+    a.sub_imm(Reg::Rbp, 4096);
+    // 1: mkdir("/tmp", 0777) == 0.
+    a.mov_data(Reg::Rdi, tmp);
+    a.mov_imm(Reg::Rsi, 0o777);
+    a.sys(sys::MKDIR);
+    expect(&mut a, 1, 0);
+    // 2: open("/tmp/f", O_CREAT|O_WRONLY|O_TRUNC, 0644) == 3; write 12 bytes.
+    a.mov_data(Reg::Rdi, f);
+    a.mov_imm(Reg::Rsi, 0o1101);
+    a.mov_imm(Reg::Rdx, 0o644);
+    a.sys(sys::OPEN);
+    expect(&mut a, 2, 3);
+    a.mov_imm(Reg::Rdi, 3);
+    a.mov_data(Reg::Rsi, text);
+    a.mov_imm(Reg::Rdx, 12);
+    a.sys(sys::WRITE);
+    expect(&mut a, 2, 12);
+    a.mov_imm(Reg::Rdi, 3);
+    a.sys(sys::CLOSE);
+    // 3: reopen read-only and read the bytes back.
+    a.mov_data(Reg::Rdi, f);
+    a.mov_imm(Reg::Rsi, 0);
+    a.sys(sys::OPEN);
+    expect(&mut a, 3, 3);
+    a.mov_imm(Reg::Rdi, 3);
+    a.mov(Reg::Rsi, Reg::Rbp);
+    a.mov_imm(Reg::Rdx, 64);
+    a.sys(sys::READ);
+    expect(&mut a, 3, 12);
+    a.load(Reg::Rax, Reg::Rbp, 0);
+    a.mov_imm(Reg::R14, u64::from_le_bytes(*b"hello up"));
+    a.mov_imm(Reg::R15, 3);
+    a.cmp(Reg::Rax, Reg::R14);
+    a.jne(bad);
+    a.mov_imm(Reg::Rdi, 3);
+    a.sys(sys::CLOSE);
+    // 4: an image file copies up on write: "HELLO" over /etc/motd.
+    a.mov_data(Reg::Rdi, motd);
+    a.mov_imm(Reg::Rsi, 1); // O_WRONLY
+    a.sys(sys::OPEN);
+    expect(&mut a, 4, 3);
+    a.mov_imm(Reg::Rdi, 3);
+    a.mov_data(Reg::Rsi, shout);
+    a.mov_imm(Reg::Rdx, 5);
+    a.sys(sys::WRITE);
+    expect(&mut a, 4, 5);
+    a.mov_imm(Reg::Rdi, 3);
+    a.sys(sys::CLOSE);
+    a.mov_data(Reg::Rdi, motd);
+    a.mov_imm(Reg::Rsi, 0);
+    a.sys(sys::OPEN);
+    a.mov_imm(Reg::Rdi, 3);
+    a.mov(Reg::Rsi, Reg::Rbp);
+    a.mov_imm(Reg::Rdx, 8);
+    a.sys(sys::READ);
+    expect(&mut a, 4, 8);
+    a.load(Reg::Rax, Reg::Rbp, 0);
+    a.mov_imm(Reg::R14, u64::from_le_bytes(*b"HELLO fr"));
+    a.mov_imm(Reg::R15, 4);
+    a.cmp(Reg::Rax, Reg::R14);
+    a.jne(bad);
+    a.mov_imm(Reg::Rdi, 3);
+    a.sys(sys::CLOSE);
+    // 5: rename("/tmp/f", "/tmp/g") == 0; stat("/tmp/f") == -ENOENT.
+    a.mov_data(Reg::Rdi, f);
+    a.mov_data(Reg::Rsi, g_abs);
+    a.sys(sys::RENAME);
+    expect(&mut a, 5, 0);
+    a.mov_data(Reg::Rdi, f);
+    a.mov(Reg::Rsi, Reg::Rbp);
+    a.sys(sys::STAT);
+    expect(&mut a, 5, -2);
+    // 6: chdir("/tmp"); getcwd == 5 ("/tmp\0"); open("g") relative == 3.
+    a.mov_data(Reg::Rdi, tmp);
+    a.sys(sys::CHDIR);
+    expect(&mut a, 6, 0);
+    a.mov(Reg::Rdi, Reg::Rbp);
+    a.mov_imm(Reg::Rsi, 64);
+    a.sys(sys::GETCWD);
+    expect(&mut a, 6, 5);
+    a.mov_data(Reg::Rdi, g);
+    a.mov_imm(Reg::Rsi, 0);
+    a.sys(sys::OPEN);
+    expect(&mut a, 6, 3);
+    a.mov_imm(Reg::Rdi, 3);
+    a.sys(sys::CLOSE);
+    // 7: unlink("g"); rmdir("/tmp") (now empty) == 0.
+    a.mov_data(Reg::Rdi, g);
+    a.sys(sys::UNLINK);
+    expect(&mut a, 7, 0);
+    a.mov_data(Reg::Rdi, tmp);
+    a.sys(sys::RMDIR);
+    expect(&mut a, 7, 0);
+    // 8: mkdir over an existing file is EEXIST.
+    a.mov_data(Reg::Rdi, motd);
+    a.mov_imm(Reg::Rsi, 0o755);
+    a.sys(sys::MKDIR);
+    expect(&mut a, 8, -17);
+    // All good.
+    a.mov_imm(Reg::Rdi, 1);
+    a.mov_data(Reg::Rsi, ok);
+    a.mov_imm(Reg::Rdx, 10);
+    a.sys(sys::WRITE);
+    a.mov_imm(Reg::R15, 0);
+    a.bind(bad);
+    a.mov(Reg::Rdi, Reg::R15);
+    a.sys(sys::EXIT_GROUP);
+    static_elf(&a.finish(BLOB_VADDR).unwrap_or_else(|| fail("assembler")))
+}
+
 /// The root image: `/usr/share/motd`, `/etc/motd -> /usr/share/motd`.
 fn root_image() -> &'static [u8] {
     let mut b = image::builder::Builder::new();
@@ -333,5 +473,14 @@ pub(crate) fn run() {
     }
     println!(
         "ichor: linux: brk, mmap, mprotect, munmap, uname, getdents64 ok ({syscalls} syscalls, memory returned)"
+    );
+
+    let (status, syscalls) = run_linux(&mut new_process(), &fs_program(), &["fstest"]);
+    if status != 0 {
+        println!("ichor: linux: fstest failed check {status}");
+        fail("fstest");
+    }
+    println!(
+        "ichor: linux: copy-on-write root: create, write, copy-up, rename, chdir, unlink, rmdir ok ({syscalls} syscalls)"
     );
 }

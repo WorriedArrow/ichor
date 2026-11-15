@@ -1,26 +1,26 @@
 //! The Linux x86-64 syscall personality (ADR-0002 §5), milestone 3 slice:
-//! console I/O, the read-only file system, memory (`mmap`, `brk`, demand
-//! paging), TLS, process identity, and exit. Signals are accepted but never
-//! delivered yet. The number is in
-//! `rax`, arguments in `rdi, rsi, rdx, r10, r8, r9`, and the result in
-//! `rax`; on error `rax` is `-errno`.
+//! console I/O, the root file system (an image with a copy-on-write upper
+//! layer; file calls live in [`fs`]), memory (`mmap`, `brk`, demand paging),
+//! TLS, process identity, and exit. Signals are accepted but never delivered
+//! yet. The number is in `rax`, arguments in `rdi, rsi, rdx, r10, r8, r9`,
+//! and the result in `rax`; on error `rax` is `-errno`.
 //!
 //! User memory is only ever copied (`VmSpace::copy_{from,to}_user`), never
 //! borrowed. Coverage is tracked in `docs/linux-abi.md`.
 
-use image::Kind;
+mod fs;
 
-use crate::process::{Fd, LinuxProcess, MAX_FDS, OpenFile};
+use crate::process::{Fd, LinuxProcess, MAX_FDS};
 use crate::umem;
-use crate::vfs::{self, errno::*};
+use fs::AT_FDCWD;
 
 /// Linux x86-64 syscall numbers implemented so far. `cargo xtask
 /// linux-abi-table` generates `docs/linux-abi.md` from this table: a
 /// trailing `// partial: ...` or `// stub: ...` sets an entry's status.
 mod nr {
     pub(super) const READ: u64 = 0; // partial: files and console (stdin is EOF)
-    pub(super) const WRITE: u64 = 1; // partial: console only (the root is read-only)
-    pub(super) const OPEN: u64 = 2; // partial: O_RDONLY on the read-only root
+    pub(super) const WRITE: u64 = 1;
+    pub(super) const OPEN: u64 = 2;
     pub(super) const CLOSE: u64 = 3;
     pub(super) const STAT: u64 = 4;
     pub(super) const FSTAT: u64 = 5;
@@ -33,18 +33,36 @@ mod nr {
     pub(super) const RT_SIGACTION: u64 = 13; // stub: accepted, signals are never delivered
     pub(super) const RT_SIGPROCMASK: u64 = 14; // stub: accepted, the mask is always empty
     pub(super) const IOCTL: u64 = 16; // partial: TIOCGWINSZ on the console
+    pub(super) const PREAD64: u64 = 17;
+    pub(super) const PWRITE64: u64 = 18;
     pub(super) const READV: u64 = 19;
-    pub(super) const WRITEV: u64 = 20; // partial: console only
-    pub(super) const ACCESS: u64 = 21;
+    pub(super) const WRITEV: u64 = 20;
+    pub(super) const ACCESS: u64 = 21; // partial: existence only (every process is root)
     pub(super) const SCHED_YIELD: u64 = 24;
     pub(super) const MADVISE: u64 = 28; // stub: advice is ignored
-    pub(super) const DUP: u64 = 32;
-    pub(super) const DUP2: u64 = 33;
+    pub(super) const DUP: u64 = 32; // partial: the copy has its own offset
+    pub(super) const DUP2: u64 = 33; // partial: the copy has its own offset
     pub(super) const GETPID: u64 = 39; // partial: always 1
     pub(super) const EXIT: u64 = 60; // partial: ends the whole process (single-threaded)
     pub(super) const UNAME: u64 = 63;
     pub(super) const FCNTL: u64 = 72; // partial: F_DUPFD, F_GETFD/SETFD, F_GETFL/SETFL
-    pub(super) const GETCWD: u64 = 79; // partial: the working directory is always /
+    pub(super) const FSYNC: u64 = 74; // partial: the upper layer is memory
+    pub(super) const FDATASYNC: u64 = 75; // partial: the upper layer is memory
+    pub(super) const TRUNCATE: u64 = 76;
+    pub(super) const FTRUNCATE: u64 = 77;
+    pub(super) const GETCWD: u64 = 79;
+    pub(super) const CHDIR: u64 = 80;
+    pub(super) const FCHDIR: u64 = 81;
+    pub(super) const RENAME: u64 = 82;
+    pub(super) const MKDIR: u64 = 83;
+    pub(super) const RMDIR: u64 = 84;
+    pub(super) const CREAT: u64 = 85;
+    pub(super) const UNLINK: u64 = 87;
+    pub(super) const SYMLINK: u64 = 88;
+    pub(super) const READLINK: u64 = 89;
+    pub(super) const CHMOD: u64 = 90;
+    pub(super) const FCHMOD: u64 = 91;
+    pub(super) const UMASK: u64 = 95;
     pub(super) const GETTIMEOFDAY: u64 = 96; // partial: time since boot (no RTC yet)
     pub(super) const GETRLIMIT: u64 = 97;
     pub(super) const GETUID: u64 = 102; // partial: always 0
@@ -60,28 +78,31 @@ mod nr {
     pub(super) const SET_TID_ADDRESS: u64 = 218; // stub: returns TID 1
     pub(super) const CLOCK_GETTIME: u64 = 228; // partial: every clock counts from boot
     pub(super) const EXIT_GROUP: u64 = 231;
-    pub(super) const OPENAT: u64 = 257; // partial: AT_FDCWD or absolute paths
-    pub(super) const NEWFSTATAT: u64 = 262; // partial: AT_FDCWD or absolute paths
-    pub(super) const FACCESSAT: u64 = 269; // partial: AT_FDCWD or absolute paths
+    pub(super) const OPENAT: u64 = 257;
+    pub(super) const MKDIRAT: u64 = 258;
+    pub(super) const NEWFSTATAT: u64 = 262;
+    pub(super) const UNLINKAT: u64 = 263;
+    pub(super) const RENAMEAT: u64 = 264;
+    pub(super) const SYMLINKAT: u64 = 266;
+    pub(super) const READLINKAT: u64 = 267;
+    pub(super) const FCHMODAT: u64 = 268;
+    pub(super) const FACCESSAT: u64 = 269; // partial: existence only (every process is root)
     pub(super) const SET_ROBUST_LIST: u64 = 273; // stub: accepted (single-threaded)
-    pub(super) const DUP3: u64 = 292;
+    pub(super) const DUP3: u64 = 292; // partial: the copy has its own offset
     pub(super) const PRLIMIT64: u64 = 302; // partial: reads limits, ignores new ones
+    pub(super) const RENAMEAT2: u64 = 316; // partial: RENAME_NOREPLACE only
 }
 
+const EPERM: i64 = 1;
 const EBADF: i64 = 9;
+const EAGAIN: i64 = 11;
+const EACCES: i64 = 13;
 const EFAULT: i64 = 14;
-const EISDIR: i64 = 21;
+const ENODEV: i64 = 19;
 const EINVAL: i64 = 22;
 const EMFILE: i64 = 24;
-const EROFS: i64 = 30;
+const ENOTTY: i64 = 25;
 const ENOSYS: i64 = 38;
-
-const O_ACCMODE: u64 = 0o3;
-const O_CREAT: u64 = 0o100;
-const O_TRUNC: u64 = 0o1000;
-const O_DIRECTORY: u64 = 0o200_000;
-const AT_FDCWD: i64 = -100;
-const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
 
 /// What the kernel should do after a Linux syscall.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -95,12 +116,18 @@ pub(crate) enum Outcome {
 /// Dispatches one Linux syscall, writing the result into `ctx.rax`.
 pub(crate) fn dispatch(p: &mut LinuxProcess, ctx: &mut frame::user::UserContext) -> Outcome {
     let (nr, a) = ctx.syscall_args();
+    let i = |v: u64| v as i64;
     let result: Result<u64, i64> = match nr {
-        nr::READ => read(p, a[0], a[1], a[2] as usize),
-        nr::WRITE => write(p, a[0], a[1], a[2] as usize),
-        nr::WRITEV => writev(p, a[0], a[1], a[2] as usize),
-        nr::OPEN => open(p, AT_FDCWD, a[0], a[1]),
-        nr::OPENAT => open(p, a[0] as i64, a[1], a[2]),
+        // Files and paths.
+        nr::READ => fs::read(p, a[0], a[1], a[2] as usize),
+        nr::WRITE => fs::write(p, a[0], a[1], a[2] as usize),
+        nr::PREAD64 => fs::pread(p, a[0], a[1], a[2] as usize, a[3]),
+        nr::PWRITE64 => fs::pwrite(p, a[0], a[1], a[2] as usize, a[3]),
+        nr::READV => fs::vector(p, a[0], a[1], a[2] as usize, false),
+        nr::WRITEV => fs::vector(p, a[0], a[1], a[2] as usize, true),
+        nr::OPEN => fs::open(p, AT_FDCWD, a[0], a[1], a[2]),
+        nr::OPENAT => fs::open(p, i(a[0]), a[1], a[2], a[3]),
+        nr::CREAT => fs::open(p, AT_FDCWD, a[0], 0o1101, a[1]), // O_CREAT|O_TRUNC|O_WRONLY
         nr::CLOSE => {
             if p.close(a[0]) {
                 Ok(0)
@@ -108,32 +135,55 @@ pub(crate) fn dispatch(p: &mut LinuxProcess, ctx: &mut frame::user::UserContext)
                 Err(EBADF)
             }
         }
-        nr::STAT => stat_path(p, AT_FDCWD, a[0], a[1], true),
-        nr::LSTAT => stat_path(p, AT_FDCWD, a[0], a[1], false),
-        nr::NEWFSTATAT => stat_path(p, a[0] as i64, a[1], a[2], a[3] & AT_SYMLINK_NOFOLLOW == 0),
-        nr::FSTAT => fstat(p, a[0], a[1]),
-        nr::LSEEK => lseek(p, a[0], a[1] as i64, a[2]),
+        nr::STAT => fs::stat(p, a[0], a[1], true),
+        nr::LSTAT => fs::stat(p, a[0], a[1], false),
+        nr::NEWFSTATAT => fs::fstatat(p, i(a[0]), a[1], a[2], a[3]),
+        nr::FSTAT => fs::fstat(p, a[0], a[1]),
+        nr::LSEEK => fs::lseek(p, a[0], i(a[1]), a[2]),
+        nr::ACCESS => fs::access(p, AT_FDCWD, a[0], a[1]),
+        nr::FACCESSAT => fs::access(p, i(a[0]), a[1], a[2]),
+        nr::TRUNCATE => fs::truncate(p, a[0], a[1]),
+        nr::FTRUNCATE => fs::ftruncate(p, a[0], a[1]),
+        nr::FSYNC | nr::FDATASYNC => fs::fsync(p, a[0]),
+        nr::GETDENTS64 => fs::getdents64(p, a[0], a[1], a[2] as usize),
+        nr::MKDIR => fs::mkdir(p, AT_FDCWD, a[0], a[1]),
+        nr::MKDIRAT => fs::mkdir(p, i(a[0]), a[1], a[2]),
+        nr::RMDIR => fs::unlink(p, AT_FDCWD, a[0], 0x200),
+        nr::UNLINK => fs::unlink(p, AT_FDCWD, a[0], 0),
+        nr::UNLINKAT => fs::unlink(p, i(a[0]), a[1], a[2]),
+        nr::RENAME => fs::rename(p, AT_FDCWD, a[0], AT_FDCWD, a[1], 0),
+        nr::RENAMEAT => fs::rename(p, i(a[0]), a[1], i(a[2]), a[3], 0),
+        nr::RENAMEAT2 => fs::rename(p, i(a[0]), a[1], i(a[2]), a[3], a[4]),
+        nr::SYMLINK => fs::symlink(p, a[0], AT_FDCWD, a[1]),
+        nr::SYMLINKAT => fs::symlink(p, a[0], i(a[1]), a[2]),
+        nr::READLINK => fs::readlink(p, AT_FDCWD, a[0], a[1], a[2]),
+        nr::READLINKAT => fs::readlink(p, i(a[0]), a[1], a[2], a[3]),
+        nr::CHMOD => fs::chmod(p, AT_FDCWD, a[0], a[1]),
+        nr::FCHMODAT => fs::chmod(p, i(a[0]), a[1], a[2]),
+        nr::FCHMOD => fs::fchmod(p, a[0], a[1]),
+        nr::CHDIR => fs::chdir(p, a[0]),
+        nr::FCHDIR => fs::fchdir(p, a[0]),
+        nr::GETCWD => fs::getcwd(p, a[0], a[1]),
+        nr::UMASK => fs::umask(p, a[0]),
+        // Descriptors.
+        nr::DUP => p.dup_from(a[0], 0).ok_or(EBADF),
+        nr::DUP2 => p.dup_to(a[0], a[1]).ok_or(EBADF),
+        nr::DUP3 => {
+            if a[0] == a[1] {
+                Err(EINVAL)
+            } else {
+                p.dup_to(a[0], a[1]).ok_or(EBADF)
+            }
+        }
+        nr::FCNTL => fcntl(p, a[0], a[1], a[2]),
+        nr::IOCTL => ioctl(p, a[0], a[1], a[2]),
+        // Memory.
         nr::MMAP => mmap(p, &a),
         nr::MPROTECT => p.mm.mprotect(&p.cell, a[0], a[1], a[2]),
         nr::MUNMAP => p.mm.munmap(&p.cell, a[0], a[1]),
         nr::BRK => Ok(p.mm.brk(&p.cell, a[0])),
         nr::MADVISE => Ok(0),
-        nr::READV => readv(p, a[0], a[1], a[2] as usize),
-        nr::IOCTL => ioctl(p, a[0], a[1], a[2]),
-        nr::ACCESS => access(p, AT_FDCWD, a[0], a[1]),
-        nr::FACCESSAT => access(p, a[0] as i64, a[1], a[2]),
-        nr::DUP => p.dup_from(a[0], 0).ok_or(EBADF),
-        nr::DUP2 => dup2(p, a[0], a[1]),
-        nr::DUP3 => {
-            if a[0] == a[1] {
-                Err(EINVAL)
-            } else {
-                dup2(p, a[0], a[1])
-            }
-        }
-        nr::FCNTL => fcntl(p, a[0], a[1], a[2]),
-        nr::GETDENTS64 => getdents64(p, a[0], a[1], a[2] as usize),
-        nr::GETCWD => getcwd(p, a[0], a[1]),
+        // Identity, time, limits, signals, threads.
         nr::UNAME => uname(p, a[0]),
         nr::CLOCK_GETTIME => clock_gettime(p, a[1]),
         nr::GETTIMEOFDAY => gettimeofday(p, a[0]),
@@ -159,70 +209,8 @@ pub(crate) fn dispatch(p: &mut LinuxProcess, ctx: &mut frame::user::UserContext)
 }
 
 // ---------------------------------------------------------------------------
-// Console and file I/O.
+// Console.
 // ---------------------------------------------------------------------------
-
-fn read(p: &mut LinuxProcess, fd: u64, buf: u64, count: usize) -> Result<u64, i64> {
-    match p.fd(fd).ok_or(EBADF)? {
-        Fd::Console => Ok(0), // No console input yet: EOF.
-        Fd::File(f) => {
-            if f.node.kind() == Kind::Directory {
-                return Err(EISDIR);
-            }
-            let mut chunk = [0u8; 512];
-            let mut done = 0usize;
-            let mut offset = f.offset;
-            while done < count {
-                let want = chunk.len().min(count - done);
-                let n = f.node.read_at(offset, &mut chunk[..want]);
-                if n == 0 {
-                    break;
-                }
-                let copied = p.copy_to_user(buf + done as u64, &chunk[..n]);
-                done += copied;
-                offset += copied as u64;
-                if copied < n {
-                    if done == 0 {
-                        return Err(EFAULT);
-                    }
-                    break;
-                }
-            }
-            if let Some(f) = p.file_mut(fd) {
-                f.offset = offset;
-            }
-            Ok(done as u64)
-        }
-    }
-}
-
-fn write(p: &mut LinuxProcess, fd: u64, buf: u64, count: usize) -> Result<u64, i64> {
-    match p.fd(fd).ok_or(EBADF)? {
-        Fd::Console => Ok(console_write(p, buf, count) as u64),
-        Fd::File(_) => Err(EBADF), // Opened read-only (the root is read-only).
-    }
-}
-
-fn writev(p: &mut LinuxProcess, fd: u64, iov: u64, iovcnt: usize) -> Result<u64, i64> {
-    if !matches!(p.fd(fd).ok_or(EBADF)?, Fd::Console) {
-        return Err(EBADF);
-    }
-    if iovcnt > 1024 {
-        return Err(EINVAL);
-    }
-    let mut total = 0u64;
-    for i in 0..iovcnt {
-        // struct iovec { void *iov_base; size_t iov_len; }
-        let mut hdr = [0u8; 16];
-        if p.copy_from_user(iov + i as u64 * 16, &mut hdr) != 16 {
-            return Err(EFAULT);
-        }
-        let base = le_u64(&hdr[0..8]);
-        let len = le_u64(&hdr[8..16]) as usize;
-        total += console_write(p, base, len) as u64;
-    }
-    Ok(total)
-}
 
 /// Copies up to `count` bytes from user memory to the console.
 fn console_write(p: &mut LinuxProcess, buf: u64, count: usize) -> usize {
@@ -250,217 +238,6 @@ fn le_u64(b: &[u8]) -> u64 {
     u64::from_le_bytes(a)
 }
 
-// ---------------------------------------------------------------------------
-// Paths.
-// ---------------------------------------------------------------------------
-
-/// Copies a NUL-terminated path out of user memory.
-fn user_path(p: &mut LinuxProcess, addr: u64) -> Result<alloc::string::String, i64> {
-    let mut out = alloc::vec::Vec::new();
-    let mut chunk = [0u8; 256];
-    while out.len() < vfs::PATH_MAX {
-        let got = p.copy_from_user(addr + out.len() as u64, &mut chunk);
-        if got == 0 {
-            return Err(EFAULT);
-        }
-        if let Some(nul) = chunk[..got].iter().position(|&b| b == 0) {
-            out.extend_from_slice(&chunk[..nul]);
-            return alloc::string::String::from_utf8(out).map_err(|_| ENOENT);
-        }
-        out.extend_from_slice(&chunk[..got]);
-    }
-    Err(ENAMETOOLONG)
-}
-
-/// Checks a `dirfd`: only `AT_FDCWD` (or an absolute path) is supported, as
-/// the working directory is always `/` for now.
-fn check_dirfd(dirfd: i64, path: &str) -> Result<(), i64> {
-    if dirfd == AT_FDCWD || path.starts_with('/') {
-        Ok(())
-    } else {
-        Err(EBADF)
-    }
-}
-
-fn open(p: &mut LinuxProcess, dirfd: i64, path: u64, flags: u64) -> Result<u64, i64> {
-    let path = user_path(p, path)?;
-    check_dirfd(dirfd, &path)?;
-    if flags & O_ACCMODE != 0 || flags & (O_CREAT | O_TRUNC) != 0 {
-        // Anything but O_RDONLY needs the copy-on-write upper layer.
-        let exists = p.vfs.resolve(&path, true).is_ok();
-        return Err(if exists || flags & O_CREAT != 0 {
-            EROFS
-        } else {
-            ENOENT
-        });
-    }
-    let node = p.vfs.resolve(&path, true)?;
-    if flags & O_DIRECTORY != 0 && node.kind() != Kind::Directory {
-        return Err(ENOTDIR);
-    }
-    p.install(Fd::File(OpenFile { node, offset: 0 }))
-        .ok_or(EMFILE)
-}
-
-fn lseek(p: &mut LinuxProcess, fd: u64, offset: i64, whence: u64) -> Result<u64, i64> {
-    const SEEK_SET: u64 = 0;
-    const SEEK_CUR: u64 = 1;
-    const SEEK_END: u64 = 2;
-    let f = p.file_mut(fd).ok_or(EBADF)?;
-    let base = match whence {
-        SEEK_SET => 0i64,
-        SEEK_CUR => f.offset as i64,
-        SEEK_END => f.node.size() as i64,
-        _ => return Err(EINVAL),
-    };
-    let new = base.checked_add(offset).filter(|&n| n >= 0).ok_or(EINVAL)?;
-    f.offset = new as u64;
-    Ok(new as u64)
-}
-
-// ---------------------------------------------------------------------------
-// stat.
-// ---------------------------------------------------------------------------
-
-const S_IFREG: u32 = 0o100_000;
-const S_IFDIR: u32 = 0o040_000;
-const S_IFLNK: u32 = 0o120_000;
-const S_IFCHR: u32 = 0o020_000;
-
-/// Builds an x86-64 `struct stat` (144 bytes).
-fn stat_bytes(ino: u64, mode: u32, size: u64) -> [u8; 144] {
-    let mut st = [0u8; 144];
-    st[0..8].copy_from_slice(&1u64.to_le_bytes()); // st_dev
-    st[8..16].copy_from_slice(&ino.to_le_bytes()); // st_ino
-    st[16..24].copy_from_slice(&1u64.to_le_bytes()); // st_nlink
-    st[24..28].copy_from_slice(&mode.to_le_bytes()); // st_mode
-    st[48..56].copy_from_slice(&size.to_le_bytes()); // st_size
-    st[56..64].copy_from_slice(&4096u64.to_le_bytes()); // st_blksize
-    st[64..72].copy_from_slice(&size.div_ceil(512).to_le_bytes()); // st_blocks
-    st
-}
-
-fn node_stat(node: &image::Node<'static>) -> [u8; 144] {
-    let kind = match node.kind() {
-        Kind::File => S_IFREG,
-        Kind::Directory => S_IFDIR,
-        Kind::Symlink => S_IFLNK,
-    };
-    stat_bytes(node.inode(), kind | (node.mode & 0o7777), node.size())
-}
-
-fn put_stat(p: &mut LinuxProcess, addr: u64, st: &[u8; 144]) -> Result<u64, i64> {
-    if p.copy_to_user(addr, st) == st.len() {
-        Ok(0)
-    } else {
-        Err(EFAULT)
-    }
-}
-
-fn fstat(p: &mut LinuxProcess, fd: u64, addr: u64) -> Result<u64, i64> {
-    let st = match p.fd(fd).ok_or(EBADF)? {
-        Fd::Console => stat_bytes(0, S_IFCHR | 0o620, 0),
-        Fd::File(f) => node_stat(&f.node),
-    };
-    put_stat(p, addr, &st)
-}
-
-fn stat_path(
-    p: &mut LinuxProcess,
-    dirfd: i64,
-    path: u64,
-    addr: u64,
-    follow: bool,
-) -> Result<u64, i64> {
-    let path = user_path(p, path)?;
-    check_dirfd(dirfd, &path)?;
-    let node = p.vfs.resolve(&path, follow)?;
-    put_stat(p, addr, &node_stat(&node))
-}
-
-// ---------------------------------------------------------------------------
-// Misc.
-// ---------------------------------------------------------------------------
-
-const EPERM: i64 = 1;
-/// One past the highest user address (the top of the lower canonical half).
-const USER_ADDR_END: u64 = 0x0000_7fff_ffff_f000;
-const ARCH_SET_GS: u64 = 0x1001;
-const ARCH_SET_FS: u64 = 0x1002;
-
-/// `arch_prctl`: lets a static binary set its FS base (TLS). GS is not
-/// settable (the kernel keeps its per-CPU block there; see ADR-0001).
-fn arch_prctl(ctx: &mut frame::user::UserContext, code: u64, addr: u64) -> Result<u64, i64> {
-    match code {
-        ARCH_SET_FS => {
-            // Like Linux: the base must be a user address (anything else
-            // would fault when loaded into the MSR).
-            if addr >= USER_ADDR_END {
-                return Err(EPERM);
-            }
-            ctx.fs_base = addr;
-            Ok(0)
-        }
-        ARCH_SET_GS => Err(EINVAL),
-        _ => Err(EINVAL),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Memory.
-// ---------------------------------------------------------------------------
-
-fn mmap(p: &mut LinuxProcess, a: &[u64; 6]) -> Result<u64, i64> {
-    let (addr, len, prot, map_flags, fd, offset) = (a[0], a[1], a[2], a[3], a[4], a[5]);
-    if map_flags & umem::flags::MAP_ANONYMOUS != 0 {
-        return p.mm.mmap(&p.cell, addr, len, prot, map_flags, None);
-    }
-    let node = match p.fd(fd).ok_or(EBADF)? {
-        Fd::File(f) if f.node.kind() == Kind::File => f.node,
-        Fd::File(_) | Fd::Console => return Err(ENODEV),
-    };
-    if map_flags & umem::flags::MAP_SHARED != 0 && prot & 2 != 0 {
-        return Err(EACCES); // Shared and writable needs a writable file.
-    }
-    let src = umem::FileSource {
-        node: &node,
-        offset,
-    };
-    p.mm.mmap(&p.cell, addr, len, prot, map_flags, Some(src))
-}
-
-// ---------------------------------------------------------------------------
-// More file and descriptor calls.
-// ---------------------------------------------------------------------------
-
-const EAGAIN: i64 = 11;
-const EACCES: i64 = 13;
-const ENODEV: i64 = 19;
-const ENOTDIR: i64 = 20;
-const ENOTTY: i64 = 25;
-const ERANGE: i64 = 34;
-
-fn readv(p: &mut LinuxProcess, fd: u64, iov: u64, iovcnt: usize) -> Result<u64, i64> {
-    if iovcnt > 1024 {
-        return Err(EINVAL);
-    }
-    p.fd(fd).ok_or(EBADF)?;
-    let mut total = 0u64;
-    for i in 0..iovcnt {
-        let mut hdr = [0u8; 16];
-        if p.copy_from_user(iov + i as u64 * 16, &mut hdr) != 16 {
-            return Err(EFAULT);
-        }
-        let (base, len) = (le_u64(&hdr[0..8]), le_u64(&hdr[8..16]) as usize);
-        let n = read(p, fd, base, len)?;
-        total += n;
-        if (n as usize) < len {
-            break;
-        }
-    }
-    Ok(total)
-}
-
 fn ioctl(p: &mut LinuxProcess, fd: u64, request: u64, arg: u64) -> Result<u64, i64> {
     const TIOCGWINSZ: u64 = 0x5413;
     match (p.fd(fd).ok_or(EBADF)?, request) {
@@ -479,21 +256,6 @@ fn ioctl(p: &mut LinuxProcess, fd: u64, request: u64, arg: u64) -> Result<u64, i
     }
 }
 
-fn access(p: &mut LinuxProcess, dirfd: i64, path: u64, mode: u64) -> Result<u64, i64> {
-    const W_OK: u64 = 2;
-    let path = user_path(p, path)?;
-    check_dirfd(dirfd, &path)?;
-    p.vfs.resolve(&path, true)?;
-    if mode & W_OK != 0 {
-        return Err(EROFS);
-    }
-    Ok(0)
-}
-
-fn dup2(p: &mut LinuxProcess, old: u64, new: u64) -> Result<u64, i64> {
-    p.dup_to(old, new).ok_or(EBADF)
-}
-
 fn fcntl(p: &mut LinuxProcess, fd: u64, cmd: u64, arg: u64) -> Result<u64, i64> {
     const F_DUPFD: u64 = 0;
     const F_GETFD: u64 = 1;
@@ -508,77 +270,34 @@ fn fcntl(p: &mut LinuxProcess, fd: u64, cmd: u64, arg: u64) -> Result<u64, i64> 
         F_GETFD | F_SETFD | F_SETFL => Ok(0),
         F_GETFL => Ok(match f {
             Fd::Console => O_RDWR,
-            Fd::File(_) => 0,
+            Fd::File(of) => of.flags,
         }),
         _ => Err(EINVAL),
     }
 }
 
-/// `getdents64`: directory entries as `struct linux_dirent64`, including
-/// `.` and `..`. The file offset counts entries.
-fn getdents64(p: &mut LinuxProcess, fd: u64, buf: u64, count: usize) -> Result<u64, i64> {
-    const DT_DIR: u8 = 4;
-    const DT_REG: u8 = 8;
-    const DT_LNK: u8 = 10;
-    const HEADER: usize = 19; // d_ino, d_off, d_reclen, d_type
-    let f = match p.fd(fd).ok_or(EBADF)? {
-        Fd::File(f) => f,
-        Fd::Console => return Err(ENOTDIR),
-    };
-    if f.node.kind() != Kind::Directory {
-        return Err(ENOTDIR);
-    }
-    let mut out: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
-    let mut index = f.offset;
-    loop {
-        let entry = match index {
-            0 => Some((f.node.inode(), DT_DIR, ".")),
-            1 => Some((f.node.inode(), DT_DIR, "..")),
-            i => f.node.entries().nth((i - 2) as usize).map(|e| {
-                let t = match e.kind() {
-                    Kind::Directory => DT_DIR,
-                    Kind::File => DT_REG,
-                    Kind::Symlink => DT_LNK,
-                };
-                (e.inode(), t, e.name())
-            }),
-        };
-        let Some((ino, dtype, name)) = entry else {
-            break;
-        };
-        let reclen = (HEADER + name.len() + 1).next_multiple_of(8);
-        if out.len() + reclen > count {
-            if out.is_empty() {
-                return Err(EINVAL);
-            }
-            break;
-        }
-        let start = out.len();
-        out.extend_from_slice(&ino.to_le_bytes());
-        out.extend_from_slice(&(index + 1).to_le_bytes()); // d_off
-        out.extend_from_slice(&(reclen as u16).to_le_bytes());
-        out.push(dtype);
-        out.extend_from_slice(name.as_bytes());
-        out.resize(start + reclen, 0);
-        index += 1;
-    }
-    if p.copy_to_user(buf, &out) != out.len() {
-        return Err(EFAULT);
-    }
-    if let Some(f) = p.file_mut(fd) {
-        f.offset = index;
-    }
-    Ok(out.len() as u64)
-}
+// ---------------------------------------------------------------------------
+// Memory.
+// ---------------------------------------------------------------------------
 
-fn getcwd(p: &mut LinuxProcess, buf: u64, size: u64) -> Result<u64, i64> {
-    if size < 2 {
-        return Err(ERANGE);
+fn mmap(p: &mut LinuxProcess, a: &[u64; 6]) -> Result<u64, i64> {
+    let (addr, len, prot, map_flags, fd, offset) = (a[0], a[1], a[2], a[3], a[4], a[5]);
+    if map_flags & umem::flags::MAP_ANONYMOUS != 0 {
+        return p.mm.mmap(&p.cell, addr, len, prot, map_flags, None);
     }
-    if p.copy_to_user(buf, b"/\0") != 2 {
-        return Err(EFAULT);
+    if matches!(p.fd(fd).ok_or(EBADF)?, Fd::Console) {
+        return Err(ENODEV);
     }
-    Ok(2)
+    if map_flags & umem::flags::MAP_SHARED != 0 && prot & 2 != 0 {
+        // A shared writable mapping would need writes to reach the file.
+        return Err(EACCES);
+    }
+    let bytes = fs::file_bytes(p, fd, offset, len)?;
+    let src = umem::FileSource {
+        bytes: &bytes,
+        offset,
+    };
+    p.mm.mmap(&p.cell, addr, len, prot, map_flags, Some(src))
 }
 
 // ---------------------------------------------------------------------------
@@ -676,5 +395,28 @@ fn futex(p: &mut LinuxProcess, uaddr: u64, op: u64) -> Result<u64, i64> {
         }
         FUTEX_WAKE => Ok(0),
         _ => Err(ENOSYS),
+    }
+}
+
+/// One past the highest user address (the top of the lower canonical half).
+const USER_ADDR_END: u64 = 0x0000_7fff_ffff_f000;
+const ARCH_SET_GS: u64 = 0x1001;
+const ARCH_SET_FS: u64 = 0x1002;
+
+/// `arch_prctl`: lets a static binary set its FS base (TLS). GS is not
+/// settable (the kernel keeps its per-CPU block there; see ADR-0001).
+fn arch_prctl(ctx: &mut frame::user::UserContext, code: u64, addr: u64) -> Result<u64, i64> {
+    match code {
+        ARCH_SET_FS => {
+            // Like Linux: the base must be a user address (anything else
+            // would fault when loaded into the MSR).
+            if addr >= USER_ADDR_END {
+                return Err(EPERM);
+            }
+            ctx.fs_base = addr;
+            Ok(0)
+        }
+        ARCH_SET_GS => Err(EINVAL),
+        _ => Err(EINVAL),
     }
 }

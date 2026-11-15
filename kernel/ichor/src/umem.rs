@@ -37,9 +37,10 @@ pub(crate) mod flags {
     pub(crate) const MAP_FIXED_NOREPLACE: u64 = 0x10_0000;
 }
 
-/// A file mapping's source: the file and the offset of the first page.
+/// A file mapping's source: the file's bytes from `offset` on (already
+/// read, at most the mapping's length; the rest of the mapping is zero).
 pub(crate) struct FileSource<'a> {
-    pub(crate) node: &'a image::Node<'static>,
+    pub(crate) bytes: &'a [u8],
     pub(crate) offset: u64,
 }
 
@@ -208,19 +209,19 @@ impl Mm {
             return Err(ENOMEM);
         }
         if let Some(f) = file {
-            // Private file mappings are copied in now (the root is read-only,
-            // so a shared mapping can never observe a write either).
-            let mut buf = alloc::vec![0u8; PAGE_SIZE as usize];
+            // File mappings are copied in now. A shared mapping is only
+            // allowed read-only, so it cannot miss a write to the file it
+            // would have made; it can miss later writes by others (partial).
             let mut va = start;
             while va < start + len {
-                let off = f.offset + (va - start);
-                let n = f.node.read_at(off, &mut buf);
-                if n > 0 {
+                let at = (va - start) as usize;
+                let chunk = f.bytes.get(at..f.bytes.len().min(at + PAGE_SIZE as usize));
+                if let Some(chunk) = chunk.filter(|c| !c.is_empty()) {
                     let Some(frame) = self.frame(cell, va) else {
                         self.munmap(cell, start, len)?;
                         return Err(ENOMEM);
                     };
-                    frame.writer().write(&buf[..n]);
+                    frame.writer().write(chunk);
                     if prot.accessible() && cell.space().map(va, &frame, user_prot(prot)).is_err() {
                         self.munmap(cell, start, len)?;
                         return Err(ENOMEM);
