@@ -8,6 +8,7 @@ version = "0.0.0"
 dependencies = [
  "ichor-cmdline",
  "ichor-frame",
+ "ichor-sched",
 ]
 
 [[package]]
@@ -34,6 +35,10 @@ dependencies = [
 
 [[package]]
 name = "ichor-pe"
+version = "0.0.0"
+
+[[package]]
+name = "ichor-sched"
 version = "0.0.0"
 
 [[package]]

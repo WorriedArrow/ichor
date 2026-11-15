@@ -12,5 +12,8 @@
 # steps up to its ceiling of 6,000 lines / 320 sites.
 # Step 1 (paging, page allocator, heap): 1,950 / 115.
 # Step 2 (traps, x2APIC, timer, ACPI access, SMP, per-CPU data): 3,000 / 160.
-max_code_lines = 3000
-max_unsafe_sites = 160
+#
+# Milestone 2: ADR-0003 sets the ceiling at 7,000 / 300.
+# Step 3 (tasks, context switch, atomic mode, scheduler hook): 3,700 / 170.
+max_code_lines = 3700
+max_unsafe_sites = 170

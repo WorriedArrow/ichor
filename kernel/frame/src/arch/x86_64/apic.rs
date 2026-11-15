@@ -108,7 +108,6 @@ pub(crate) fn eoi() {
 }
 
 /// Sends a fixed-delivery IPI to the CPU with x2APIC ID `dest`.
-#[allow(dead_code)] // The scheduler's wake-up path (milestone 2).
 pub(crate) fn send_ipi(dest: u32, vector: u8) {
     write(MSR_ICR, (u64::from(dest) << 32) | u64::from(vector));
 }
@@ -221,19 +220,88 @@ pub(crate) fn init_timer() {
     write(MSR_LVT_TIMER, u64::from(TIMER_VECTOR));
 }
 
-/// Arms this CPU's timer to fire once, `ns` nanoseconds from now.
-pub(crate) fn arm_timer_ns(ns: u64) {
+/// Which of a CPU's two multiplexed timer deadlines.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TimerKind {
+    /// The scheduler's timeslice.
+    Slice = 0,
+    /// The kernel's own timer (`time::arm_timer`).
+    Kernel = 1,
+}
+
+crate::cpu_local! {
+    /// Absolute TSC deadlines per kind; 0 means unarmed.
+    static DEADLINES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+}
+
+fn ns_to_tsc(ns: u64) -> u64 {
+    (u128::from(ns) * u128::from(tsc_hz()) / 1_000_000_000) as u64
+}
+
+/// Programs the hardware for the earliest armed deadline.
+fn program(d: &[AtomicU64; 2]) {
+    let next = d.iter().map(|x| x.load(Relaxed)).filter(|&x| x != 0).min();
+    let Some(at) = next else { return };
     if DEADLINE_MODE.load(Relaxed) {
-        let ticks = (u128::from(ns) * u128::from(tsc_hz()) / 1_000_000_000) as u64;
         // SAFETY: IA32_TSC_DEADLINE exists when CPUID reports TSC-deadline
         // support (checked in `init_timer`); writing it only arms this
         // CPU's timer interrupt.
-        unsafe { wrmsr(regs::MSR_TSC_DEADLINE, rdtsc().wrapping_add(ticks.max(1))) };
+        unsafe { wrmsr(regs::MSR_TSC_DEADLINE, at.max(1)) };
     } else {
-        let per_ms = LAPIC_TICKS_PER_MS.load(Relaxed);
-        let ticks =
-            (u128::from(ns) * u128::from(per_ms) / 1_000_000).clamp(1, u128::from(u32::MAX));
+        let left_ns =
+            (u128::from(at.saturating_sub(rdtsc())) * 1_000_000_000) / u128::from(tsc_hz().max(1));
+        let per_ms = u128::from(LAPIC_TICKS_PER_MS.load(Relaxed));
+        let ticks = (left_ns * per_ms / 1_000_000).clamp(1, u128::from(u32::MAX));
         write(MSR_TIMER_INIT, ticks as u64);
+    }
+}
+
+/// `cpu`'s armed deadlines as nanoseconds from now (negative: overdue),
+/// for diagnostics.
+pub(crate) fn deadlines_ns(cpu: crate::cpu::CpuId) -> [Option<i64>; 2] {
+    let now = rdtsc();
+    let hz = tsc_hz().max(1);
+    DEADLINES.get_on(cpu).each_ref().map(|d| {
+        let at = d.load(Relaxed);
+        (at != 0)
+            .then(|| ((i128::from(at) - i128::from(now)) * 1_000_000_000 / i128::from(hz)) as i64)
+    })
+}
+
+/// Arms deadline `kind` on this CPU, `ns` nanoseconds from now.
+pub(crate) fn arm(kind: TimerKind, ns: u64) {
+    let g = crate::cpu::IrqGuard::new();
+    let d = DEADLINES.get(&g);
+    d[kind as usize].store(rdtsc().wrapping_add(ns_to_tsc(ns).max(1)), Relaxed);
+    program(d);
+}
+
+/// Handles this CPU's timer interrupt: fires expired deadlines, re-arms.
+fn on_timer_interrupt() {
+    let (slice, kernel) = {
+        let g = crate::cpu::IrqGuard::new();
+        let d = DEADLINES.get(&g);
+        let now = rdtsc();
+        let fired = |k: TimerKind| {
+            let at = d[k as usize].load(Relaxed);
+            let f = at != 0 && at <= now;
+            if f {
+                d[k as usize].store(0, Relaxed);
+            }
+            f
+        };
+        let r = (fired(TimerKind::Slice), fired(TimerKind::Kernel));
+        program(d);
+        r
+    };
+    if kernel {
+        let handler = *TIMER_HANDLER.lock();
+        if let Some(h) = handler {
+            h();
+        }
+    }
+    if slice {
+        crate::task::on_tick();
     }
 }
 
@@ -256,10 +324,7 @@ pub(crate) fn handle_irq(vector: u8, _frame: &mut TrapFrame) {
         SPURIOUS_VECTOR => return, // no EOI for spurious interrupts
         TIMER_VECTOR => {
             eoi();
-            let handler = *TIMER_HANDLER.lock();
-            if let Some(h) = handler {
-                h();
-            }
+            on_timer_interrupt();
             return;
         }
         IPI_VECTOR => {

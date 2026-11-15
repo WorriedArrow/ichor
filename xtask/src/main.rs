@@ -135,12 +135,14 @@ fn cmd_test(o: &Opts) -> Result<()> {
     // Build the kernel once, then hand it to the integration tests.
     let kernel = build::kernel(o.profile)?;
     let mut cmd = cargo();
-    cmd.args(["test", "--package", "ichor-tests"])
-        .env("ICHOR_KERNEL", &kernel)
-        .env(
-            "ICHOR_ACCEL",
-            format!("{:?}", o.accel.resolve()).to_lowercase(),
-        );
+    cmd.args(["test", "--package", "ichor-tests"]);
+    if std::env::var_os("ICHOR_TEST_VERBOSE").is_some() {
+        cmd.args(["--", "--nocapture"]);
+    }
+    cmd.env("ICHOR_KERNEL", &kernel).env(
+        "ICHOR_ACCEL",
+        format!("{:?}", o.accel.resolve()).to_lowercase(),
+    );
     run_cmd(&mut cmd)
 }
 

@@ -14,6 +14,7 @@ bench = false
 [dependencies]
 frame.workspace = true
 cmdline.workspace = true
+sched.workspace = true
 
 [lints]
 workspace = true

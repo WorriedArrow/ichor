@@ -6,6 +6,7 @@ members = [
     "kernel/pe",
     "kernel/buddy",
     "kernel/acpi",
+    "kernel/sched",
     "kernel/ichor",
     "tests",
     "xtask",
@@ -18,6 +19,7 @@ default-members = [
     "kernel/pe",
     "kernel/buddy",
     "kernel/acpi",
+    "kernel/sched",
     "tests",
     "xtask",
 ]
@@ -34,6 +36,7 @@ cmdline = { package = "ichor-cmdline", path = "kernel/cmdline" }
 pe = { package = "ichor-pe", path = "kernel/pe" }
 buddy = { package = "ichor-buddy", path = "kernel/buddy" }
 acpi = { package = "ichor-acpi", path = "kernel/acpi" }
+sched = { package = "ichor-sched", path = "kernel/sched" }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

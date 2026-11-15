@@ -96,6 +96,9 @@ pub fn start_aps(ap_main: fn(CpuId) -> !) -> usize {
         }
     }
     let count = stacks.len() - 1;
+    for i in 1..=count {
+        cpu::register_ap_block(CpuId::new(i as u32));
+    }
     let stacks: &'static [u64] = stacks.leak();
 
     // AP page tables: identity map of the first 2 MiB plus the kernel half.
@@ -166,6 +169,7 @@ extern "sysv64" fn ap_entry(index: u32) -> ! {
         arch::halt_forever();
     }
     let id = CpuId::new(index);
+    cpu::init_ap_block(id);
     crate::boot::init_cpu(id);
     let main = *AP_MAIN.lock();
     match main {

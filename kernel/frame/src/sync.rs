@@ -38,6 +38,7 @@ impl<T: ?Sized> SpinLock<T> {
     /// Spins until the lock is acquired.
     pub fn lock(&self) -> SpinLockGuard<'_, T> {
         let irq = arch::save_and_disable_interrupts();
+        crate::cpu::atomic_enter();
         while self
             .locked
             .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
@@ -57,6 +58,7 @@ impl<T: ?Sized> SpinLock<T> {
     /// Acquires the lock if it is free.
     pub fn try_lock(&self) -> Option<SpinLockGuard<'_, T>> {
         let irq = arch::save_and_disable_interrupts();
+        crate::cpu::atomic_enter();
         match self
             .locked
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
@@ -67,6 +69,7 @@ impl<T: ?Sized> SpinLock<T> {
                 _not_send: PhantomData,
             }),
             Err(_) => {
+                crate::cpu::atomic_leave();
                 arch::restore_interrupts(irq);
                 None
             }
@@ -118,6 +121,7 @@ impl<T: ?Sized> DerefMut for SpinLockGuard<'_, T> {
 impl<T: ?Sized> Drop for SpinLockGuard<'_, T> {
     fn drop(&mut self) {
         self.lock.locked.store(false, Ordering::Release);
+        crate::cpu::atomic_leave();
         arch::restore_interrupts(self.irq);
     }
 }

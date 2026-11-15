@@ -7,6 +7,9 @@
 //! half, the page allocator and heap work, traps are handled (including a
 //! stack overflow caught by a guard page), and every CPU comes online and
 //! takes timer interrupts.
+//!
+//! Milestone 2 (scheduler): kernel threads run on every CPU, block and wake
+//! through wait queues, and never-yielding threads are preempted.
 
 use ichor_tests::{Exit, boot};
 
@@ -30,6 +33,8 @@ fn m1_boots_on_four_cpus() {
     out.assert_in_order(BOOT_MARKERS);
     out.assert_in_order(&[
         "ichor: smp: 4 CPUs online, every CPU took 5 timer interrupts",
+        "ichor: sched: 32 threads finished, ran on 4 CPUs",
+        "ichor: sched: 9 spinners on 4 CPUs all ran (preemption works",
         "ichor: boot complete; halting",
     ]);
     // Every page the heap self-test used came back.
@@ -60,6 +65,20 @@ fn m1_boots_on_one_cpu() {
     out.assert_in_order(BOOT_MARKERS);
     out.assert_in_order(&[
         "ichor: smp: 1 CPUs online, every CPU took 5 timer interrupts",
+        "ichor: sched: 32 threads finished, ran on 1 CPUs",
+        "ichor: sched: 3 spinners on 1 CPUs all ran (preemption works",
+        "ichor: boot complete; halting",
+    ]);
+}
+
+#[test]
+fn m2_scheduler_on_eight_cpus() {
+    let out = boot("m2-smp8", "", 8);
+    out.assert_exit(Exit::Success);
+    out.assert_in_order(&[
+        "ichor: smp: 8 CPUs online, every CPU took 5 timer interrupts",
+        "ichor: sched: 32 threads finished, ran on ",
+        "ichor: sched: 17 spinners on 8 CPUs all ran (preemption works",
         "ichor: boot complete; halting",
     ]);
 }

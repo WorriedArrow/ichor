@@ -8,6 +8,7 @@ pub(crate) mod paging;
 pub(crate) mod qemu;
 pub(crate) mod regs;
 pub(crate) mod smp;
+pub(crate) mod switch;
 pub(crate) mod trap;
 
 pub use self::trap::TrapFrame;
@@ -68,6 +69,45 @@ pub(crate) fn cpu_index() -> u32 {
     // index) before any code that can ask for the CPU index runs.
     unsafe { asm!("mov {}, gs:[8]", out(reg) index, options(nostack, preserves_flags, readonly)) };
     index as u32
+}
+
+/// Increments this CPU's atomic depth (`gs:[48]`). One instruction, so it
+/// cannot be torn by an interrupt or a migration.
+pub(crate) fn atomic_depth_inc() {
+    // SAFETY: GS points at this CPU's block (callers check that blocks are
+    // ready); offset 48 is its `atomic_depth` counter, otherwise accessed only
+    // atomically.
+    unsafe { asm!("inc qword ptr gs:[48]", options(nostack)) };
+}
+
+/// Decrements this CPU's atomic depth.
+pub(crate) fn atomic_depth_dec() {
+    // SAFETY: as in `atomic_depth_inc`.
+    unsafe { asm!("dec qword ptr gs:[48]", options(nostack)) };
+}
+
+/// This CPU's atomic depth.
+pub(crate) fn atomic_depth() -> u64 {
+    let d: u64;
+    // SAFETY: as in `atomic_depth_inc`; a plain load.
+    unsafe { asm!("mov {}, gs:[48]", out(reg) d, options(nostack, preserves_flags, readonly)) };
+    d
+}
+
+/// Switches to page table root `root` (0 means the kernel's), if it is
+/// not already active.
+pub(crate) fn activate_root(root: u64) {
+    let target = if root == 0 {
+        crate::mm::kspace::kernel_root()
+    } else {
+        root
+    };
+    if regs::read_cr3() & 0x000f_ffff_ffff_f000 != target {
+        // SAFETY: `target` is the kernel PML4 or a user root built by frame,
+        // which shares every kernel-half entry, so the running code, stack
+        // and data stay mapped.
+        unsafe { regs::write_cr3(target) };
+    }
 }
 
 /// Stops the current CPU forever with interrupts masked.

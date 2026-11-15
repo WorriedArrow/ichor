@@ -33,6 +33,7 @@ pub mod mm;
 pub mod power;
 pub mod smp;
 pub mod sync;
+pub mod task;
 pub mod time;
 
 mod panic;

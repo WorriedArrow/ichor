@@ -10,7 +10,7 @@
 use alloc::boxed::Box;
 use core::fmt;
 use core::marker::PhantomData;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use crate::arch;
 
@@ -60,23 +60,74 @@ pub fn online() -> impl Iterator<Item = CpuId> {
     (0..online_count() as u32).map(CpuId)
 }
 
-/// The per-CPU block GS points at.
+/// The per-CPU block GS points at. Field offsets are used by assembly
+/// (`arch::x86_64`), so the layout is fixed.
 #[repr(C)]
+#[derive(Debug)]
 pub(crate) struct CpuBlock {
-    /// Offset 0: the block's own address.
-    self_addr: u64,
-    /// Offset 8: the CPU index.
-    index: u64,
+    /// 0: the block's own address.
+    pub(crate) self_addr: AtomicU64,
+    /// 8: the CPU index.
+    pub(crate) index: AtomicU64,
+    /// 16: kernel stack pointer saved by user-mode entry.
+    pub(crate) kernel_rsp: AtomicU64,
+    /// 24: user stack pointer saved by the syscall entry.
+    pub(crate) user_rsp: AtomicU64,
+    /// 32: the `UserContext` being executed.
+    pub(crate) user_ctx: AtomicU64,
+    /// 40: scratch for the syscall entry.
+    pub(crate) scratch: AtomicU64,
+    /// 48: number of live `IrqGuard`s and spinlock guards ("atomic depth").
+    pub(crate) atomic_depth: AtomicU64,
 }
 
-/// Sets up the calling CPU's block (GS base).
-pub(crate) fn init_this_cpu(id: CpuId) {
-    let block = Box::leak(Box::new(CpuBlock {
-        self_addr: 0,
-        index: u64::from(id.0),
-    }));
-    block.self_addr = core::ptr::addr_of!(*block) as u64;
-    arch::set_cpu_block(block.self_addr);
+impl CpuBlock {
+    const fn new(index: u64) -> Self {
+        Self {
+            self_addr: AtomicU64::new(0),
+            index: AtomicU64::new(index),
+            kernel_rsp: AtomicU64::new(0),
+            user_rsp: AtomicU64::new(0),
+            user_ctx: AtomicU64::new(0),
+            scratch: AtomicU64::new(0),
+            atomic_depth: AtomicU64::new(0),
+        }
+    }
+}
+
+static BOOT_CPU_BLOCK: CpuBlock = CpuBlock::new(0);
+/// Set once the boot CPU's GS points at its block. Until then (early boot,
+/// one CPU, no scheduler) the atomic depth is not tracked.
+static BLOCKS_READY: AtomicBool = AtomicBool::new(false);
+
+/// Points the boot CPU's GS at its (static) block.
+pub(crate) fn init_boot_cpu_block() {
+    let addr = core::ptr::addr_of!(BOOT_CPU_BLOCK) as u64;
+    BOOT_CPU_BLOCK.self_addr.store(addr, Ordering::Relaxed);
+    arch::set_cpu_block(addr);
+    BLOCKS_READY.store(true, Ordering::Release);
+}
+
+/// AP blocks' addresses, indexed by CPU index (0, the boot CPU, unused).
+static AP_BLOCKS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+
+/// Allocates the block for AP `id` (before it starts). Blocks are leaked:
+/// CPUs never go away.
+pub(crate) fn register_ap_block(id: CpuId) {
+    let block: &'static CpuBlock = Box::leak(Box::new(CpuBlock::new(u64::from(id.0))));
+    let addr = core::ptr::addr_of!(*block) as u64;
+    block.self_addr.store(addr, Ordering::Relaxed);
+    if let Some(slot) = AP_BLOCKS.get(id.index()) {
+        slot.store(addr, Ordering::Release);
+    }
+}
+
+/// Points an AP's GS at the block registered for it.
+pub(crate) fn init_ap_block(id: CpuId) {
+    let addr = AP_BLOCKS
+        .get(id.index())
+        .map_or(0, |b| b.load(Ordering::Acquire));
+    arch::set_cpu_block(addr);
 }
 
 /// Counts the calling CPU as online (after all of its initialization).
@@ -84,17 +135,45 @@ pub(crate) fn mark_online() {
     ONLINE.fetch_add(1, Ordering::AcqRel);
 }
 
+/// Enters atomic mode (a guard that masks interrupts was created).
+pub(crate) fn atomic_enter() {
+    if BLOCKS_READY.load(Ordering::Relaxed) {
+        arch::atomic_depth_inc();
+    }
+}
+
+/// Leaves atomic mode (that guard was dropped).
+pub(crate) fn atomic_leave() {
+    if BLOCKS_READY.load(Ordering::Relaxed) {
+        arch::atomic_depth_dec();
+    }
+}
+
+/// How many interrupt-masking guards are live on this CPU.
+pub(crate) fn atomic_depth() -> u64 {
+    if BLOCKS_READY.load(Ordering::Relaxed) {
+        arch::atomic_depth()
+    } else {
+        0
+    }
+}
+
 /// The CPU this code is running on.
 ///
-/// Without a guard the answer may be stale by the time it is used once
-/// the scheduler can migrate tasks (milestone 2); hold an [`IrqGuard`] when
-/// that matters.
+/// Without a guard the answer may be stale by the time it is used, because
+/// the scheduler can migrate tasks; hold an [`IrqGuard`] when that matters.
 pub fn current() -> CpuId {
+    if !BLOCKS_READY.load(Ordering::Relaxed) {
+        return CpuId::BOOT;
+    }
     CpuId(arch::cpu_index())
 }
 
 /// Interrupts are masked on this CPU while the guard lives; restores the
-/// previous state on drop. Not `Send` or `Sync`: it describes this CPU.
+/// previous state on drop. While any guard is live the CPU is in *atomic
+/// mode*: the current task cannot be preempted, and sleeping, yielding or
+/// re-enabling interrupts panics. Not `Send` or `Sync`: it describes this
+/// CPU.
 pub struct IrqGuard {
     was_enabled: bool,
     _not_send: PhantomData<*mut ()>,
@@ -103,8 +182,10 @@ pub struct IrqGuard {
 impl IrqGuard {
     /// Masks interrupts on this CPU.
     pub fn new() -> Self {
+        let was_enabled = arch::save_and_disable_interrupts();
+        atomic_enter();
         Self {
-            was_enabled: arch::save_and_disable_interrupts(),
+            was_enabled,
             _not_send: PhantomData,
         }
     }
@@ -123,6 +204,7 @@ impl Default for IrqGuard {
 
 impl Drop for IrqGuard {
     fn drop(&mut self) {
+        atomic_leave();
         arch::restore_interrupts(self.was_enabled);
     }
 }
@@ -190,8 +272,9 @@ impl<T> fmt::Debug for CpuLocal<T> {
 /// ```
 #[macro_export]
 macro_rules! cpu_local {
-    ($($vis:vis static $name:ident: $ty:ty = $init:expr;)+) => {
+    ($($(#[$attr:meta])* $vis:vis static $name:ident: $ty:ty = $init:expr;)+) => {
         $(
+            $(#[$attr])*
             $vis static $name: $crate::cpu::CpuLocal<$ty> = $crate::cpu::CpuLocal::from_slots(
                 [const { $crate::cpu::CachePadded($init) }; $crate::cpu::MAX_CPUS],
             );

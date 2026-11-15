@@ -193,8 +193,9 @@ pub(crate) fn init_cpu() -> Option<()> {
     // SAFETY: `gdt` describes a 'static GDT whose code/data selectors match
     // `KERNEL_CS`/`KERNEL_SS`; CS is reloaded with a far return to the next
     // instruction and the data segments with the kernel data selector; the
-    // TSS descriptor points at a 'static TSS. FS/GS are nulled (their bases
-    // are set through MSRs afterwards).
+    // TSS descriptor points at a 'static TSS. FS/GS are left alone: in
+    // 64-bit mode only their MSR-held bases matter, and reloading GS would
+    // clear the per-CPU block pointer.
     unsafe {
         asm!(
             "lgdt [{gdt}]",
@@ -207,9 +208,6 @@ pub(crate) fn init_cpu() -> Option<()> {
             "mov ss, {tmp:e}",
             "mov ds, {tmp:e}",
             "mov es, {tmp:e}",
-            "xor {tmp:e}, {tmp:e}",
-            "mov fs, {tmp:e}",
-            "mov gs, {tmp:e}",
             "mov {tmp:e}, {tss}",
             "ltr {tmp:x}",
             "lidt [{idt}]",
@@ -279,7 +277,14 @@ extern "sysv64" fn trap_dispatch(f: &mut TrapFrame) {
             BREAKPOINTS.fetch_add(1, Relaxed);
         }
         2 => super::apic::handle_nmi(),
-        FIRST_IRQ_VECTOR..=255 => super::apic::handle_irq(vector, f),
+        FIRST_IRQ_VECTOR..=255 => {
+            super::apic::handle_irq(vector, f);
+            // Preempt only code that ran with interrupts enabled (so it held
+            // no guard and no spinlock).
+            if f.rflags & (1 << 9) != 0 {
+                crate::task::preempt_point();
+            }
+        }
         14 => {
             let addr = regs::read_cr2();
             let what = if in_stack_guard(addr) {

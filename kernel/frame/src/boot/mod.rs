@@ -135,16 +135,15 @@ pub(crate) fn acpi_rsdp() -> Option<PhysAddr> {
 pub(crate) fn init_cpu(id: CpuId) {
     arch::cpu::enable_nx();
     arch::cpu::enable_protections();
-    // Loading the GDT reloads GS with a null selector, which clears the GS
-    // base, so the per-CPU block is installed afterwards.
     if arch::trap::init_cpu().is_none() {
         fatal("out of memory for CPU tables");
     }
-    crate::cpu::init_this_cpu(id);
     if let Err(e) = arch::apic::init_local() {
         fatal(e);
     }
     arch::apic::init_timer();
+    crate::task::register_cpu();
+    let _ = id;
     crate::cpu::mark_online();
 }
 
@@ -178,6 +177,7 @@ pub(crate) extern "sysv64" fn kernel_space_entry() -> ! {
         fatal("higher-half entry reached twice");
     };
     mm::kspace::finish_switch();
+    crate::cpu::init_boot_cpu_block();
     let mut early = core::mem::replace(&mut state.early, EarlyAlloc::EMPTY);
     if let Err(e) = mm::init(state.regions(), &mut early) {
         fatal(e);

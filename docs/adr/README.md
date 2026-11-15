@@ -8,6 +8,7 @@ brief where they conflict with it.
 |---|---|---|
 | [0001](0001-kernel-architecture.md) | Kernel architecture and the frame crate's API surface | Accepted |
 | [0002](0002-cells-and-capabilities.md) | Cell model and capabilities | Accepted |
+| [0003](0003-frame-budget-milestone-2.md) | Frame growth for milestone 2 | Accepted |
 
 ## Planned
 

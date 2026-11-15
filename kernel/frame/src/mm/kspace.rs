@@ -231,6 +231,11 @@ pub(crate) fn finish_switch() {
     arch::cpu::enable_protections();
 }
 
+/// Physical address of the kernel PML4.
+pub(crate) fn kernel_root() -> u64 {
+    KERNEL_ROOT.load(Ordering::Relaxed)
+}
+
 /// Allocates and maps a new kernel stack below a guard page; returns its top.
 pub(crate) fn alloc_stack() -> Option<u64> {
     let pages = page_alloc::alloc(STACK_PAGES.trailing_zeros() as u8, kind::ALLOCATED)?;
