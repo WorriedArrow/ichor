@@ -37,6 +37,12 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
+#[cfg(any(test, feature = "builder"))]
+extern crate alloc;
+
+#[cfg(any(test, feature = "builder"))]
+pub mod builder;
+
 /// Content-chunk size: one page. Files are split into chunks so identical
 /// pages across files and layers dedupe.
 pub const CHUNK_SIZE: u64 = 4096;
@@ -106,6 +112,11 @@ impl<'a> Node<'a> {
     /// Size in bytes (file length, or symlink target length).
     pub fn size(&self) -> u64 {
         self.size
+    }
+
+    /// A number unique to this node within its image (for `st_ino`).
+    pub fn inode(&self) -> u64 {
+        self.index as u64 + 1
     }
 
     /// The node's own name.
@@ -339,178 +350,12 @@ impl<'a> Image<'a> {
 mod tests {
     extern crate std;
     use super::*;
-    use std::collections::BTreeMap;
     use std::vec::Vec;
 
-    /// A test builder mirroring the control-plane writer. Each file records a
-    /// contiguous run of chunk-table entries; entries with identical content
-    /// share the same data bytes (dedup), and carry the content hash so the
-    /// page cache can share physical pages.
-    #[derive(Default)]
-    struct Builder {
-        nodes: Vec<NodeRec>,
-        strings: Vec<u8>,
-        chunk_table: Vec<(u64, u64, Hash)>, // (data_rel, len, hash)
-        dirents: Vec<u64>,
-        data: Vec<u8>,
-        data_by_hash: BTreeMap<Hash, u64>,
-    }
-
-    struct NodeRec {
-        kind: u32,
-        mode: u32,
-        size: u64,
-        first: u64,
-        count: u64,
-        name_off: u64,
-        name_len: u64,
-    }
-
-    fn fake_hash(bytes: &[u8]) -> Hash {
-        let mut h = [0u8; 32];
-        let mut acc: u64 = 0xcbf2_9ce4_8422_2325;
-        for (i, &b) in bytes.iter().enumerate() {
-            acc = (acc ^ u64::from(b)).wrapping_mul(0x100_0000_01b3);
-            h[i % 32] ^= (acc >> (i % 8)) as u8;
-        }
-        h[0] ^= bytes.len() as u8;
-        h
-    }
-
-    impl Builder {
-        fn string(&mut self, s: &str) -> (u64, u64) {
-            let off = self.strings.len() as u64;
-            self.strings.extend_from_slice(s.as_bytes());
-            (off, s.len() as u64)
-        }
-
-        fn push_chunk(&mut self, page: &[u8]) {
-            let hash = fake_hash(page);
-            let data = &mut self.data;
-            let data_rel = *self.data_by_hash.entry(hash).or_insert_with(|| {
-                let at = data.len() as u64;
-                data.extend_from_slice(page);
-                at
-            });
-            self.chunk_table.push((data_rel, page.len() as u64, hash));
-        }
-
-        fn file(&mut self, name: &str, content: &[u8], mode: u32) -> usize {
-            let (name_off, name_len) = self.string(name);
-            let first = self.chunk_table.len() as u64;
-            let mut count = 0;
-            for page in content.chunks(CHUNK_SIZE as usize) {
-                self.push_chunk(page);
-                count += 1;
-            }
-            self.nodes.push(NodeRec {
-                kind: 0,
-                mode,
-                size: content.len() as u64,
-                first,
-                count,
-                name_off,
-                name_len,
-            });
-            self.nodes.len() - 1
-        }
-
-        fn symlink(&mut self, name: &str, target: &str) -> usize {
-            let (name_off, name_len) = self.string(name);
-            let (t_off, t_len) = self.string(target);
-            self.nodes.push(NodeRec {
-                kind: 2,
-                mode: 0o777,
-                size: t_len,
-                first: t_off,
-                count: t_len,
-                name_off,
-                name_len,
-            });
-            self.nodes.len() - 1
-        }
-
-        fn dir(&mut self, name: &str, children: &[usize], mode: u32) -> usize {
-            let (name_off, name_len) = self.string(name);
-            let first = self.dirents.len() as u64;
-            for &c in children {
-                self.dirents.push(c as u64);
-            }
-            self.nodes.push(NodeRec {
-                kind: 1,
-                mode,
-                size: children.len() as u64,
-                first,
-                count: children.len() as u64,
-                name_off,
-                name_len,
-            });
-            self.nodes.len() - 1
-        }
-
-        fn finish(mut self, root: usize) -> Vec<u8> {
-            // Ensure node 0 is the root: swap, and remap dirents that point
-            // at node 0 or `root`.
-            self.nodes.swap(0, root);
-            for d in &mut self.dirents {
-                if *d == 0 {
-                    *d = root as u64;
-                } else if *d == root as u64 {
-                    *d = 0;
-                }
-            }
-            let node_count = self.nodes.len();
-            let chunk_count = self.chunk_table.len();
-            let dirents_count = self.dirents.len();
-            let nodes_offset = HEADER_LEN;
-            let dirents_offset = nodes_offset + node_count * NODE_LEN;
-            let chunk_table_offset = dirents_offset + dirents_count * 8;
-            let strings_offset = chunk_table_offset + chunk_count * CHUNK_LEN;
-            let data_offset = strings_offset + self.strings.len();
-
-            let mut b = Vec::new();
-            b.extend_from_slice(MAGIC);
-            b.extend_from_slice(&VERSION.to_le_bytes());
-            b.extend_from_slice(&0u32.to_le_bytes());
-            for v in [
-                node_count as u64,
-                nodes_offset as u64,
-                chunk_count as u64,
-                chunk_table_offset as u64,
-                dirents_offset as u64,
-                dirents_count as u64,
-                strings_offset as u64,
-                self.strings.len() as u64,
-                data_offset as u64,
-            ] {
-                b.extend_from_slice(&v.to_le_bytes());
-            }
-            assert_eq!(b.len(), HEADER_LEN);
-            for n in &self.nodes {
-                b.extend_from_slice(&n.kind.to_le_bytes());
-                b.extend_from_slice(&n.mode.to_le_bytes());
-                b.extend_from_slice(&n.size.to_le_bytes());
-                b.extend_from_slice(&n.first.to_le_bytes());
-                b.extend_from_slice(&n.count.to_le_bytes());
-                b.extend_from_slice(&n.name_off.to_le_bytes());
-                b.extend_from_slice(&n.name_len.to_le_bytes());
-            }
-            for d in &self.dirents {
-                b.extend_from_slice(&d.to_le_bytes());
-            }
-            for (rel, len, hash) in &self.chunk_table {
-                b.extend_from_slice(&rel.to_le_bytes());
-                b.extend_from_slice(&len.to_le_bytes());
-                b.extend_from_slice(hash);
-            }
-            b.extend_from_slice(&self.strings);
-            b.extend_from_slice(&self.data);
-            b
-        }
-    }
+    use crate::builder::Builder;
 
     fn sample() -> Vec<u8> {
-        let mut bld = Builder::default();
+        let mut bld = Builder::new();
         let page = std::vec![0xABu8; CHUNK_SIZE as usize];
         let mut sh = page.clone();
         sh.extend_from_slice(b"#!script");
@@ -551,7 +396,7 @@ mod tests {
 
     #[test]
     fn reads_across_chunk_boundaries() {
-        let mut bld = Builder::default();
+        let mut bld = Builder::new();
         let mut content = Vec::new();
         for i in 0..(CHUNK_SIZE as usize * 2 + 100) {
             content.push((i % 251) as u8);
@@ -574,7 +419,7 @@ mod tests {
 
     #[test]
     fn identical_pages_share_data() {
-        let mut bld = Builder::default();
+        let mut bld = Builder::new();
         let page = std::vec![0x5Au8; CHUNK_SIZE as usize];
         let a = bld.file("a", &page, 0o644);
         let b = bld.file("b", &page, 0o644);

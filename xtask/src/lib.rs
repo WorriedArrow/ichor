@@ -9,6 +9,7 @@
 
 pub mod audit;
 pub mod build;
+pub mod linux_abi;
 pub mod qemu;
 
 use std::path::{Path, PathBuf};

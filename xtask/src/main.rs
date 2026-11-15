@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use xtask::build::{self, KERNEL_TARGET, Profile};
 use xtask::qemu::{self, Accel, Exit, RunConfig};
-use xtask::{Result, audit, cargo, run_cmd};
+use xtask::{Result, audit, cargo, linux_abi, run_cmd};
 
 const HELP: &str = "\
 cargo xtask <command> [options]
@@ -19,6 +19,7 @@ Commands:
   test         Host unit tests, then QEMU integration tests (tests/)
   lint         rustfmt check, clippy (host + kernel target), unsafe policy, frame budget
   frame-audit  Print frame's size and unsafe-site count; fail if over budget
+  linux-abi-table  Regenerate docs/linux-abi.md from the Linux syscall table
   help         Show this message
 
 Options:
@@ -177,6 +178,7 @@ fn cmd_lint() -> Result<()> {
     )?;
     audit::check_forbid_unsafe()?;
     audit::check_frame_budget()?;
+    linux_abi::check_table()?;
     Ok(())
 }
 
@@ -191,6 +193,7 @@ fn main() -> ExitCode {
         "test" => cmd_test(&o),
         "lint" => cmd_lint(),
         "frame-audit" => audit::check_frame_budget().map(|_| ()),
+        "linux-abi-table" => linux_abi::write_table(),
         "help" | "--help" | "-h" => {
             print!("{HELP}");
             Ok(())

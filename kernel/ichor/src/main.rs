@@ -15,11 +15,14 @@ mod kcell;
 mod linuxabi;
 mod loader;
 mod nativeabi;
+mod process;
 mod proctest;
 mod runtest;
 mod sched;
 mod selftest;
+mod testprog;
 mod usertest;
+mod vfs;
 
 use frame::boot::{BootInfo, MemoryKind};
 use frame::cpu::CpuId;

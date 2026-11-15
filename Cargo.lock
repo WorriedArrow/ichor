@@ -12,6 +12,7 @@ dependencies = [
  "ichor-cmdline",
  "ichor-elf",
  "ichor-frame",
+ "ichor-image",
  "ichor-sched",
 ]
 

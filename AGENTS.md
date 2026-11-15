@@ -38,7 +38,22 @@ Milestones 0-2 are done.
   revocation, and that a ring-3 native process acts only on handles its cell
   holds.
 
+- M3 so far: `kernel/elf` (load plans), `kernel/image` (read-only,
+  content-addressed image format; `builder` feature is the writer), and in
+  the kernel: `loader` (ELF into a cell's `VmSpace`), `vfs` (root mounted
+  from an image; `.`/`..`, bounded symlink following), `process` (Linux
+  process + fd table), `linuxabi` (console I/O, open/openat/read/close,
+  stat family, lseek, arch_prctl, exit). Coverage is generated into
+  `docs/linux-abi.md` (`cargo xtask linux-abi-table`; lint checks it).
+  `testprog` is a tiny assembler for self-test binaries. Real static Linux
+  ELFs run in cells and read files from a mounted image.
+
 `tests/boot.rs` proves all of this on 1, 4 and 8 vCPUs.
+
+Next for milestone 3: virtio-blk (needs frame `IoMem`/DMA + a budget ADR),
+mounting the root image from a block device, `mmap`/`brk`/`getdents64`/
+signals stubs and whatever else a static busybox traces to, then the
+busybox QEMU test. The side-channel ADR is still owed.
 
 The side-channel ADR (due before milestone 2 "completes" per ADR-0001) is
 still owed and now also needs to cover the GS-in-ring-3 info leak noted in

@@ -134,6 +134,17 @@ impl<'a> UserMode<'a> {
     /// with the user's registers.
     pub fn execute(&mut self) -> UserEvent {
         use core::sync::atomic::Ordering::Relaxed;
+        // Never enter ring 3 with state `iretq` or `wrmsr` would fault on in
+        // the kernel: RIP and RSP must be user addresses, and so must the FS
+        // base. Report such a context as a #GP from the thread instead.
+        let user = |a: u64| a < super::paging::USER_END;
+        if !user(self.ctx.rip) || !user(self.ctx.rsp) || !user(self.ctx.fs_base) {
+            return UserEvent::Exception {
+                vector: 13,
+                error: 0,
+                cr2: 0,
+            };
+        }
         let _guard = cpu::IrqGuard::new();
         let block = cpu::this_block();
         self.ctx.rflags = (self.ctx.rflags & USER_RFLAGS_ALLOWED) | RFLAGS_IF | RFLAGS_RESERVED1;

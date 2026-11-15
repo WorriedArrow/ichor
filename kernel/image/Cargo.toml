@@ -9,5 +9,9 @@ publish.workspace = true
 [lib]
 name = "image"
 
+[features]
+# The image writer (needs `alloc`). The kernel reader does not.
+builder = []
+
 [lints]
 workspace = true

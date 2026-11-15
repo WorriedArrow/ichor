@@ -51,6 +51,8 @@ fn m1_boots_on_four_cpus() {
         "ichor: proc: native process ran, MEM_SIZE ok (4096), forged handle denied (error 2)",
         "hello from a real Linux ELF running on Ichor",
         "ichor: linux: static ELF ran via the Linux ABI, exited 7 after 2 syscalls",
+        "hello from /etc/motd inside an Ichor image",
+        "ichor: linux: cat read /etc/motd through a symlink in the image",
         "ichor: boot complete; halting",
     ]);
     // Every page the heap self-test used came back.
@@ -88,6 +90,8 @@ fn m1_boots_on_one_cpu() {
         "ichor: proc: native process ran, MEM_SIZE ok (4096), forged handle denied (error 2)",
         "hello from a real Linux ELF running on Ichor",
         "ichor: linux: static ELF ran via the Linux ABI, exited 7 after 2 syscalls",
+        "hello from /etc/motd inside an Ichor image",
+        "ichor: linux: cat read /etc/motd through a symlink in the image",
         "ichor: boot complete; halting",
     ]);
 }
@@ -105,6 +109,8 @@ fn m2_scheduler_on_eight_cpus() {
         "ichor: proc: native process ran, MEM_SIZE ok (4096), forged handle denied (error 2)",
         "hello from a real Linux ELF running on Ichor",
         "ichor: linux: static ELF ran via the Linux ABI, exited 7 after 2 syscalls",
+        "hello from /etc/motd inside an Ichor image",
+        "ichor: linux: cat read /etc/motd through a symlink in the image",
         "ichor: boot complete; halting",
     ]);
 }

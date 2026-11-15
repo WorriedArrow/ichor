@@ -19,6 +19,7 @@ cap.workspace = true
 cell.workspace = true
 ichor-abi.workspace = true
 elf.workspace = true
+image = { workspace = true, features = ["builder"] }
 
 [lints]
 workspace = true
