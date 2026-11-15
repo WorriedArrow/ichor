@@ -82,6 +82,17 @@ extern "sysv64" fn trap_common() {
         "mov rdi, rsp",
         "cld",
         "call {dispatch}",
+        // A CPU *exception* (vector < 32) taken in ring 3 does not return to
+        // ring 3: it longjmps back into `UserMode::execute`. CS is at frame
+        // offset 144, the vector at 120.
+        "mov rax, [rsp + 144]",
+        "test rax, 3",
+        "jz 2f",
+        "mov rax, [rsp + 120]",
+        "cmp rax, 32",
+        "jae 2f",
+        "jmp ichor_user_resume",
+        "2:",
         "pop rax", "pop rbx", "pop rcx", "pop rdx", "pop rsi", "pop rdi", "pop rbp",
         "pop r8", "pop r9", "pop r10", "pop r11", "pop r12", "pop r13", "pop r14", "pop r15",
         "add rsp, 16",
@@ -138,6 +149,30 @@ struct Tss {
     iomap_base: u16,
 }
 
+crate::cpu_local! {
+    /// Address of this CPU's TSS RSP0 field, for `set_rsp0`.
+    static RSP0_SLOT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+}
+
+/// Sets the kernel stack the CPU switches to on a trap from ring 3.
+pub(crate) fn set_rsp0(top: u64) {
+    let g = crate::cpu::IrqGuard::new();
+    let slot = RSP0_SLOT.get(&g).load(Relaxed);
+    if slot != 0 {
+        // The TSS is `packed(4)`, so `rsp[0]` is only 4-byte aligned; write
+        // it as two 32-bit halves. A trap cannot observe a torn value: this
+        // CPU is not in ring 3 while it updates its own RSP0.
+        let lo = core::ptr::with_exposed_provenance_mut::<u32>(slot as usize);
+        let hi = core::ptr::with_exposed_provenance_mut::<u32>(slot as usize + 4);
+        // SAFETY: `slot` is the address of this CPU's leaked TSS `rsp[0]`
+        // field (set in `init_cpu`), 4-byte aligned; writing it only changes
+        // where a ring-3 trap lands.
+        unsafe { lo.write_volatile(top as u32) };
+        // SAFETY: as above; the high half, 4 bytes up.
+        unsafe { hi.write_volatile((top >> 32) as u32) };
+    }
+}
+
 /// One CPU's GDT and TSS. Leaked: CPUs never go away.
 #[repr(C, align(16))]
 struct CpuTables {
@@ -180,6 +215,12 @@ pub(crate) fn init_cpu() -> Option<()> {
         | (0x89 << 40) // present, 64-bit available TSS
         | (((tss >> 24) & 0xff) << 56);
     tables.gdt[6] = tss >> 32;
+    let rsp0_addr = core::ptr::addr_of!(tables.tss.rsp[0]) as u64;
+    {
+        let g = crate::cpu::IrqGuard::new();
+        RSP0_SLOT.get(&g).store(rsp0_addr, Relaxed);
+        crate::cpu::this_block().rsp0_ptr.store(rsp0_addr, Relaxed);
+    }
     let tables: &'static CpuTables = tables;
 
     let gdt = DescriptorPointer {
@@ -272,6 +313,14 @@ fn in_stack_guard(addr: u64) -> bool {
 #[allow(clippy::panic)] // Unexpected kernel exceptions are kernel bugs.
 extern "sysv64" fn trap_dispatch(f: &mut TrapFrame) {
     let vector = f.vector as u8;
+    // An exception taken in ring 3 (not an interrupt, not NMI) is recorded
+    // into the thread's context; the stub tail longjmps back into
+    // `UserMode::execute`. We must not panic on it: user code faulting is
+    // routine.
+    if f.cs & 3 == 3 && vector < 32 && vector != 2 {
+        super::usermode::record_user_trap(f);
+        return;
+    }
     match vector {
         3 => {
             BREAKPOINTS.fetch_add(1, Relaxed);

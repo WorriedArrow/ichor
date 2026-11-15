@@ -15,5 +15,6 @@
 #
 # Milestone 2: ADR-0003 sets the ceiling at 7,000 / 300.
 # Step 3 (tasks, context switch, atomic mode, scheduler hook): 3,700 / 170.
-max_code_lines = 3700
-max_unsafe_sites = 170
+# Step 4 (user mode, VmSpace/UFrame, VmReader/Writer, sleeping Mutex): 4,500 / 215.
+max_code_lines = 4500
+max_unsafe_sites = 215

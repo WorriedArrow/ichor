@@ -21,6 +21,12 @@ pub(crate) mod kind {
     pub(crate) const TAIL: u8 = 4;
     /// A heap slab page; `class` is the size class.
     pub(crate) const SLAB: u8 = 5;
+    /// An untyped page (`UFrame`): may be mapped into user space; its
+    /// contents are only ever copied, never referenced. `refcount` counts
+    /// `UFrame` handles plus user mappings.
+    pub(crate) const UNTYPED: u8 = 6;
+    /// A page-table page of a user address space.
+    pub(crate) const PAGE_TABLE: u8 = 7;
 }
 
 /// Sentinel for "no page" in the `next`/`prev` links.

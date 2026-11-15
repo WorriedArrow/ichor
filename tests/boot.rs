@@ -10,6 +10,9 @@
 //!
 //! Milestone 2 (scheduler): kernel threads run on every CPU, block and wake
 //! through wait queues, and never-yielding threads are preempted.
+//!
+//! Milestone 2 (user mode): a ring-3 program runs in its own address space,
+//! makes a syscall, faults, and is isolated from another address space.
 
 use ichor_tests::{Exit, boot};
 
@@ -35,6 +38,7 @@ fn m1_boots_on_four_cpus() {
         "ichor: smp: 4 CPUs online, every CPU took 5 timer interrupts",
         "ichor: sched: 32 threads finished, ran on 4 CPUs",
         "ichor: sched: 9 spinners on 4 CPUs all ran (preemption works",
+        "ichor: user: ring-3 program ran, 1 syscall(s), page fault at 0 handled, isolation ok",
         "ichor: boot complete; halting",
     ]);
     // Every page the heap self-test used came back.
@@ -67,6 +71,7 @@ fn m1_boots_on_one_cpu() {
         "ichor: smp: 1 CPUs online, every CPU took 5 timer interrupts",
         "ichor: sched: 32 threads finished, ran on 1 CPUs",
         "ichor: sched: 3 spinners on 1 CPUs all ran (preemption works",
+        "ichor: user: ring-3 program ran, 1 syscall(s), page fault at 0 handled, isolation ok",
         "ichor: boot complete; halting",
     ]);
 }
@@ -79,6 +84,7 @@ fn m2_scheduler_on_eight_cpus() {
         "ichor: smp: 8 CPUs online, every CPU took 5 timer interrupts",
         "ichor: sched: 32 threads finished, ran on ",
         "ichor: sched: 17 spinners on 8 CPUs all ran (preemption works",
+        "ichor: user: ring-3 program ran, 1 syscall(s), page fault at 0 handled, isolation ok",
         "ichor: boot complete; halting",
     ]);
 }

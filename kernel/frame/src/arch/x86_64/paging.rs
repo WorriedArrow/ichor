@@ -84,7 +84,7 @@ pub(crate) unsafe fn table<'a>(pa: PhysAddr) -> &'a Table {
 
 /// Why a mapping could not be installed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum MapError {
+pub enum MapError {
     OutOfMemory,
     AlreadyMapped,
     Misaligned,
@@ -276,4 +276,194 @@ pub(crate) unsafe fn set_entry(pa: PhysAddr, index: usize, value: u64) {
     if let Some(e) = t.get(index) {
         e.store(value, Relaxed);
     }
+}
+
+// ---------------------------------------------------------------------------
+// User address spaces (lower half, 4 KiB pages only).
+// ---------------------------------------------------------------------------
+
+const USER: u64 = 1 << 2;
+
+/// One past the highest user virtual address.
+pub(crate) const USER_END: u64 = 0x0000_7fff_ffff_f000;
+
+/// Permissions of a user page. User pages are always readable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UserProt {
+    pub write: bool,
+    pub exec: bool,
+}
+
+impl UserProt {
+    fn bits(self) -> u64 {
+        let mut e = PRESENT | USER;
+        if self.write {
+            e |= WRITABLE;
+        }
+        if !self.exec {
+            e |= NO_EXECUTE;
+        }
+        e
+    }
+
+    fn from_bits(e: u64) -> Self {
+        Self {
+            write: e & WRITABLE != 0,
+            exec: e & NO_EXECUTE == 0,
+        }
+    }
+}
+
+/// Finds the last-level entry for `va`, creating intermediate tables with
+/// `alloc` when given.
+///
+/// # Safety
+///
+/// `root` and every table reachable from its lower half must satisfy
+/// [`table`]'s contract for `'a`; `alloc` must return zeroed pages that do.
+unsafe fn user_leaf<'a>(
+    root: PhysAddr,
+    va: u64,
+    mut alloc: Option<&mut dyn FnMut() -> Option<PhysAddr>>,
+) -> Result<Option<&'a AtomicU64>, MapError> {
+    if va >= USER_END || !va.is_multiple_of(PAGE_SIZE) {
+        return Err(MapError::Misaligned);
+    }
+    // SAFETY: caller contract.
+    let mut t: &'a Table = unsafe { table(root) };
+    for index in [pml4_index(va), pdpt_index(va), pd_index(va)] {
+        let e = t[index].load(Relaxed);
+        let next = if e & PRESENT != 0 {
+            if e & HUGE != 0 {
+                return Err(MapError::AlreadyMapped);
+            }
+            PhysAddr::new(e & ADDR_MASK)
+        } else if let Some(a) = alloc.as_mut() {
+            let pa = a().ok_or(MapError::OutOfMemory)?;
+            t[index].store(pa.as_u64() | PRESENT | WRITABLE | USER, Relaxed);
+            pa
+        } else {
+            return Ok(None);
+        };
+        // SAFETY: `next` is a table of this address space (caller contract)
+        // or a fresh one from `alloc`.
+        t = unsafe { table(next) };
+    }
+    Ok(Some(&t[pt_index(va)]))
+}
+
+/// Maps the page at `pa` at user address `va`.
+///
+/// # Safety
+///
+/// [`user_leaf`]'s contract. The caller transfers one reference to the
+/// untyped page `pa` into the mapping.
+pub(crate) unsafe fn user_map(
+    root: PhysAddr,
+    va: u64,
+    pa: PhysAddr,
+    prot: UserProt,
+    alloc: &mut dyn FnMut() -> Option<PhysAddr>,
+) -> Result<(), MapError> {
+    // SAFETY: caller contract.
+    let leaf = unsafe { user_leaf(root, va, Some(alloc)) }?.ok_or(MapError::OutOfMemory)?;
+    set_leaf(leaf, pa.as_u64(), prot.bits())
+}
+
+/// Removes the mapping at `va`, returning the page it mapped. The caller
+/// must flush the TLB.
+///
+/// # Safety
+///
+/// [`user_leaf`]'s contract.
+pub(crate) unsafe fn user_unmap(root: PhysAddr, va: u64) -> Option<PhysAddr> {
+    // SAFETY: caller contract.
+    let leaf = unsafe { user_leaf(root, va, None) }.ok()??;
+    let e = leaf.swap(0, Relaxed);
+    (e & PRESENT != 0).then(|| PhysAddr::new(e & ADDR_MASK))
+}
+
+/// Changes the permissions of the mapping at `va`. The caller must flush
+/// the TLB.
+///
+/// # Safety
+///
+/// [`user_leaf`]'s contract.
+pub(crate) unsafe fn user_protect(root: PhysAddr, va: u64, prot: UserProt) -> bool {
+    // SAFETY: caller contract.
+    let Some(leaf) = unsafe { user_leaf(root, va, None) }.ok().flatten() else {
+        return false;
+    };
+    let e = leaf.load(Relaxed);
+    if e & PRESENT == 0 {
+        return false;
+    }
+    leaf.store((e & ADDR_MASK) | prot.bits(), Relaxed);
+    true
+}
+
+/// The page and permissions mapped at page-aligned `va`.
+///
+/// # Safety
+///
+/// [`user_leaf`]'s contract.
+pub(crate) unsafe fn user_translate(root: PhysAddr, va: u64) -> Option<(PhysAddr, UserProt)> {
+    // SAFETY: caller contract.
+    let leaf = unsafe { user_leaf(root, va, None) }.ok()??;
+    let e = leaf.load(Relaxed);
+    (e & PRESENT != 0).then(|| (PhysAddr::new(e & ADDR_MASK), UserProt::from_bits(e)))
+}
+
+/// Clears the whole lower half of `root`, calling `leaf` for every mapped
+/// page and `table` for every page-table page below the PML4.
+///
+/// # Safety
+///
+/// [`user_leaf`]'s contract; the address space must not be active on any
+/// CPU.
+pub(crate) unsafe fn user_teardown(
+    root: PhysAddr,
+    leaf: &mut dyn FnMut(PhysAddr),
+    table_page: &mut dyn FnMut(PhysAddr),
+) {
+    fn walk(
+        t: &Table,
+        level: u8,
+        leaf: &mut dyn FnMut(PhysAddr),
+        table_page: &mut dyn FnMut(PhysAddr),
+    ) {
+        for e in t {
+            let v = e.swap(0, Relaxed);
+            if v & PRESENT == 0 {
+                continue;
+            }
+            let pa = PhysAddr::new(v & ADDR_MASK);
+            if level == 1 {
+                leaf(pa);
+            } else {
+                // SAFETY: a present non-leaf entry of a user address space
+                // points at one of its tables (`user_teardown`'s contract).
+                walk(unsafe { table(pa) }, level - 1, leaf, table_page);
+                table_page(pa);
+            }
+        }
+    }
+    // SAFETY: caller contract.
+    let root_t = unsafe { table(root) };
+    for e in root_t.iter().take(256) {
+        let v = e.swap(0, Relaxed);
+        if v & PRESENT == 0 {
+            continue;
+        }
+        let pa = PhysAddr::new(v & ADDR_MASK);
+        // SAFETY: as in `walk`.
+        walk(unsafe { table(pa) }, 3, leaf, table_page);
+        table_page(pa);
+    }
+}
+
+/// Flushes the TLB entry for `va` on this CPU.
+pub(crate) fn flush_page(va: u64) {
+    // SAFETY: `invlpg` only drops a TLB entry.
+    unsafe { core::arch::asm!("invlpg [{}]", in(reg) va, options(nostack, preserves_flags)) };
 }

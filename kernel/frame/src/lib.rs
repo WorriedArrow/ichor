@@ -35,5 +35,6 @@ pub mod smp;
 pub mod sync;
 pub mod task;
 pub mod time;
+pub mod user;
 
 mod panic;

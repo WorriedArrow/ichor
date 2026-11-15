@@ -243,3 +243,21 @@ fn recurse(n: u64) -> u64 {
     let frame = core::hint::black_box([n; 32]);
     recurse(frame[0] + 1).wrapping_add(frame[31])
 }
+
+/// Runs the ring-3 self-test on its own kernel thread (entering ring 3 sets
+/// that thread's RSP0, so it must not be the adopted main task).
+pub(crate) fn user_mode() {
+    use core::sync::atomic::{AtomicBool, Ordering::Relaxed};
+    static DONE: AtomicBool = AtomicBool::new(false);
+    static GATE: WaitQueue = WaitQueue::new();
+    let spawned = TaskOptions::new(|| {
+        crate::usertest::run();
+        DONE.store(true, Relaxed);
+        GATE.wake_all();
+    })
+    .spawn();
+    if spawned.is_none() {
+        fail("could not spawn the user-mode test thread");
+    }
+    GATE.wait_until(|| DONE.load(Relaxed).then_some(()));
+}

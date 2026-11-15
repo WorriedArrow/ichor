@@ -131,3 +131,89 @@ impl<T: ?Sized + fmt::Debug> fmt::Debug for SpinLockGuard<'_, T> {
         fmt::Debug::fmt(&**self, f)
     }
 }
+
+/// A sleeping mutual-exclusion lock: waiters block (other tasks run)
+/// instead of spinning. Must not be taken in atomic mode.
+pub struct Mutex<T: ?Sized> {
+    locked: AtomicBool,
+    waiters: crate::task::WaitQueue,
+    data: UnsafeCell<T>,
+}
+
+// SAFETY: as for `SpinLock`: at most one `&mut T` exists at a time.
+unsafe impl<T: ?Sized + Send> Sync for Mutex<T> {}
+
+impl<T> Mutex<T> {
+    pub const fn new(value: T) -> Self {
+        Self {
+            locked: AtomicBool::new(false),
+            waiters: crate::task::WaitQueue::new(),
+            data: UnsafeCell::new(value),
+        }
+    }
+}
+
+impl<T: ?Sized> Mutex<T> {
+    /// Acquires the lock, sleeping while another task holds it.
+    pub fn lock(&self) -> MutexGuard<'_, T> {
+        loop {
+            if self
+                .locked
+                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                return MutexGuard {
+                    lock: self,
+                    _not_send: PhantomData,
+                };
+            }
+            self.waiters
+                .wait_until(|| (!self.locked.load(Ordering::Relaxed)).then_some(()));
+        }
+    }
+}
+
+impl<T: ?Sized> fmt::Debug for Mutex<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Mutex")
+            .field("locked", &self.locked.load(Ordering::Relaxed))
+            .finish_non_exhaustive()
+    }
+}
+
+/// Exclusive access to the data in a [`Mutex`]; unlocks on drop.
+pub struct MutexGuard<'a, T: ?Sized> {
+    lock: &'a Mutex<T>,
+    _not_send: PhantomData<*mut ()>,
+}
+
+// SAFETY: `&MutexGuard<T>` only exposes `&T` (see `SpinLockGuard`).
+unsafe impl<T: ?Sized + Sync> Sync for MutexGuard<'_, T> {}
+
+impl<T: ?Sized> Deref for MutexGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        // SAFETY: the guard exists only while the lock is held by us.
+        unsafe { &*self.lock.data.get() }
+    }
+}
+
+impl<T: ?Sized> DerefMut for MutexGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        // SAFETY: as in `deref`, and `&mut self` makes this borrow unique.
+        unsafe { &mut *self.lock.data.get() }
+    }
+}
+
+impl<T: ?Sized> Drop for MutexGuard<'_, T> {
+    fn drop(&mut self) {
+        self.lock.locked.store(false, Ordering::Release);
+        self.lock.waiters.wake_one();
+    }
+}
+
+impl<T: ?Sized + fmt::Debug> fmt::Debug for MutexGuard<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&**self, f)
+    }
+}

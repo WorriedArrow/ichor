@@ -12,6 +12,7 @@ extern crate alloc;
 
 mod sched;
 mod selftest;
+mod usertest;
 
 use frame::boot::{BootInfo, MemoryKind};
 use frame::cpu::CpuId;
@@ -73,6 +74,7 @@ fn kmain(info: BootInfo) -> ! {
     frame::task::inject_scheduler(&sched::SCHEDULER);
     selftest::threads();
     selftest::preemption();
+    selftest::user_mode();
 
     if cmdline.flag("test_stack_overflow") {
         selftest::stack_overflow();

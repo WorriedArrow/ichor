@@ -14,10 +14,12 @@
 //! address space can share the kernel half by copying PML4 entries.
 
 pub(crate) mod early;
+mod frame;
 mod heap;
 pub(crate) mod kspace;
 mod meta;
 pub(crate) mod page_alloc;
+mod vmspace;
 
 use core::fmt;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -25,7 +27,17 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use self::early::EarlyAlloc;
 use crate::boot::MemoryRegion;
 
+pub use self::frame::{UFrame, VmReader, VmWriter};
 pub use self::page_alloc::{MemStats, stats};
+pub use self::vmspace::VmSpace;
+
+/// Unbinds any user address space from the current task and switches back to
+/// the kernel address space. Call before dropping a `VmSpace` the current
+/// task was bound to.
+pub fn activate_kernel_space() {
+    crate::task::set_current_vm_root(0);
+}
+pub use crate::arch::paging::{MapError, UserProt};
 
 /// Size of a base page on every architecture Ichor supports.
 pub const PAGE_SIZE: u64 = 4096;

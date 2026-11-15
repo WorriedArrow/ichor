@@ -4,14 +4,16 @@ pub(crate) mod apic;
 pub mod cpu;
 pub(crate) mod early_console;
 mod io;
-pub(crate) mod paging;
+pub mod paging;
 pub(crate) mod qemu;
 pub(crate) mod regs;
 pub(crate) mod smp;
 pub(crate) mod switch;
 pub(crate) mod trap;
+pub(crate) mod usermode;
 
 pub use self::trap::TrapFrame;
+pub use self::usermode::{UserContext, UserEvent, UserMode};
 
 use core::arch::asm;
 
@@ -108,6 +110,48 @@ pub(crate) fn activate_root(root: u64) {
         // and data stay mapped.
         unsafe { regs::write_cr3(target) };
     }
+}
+
+/// Copies `len` bytes of untyped memory (memory that other agents, such as
+/// user threads, may access concurrently). The copy is done by `rep movsb`
+/// and so is outside the Rust memory model: concurrent writes give
+/// unspecified bytes, not undefined behaviour.
+///
+/// # Safety
+///
+/// `src` must be mapped and readable for `len` bytes and `dst` mapped and
+/// writable for `len` bytes, and `dst` must not overlap memory that Rust
+/// code holds a reference to.
+pub(crate) unsafe fn copy_untyped(dst: *mut u8, src: *const u8, len: usize) {
+    // SAFETY: caller contract.
+    unsafe {
+        asm!(
+            "rep movsb",
+            inout("rcx") len => _,
+            inout("rdi") dst => _,
+            inout("rsi") src => _,
+            options(nostack, preserves_flags)
+        )
+    };
+}
+
+/// Fills `len` bytes of untyped memory with `byte`.
+///
+/// # Safety
+///
+/// `dst` must be mapped and writable for `len` bytes and must not overlap
+/// memory that Rust code holds a reference to.
+pub(crate) unsafe fn fill_untyped(dst: *mut u8, byte: u8, len: usize) {
+    // SAFETY: caller contract.
+    unsafe {
+        asm!(
+            "rep stosb",
+            inout("rcx") len => _,
+            inout("rdi") dst => _,
+            in("al") byte,
+            options(nostack, preserves_flags)
+        )
+    };
 }
 
 /// Stops the current CPU forever with interrupts masked.

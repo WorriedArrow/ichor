@@ -79,6 +79,15 @@ pub(crate) struct CpuBlock {
     pub(crate) scratch: AtomicU64,
     /// 48: number of live `IrqGuard`s and spinlock guards ("atomic depth").
     pub(crate) atomic_depth: AtomicU64,
+    /// 56: why the last user run trapped back (0 none, 1 syscall, 2 exception).
+    pub(crate) event_kind: AtomicU64,
+    /// 64: exception vector and error code, packed (vector in low byte).
+    pub(crate) event_info: AtomicU64,
+    /// 72: faulting address (CR2) for a user exception.
+    pub(crate) event_cr2: AtomicU64,
+    /// 80: address of this CPU's TSS RSP0 field; the user-entry stub writes
+    /// the kernel stack a ring-3 trap should land on here.
+    pub(crate) rsp0_ptr: AtomicU64,
 }
 
 impl CpuBlock {
@@ -91,6 +100,10 @@ impl CpuBlock {
             user_ctx: AtomicU64::new(0),
             scratch: AtomicU64::new(0),
             atomic_depth: AtomicU64::new(0),
+            event_kind: AtomicU64::new(0),
+            event_info: AtomicU64::new(0),
+            event_cr2: AtomicU64::new(0),
+            rsp0_ptr: AtomicU64::new(0),
         }
     }
 }
@@ -128,6 +141,30 @@ pub(crate) fn init_ap_block(id: CpuId) {
         .get(id.index())
         .map_or(0, |b| b.load(Ordering::Acquire));
     arch::set_cpu_block(addr);
+}
+
+/// This CPU's per-CPU block. Resolved from the CPU index, not from the raw
+/// GS value, so a user thread cannot have forged it.
+pub(crate) fn this_block() -> &'static CpuBlock {
+    let index = current().index();
+    if index == 0 {
+        return &BOOT_CPU_BLOCK;
+    }
+    let addr = AP_BLOCKS
+        .get(index)
+        .map_or(0, |b| b.load(Ordering::Acquire));
+    let ptr = core::ptr::with_exposed_provenance::<CpuBlock>(addr as usize);
+    // SAFETY: AP blocks are leaked `&'static CpuBlock`s (see
+    // `register_ap_block`); `addr` is the one registered for this CPU index,
+    // or 0 before registration, in which case we fall back to the boot
+    // block. All fields are atomics, so sharing is sound.
+    if addr != 0 {
+        // SAFETY: AP blocks are leaked `&'static CpuBlock`s; `addr` is the
+        // one registered for this CPU index. All fields are atomics.
+        unsafe { &*ptr }
+    } else {
+        &BOOT_CPU_BLOCK
+    }
 }
 
 /// Counts the calling CPU as online (after all of its initialization).

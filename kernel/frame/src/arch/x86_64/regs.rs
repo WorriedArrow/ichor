@@ -11,6 +11,7 @@ pub(crate) const CR4_SMAP: u64 = 1 << 21;
 
 pub(crate) const MSR_EFER: u32 = 0xC000_0080;
 pub(crate) const EFER_NXE: u64 = 1 << 11;
+pub(crate) const MSR_FS_BASE: u32 = 0xC000_0100;
 pub(crate) const MSR_GS_BASE: u32 = 0xC000_0101;
 pub(crate) const MSR_KERNEL_GS_BASE: u32 = 0xC000_0102;
 pub(crate) const MSR_APIC_BASE: u32 = 0x1B;

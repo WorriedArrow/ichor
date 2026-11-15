@@ -97,7 +97,6 @@ impl Task {
 
     /// Sets the page table root this task runs with and activates it if
     /// this is the current task.
-    #[allow(dead_code)] // First user: `VmSpace::activate` (milestone 2, user mode).
     pub(crate) fn set_vm_root(self: &Arc<Self>, root: u64) {
         self.vm_root.store(root, Ordering::Relaxed);
         let g = IrqGuard::new();
@@ -334,6 +333,12 @@ fn adopt(is_idle: bool) -> Arc<Task> {
         data: Box::new(()),
         vm_root: AtomicU64::new(0),
     })
+}
+
+/// Binds page table root `root` (0: the kernel's) to the current task, so
+/// the scheduler re-activates it on every resume, and activates it now.
+pub fn set_current_vm_root(root: u64) {
+    current().set_vm_root(root);
 }
 
 /// The task running on this CPU. The first call on a CPU adopts whatever is

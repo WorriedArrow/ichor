@@ -142,6 +142,10 @@ pub(crate) fn init_cpu(id: CpuId) {
         fatal(e);
     }
     arch::apic::init_timer();
+    // Syscall entry and a fallback ring-3 fault stack for this CPU. Per-task
+    // RSP0 is set on each `UserMode::execute`; this is only a safety net.
+    let fault_stack = crate::mm::kspace::alloc_stack().unwrap_or(0);
+    arch::usermode::init_cpu(fault_stack);
     crate::task::register_cpu();
     let _ = id;
     crate::cpu::mark_online();
