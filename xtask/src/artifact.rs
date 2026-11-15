@@ -157,6 +157,23 @@ pub const ALPINE_PACKAGES: &[Artifact] = &[
         "https://dl-cdn.alpinelinux.org/alpine/v3.20/main/x86_64/jq-1.7.1-r0.apk",
         "219edabad0ef4250055d23df237b8d8103015a855e75367951c14314f833c507",
     ),
+    // Milestone 5's servers: nginx (with its pcre) from main, and redis
+    // 7.2 (the last BSD-licensed series) from community.
+    alpine_pkg(
+        "pcre-8.45-r3.apk",
+        "https://dl-cdn.alpinelinux.org/alpine/v3.20/main/x86_64/pcre-8.45-r3.apk",
+        "998e0945061652386ad1a38fc2425513f4ddf47011b0d382f5c802190f1c53e1",
+    ),
+    alpine_pkg(
+        "nginx-1.26.3-r0.apk",
+        "https://dl-cdn.alpinelinux.org/alpine/v3.20/main/x86_64/nginx-1.26.3-r0.apk",
+        "0cb1ca897f34f4313e82261bf51029a070d0ea0d2695b7532fbf5d7a32c18ed5",
+    ),
+    alpine_pkg(
+        "redis-7.2.9-r0.apk",
+        "https://dl-cdn.alpinelinux.org/alpine/v3.20/community/x86_64/redis-7.2.9-r0.apk",
+        "9c8d51b1fba7cebc1c7864b88971e3ba3ea2d9a8082d46eebcbe4b446918f779",
+    ),
 ];
 
 /// Alpine 3.20's `linux-virt` kernel package (Linux 6.6.142, the kernel

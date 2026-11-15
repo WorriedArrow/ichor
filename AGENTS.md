@@ -15,12 +15,38 @@ a framekernel. The founding brief is the source of truth until an ADR in
 
 ## Status
 
-**Active milestone: 5.** Network stack, virtio-net, inter-cell switching;
-nginx and redis serve traffic from cells. The design is ADR-0010: our own
-sans-I/O stack in `kernel/net` (host-tested), one stack per cell, an
-in-kernel cell switch with assigned addresses, proxy ARP, anti-spoofing,
-rate limits, a cross-cell fast path, and NAT plus published ports at the
-uplink; virtio-net first (polled).
+**Active milestone: 6.** The control plane pulls a real OCI image from a
+registry, verifies it, converts it, and runs it through the gRPC API.
+The design is ADR-0012: `services/control`, a native-ABI service embedded
+in the kernel image and run in the system cell; `services/rt` its only
+`unsafe` crate; native ABI v2 (sockets, waiting, images, cells); our own
+host-tested crates for crypto, X.509, TLS 1.2 + 1.3 (Docker Hub's blob CDN
+is TLS 1.2 only), HTTP/1.1 and HTTP/2, gRPC/protobuf, OCI, layer
+conversion and DNS; Mozilla's CA bundle as boot-volume configuration.
+Order: crypto, X.509, TLS, HTTP + OCI + layer (host-tested against
+recorded traffic), native ABI v2 + `services/rt` + the loader, HTTP/2 +
+gRPC, then the end-to-end pull-and-run test.
+
+Roadmap from the founding brief (the brief is not checked in; this is
+its milestone list as an earlier session recorded it):
+
+6. Control plane pulls a real OCI image from a registry, verifies it,
+   converts it, and runs it through the gRPC API.
+7. io_uring; postgres, node, python, go, and JVM workloads pass their own
+   test suites at a tracked pass rate.
+8. Cloud drivers and metadata: Ichor boots and runs containers on AWS,
+   GCP, Azure, and one bare-metal machine (needs the owner's accounts and
+   hardware).
+9. CRI: a kubelet schedules onto Ichor.
+
+**Milestone 5 is done** (2026-11-15): network stack, virtio-net,
+inter-cell switching; nginx and redis serve traffic from cells, to each
+other and to the host through a published port. The design is ADR-0010:
+our own sans-I/O stack in `kernel/net` (host-tested), one stack per cell,
+an in-kernel cell switch with assigned addresses, anti-spoofing, rate
+limits, a cross-cell fast path, and NAT plus published ports at the
+uplink; virtio-net (polled). Open from it: IPv6, ICMP errors for UDP,
+`MSG_PEEK`, interrupt-driven virtio-net (milestone 8 with cloud NICs).
 
 - M5 so far: `kernel/net` (wire formats, an IPv4 interface with ARP, a
   TCP state machine tested over a lossy, reordering simulated link),
@@ -31,8 +57,51 @@ uplink; virtio-net first (polled).
   `SOCK_STREAM` sockets as poll/epoll-able objects (socket, bind, listen,
   accept4, connect incl. non-blocking, send*/recv*, shutdown,
   get/setsockopt, getsockname/getpeername, SIGPIPE). Debian's perl runs a
-  socket session on every boot. Next: the cell switch, NAT and published
-  ports at the uplink, then nginx and redis.
+  socket session on every boot. `switch.rs` + `net::switch`/`net::nat`:
+  the cell switch (assigned 10.88.0.0/16 addresses, anti-spoofing, the
+  cross-cell fast path), source NAT and published ports at the uplink; a
+  SYN for an unpublished uplink port gets RST.
+- M5 workloads (`alpinetest::servers`): Alpine's own nginx 1.26 and redis
+  7.2 (pinned packages in the Alpine mirror) run in a server cell; a client
+  cell checks them with wget, redis-cli and redis-benchmark through the
+  switch, and with `net_publish` the host fetches from nginx through the
+  published port (`a_published_port_serves_the_host_from_a_cell`). Needed
+  on the way: TCP_CORK and friends (recorded), `setitimer`/`getitimer`/
+  `alarm` (`itimer.rs`, ITIMER_REAL), a 65,536-entry descriptor ceiling
+  (soft 1024; raising a hard limit is EPERM, CAP_SYS_RESOURCE being outside
+  the cell bounding set), Linux's epoll maxevents bound, and
+  `/proc/sys/net/core/somaxconn`. Load exposed three Linux behaviors we
+  lacked: epoll entries now name their open file description weakly and
+  vanish when it closes (nginx never DELs before `close`; a reused fd
+  number was EEXIST and closed sockets stayed alive); TCP takes a bare FIN
+  against a zero window, sends no window update after the peer's FIN, and
+  ends TIME_WAIT quietly on a RST; the NAT lets a SYN reopen a finished
+  mapping.
+- M5 UDP: `SOCK_DGRAM` sockets on the same per-cell stack (own port
+  space, 256 KiB receive queue that drops when full, autobind on first
+  send, connect/AF_UNSPEC, MSG_TRUNC, msg_name in sendmsg/recvmsg).
+  Tested on loopback (Debian perl), across the switch between cells, and
+  through the uplink's NAT to a host UDP echo. No ICMP errors yet.
+- M5 `AF_UNIX` (`linuxabi/unix.rs`): stream, datagram and seqpacket
+  sockets, `socketpair`, path names (a socket node in the cell's root,
+  `overlay::Kind::Socket`, checked for write permission; open is ENXIO)
+  and per-cell abstract names (autobind too), `SCM_RIGHTS` (passes open
+  file descriptions; `MSG_CTRUNC`), `SCM_CREDENTIALS`/`SO_PASSCRED`,
+  `SO_PEERCRED`, and `O_ASYNC`/`F_SETOWN`/`FIOASYNC` posting SIGIO. A
+  descriptor's `UnixSocket` owns an `Endpoint`; closing it shuts the
+  endpoint down outside every lock, so endpoints are cheap to drop inside
+  wait conditions. nginx now runs with its master process and workers.
+  Tests: `scm_rights_program` (runtest) and Debian perl's `UNIX_SCRIPT`.
+  Not yet: `MSG_PEEK`, a collector for `SCM_RIGHTS` cycles.
+- M5 socket memory: each stack charges what its sockets buffer to the
+  cell's account by the page (`Inner::settle` after every operation);
+  short of memory, it caps every connection's buffers where they stand
+  (`Tcp::set_cap`: the window closes, writers wait) and drops datagrams,
+  resuming with twice `RESERVE` pages of headroom. `AF_UNIX` queues charge
+  the receiving cell; a write it cannot cover waits (ENOBUFS with nothing
+  queued). Closing a TCP socket drops what it never read and answers later
+  data with RST, as Linux does. Self-tests: `netstack::accounting_selftest`
+  and `unix::accounting_selftest`.
 
 Milestones 0-4 are done (4's acceptance test: Debian's `apt-get install`
 from a local mirror). Phase E (scalability) is done except the vDSO
@@ -371,7 +440,10 @@ Useful options: `--release`, `--accel auto|kvm|whpx|hvf|tcg`, `--smp N`,
 qemu args>`.
 
 Environment overrides: `ICHOR_QEMU`, `ICHOR_OVMF_CODE` + `ICHOR_OVMF_VARS`,
-`ICHOR_ACCEL`, `ICHOR_TEST_VERBOSE=1` (echo guest serial during tests), and
+`ICHOR_ACCEL`, `ICHOR_TEST_VERBOSE=1` (echo guest serial during tests),
+`ICHOR_TEST_CMDLINE` (extra kernel options for every test boot, e.g.
+`trace_errors` while chasing a flaky test; load the host with busy loops
+to reproduce timing bugs: 11 parallel QEMUs on TCG are slow), and
 `ICHOR_REQUIRE_KVM=1` (CI sets it: `cargo xtask test` fails unless KVM is
 the accelerator).
 

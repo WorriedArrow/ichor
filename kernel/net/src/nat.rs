@@ -26,7 +26,9 @@ pub const IDLE: Duration = Duration::from_secs(600);
 pub const CLOSING: Duration = Duration::from_secs(60);
 
 const FIN: u8 = 0x01;
+const SYN: u8 = 0x02;
 const RST: u8 = 0x04;
+const ACK: u8 = 0x10;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Mapping {
@@ -48,6 +50,16 @@ impl Mapping {
             IDLE
         };
         now.saturating_sub(self.last) > life
+    }
+
+    /// A new connection request on a TCP mapping that has finished (both
+    /// FINs or a RST) starts a fresh mapping, as Linux's conntrack lets a
+    /// SYN reopen a closing entry: the endpoints may be reused, and a
+    /// published port may now point somewhere else.
+    fn reopened_by(&self, proto: u8, flags: u8) -> bool {
+        proto == PROTO_TCP
+            && flags & (SYN | ACK | RST) == SYN
+            && (self.reset || (self.fin_in && self.fin_out))
     }
 }
 
@@ -152,7 +164,14 @@ impl Nat {
         now: Duration,
     ) -> Option<Endpoint> {
         let key = match self.by_inside.get(&(proto, inside, remote)).copied() {
-            Some(k) if self.by_outside.get(&k).is_some_and(|m| !m.expired(now)) => k,
+            Some(k)
+                if self
+                    .by_outside
+                    .get(&k)
+                    .is_some_and(|m| !m.expired(now) && !m.reopened_by(proto, flags)) =>
+            {
+                k
+            }
             stale => {
                 if let Some(k) = stale {
                     self.forget(k);
@@ -199,13 +218,17 @@ impl Nat {
         now: Duration,
     ) -> Option<Endpoint> {
         let key = (proto, port, remote);
-        if self.by_outside.get(&key).is_some_and(|m| m.expired(now)) {
+        if self
+            .by_outside
+            .get(&key)
+            .is_some_and(|m| m.expired(now) || m.reopened_by(proto, flags))
+        {
             self.forget(key);
         }
         if !self.by_outside.contains_key(&key) {
             let inside = *self.published.get(&(proto, port))?;
             // Only a connection request opens a TCP mapping from outside.
-            if proto == PROTO_TCP && (flags & 0x02 == 0 || flags & 0x10 != 0) {
+            if proto == PROTO_TCP && (flags & SYN == 0 || flags & ACK != 0) {
                 return None;
             }
             let m = Mapping {
@@ -280,8 +303,6 @@ mod tests {
     const CELL: Ipv4Addr = Ipv4Addr::new(10, 88, 0, 2);
     const CELL2: Ipv4Addr = Ipv4Addr::new(10, 88, 0, 3);
     const FAR: Ipv4Addr = Ipv4Addr::new(93, 184, 216, 34);
-    const SYN: u8 = 0x02;
-    const ACK: u8 = 0x10;
 
     fn t(s: u64) -> Duration {
         Duration::from_secs(s)
@@ -382,6 +403,48 @@ mod tests {
         n.expire(t(0) + IDLE + t(1));
         assert!(n.is_empty());
         assert_eq!(n.inbound(PROTO_TCP, (FAR, 80), a.1, ACK, IDLE + t(2)), None);
+    }
+
+    /// A SYN on a finished mapping starts over: to the cell the port is
+    /// published to now, and outbound with the same endpoints again.
+    #[test]
+    fn a_syn_reopens_a_finished_mapping() {
+        let mut n = Nat::new(UP);
+        assert!(n.publish(PROTO_TCP, 8080, (CELL, 80)));
+        let far = (FAR, 5555);
+        assert_eq!(n.inbound(PROTO_TCP, far, 8080, SYN, t(0)), Some((CELL, 80)));
+        // Nothing listened: the cell answered RST.
+        n.outbound(PROTO_TCP, (CELL, 80), far, RST | ACK, t(0));
+        n.unpublish(PROTO_TCP, 8080);
+        assert!(n.publish(PROTO_TCP, 8080, (CELL2, 80)));
+        // The same remote endpoint connects again within CLOSING.
+        assert_eq!(
+            n.inbound(PROTO_TCP, far, 8080, SYN, t(5)),
+            Some((CELL2, 80))
+        );
+        assert_eq!(
+            n.outbound(PROTO_TCP, (CELL2, 80), far, SYN | ACK, t(5)),
+            Some((UP, 8080))
+        );
+        // A live mapping is not reopened by a stray SYN.
+        assert_eq!(
+            n.inbound(PROTO_TCP, far, 8080, SYN, t(6)),
+            Some((CELL2, 80))
+        );
+        // Outbound: a cell reusing its endpoint after a close both ways.
+        let a = n
+            .outbound(PROTO_TCP, (CELL, 1), (FAR, 80), SYN, t(0))
+            .unwrap();
+        n.outbound(PROTO_TCP, (CELL, 1), (FAR, 80), FIN | ACK, t(1));
+        n.inbound(PROTO_TCP, (FAR, 80), a.1, FIN | ACK, t(1));
+        let b = n
+            .outbound(PROTO_TCP, (CELL, 1), (FAR, 80), SYN, t(2))
+            .unwrap();
+        assert_ne!(a.1, b.1, "a fresh mapping, not the closing one");
+        assert_eq!(
+            n.inbound(PROTO_TCP, (FAR, 80), b.1, SYN | ACK, t(2)),
+            Some((CELL, 1))
+        );
     }
 
     #[test]

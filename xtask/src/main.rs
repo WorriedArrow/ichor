@@ -46,6 +46,7 @@ Environment:
   ICHOR_QEMU, ICHOR_OVMF_CODE, ICHOR_OVMF_VARS   override tool discovery
   ICHOR_ACCEL                                    default accelerator
   ICHOR_TEST_VERBOSE=1                           echo guest serial during tests
+  ICHOR_TEST_CMDLINE=<opts>                      extra kernel options for every test boot
 ";
 
 #[derive(Debug)]

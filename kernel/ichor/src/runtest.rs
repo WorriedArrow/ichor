@@ -71,6 +71,10 @@ mod sys {
     pub(super) const EPOLL_PWAIT: u64 = 281;
     pub(super) const MREMAP: u64 = 25;
     pub(super) const PRCTL: u64 = 157;
+    pub(super) const SENDMSG: u64 = 46;
+    pub(super) const RECVMSG: u64 = 47;
+    pub(super) const SOCKETPAIR: u64 = 53;
+    pub(super) const GETSOCKOPT: u64 = 55;
 }
 
 const MOTD: &[u8] = b"hello from /etc/motd inside an Ichor image\n";
@@ -124,8 +128,19 @@ pub(crate) fn run_linux(
         }
         frame::task::yield_now();
     };
-    let cached = cache_ns.map_or(0, |ns| crate::pagecache::private_pages(ns) as u64);
+    // Orphans the program left (killed, or exiting on their own) may still
+    // be on their way out: give the cell's other processes time to go.
+    let deadline = frame::time::now() + core::time::Duration::from_secs(30);
+    let cached = loop {
+        let cached = cache_ns.map_or(0, |ns| crate::pagecache::private_pages(ns) as u64);
+        if cell.account().used() == cached || frame::time::now() > deadline {
+            break cached;
+        }
+        frame::task::yield_now();
+    };
     if cell.account().used() != cached {
+        let (threads, procs, _) = proc::census(cell.id());
+        println!("ichor: runtest: {procs} processes ({threads} threads) still live in the cell");
         println!(
             "ichor: runtest: {} pages still charged ({cached} private cache pages)",
             cell.account().used()
@@ -843,6 +858,186 @@ pub(crate) fn cloexec_program() -> Vec<u8> {
     static_elf(&a.finish(BLOB_VADDR).unwrap_or_else(|| fail("assembler")))
 }
 
+/// `AF_UNIX` descriptor passing: a stream socketpair (fds 3, 4) carries
+/// `/etc/motd`'s descriptor (5) with `SCM_RIGHTS`; after the sender closes
+/// it, the receiver gets it back as fd 5 in a 24-byte control message and
+/// reads the file through it. A seqpacket pair (6, 7) keeps two writes
+/// apart, and `SO_PEERCRED` names this process. Exits 0, or the number of
+/// the failed check.
+fn scm_rights_program() -> Vec<u8> {
+    const AF_UNIX: u64 = 1;
+    const SOCK_STREAM: u64 = 1;
+    const SOCK_SEQPACKET: u64 = 5;
+    const SOL_SOCKET: u64 = 1;
+    const SO_PEERCRED: u64 = 17;
+    let mut a = Asm::new();
+    let bad = a.label();
+    let motd = a.data(b"/etc/motd\0");
+    let abc = a.data(b"abcde");
+    let expect = |a: &mut Asm, n: u64, v: i32| {
+        a.mov_imm(Reg::R15, n);
+        a.cmp_imm(Reg::Rax, v);
+        a.jne(bad);
+    };
+    // Stores `v` at rbp+off.
+    let put = |a: &mut Asm, off: i32, v: u64| {
+        a.mov_imm(Reg::Rax, v);
+        a.store(Reg::Rbp, off, Reg::Rax);
+    };
+    // Stores rbp+target at rbp+off.
+    let put_ptr = |a: &mut Asm, off: i32, target: i32| {
+        a.mov(Reg::Rax, Reg::Rbp);
+        a.add_imm(Reg::Rax, target);
+        a.store(Reg::Rbp, off, Reg::Rax);
+    };
+    // msghdr at rbp+256: iov rbp+64 (1 byte at rbp+128), control rbp+192
+    // (24 bytes).
+    let msghdr = |a: &mut Asm| {
+        put(a, 256, 0);
+        put(a, 264, 0);
+        put_ptr(a, 272, 64);
+        put(a, 280, 1);
+        put_ptr(a, 288, 192);
+        put(a, 296, 24);
+        put(a, 304, 0);
+        put_ptr(a, 64, 128);
+        put(a, 72, 1);
+    };
+    a.mov(Reg::Rbp, Reg::Rsp);
+    a.sub_imm(Reg::Rbp, 4096);
+    // 1: socketpair(AF_UNIX, SOCK_STREAM) -> fds 3 and 4.
+    a.mov_imm(Reg::Rdi, AF_UNIX);
+    a.mov_imm(Reg::Rsi, SOCK_STREAM);
+    a.mov_imm(Reg::Rdx, 0);
+    a.mov(Reg::R10, Reg::Rbp);
+    a.sys(sys::SOCKETPAIR);
+    expect(&mut a, 1, 0);
+    a.load(Reg::Rax, Reg::Rbp, 0);
+    a.mov_imm(Reg::R14, 3 | (4 << 32));
+    a.mov_imm(Reg::R15, 1);
+    a.cmp(Reg::Rax, Reg::R14);
+    a.jne(bad);
+    // 2: open(/etc/motd) -> 5.
+    a.mov_data(Reg::Rdi, motd);
+    a.mov_imm(Reg::Rsi, 0);
+    a.sys(sys::OPEN);
+    expect(&mut a, 2, 5);
+    // 3: sendmsg(3, "x" + SCM_RIGHTS [5]) -> 1.
+    put(&mut a, 128, u64::from(b'x'));
+    put(&mut a, 192, 20);
+    put(&mut a, 200, SOL_SOCKET | (1 << 32));
+    put(&mut a, 208, 5);
+    msghdr(&mut a);
+    a.mov_imm(Reg::Rdi, 3);
+    a.mov(Reg::Rsi, Reg::Rbp);
+    a.add_imm(Reg::Rsi, 256);
+    a.mov_imm(Reg::Rdx, 0);
+    a.sys(sys::SENDMSG);
+    expect(&mut a, 3, 1);
+    // 4: close(5): the message still holds the open file.
+    a.mov_imm(Reg::Rdi, 5);
+    a.sys(sys::CLOSE);
+    expect(&mut a, 4, 0);
+    // 5: recvmsg(4) -> 1 byte, "x".
+    for off in [128, 192, 200, 208] {
+        put(&mut a, off, 0);
+    }
+    msghdr(&mut a);
+    a.mov_imm(Reg::Rdi, 4);
+    a.mov(Reg::Rsi, Reg::Rbp);
+    a.add_imm(Reg::Rsi, 256);
+    a.mov_imm(Reg::Rdx, 0);
+    a.sys(sys::RECVMSG);
+    expect(&mut a, 5, 1);
+    a.load(Reg::Rax, Reg::Rbp, 128);
+    expect(&mut a, 5, i32::from(b'x'));
+    // 6: one SCM_RIGHTS control message of 20 bytes naming fd 5; the
+    // control length came back as 24.
+    a.load(Reg::Rax, Reg::Rbp, 192);
+    expect(&mut a, 6, 20);
+    a.load(Reg::Rax, Reg::Rbp, 200);
+    a.mov_imm(Reg::R14, SOL_SOCKET | (1 << 32));
+    a.mov_imm(Reg::R15, 6);
+    a.cmp(Reg::Rax, Reg::R14);
+    a.jne(bad);
+    a.load(Reg::Rax, Reg::Rbp, 208);
+    expect(&mut a, 6, 5);
+    a.load(Reg::Rax, Reg::Rbp, 296);
+    expect(&mut a, 6, 24);
+    // 7: read(5) reads /etc/motd through the passed descriptor.
+    a.mov_imm(Reg::Rdi, 5);
+    a.mov(Reg::Rsi, Reg::Rbp);
+    a.add_imm(Reg::Rsi, 128);
+    a.mov_imm(Reg::Rdx, 5);
+    a.sys(sys::READ);
+    expect(&mut a, 7, 5);
+    // The same five bytes as a fresh open reads (fstest rewrote the file
+    // earlier in this root).
+    put(&mut a, 144, 0);
+    a.mov_data(Reg::Rdi, motd);
+    a.mov_imm(Reg::Rsi, 0);
+    a.sys(sys::OPEN);
+    expect(&mut a, 7, 6);
+    a.mov_imm(Reg::Rdi, 6);
+    a.mov(Reg::Rsi, Reg::Rbp);
+    a.add_imm(Reg::Rsi, 144);
+    a.mov_imm(Reg::Rdx, 5);
+    a.sys(sys::READ);
+    expect(&mut a, 7, 5);
+    a.mov_imm(Reg::Rdi, 6);
+    a.sys(sys::CLOSE);
+    a.load(Reg::Rax, Reg::Rbp, 128);
+    a.load(Reg::R14, Reg::Rbp, 144);
+    a.mov_imm(Reg::R15, 7);
+    a.cmp(Reg::Rax, Reg::R14);
+    a.jne(bad);
+    // 8: a seqpacket pair (6, 7): writes of 3 and 2 bytes read back as 3
+    // and 2.
+    a.mov_imm(Reg::Rdi, AF_UNIX);
+    a.mov_imm(Reg::Rsi, SOCK_SEQPACKET);
+    a.mov_imm(Reg::Rdx, 0);
+    a.mov(Reg::R10, Reg::Rbp);
+    a.sys(sys::SOCKETPAIR);
+    expect(&mut a, 8, 0);
+    for (data, len) in [(0u64, 3u64), (3, 2)] {
+        a.mov_imm(Reg::Rdi, 6);
+        a.mov_data(Reg::Rsi, abc);
+        a.add_imm(Reg::Rsi, data as i32);
+        a.mov_imm(Reg::Rdx, len);
+        a.sys(sys::WRITE);
+        expect(&mut a, 8, len as i32);
+    }
+    for len in [3, 2] {
+        a.mov_imm(Reg::Rdi, 7);
+        a.mov(Reg::Rsi, Reg::Rbp);
+        a.add_imm(Reg::Rsi, 128);
+        a.mov_imm(Reg::Rdx, 100);
+        a.sys(sys::READ);
+        expect(&mut a, 8, len);
+    }
+    // 9: SO_PEERCRED on fd 3: this process, uid 0.
+    put(&mut a, 336, 12);
+    a.mov_imm(Reg::Rdi, 3);
+    a.mov_imm(Reg::Rsi, SOL_SOCKET);
+    a.mov_imm(Reg::Rdx, SO_PEERCRED);
+    a.mov(Reg::R10, Reg::Rbp);
+    a.add_imm(Reg::R10, 320);
+    a.mov(Reg::R8, Reg::Rbp);
+    a.add_imm(Reg::R8, 336);
+    a.sys(sys::GETSOCKOPT);
+    expect(&mut a, 9, 0);
+    a.sys(sys::GETPID);
+    a.load(Reg::R14, Reg::Rbp, 320);
+    a.mov_imm(Reg::R15, 9);
+    a.cmp(Reg::Rax, Reg::R14);
+    a.jne(bad);
+    a.mov_imm(Reg::R15, 0);
+    a.bind(bad);
+    a.mov(Reg::Rdi, Reg::R15);
+    a.sys(sys::EXIT_GROUP);
+    static_elf(&a.finish(BLOB_VADDR).unwrap_or_else(|| fail("assembler")))
+}
+
 /// Resource limits and the alternate signal stack. `RLIMIT_NOFILE` (5, 5)
 /// lets fds 3 and 4 open, then `open` fails with EMFILE and `dup2` to 7
 /// with EBADF; a hard limit over the table size is EPERM. A SIGUSR1 handler
@@ -911,8 +1106,8 @@ fn limits_program() -> Vec<u8> {
     a.mov_imm(Reg::Rsi, 7);
     a.sys(sys::DUP2);
     expect(&mut a, 6, -9);
-    // 7: a hard limit past the table: EPERM.
-    pair(&mut a, 5, 4096);
+    // 7: a hard limit past the table (MAX_FDS, 65,536): EPERM.
+    pair(&mut a, 5, 1 << 20);
     prlimit(&mut a, 0, -1);
     expect(&mut a, 7, -1);
     // 8-9: stack_t at rbp+64: too small is ENOMEM, then 64 KiB 1 MiB down.
@@ -1794,6 +1989,15 @@ pub(crate) fn run() {
     }
     println!(
         "ichor: linux: fcntl record locks: conflict, F_GETLK, F_SETLKW wakeup ok ({syscalls} syscalls)"
+    );
+
+    let (status, syscalls) = run_linux(new_process(), &scm_rights_program(), None, &["unixtest"]);
+    if status != 0 {
+        println!("ichor: linux: unixtest failed check {status}");
+        fail("unixtest");
+    }
+    println!(
+        "ichor: linux: SCM_RIGHTS passed a descriptor over AF_UNIX, seqpacket kept boundaries, SO_PEERCRED named us ({syscalls} syscalls)"
     );
 
     let (status, syscalls) = run_linux(new_process(), &limits_program(), None, &["limitstest"]);

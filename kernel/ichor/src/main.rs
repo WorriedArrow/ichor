@@ -21,6 +21,7 @@ mod debiantest;
 mod dev;
 mod file;
 mod futex;
+mod itimer;
 mod kcell;
 mod linuxabi;
 mod loader;
@@ -146,6 +147,8 @@ fn kmain(info: BootInfo) -> ! {
     runtest::run();
     // The network first: the disks' cell tests use its uplink.
     nettest::run();
+    netstack::accounting_selftest();
+    linuxabi::unix::accounting_selftest();
     blktest::run();
 
     if cmdline.flag("test_stack_overflow") {

@@ -11,6 +11,9 @@
 mod exec;
 mod fs;
 pub(crate) mod socket;
+pub(crate) mod unix;
+
+use core::time::Duration;
 
 use crate::process::{Fd, LinuxProcess};
 use crate::umem;
@@ -40,7 +43,7 @@ mod nr {
     pub(super) const RT_SIGACTION: u64 = 13;
     pub(super) const RT_SIGPROCMASK: u64 = 14;
     pub(super) const RT_SIGRETURN: u64 = 15;
-    pub(super) const IOCTL: u64 = 16; // partial: termios, window size, job control and ptmx ioctls on ptys (the console is not a tty); FIONBIO, FIOCLEX/FIONCLEX
+    pub(super) const IOCTL: u64 = 16; // partial: termios, window size, job control and ptmx ioctls on ptys (the console is not a tty); FIONBIO, FIOCLEX/FIONCLEX; FIOASYNC on AF_UNIX sockets
     pub(super) const PREAD64: u64 = 17;
     pub(super) const PWRITE64: u64 = 18;
     pub(super) const READV: u64 = 19;
@@ -53,24 +56,28 @@ mod nr {
     pub(super) const MADVISE: u64 = 28; // partial: DONTNEED on the loaded image's own segments zero-fills
     pub(super) const PAUSE: u64 = 34;
     pub(super) const NANOSLEEP: u64 = 35;
+    pub(super) const GETITIMER: u64 = 36; // partial: ITIMER_REAL only
+    pub(super) const ALARM: u64 = 37;
+    pub(super) const SETITIMER: u64 = 38; // partial: ITIMER_REAL only
     pub(super) const DUP: u64 = 32;
     pub(super) const DUP2: u64 = 33;
     pub(super) const GETPID: u64 = 39;
     pub(super) const SENDFILE: u64 = 40;
-    pub(super) const SOCKET: u64 = 41; // partial: AF_INET SOCK_STREAM (TCP) only; others EAFNOSUPPORT/ESOCKTNOSUPPORT
-    pub(super) const CONNECT: u64 = 42;
+    pub(super) const SOCKET: u64 = 41; // partial: AF_INET (TCP, UDP) and AF_UNIX (stream, dgram, seqpacket); no AF_INET6 or AF_NETLINK
+    pub(super) const CONNECT: u64 = 42; // partial: no ICMP errors, so a connected UDP socket never sees ECONNREFUSED
     pub(super) const ACCEPT: u64 = 43;
     pub(super) const SENDTO: u64 = 44; // partial: no out-of-band data
     pub(super) const RECVFROM: u64 = 45; // partial: no MSG_PEEK, no out-of-band data
-    pub(super) const SENDMSG: u64 = 46; // partial: no control messages
-    pub(super) const RECVMSG: u64 = 47; // partial: no MSG_PEEK, no control messages
+    pub(super) const SENDMSG: u64 = 46; // partial: control messages (SCM_RIGHTS, SCM_CREDENTIALS) on AF_UNIX only
+    pub(super) const RECVMSG: u64 = 47; // partial: no MSG_PEEK; control messages on AF_UNIX only
     pub(super) const SHUTDOWN: u64 = 48;
-    pub(super) const BIND: u64 = 49; // partial: loopback and INADDR_ANY until the cell switch
+    pub(super) const BIND: u64 = 49; // partial: the cell's own IPv4 addresses (loopback, its switch address, INADDR_ANY)
     pub(super) const LISTEN: u64 = 50;
     pub(super) const GETSOCKNAME: u64 = 51;
     pub(super) const GETPEERNAME: u64 = 52;
-    pub(super) const SETSOCKOPT: u64 = 54; // partial: SO_REUSEADDR acts; other known options are recorded only
-    pub(super) const GETSOCKOPT: u64 = 55; // partial: SO_ERROR, SO_TYPE, SO_ACCEPTCONN, SO_REUSEADDR; others echo what was set
+    pub(super) const SOCKETPAIR: u64 = 53;
+    pub(super) const SETSOCKOPT: u64 = 54; // partial: SO_REUSEADDR and SO_PASSCRED act; other known options are recorded only
+    pub(super) const GETSOCKOPT: u64 = 55; // partial: SO_ERROR, SO_TYPE, SO_ACCEPTCONN, SO_REUSEADDR, SO_PEERCRED, SO_PASSCRED; others echo what was set
     pub(super) const CLONE: u64 = 56; // partial: fork, vfork-style and thread clones
     pub(super) const FORK: u64 = 57;
     pub(super) const VFORK: u64 = 58; // partial: the child gets a copy-on-write copy, not the parent's memory
@@ -79,7 +86,7 @@ mod nr {
     pub(super) const WAIT4: u64 = 61; // partial: rusage is all zero (no accounting yet)
     pub(super) const KILL: u64 = 62;
     pub(super) const UNAME: u64 = 63;
-    pub(super) const FCNTL: u64 = 72; // partial: no F_SETOWN/F_*SIG/leases/seals
+    pub(super) const FCNTL: u64 = 72; // partial: F_SETOWN/F_GETOWN and O_ASYNC on AF_UNIX sockets only; no F_*SIG/leases/seals
     pub(super) const FLOCK: u64 = 73;
     pub(super) const FSYNC: u64 = 74; // partial: the upper layer is memory
     pub(super) const FDATASYNC: u64 = 75; // partial: the upper layer is memory
@@ -184,6 +191,7 @@ mod nr {
 
 const EPERM: i64 = 1;
 const EBADF: i64 = 9;
+const ENOMEM: i64 = 12;
 const EACCES: i64 = 13;
 const EFAULT: i64 = 14;
 const ENODEV: i64 = 19;
@@ -289,6 +297,13 @@ pub(crate) fn dispatch(p: &mut LinuxProcess, ctx: &mut frame::user::UserContext)
         nr::CONNECT => socket::connect(p, a[0], a[1], a[2]),
         nr::GETSOCKNAME => socket::getsockname(p, a[0], a[1], a[2]),
         nr::GETPEERNAME => socket::getpeername(p, a[0], a[1], a[2]),
+        nr::SOCKETPAIR => socket::socketpair(
+            p,
+            a[0] & 0xffff_ffff,
+            a[1] & 0xffff_ffff,
+            a[2] & 0xffff_ffff,
+            a[3],
+        ),
         nr::SETSOCKOPT => {
             socket::setsockopt(p, a[0], a[1] & 0xffff_ffff, a[2] & 0xffff_ffff, a[3], a[4])
         }
@@ -362,6 +377,9 @@ pub(crate) fn dispatch(p: &mut LinuxProcess, ctx: &mut frame::user::UserContext)
         nr::RT_SIGSUSPEND => signal::sigsuspend(p, a[0], a[1]),
         nr::PAUSE => signal::pause(p),
         nr::NANOSLEEP => signal::nanosleep(p, a[0], a[1]),
+        nr::GETITIMER => getitimer(p, a[0], a[1]),
+        nr::ALARM => alarm(p, a[0]),
+        nr::SETITIMER => setitimer(p, a[0], a[1], a[2]),
         nr::CLOCK_NANOSLEEP if a[1] == 0 => signal::nanosleep(p, a[2], a[3]),
         nr::CLOCK_NANOSLEEP => Err(EINVAL), // TIMER_ABSTIME
         nr::KILL => signal::kill(p, i(a[0]), a[1]),
@@ -545,7 +563,22 @@ fn ioctl(p: &mut LinuxProcess, fd: u64, request: u64, arg: u64) -> Result<u64, i
     const FIONCLEX: u64 = 0x5450;
     const FIOCLEX: u64 = 0x5451;
     const FIONBIO: u64 = 0x5421;
+    const FIOASYNC: u64 = 0x5452;
     let desc = p.desc(fd).ok_or(EBADF)?;
+    if request == FIOASYNC {
+        // O_ASYNC: AF_UNIX sockets only (partial).
+        let mut b = [0u8; 4];
+        if p.copy_from_user(arg, &mut b) != 4 {
+            return Err(EFAULT);
+        }
+        let st = desc.state();
+        let Fd::Object(o) = &*st else {
+            return Err(ENOTTY);
+        };
+        let u = o.obj.unix().ok_or(ENOTTY)?;
+        u.set_async(Some(u32::from_le_bytes(b) != 0), None);
+        return Ok(0);
+    }
     if !matches!(request, FIOCLEX | FIONCLEX | FIONBIO) {
         let obj = match &*desc.state() {
             Fd::Object(o) => Some(o.obj.clone()),
@@ -597,9 +630,12 @@ fn fcntl(p: &mut LinuxProcess, fd: u64, cmd: u64, arg: u64) -> Result<u64, i64> 
     const F_OFD_SETLK: u64 = 37;
     const F_OFD_SETLKW: u64 = 38;
     const F_DUPFD_CLOEXEC: u64 = 1030;
+    const F_SETOWN: u64 = 8;
+    const F_GETOWN: u64 = 9;
     const FD_CLOEXEC: u64 = 1;
     const O_RDWR: u64 = 2;
     const O_APPEND: u64 = 0o2000;
+    const O_ASYNC: u64 = 0o20000;
     let desc = p.desc(fd).ok_or(EBADF)?;
     match cmd {
         F_DUPFD => p.dup_from(fd, arg, false).ok_or(EMFILE),
@@ -617,11 +653,15 @@ fn fcntl(p: &mut LinuxProcess, fd: u64, cmd: u64, arg: u64) -> Result<u64, i64> 
             Fd::Console | Fd::Dev(_) => O_RDWR,
             Fd::File(of) => of.flags,
             Fd::Pipe(e) => u64::from(e.write) | if e.nonblock { fs::O_NONBLOCK } else { 0 },
-            Fd::Object(o) => O_RDWR | if o.nonblock { fs::O_NONBLOCK } else { 0 },
+            Fd::Object(o) => {
+                let asy = o.obj.unix().is_some_and(|u| u.is_async());
+                O_RDWR | if o.nonblock { fs::O_NONBLOCK } else { 0 } | if asy { O_ASYNC } else { 0 }
+            }
         }),
         F_SETFL => {
-            // Only O_APPEND and O_NONBLOCK can change after open (Linux also
-            // takes O_ASYNC/O_DIRECT/O_NOATIME, which mean nothing here).
+            // O_APPEND and O_NONBLOCK can change after open, and O_ASYNC on
+            // AF_UNIX sockets (Linux also takes O_DIRECT/O_NOATIME, which
+            // mean nothing here).
             let nb = arg & fs::O_NONBLOCK != 0;
             match &mut *desc.state() {
                 Fd::File(of) => {
@@ -629,9 +669,31 @@ fn fcntl(p: &mut LinuxProcess, fd: u64, cmd: u64, arg: u64) -> Result<u64, i64> 
                         | (arg & (O_APPEND | fs::O_NONBLOCK));
                 }
                 Fd::Pipe(e) => e.nonblock = nb,
-                Fd::Object(o) => o.nonblock = nb,
+                Fd::Object(o) => {
+                    o.nonblock = nb;
+                    if let Some(u) = o.obj.unix() {
+                        u.set_async(Some(arg & O_ASYNC != 0), None);
+                    }
+                }
                 Fd::Console | Fd::Dev(_) => {}
             }
+            Ok(0)
+        }
+        // SIGIO ownership: AF_UNIX sockets only (partial).
+        F_SETOWN | F_GETOWN => {
+            let st = desc.state();
+            let Fd::Object(o) = &*st else {
+                return Err(EINVAL);
+            };
+            let u = o.obj.unix().ok_or(EINVAL)?;
+            if cmd == F_GETOWN {
+                return Ok(u.owner());
+            }
+            // A process group (negative) is not kept.
+            if (arg as i64) < 0 {
+                return Err(EINVAL);
+            }
+            u.set_async(None, Some(arg));
             Ok(0)
         }
         F_GETLK | F_SETLK | F_SETLKW | F_OFD_GETLK | F_OFD_SETLK | F_OFD_SETLKW => {
@@ -1104,8 +1166,10 @@ fn prlimit(p: &mut LinuxProcess, pid: u64, resource: u64, new: u64, old: u64) ->
         if soft > hard {
             return Err(EINVAL);
         }
-        // The descriptor table holds MAX_FDS entries.
-        if r == RLIMIT_NOFILE && hard > MAX_FDS as u64 {
+        // Raising a hard limit needs CAP_SYS_RESOURCE, which is outside
+        // the cell bounding set (ADR-0009 §3), as in Docker's default; and
+        // the descriptor table holds MAX_FDS entries.
+        if hard > max || (r == RLIMIT_NOFILE && hard > MAX_FDS as u64) {
             return Err(EPERM);
         }
         p.group.set_limit(r, soft, hard);
@@ -1114,6 +1178,86 @@ fn prlimit(p: &mut LinuxProcess, pid: u64, resource: u64, new: u64, old: u64) ->
         put_pair(p, old, cur, max)?;
     }
     Ok(0)
+}
+
+const ITIMER_REAL: u64 = 0;
+
+/// A user `struct itimerval` (interval, then value; `timeval`s).
+fn put_itimerval(
+    p: &mut LinuxProcess,
+    at: u64,
+    (value, interval): (Duration, Duration),
+) -> Result<(), i64> {
+    let mut b = [0u8; 32];
+    for (i, d) in [interval, value].into_iter().enumerate() {
+        b[i * 16..i * 16 + 8].copy_from_slice(&d.as_secs().to_le_bytes());
+        b[i * 16 + 8..i * 16 + 16].copy_from_slice(&u64::from(d.subsec_micros()).to_le_bytes());
+    }
+    if p.copy_to_user(at, &b) != 32 {
+        return Err(EFAULT);
+    }
+    Ok(())
+}
+
+/// Only the real-time timer exists: `ITIMER_VIRTUAL` and `ITIMER_PROF`
+/// (CPU time) are `EINVAL` (partial).
+fn which_real(which: u64) -> Result<(), i64> {
+    if which == ITIMER_REAL {
+        Ok(())
+    } else {
+        Err(EINVAL)
+    }
+}
+
+/// `getitimer(which, curr)`.
+fn getitimer(p: &mut LinuxProcess, which: u64, curr: u64) -> Result<u64, i64> {
+    which_real(which)?;
+    let v = crate::itimer::get(p.cell.id(), p.group.tgid);
+    put_itimerval(p, curr, v).map(|()| 0)
+}
+
+/// `setitimer(which, new, old)`: arms `ITIMER_REAL` (`SIGALRM`).
+fn setitimer(p: &mut LinuxProcess, which: u64, new: u64, old: u64) -> Result<u64, i64> {
+    which_real(which)?;
+    let mut b = [0u8; 32];
+    if new != 0 && p.copy_from_user(new, &mut b) != 32 {
+        return Err(EFAULT);
+    }
+    let tv = |at: usize| -> Result<Duration, i64> {
+        let s = i64::from_le_bytes(b[at..at + 8].try_into().unwrap_or([0; 8]));
+        let us = i64::from_le_bytes(b[at + 8..at + 16].try_into().unwrap_or([0; 8]));
+        if s < 0 || !(0..1_000_000).contains(&us) {
+            return Err(EINVAL);
+        }
+        Ok(Duration::new(s as u64, us as u32 * 1000))
+    };
+    let (interval, value) = (tv(0)?, tv(16)?);
+    let prev = if new == 0 {
+        crate::itimer::get(p.cell.id(), p.group.tgid)
+    } else {
+        crate::itimer::set(p.cell.id(), p.group.tgid, value, interval).ok_or(ENOMEM)?
+    };
+    if old != 0 {
+        put_itimerval(p, old, prev)?;
+    }
+    Ok(0)
+}
+
+/// `alarm(seconds)`: a one-shot `ITIMER_REAL`; returns the seconds the
+/// previous alarm had left, rounded as Linux does.
+fn alarm(p: &mut LinuxProcess, secs: u64) -> Result<u64, i64> {
+    let secs = secs & 0xffff_ffff;
+    let (left, _) = crate::itimer::set(
+        p.cell.id(),
+        p.group.tgid,
+        Duration::from_secs(secs),
+        Duration::ZERO,
+    )
+    .ok_or(ENOMEM)?;
+    if left.is_zero() {
+        return Ok(0);
+    }
+    Ok((left.as_secs() + u64::from(left.subsec_micros() >= 500_000)).max(1))
 }
 
 /// One past the highest user address (the top of the lower canonical half).

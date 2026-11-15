@@ -106,9 +106,17 @@ uplink, which is a real Ethernet interface (`net::iface`). Cells use
 10.88.0.0/16 (the switch is .1); NAT and published ports live in
 `net::nat`. The cross-cell fast path hands the owned segment buffer from
 one stack to the other inside the sending call, with no device and no
-copy. Socket buffers are not yet charged to the cell's account; that,
-UDP, and `AF_UNIX` are the remaining milestone 5 networking pieces
-besides the workloads.
+copy.
+
+### Amendment (2026-11-15): milestone 5 closed
+
+UDP shares each stack; `AF_UNIX` is `linuxabi/unix.rs` (paths are socket
+nodes in the cell's root, abstract names are keyed by cell). Socket
+buffers are charged to the cell's account by the page; when the account
+runs short a stack caps its connections' buffers where they stand (TCP
+windows close, writers wait) and drops datagrams, instead of failing
+allocations or growing past the cell's memory. A single operation may
+add one write's or segment's worth before the cap takes effect.
 
 ## Alternatives considered
 

@@ -121,6 +121,9 @@ pub enum Kind {
     Symlink,
     /// A character device node; the kernel decides what it is from `rdev`.
     CharDevice,
+    /// A socket node (`bind` of an `AF_UNIX` path); the kernel keeps what
+    /// listens there.
+    Socket,
 }
 
 /// A timestamp (seconds and nanoseconds since the epoch the kernel's
@@ -251,6 +254,7 @@ enum Data<'a> {
     Dir(Dir<'a>),
     Symlink(String),
     Device(u32),
+    Socket,
 }
 
 #[derive(Debug)]
@@ -290,6 +294,7 @@ impl Inode<'_> {
             Data::Dir(_) => Kind::Directory,
             Data::Symlink(_) => Kind::Symlink,
             Data::Device(_) => Kind::CharDevice,
+            Data::Socket => Kind::Socket,
         }
     }
 }
@@ -657,7 +662,7 @@ impl<'a> Overlay<'a> {
             Data::File(f) => f.size,
             Data::Dir(_) => 4096,
             Data::Symlink(t) => t.len() as u64,
-            Data::Device(_) => 0,
+            Data::Device(_) | Data::Socket => 0,
         };
         let rdev = match i.data {
             Data::Device(d) => d,
@@ -688,7 +693,7 @@ impl<'a> Overlay<'a> {
             Data::LowerFile(n) => self.read_lower(n, offset, out),
             Data::File(f) => Ok(f.read(offset, out)),
             Data::Dir(_) => Err(EISDIR),
-            Data::Symlink(_) | Data::Device(_) => Err(EINVAL),
+            Data::Symlink(_) | Data::Device(_) | Data::Socket => Err(EINVAL),
         }
     }
 
@@ -736,7 +741,7 @@ impl<'a> Overlay<'a> {
             Data::LowerFile(n) => *n,
             Data::File(_) => return Ok(()),
             Data::Dir(_) => return Err(EISDIR),
-            Data::Symlink(_) | Data::Device(_) => return Err(EINVAL),
+            Data::Symlink(_) | Data::Device(_) | Data::Socket => return Err(EINVAL),
         };
         let size = usize::try_from(node.size()).map_err(|_| EFBIG)?;
         if size > MAX_FILE {
@@ -770,8 +775,10 @@ impl<'a> Overlay<'a> {
         if len > MAX_FILE {
             return Err(EFBIG);
         }
-        if matches!(self.get(ino)?.data, Data::Device(_)) {
-            return Ok(()); // `O_TRUNC` on /dev/null and friends
+        match self.get(ino)?.data {
+            Data::Device(_) => return Ok(()), // `O_TRUNC` on /dev/null and friends
+            Data::Socket => return Err(EINVAL),
+            _ => {}
         }
         if len == 0 && matches!(self.get(ino)?.data, Data::LowerFile(_)) {
             // No need to copy bytes that are about to be dropped.
@@ -954,6 +961,12 @@ impl<'a> Overlay<'a> {
     /// Creates a character device node.
     pub fn mknod(&mut self, dir: Ino, name: &str, mode: u32, rdev: u32) -> Result<Ino, i64> {
         let inode = Inode::fresh(Data::Device(rdev), mode & 0o7777, 1, (self.clock)());
+        self.add(dir, name, inode)
+    }
+
+    /// Creates a socket node (what `bind` of an `AF_UNIX` path leaves).
+    pub fn mksocket(&mut self, dir: Ino, name: &str, mode: u32) -> Result<Ino, i64> {
+        let inode = Inode::fresh(Data::Socket, mode & 0o7777, 1, (self.clock)());
         self.add(dir, name, inode)
     }
 
@@ -1429,6 +1442,23 @@ mod tests {
         assert!(fs.truncate(null, 0).is_ok());
         assert_eq!(fs.write(null, 0, b"x"), Err(EINVAL));
         assert_eq!(fs.readdir(dev).unwrap()[0].2, Kind::CharDevice);
+    }
+
+    #[test]
+    fn socket_nodes() {
+        let mut fs = Overlay::empty(1 << 20);
+        let run = fs.mkdir(ROOT, "run", 0o755).unwrap();
+        let s = fs.mksocket(run, "app.sock", 0o755).unwrap();
+        let st = fs.stat(s).unwrap();
+        assert_eq!((st.kind, st.mode, st.size), (Kind::Socket, 0o755, 0));
+        assert_eq!(fs.mksocket(run, "app.sock", 0o755), Err(EEXIST));
+        let mut buf = [0u8; 4];
+        assert_eq!(fs.read(s, 0, &mut buf), Err(EINVAL));
+        assert_eq!(fs.write(s, 0, b"x"), Err(EINVAL));
+        assert_eq!(fs.truncate(s, 0), Err(EINVAL));
+        assert_eq!(fs.readdir(run).unwrap()[0].2, Kind::Socket);
+        fs.unlink(run, "app.sock").unwrap();
+        assert_eq!(fs.lookup(run, "app.sock"), Err(ENOENT));
     }
 
     #[test]

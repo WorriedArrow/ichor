@@ -101,7 +101,11 @@ pub(crate) fn lookup(p: &LinuxProcess, path: &str, follow_last: bool) -> Option<
         ["version"] => Ok(Node::File(
             b"Linux version 6.6.0-ichor (Ichor framekernel) #1 SMP\n".to_vec(),
         )),
-        ["sys"] => Ok(dir(&[("kernel", DT_DIR)])),
+        ["sys"] => Ok(dir(&[("kernel", DT_DIR), ("net", DT_DIR)])),
+        ["sys", "net"] => Ok(dir(&[("core", DT_DIR)])),
+        ["sys", "net", "core"] => Ok(dir(&[("somaxconn", DT_REG)])),
+        // `listen` clamps backlogs to this (redis checks it).
+        ["sys", "net", "core", "somaxconn"] => Ok(Node::File(b"4096\n".to_vec())),
         ["sys", "kernel"] => Ok(dir(&[
             ("hostname", DT_REG),
             ("osrelease", DT_REG),
@@ -178,12 +182,11 @@ fn process(p: &LinuxProcess, rest: &[&str], follow_last: bool) -> Result<Node, i
         }
         ["exe"] => Ok(Node::Link(p.group.exe())),
         ["fd"] => {
-            let mut v = Vec::new();
-            for n in 0..crate::process::MAX_FDS as u64 {
-                if p.fd(n).is_some() {
-                    v.push((n.to_string(), DT_LNK));
-                }
-            }
+            let v = p
+                .open_fds()
+                .into_iter()
+                .map(|n| (n.to_string(), DT_LNK))
+                .collect();
             Ok(Node::Dir(v))
         }
         ["fd", n] => {
@@ -226,10 +229,11 @@ fn describe(p: &LinuxProcess, f: &Fd) -> String {
             "pipe:[{:x}]",
             alloc::sync::Arc::as_ptr(&e.pipe) as usize & 0xffff_ffff
         ),
-        Fd::Object(o) => match (o.obj.tty(), o.obj.socket()) {
-            (Some(t), _) => t.path(),
-            (None, Some(s)) => alloc::format!("socket:[{}]", s.inode()),
-            (None, None) => "anon_inode:[eventpoll]".to_string(),
+        Fd::Object(o) => match (o.obj.tty(), o.obj.socket(), o.obj.unix()) {
+            (Some(t), _, _) => t.path(),
+            (None, Some(s), _) => alloc::format!("socket:[{}]", s.inode()),
+            (None, None, Some(u)) => alloc::format!("socket:[{}]", u.inode()),
+            (None, None, None) => "anon_inode:[eventpoll]".to_string(),
         },
     }
 }

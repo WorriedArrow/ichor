@@ -69,12 +69,15 @@ fn m1_boots_on_four_cpus() {
         "ichor: linux: munmap shot down a page another thread was reading",
         "ichor: linux: poll timeout and wakeup, epoll, eventfd ok",
         "ichor: linux: fcntl record locks: conflict, F_GETLK, F_SETLKW wakeup ok",
+        "ichor: linux: SCM_RIGHTS passed a descriptor over AF_UNIX, seqpacket kept boundaries, SO_PEERCRED named us",
         "ichor: linux: RLIMIT_NOFILE enforced, SA_ONSTACK handler ran on the sigaltstack",
         "ichor: linux: madvise DONTNEED zero-fills anonymous pages, refills file pages",
         "ichor: linux: MAP_SHARED anonymous memory and its futex are shared across fork",
         "ichor: linux: mremap moves and resizes mappings; prctl names and bounding set ok",
         "ichor: linux: EPOLLET edges, ppoll/epoll_pwait signal masks, vfork waits for the child",
         "ichor: linux: AVX state is per thread and survives signals",
+        "ichor: net: socket buffers are charged to the cell: a 1 MiB loopback transfer peaked at",
+        "ichor: unix: a stream queue stopped at its cell's 24 pages and gave them back when read",
         "ichor: blk: virtio-blk disk, ",
         "ichor: pagecache: opted-out cells read private copies charged to their own account; sharing cells share",
         "ichor: blk: virtio-blk: verified 300 KiB read across multiple requests",
@@ -118,6 +121,12 @@ fn m1_boots_on_four_cpus() {
         "alpine: the image carries owners and times",
         "alpine: users and permissions are enforced",
         "alpine: sysinfo shows the cell",
+        "alpine: nginx and redis installed from the local mirror",
+        "alpine: redis-benchmark: SET:",
+        "alpine: redis-benchmark: GET:",
+        "alpine: nginx served six pages and redis answered from cell 10.88.",
+        "workers over AF_UNIX channels and stopped them",
+        "alpine: nginx and redis stopped",
         "ichor: alpine: all runs passed",
         "ichor: debian: root disk holds Debian 12",
         "debian: dash runs, release 12",
@@ -125,9 +134,13 @@ fn m1_boots_on_four_cpus() {
         "debian: nproc, getconf and stat agree",
         "debian: pty: openpty, line editing, echo, stty, ^C and hangup work",
         "debian: sockets: refused, EADDRINUSE, 1 MiB each way, half-close, non-blocking connect and accept work",
+        "debian: udp: datagrams keep boundaries and sources, truncate, connect filters, ports are per protocol",
+        "debian: alarm and setitimer deliver SIGALRM, getitimer reads back",
+        "debian: unix: socketpair, path servers, abstract datagrams, SO_PEERCRED and end of file work",
         "Hello, world!",
         "debian: apt-get installed hello and jq from the local repository",
         "through the switch; loopback is per cell",
+        "debian: cells: a datagram crossed the switch and came back",
         "ichor: debian: all runs passed",
         "ichor: blk: nvme block size 4096 bytes",
         "ichor: blk: nvme: verified 300 KiB read across multiple requests",
@@ -189,12 +202,15 @@ fn m1_boots_on_one_cpu() {
         "ichor: linux: munmap shot down a page another thread was reading",
         "ichor: linux: poll timeout and wakeup, epoll, eventfd ok",
         "ichor: linux: fcntl record locks: conflict, F_GETLK, F_SETLKW wakeup ok",
+        "ichor: linux: SCM_RIGHTS passed a descriptor over AF_UNIX, seqpacket kept boundaries, SO_PEERCRED named us",
         "ichor: linux: RLIMIT_NOFILE enforced, SA_ONSTACK handler ran on the sigaltstack",
         "ichor: linux: madvise DONTNEED zero-fills anonymous pages, refills file pages",
         "ichor: linux: MAP_SHARED anonymous memory and its futex are shared across fork",
         "ichor: linux: mremap moves and resizes mappings; prctl names and bounding set ok",
         "ichor: linux: EPOLLET edges, ppoll/epoll_pwait signal masks, vfork waits for the child",
         "ichor: linux: AVX state is per thread and survives signals",
+        "ichor: net: socket buffers are charged to the cell: a 1 MiB loopback transfer peaked at",
+        "ichor: unix: a stream queue stopped at its cell's 24 pages and gave them back when read",
         "ichor: blk: virtio-blk disk, ",
         "ichor: blk: virtio-blk: verified 300 KiB read across multiple requests",
         "ichor: blk: mounted the root image from the virtio-blk disk",
@@ -237,6 +253,12 @@ fn m1_boots_on_one_cpu() {
         "alpine: the image carries owners and times",
         "alpine: users and permissions are enforced",
         "alpine: sysinfo shows the cell",
+        "alpine: nginx and redis installed from the local mirror",
+        "alpine: redis-benchmark: SET:",
+        "alpine: redis-benchmark: GET:",
+        "alpine: nginx served six pages and redis answered from cell 10.88.",
+        "workers over AF_UNIX channels and stopped them",
+        "alpine: nginx and redis stopped",
         "ichor: alpine: all runs passed",
         "ichor: debian: root disk holds Debian 12",
         "debian: dash runs, release 12",
@@ -244,9 +266,13 @@ fn m1_boots_on_one_cpu() {
         "debian: nproc, getconf and stat agree",
         "debian: pty: openpty, line editing, echo, stty, ^C and hangup work",
         "debian: sockets: refused, EADDRINUSE, 1 MiB each way, half-close, non-blocking connect and accept work",
+        "debian: udp: datagrams keep boundaries and sources, truncate, connect filters, ports are per protocol",
+        "debian: alarm and setitimer deliver SIGALRM, getitimer reads back",
+        "debian: unix: socketpair, path servers, abstract datagrams, SO_PEERCRED and end of file work",
         "Hello, world!",
         "debian: apt-get installed hello and jq from the local repository",
         "through the switch; loopback is per cell",
+        "debian: cells: a datagram crossed the switch and came back",
         "ichor: debian: all runs passed",
         "ichor: blk: nvme block size 4096 bytes",
         "ichor: blk: nvme: verified 300 KiB read across multiple requests",
@@ -288,12 +314,15 @@ fn m2_scheduler_on_eight_cpus() {
         "ichor: linux: munmap shot down a page another thread was reading",
         "ichor: linux: poll timeout and wakeup, epoll, eventfd ok",
         "ichor: linux: fcntl record locks: conflict, F_GETLK, F_SETLKW wakeup ok",
+        "ichor: linux: SCM_RIGHTS passed a descriptor over AF_UNIX, seqpacket kept boundaries, SO_PEERCRED named us",
         "ichor: linux: RLIMIT_NOFILE enforced, SA_ONSTACK handler ran on the sigaltstack",
         "ichor: linux: madvise DONTNEED zero-fills anonymous pages, refills file pages",
         "ichor: linux: MAP_SHARED anonymous memory and its futex are shared across fork",
         "ichor: linux: mremap moves and resizes mappings; prctl names and bounding set ok",
         "ichor: linux: EPOLLET edges, ppoll/epoll_pwait signal masks, vfork waits for the child",
         "ichor: linux: AVX state is per thread and survives signals",
+        "ichor: net: socket buffers are charged to the cell: a 1 MiB loopback transfer peaked at",
+        "ichor: unix: a stream queue stopped at its cell's 24 pages and gave them back when read",
         "ichor: blk: virtio-blk disk, ",
         "ichor: blk: virtio-blk: verified 300 KiB read across multiple requests",
         "ichor: blk: mounted the root image from the virtio-blk disk",
@@ -336,6 +365,12 @@ fn m2_scheduler_on_eight_cpus() {
         "alpine: the image carries owners and times",
         "alpine: users and permissions are enforced",
         "alpine: sysinfo shows the cell",
+        "alpine: nginx and redis installed from the local mirror",
+        "alpine: redis-benchmark: SET:",
+        "alpine: redis-benchmark: GET:",
+        "alpine: nginx served six pages and redis answered from cell 10.88.",
+        "workers over AF_UNIX channels and stopped them",
+        "alpine: nginx and redis stopped",
         "ichor: alpine: all runs passed",
         "ichor: debian: root disk holds Debian 12",
         "debian: dash runs, release 12",
@@ -343,9 +378,13 @@ fn m2_scheduler_on_eight_cpus() {
         "debian: nproc, getconf and stat agree",
         "debian: pty: openpty, line editing, echo, stty, ^C and hangup work",
         "debian: sockets: refused, EADDRINUSE, 1 MiB each way, half-close, non-blocking connect and accept work",
+        "debian: udp: datagrams keep boundaries and sources, truncate, connect filters, ports are per protocol",
+        "debian: alarm and setitimer deliver SIGALRM, getitimer reads back",
+        "debian: unix: socketpair, path servers, abstract datagrams, SO_PEERCRED and end of file work",
         "Hello, world!",
         "debian: apt-get installed hello and jq from the local repository",
         "through the switch; loopback is per cell",
+        "debian: cells: a datagram crossed the switch and came back",
         "ichor: debian: all runs passed",
         "ichor: blk: nvme block size 4096 bytes",
         "ichor: blk: nvme: verified 300 KiB read across multiple requests",
@@ -453,8 +492,25 @@ fn tcp_through_virtio_net_to_a_host_echo_server() {
     use std::io::{Read, Write};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    // A TCP echo and a UDP echo on the same port number.
+    let (listener, udp) = (0..50)
+        .find_map(|_| {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
+            let u = std::net::UdpSocket::bind(l.local_addr().ok()?).ok()?;
+            Some((l, u))
+        })
+        .expect("a port free for both TCP and UDP");
     let port = listener.local_addr().unwrap().port();
+    let datagrams = Arc::new(AtomicUsize::new(0));
+    let counted = datagrams.clone();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 2048];
+        while let Ok((n, from)) = udp.recv_from(&mut buf) {
+            if udp.send_to(&buf[..n], from).is_ok() {
+                counted.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    });
     // Two clients: the kernel's own TCP, then a Debian cell through the
     // cell switch's NAT.
     let totals: Arc<[AtomicUsize; 2]> = Arc::new([AtomicUsize::new(0), AtomicUsize::new(0)]);
@@ -487,7 +543,12 @@ fn tcp_through_virtio_net_to_a_host_echo_server() {
         "ichor: net: uplink 10.0.2.15 is the cell switch's",
         "through the switch; loopback is per cell",
         &format!("debian: nat: a cell echoed 256 KiB with 10.0.2.2:{port} through the uplink"),
+        "debian: nat: a datagram went through the uplink and came back",
     ]);
+    assert!(
+        datagrams.load(Ordering::SeqCst) >= 1,
+        "the host echoed no datagram"
+    );
     for (i, t) in totals.iter().enumerate() {
         assert_eq!(
             t.load(Ordering::SeqCst),
@@ -509,40 +570,90 @@ fn a_published_port_serves_the_host_from_a_cell() {
         .local_addr()
         .unwrap()
         .port();
+    // The port is published twice in turn: to Debian's perl server, then
+    // to nginx in an Alpine cell. Each answer is kept once.
+    const BODIES: [&str; 2] = [
+        "hello from an Ichor cell",
+        "hello from nginx in an Ichor cell",
+    ];
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let halt = stop.clone();
     let client = std::thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(600);
-        while Instant::now() < deadline {
-            // QEMU accepts as soon as it runs; until the cell listens the
+        let mut got: [Option<String>; 2] = [None, None];
+        // (attempts, connect failures, read errors, empty or other answers,
+        // slowest attempt), reported if an answer is missing.
+        let (mut tries, mut refused, mut errors, mut other) = (0, 0, 0, 0);
+        let mut slowest = Duration::ZERO;
+        let mut sample = String::new();
+        let start = Instant::now();
+        let deadline = start + Duration::from_secs(600);
+        while Instant::now() < deadline
+            && got.iter().any(Option::is_none)
+            && !halt.load(std::sync::atomic::Ordering::Acquire)
+        {
+            // QEMU accepts as soon as it runs; until a cell listens the
             // forwarded connection fails and this tries again.
+            tries += 1;
+            let t0 = Instant::now();
             if let Ok(mut s) = std::net::TcpStream::connect(("127.0.0.1", host_port)) {
                 let _ = s.set_read_timeout(Some(Duration::from_secs(60)));
                 let mut resp = String::new();
                 if s.write_all(b"GET / HTTP/1.0\r\nHost: ichor\r\n\r\n")
                     .is_ok()
                     && s.read_to_string(&mut resp).is_ok()
-                    && resp.contains("hello from an Ichor cell")
                 {
-                    return resp;
+                    let mut known = false;
+                    for (slot, body) in got.iter_mut().zip(BODIES) {
+                        if resp.contains(body) {
+                            *slot = Some(resp.clone());
+                            known = true;
+                        }
+                    }
+                    if !known {
+                        other += 1;
+                        if !resp.is_empty() && sample.is_empty() {
+                            sample = resp.chars().take(200).collect();
+                        }
+                    }
+                } else {
+                    errors += 1;
                 }
+            } else {
+                refused += 1;
             }
+            slowest = slowest.max(t0.elapsed());
             std::thread::sleep(Duration::from_millis(250));
         }
-        String::new()
+        let log = format!(
+            "{tries} attempts in {:?}: {refused} connect failures, {errors} read errors, \
+             {other} other answers (first non-empty: {sample:?}), slowest {slowest:?}",
+            start.elapsed()
+        );
+        (got, log)
     });
     let out = ichor_tests::boot_with("net-publish", "net_publish=8080", 2, |c| {
         c.net_user_opts = format!("hostfwd=tcp:127.0.0.1:{host_port}-:8080");
+        c.timeout = Some(Duration::from_secs(420)); // two servers wait for the host
     });
+    stop.store(true, std::sync::atomic::Ordering::Release);
+    let (got, log) = client.join().unwrap();
+    eprintln!("host client: {log}");
     out.assert_exit(Exit::Success);
     out.assert_in_order(&[
         "ichor: net: uplink 10.0.2.15 is the cell switch's",
         "debian: published: listening on port 80",
         "debian: published: served a request from 10.0.2.2",
     ]);
-    let resp = client.join().unwrap();
-    assert!(
-        resp.starts_with("HTTP/1.0 200 OK\r\n"),
-        "response: {resp:?}"
-    );
+    out.assert_in_order(&["alpine: nginx served the host through the published port"]);
+    for (resp, body) in got.iter().zip(BODIES) {
+        let resp = resp
+            .as_deref()
+            .unwrap_or_else(|| panic!("no {body:?} response"));
+        assert!(
+            resp.starts_with("HTTP/1.0 200 OK\r\n") || resp.starts_with("HTTP/1.1 200 OK\r\n"),
+            "response: {resp:?}"
+        );
+    }
 }
 
 /// The Phase E benchmarks still build and run (their numbers are printed,

@@ -28,7 +28,7 @@ use frame::sync::{Mutex, SpinLock};
 use frame::task::WaitQueue;
 
 use crate::proc;
-use crate::process::{Fd, LinuxProcess};
+use crate::process::{Description, Fd, LinuxProcess};
 
 const EAGAIN: i64 = 11;
 const EFAULT: i64 = 14;
@@ -95,6 +95,10 @@ pub(crate) trait Object: Send + Sync + Debug {
     }
     /// This object as a socket.
     fn socket(&self) -> Option<&crate::linuxabi::socket::Socket> {
+        None
+    }
+    /// This object as an `AF_UNIX` socket.
+    fn unix(&self) -> Option<&crate::linuxabi::unix::UnixSocket> {
         None
     }
 }
@@ -580,14 +584,27 @@ const EPOLLONESHOT: u32 = 1 << 30;
 const EPOLLET: u32 = 1 << 31;
 
 /// One descriptor an epoll instance watches.
+///
+/// It names the open file description weakly: as on Linux, the entry
+/// goes away once every descriptor for that description is closed (nginx
+/// closes connections without `EPOLL_CTL_DEL`), and it never keeps a
+/// closed socket alive. Partial: entries are keyed by descriptor number
+/// alone, so adding a new file at a reused number drops the entry of an
+/// older file still open through a `dup` elsewhere (Linux keeps both).
 #[derive(Debug, Clone)]
 struct Interest {
     events: u32,
     data: u64,
-    /// The object at `EPOLL_CTL_ADD`.
-    fd: Fd,
+    /// The description at `EPOLL_CTL_ADD`.
+    desc: Weak<Description>,
     /// `EPOLLET`: the change count last reported.
     seen: Option<u64>,
+}
+
+impl Interest {
+    fn names(&self, d: &Arc<Description>) -> bool {
+        core::ptr::eq(self.desc.as_ptr(), Arc::as_ptr(d))
+    }
 }
 
 /// An epoll instance: fd -> what it watches there.
@@ -644,7 +661,8 @@ pub(crate) fn epoll_ctl(
     const DEL: u64 = 2;
     const MOD: u64 = 3;
     let ep = epoll_of(p, epfd)?;
-    let target = p.fd(fd).ok_or(EBADF)?;
+    let desc = p.desc(fd).ok_or(EBADF)?;
+    let target = desc.state().clone();
     if fd == epfd {
         return Err(EINVAL);
     }
@@ -668,6 +686,11 @@ pub(crate) fn epoll_ctl(
         return Err(EINVAL);
     };
     let mut set = epoll.interest.lock();
+    // An entry at this number for a description that has been closed (or
+    // another one, the number having been reused) is gone.
+    if set.get(&fd).is_some_and(|i| !i.names(&desc)) {
+        set.remove(&fd);
+    }
     match op {
         ADD if set.contains_key(&fd) => Err(EEXIST),
         ADD | MOD if op == ADD || set.contains_key(&fd) => {
@@ -676,7 +699,7 @@ pub(crate) fn epoll_ctl(
                 Interest {
                     events,
                     data,
-                    fd: target,
+                    desc: Arc::downgrade(&desc),
                     seen: None,
                 },
             );
@@ -704,32 +727,42 @@ pub(crate) fn epoll_wait(
     max: u64,
     timeout: i64,
 ) -> Result<u64, i64> {
-    if max == 0 || max > 4096 {
+    // Linux's EP_MAX_EVENTS: servers size the array to their client limit
+    // (redis asks for 10,128). Hits are bounded by the interest list.
+    const EP_MAX_EVENTS: u64 = i32::MAX as u64 / 12;
+    if max == 0 || max > EP_MAX_EVENTS {
         return Err(EINVAL);
     }
     let ep = epoll_of(p, epfd)?;
     let Some(epoll) = ep.as_epoll() else {
         return Err(EINVAL);
     };
-    let watch: Vec<(u64, Interest)> = epoll
-        .interest
-        .lock()
-        .iter()
-        .map(|(&fd, i)| (fd, i.clone()))
-        .collect();
+    // (fd, entry, what it names, the description held for the wait).
+    // Entries whose description has been closed are forgotten.
+    let watch: Vec<(u64, Interest, Fd, Arc<Description>)> = {
+        let mut set = epoll.interest.lock();
+        set.retain(|_, i| i.desc.strong_count() > 0);
+        set.iter()
+            .filter_map(|(&fd, i)| {
+                let d = i.desc.upgrade()?;
+                let f = d.state().clone();
+                Some((fd, i.clone(), f, d))
+            })
+            .collect()
+    };
     // (fd, events, data, change count)
     let scan = || -> Vec<(u64, u32, u64, u64)> {
         let mut hits = Vec::new();
-        for (fd, i) in &watch {
+        for (fd, i, f, _) in &watch {
             if i.events & !EPOLLET == 0 {
                 continue; // a disarmed EPOLLONESHOT entry
             }
             // Read the count first: a change after it is reported next time.
-            let n = changes(&i.fd);
+            let n = changes(f);
             if i.events & EPOLLET != 0 && i.seen == Some(n) {
                 continue;
             }
-            let r = u32::from(readiness(&i.fd)) & (i.events | u32::from(POLLERR | POLLHUP));
+            let r = u32::from(readiness(f)) & (i.events | u32::from(POLLERR | POLLHUP));
             if r != 0 {
                 hits.push((*fd, r, i.data, n));
                 if hits.len() as u64 == max {
@@ -739,7 +772,7 @@ pub(crate) fn epoll_wait(
         }
         hits
     };
-    let fds = watch.iter().map(|(_, i)| &i.fd);
+    let fds = watch.iter().map(|(_, _, f, _)| f);
     let hits = wait_ready(p, fds, deadline_ms(timeout), || {
         let h = scan();
         (!h.is_empty()).then_some(h)
