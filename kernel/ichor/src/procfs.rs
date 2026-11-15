@@ -84,11 +84,11 @@ pub(crate) fn lookup(p: &LinuxProcess, path: &str, follow_last: bool) -> Option<
         ["filesystems"] => Ok(Node::File(
             b"nodev\tproc\nnodev\tdevtmpfs\n\tichor\n".to_vec(),
         )),
-        ["loadavg"] => Ok(Node::File(b"0.00 0.00 0.00 1/1 1\n".to_vec())),
+        ["loadavg"] => Ok(Node::File(loadavg(p))),
         ["meminfo"] => Ok(Node::File(meminfo(p))),
         ["mounts"] if !follow_last => Ok(Node::Link("self/mounts".to_string())),
         ["mounts"] => Ok(Node::File(mounts())),
-        ["stat"] => Ok(Node::File(stat_global())),
+        ["stat"] => Ok(Node::File(stat_global(p))),
         ["uptime"] => {
             let t = frame::time::now();
             Ok(Node::File(
@@ -200,44 +200,61 @@ fn cpuinfo() -> Vec<u8> {
     s.into_bytes()
 }
 
+/// The cell's view of memory: its account's limit and what is left of it
+/// (or the machine's free memory, if that is less), as a container sees its
+/// cgroup limit. No page cache or swap yet.
 fn meminfo(p: &LinuxProcess) -> Vec<u8> {
     let st = frame::mm::stats();
-    let kib = |pages: usize| pages as u64 * 4;
-    let _ = p;
+    let account = p.cell.account();
+    let total = account.limit().min(st.total_pages as u64) * 4;
+    let free = account.available().min(st.free_pages as u64) * 4;
     format!(
-        "MemTotal:       {:8} kB\nMemFree:        {:8} kB\nMemAvailable:   {:8} kB\n\
+        "MemTotal:       {total:8} kB\nMemFree:        {free:8} kB\nMemAvailable:   {free:8} kB\n\
          Buffers:               0 kB\nCached:                0 kB\nSwapTotal:             0 kB\n\
-         SwapFree:              0 kB\n",
-        kib(st.total_pages),
-        kib(st.free_pages),
-        kib(st.free_pages)
+         SwapFree:              0 kB\n"
     )
     .into_bytes()
+}
+
+/// Load averages are not tracked yet (0.00); the counts are the cell's live
+/// threads, with the reader as the one known to be running.
+fn loadavg(p: &LinuxProcess) -> Vec<u8> {
+    let (threads, _, last) = crate::proc::census(p.entry.cell);
+    format!("0.00 0.00 0.00 1/{threads} {last}\n").into_bytes()
 }
 
 fn mounts() -> Vec<u8> {
     b"rootfs / ichor rw 0 0\nproc /proc proc rw 0 0\ndevtmpfs /dev devtmpfs rw 0 0\n".to_vec()
 }
 
-fn stat_global() -> Vec<u8> {
+/// CPU times are not accounted yet (zeros); `processes` counts every pid
+/// handed out since boot, as Linux counts forks.
+fn stat_global(p: &LinuxProcess) -> Vec<u8> {
     let n = frame::cpu::online_count();
     let mut s = String::from("cpu  0 0 0 0 0 0 0 0 0 0\n");
     for i in 0..n {
         s.push_str(&format!("cpu{i} 0 0 0 0 0 0 0 0 0 0\n"));
     }
-    s.push_str("btime 0\nprocesses 1\nprocs_running 1\nprocs_blocked 0\n");
+    let (_, _, last) = crate::proc::census(p.entry.cell);
+    s.push_str(&format!(
+        "btime 0\nprocesses {last}\nprocs_running 1\nprocs_blocked 0\n"
+    ));
     s.into_bytes()
 }
 
 fn status(p: &LinuxProcess) -> Vec<u8> {
-    let rss = p.mm().resident_pages() as u64 * 4;
+    let (size, rss) = {
+        let mm = p.mm();
+        (mm.virtual_size() / 1024, mm.resident_pages() as u64 * 4)
+    };
     format!(
         "Name:\t{}\nState:\tR (running)\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nUid:\t0\t0\t0\t0\n\
-         Gid:\t0\t0\t0\t0\nVmRSS:\t{} kB\nThreads:\t{}\nSigBlk:\t{:016x}\n",
+         Gid:\t0\t0\t0\t0\nVmSize:\t{} kB\nVmRSS:\t{} kB\nThreads:\t{}\nSigBlk:\t{:016x}\n",
         comm(p),
         p.group.tgid,
         p.entry.pid,
         p.entry.ppid(),
+        size,
         rss,
         p.group.threads().len(),
         p.sig.mask
@@ -245,16 +262,25 @@ fn status(p: &LinuxProcess) -> Vec<u8> {
     .into_bytes()
 }
 
+/// `/proc/<pid>/stat` up to rss (field 24). CPU times are zero (not
+/// accounted yet); start time, size and resident pages are real.
 fn stat_process(p: &LinuxProcess) -> Vec<u8> {
     let (pgid, sid) = p.group.leader.group();
+    let (vsize, rss) = {
+        let mm = p.mm();
+        (mm.virtual_size(), mm.resident_pages())
+    };
     format!(
-        "{} ({}) R {} {} {} 0 -1 0 0 0 0 0 0 0 0 0 20 0 {} 0 0 0 0\n",
+        "{} ({}) R {} {} {} 0 -1 0 0 0 0 0 0 0 0 0 20 0 {} 0 {} {} {}\n",
         p.group.tgid,
         comm(p),
         p.entry.ppid(),
         pgid,
         sid,
-        p.group.threads().len()
+        p.group.threads().len(),
+        p.group.leader.started,
+        vsize,
+        rss
     )
     .into_bytes()
 }

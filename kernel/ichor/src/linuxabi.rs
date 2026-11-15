@@ -19,6 +19,9 @@ use fs::AT_FDCWD;
 /// Linux x86-64 syscall numbers implemented so far. `cargo xtask
 /// linux-abi-table` generates `docs/linux-abi.md` from this table: a
 /// trailing `// partial: ...` or `// stub: ...` sets an entry's status.
+/// `cargo xtask lint` checks that every entry has a dispatch arm and that
+/// an arm answering with a constant success (`=> Ok(0)`) is not listed as
+/// implemented.
 mod nr {
     pub(super) const READ: u64 = 0; // partial: files and console (stdin is EOF)
     pub(super) const WRITE: u64 = 1;
@@ -29,7 +32,7 @@ mod nr {
     pub(super) const LSTAT: u64 = 6;
     pub(super) const POLL: u64 = 7;
     pub(super) const LSEEK: u64 = 8;
-    pub(super) const MMAP: u64 = 9; // partial: anonymous, and private copies of files
+    pub(super) const MMAP: u64 = 9; // partial: shared file mappings are read-only snapshots
     pub(super) const MPROTECT: u64 = 10;
     pub(super) const MUNMAP: u64 = 11;
     pub(super) const BRK: u64 = 12;
@@ -55,7 +58,7 @@ mod nr {
     pub(super) const CLONE: u64 = 56; // partial: fork, vfork-style and thread clones
     pub(super) const FORK: u64 = 57;
     pub(super) const VFORK: u64 = 58; // partial: the child gets a copy-on-write copy, not the parent's memory
-    pub(super) const EXECVE: u64 = 59; // partial: static ELF binaries
+    pub(super) const EXECVE: u64 = 59; // static and PIE ELF, PT_INTERP, #! scripts
     pub(super) const EXIT: u64 = 60;
     pub(super) const WAIT4: u64 = 61; // partial: rusage is all zero (no accounting yet)
     pub(super) const KILL: u64 = 62;
@@ -104,7 +107,7 @@ mod nr {
     pub(super) const ARCH_PRCTL: u64 = 158; // partial: ARCH_SET_FS only
     pub(super) const GETTID: u64 = 186;
     pub(super) const TKILL: u64 = 200;
-    pub(super) const FUTEX: u64 = 202; // partial: private semantics only (no PI, no FUTEX_FD)
+    pub(super) const FUTEX: u64 = 202; // partial: shared only within shared anonymous memory; no PI, no FUTEX_FD
     pub(super) const EPOLL_CREATE: u64 = 213;
     pub(super) const GETDENTS64: u64 = 217;
     pub(super) const SET_TID_ADDRESS: u64 = 218;
@@ -112,8 +115,8 @@ mod nr {
     pub(super) const CLOCK_NANOSLEEP: u64 = 230; // partial: relative sleeps only
     pub(super) const UTIMES: u64 = 235;
     pub(super) const EXIT_GROUP: u64 = 231;
-    pub(super) const EPOLL_WAIT: u64 = 232;
-    pub(super) const EPOLL_CTL: u64 = 233; // partial: EPOLLET is level-triggered
+    pub(super) const EPOLL_WAIT: u64 = 232; // partial: interest list fixed for the wait; nested epoll never ready
+    pub(super) const EPOLL_CTL: u64 = 233;
     pub(super) const TGKILL: u64 = 234;
     pub(super) const OPENAT: u64 = 257;
     pub(super) const MKDIRAT: u64 = 258;

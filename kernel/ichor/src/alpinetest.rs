@@ -115,6 +115,17 @@ const RUNS: &[(&[&str], i32)] = &[
         ],
         0,
     ),
+    (
+        &[
+            "sh",
+            "-c",
+            "[ \"$(awk '/^MemTotal/ {print $2}' /proc/meminfo)\" = 32768 ] && \
+             read a b c d e </proc/loadavg && [ \"${d#*/}\" -ge 1 ] && [ \"$e\" -gt 1 ] && \
+             [ \"$(awk '/^VmSize/ {print ($2 > 0)}' /proc/self/status)\" = 1 ] && \
+             echo alpine: /proc shows cell memory and threads",
+        ],
+        0,
+    ),
 ];
 
 fn read(vfs: &Vfs, path: &str) -> Vec<u8> {

@@ -263,6 +263,11 @@ impl Mm {
         self.brk = va;
     }
 
+    /// Bytes of address space mapped (`/proc` VmSize, vsize).
+    pub(crate) fn virtual_size(&self) -> u64 {
+        self.regions.regions().map(|r| r.end - r.start).sum()
+    }
+
     /// Pages the process currently owns.
     pub(crate) fn resident_pages(&self) -> usize {
         self.pages.len()

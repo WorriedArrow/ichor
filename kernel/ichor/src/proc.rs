@@ -44,6 +44,9 @@ pub(crate) struct ProcEntry {
     /// Process group and session (meaningful on a process's first entry).
     pgid: AtomicU64,
     sid: AtomicU64,
+    /// When the thread was created, in clock ticks (`USER_HZ`, 100/s) since
+    /// boot (`/proc/<pid>/stat` starttime).
+    pub(crate) started: u64,
     /// The wait status once the process has exited.
     status: SpinLock<Option<u32>>,
     /// Woken whenever one of this process's children exits.
@@ -72,6 +75,23 @@ impl ProcEntry {
             self.sid.load(Ordering::Acquire),
         )
     }
+}
+
+/// `cell`'s live threads and processes, and the last pid handed out (for
+/// `/proc/loadavg` and `/proc/stat`).
+pub(crate) fn census(cell: u64) -> (usize, usize, u64) {
+    let t = TABLE.lock();
+    let live = t
+        .values()
+        .filter(|e| e.cell == cell && e.status.lock().is_none());
+    let (mut threads, mut procs) = (0, 0);
+    for e in live {
+        threads += 1;
+        if e.pid == e.tgid {
+            procs += 1;
+        }
+    }
+    (threads, procs, NEXT_PID.load(Ordering::Relaxed) - 1)
 }
 
 /// A process's first entry (which carries its group, session and status),
@@ -179,6 +199,7 @@ pub(crate) fn register(
         ppid: AtomicU64::new(ppid),
         pgid: AtomicU64::new(pgid),
         sid: AtomicU64::new(sid),
+        started: (frame::time::now().as_millis() / 10) as u64,
         status: SpinLock::new(None),
         children: WaitQueue::new(),
         pending: AtomicU64::new(0),

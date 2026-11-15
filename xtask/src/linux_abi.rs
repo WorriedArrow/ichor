@@ -5,6 +5,11 @@
 //! implemented syscall. A trailing `// partial: ...` or `// stub: ...`
 //! comment sets its status and note; without one it is "implemented".
 //! Everything not listed returns `-ENOSYS`.
+//!
+//! The check also reads the dispatch `match`: every listed syscall must
+//! have an arm, and an arm whose answer is a constant success (`=> Ok(0)`,
+//! the shape of a fake-success stub) must belong to a partial or stubbed
+//! entry, so the table cannot claim more than the code does.
 
 use std::fs;
 
@@ -62,6 +67,75 @@ fn parse(src: &str) -> Result<Vec<Entry>> {
     Ok(out)
 }
 
+/// The arms of `dispatch`'s `match nr { ... }`, one string per line.
+fn dispatch_body(src: &str) -> Result<&str> {
+    let start = src
+        .find("let result: Result<u64, i64> = match nr {")
+        .ok_or("no dispatch match in linuxabi.rs")?;
+    let body = &src[start..];
+    let end = body.find("\n    };").ok_or("unterminated dispatch match")?;
+    Ok(&body[..end])
+}
+
+/// Whether `body` mentions `nr::NAME` as a whole token.
+fn mentions(body: &str, name: &str) -> bool {
+    let pat = format!("nr::{name}");
+    body.match_indices(&pat).any(|(i, _)| {
+        !body[i + pat.len()..]
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+    })
+}
+
+/// Checks the table against the dispatch code (see the module docs).
+fn check_dispatch(src: &str, entries: &[Entry]) -> Result<()> {
+    let body = dispatch_body(src)?;
+    let mut errors = Vec::new();
+    for e in entries {
+        if !mentions(body, &e.name.to_uppercase()) {
+            errors.push(format!(
+                "`{}` is in the table but has no dispatch arm",
+                e.name
+            ));
+        }
+    }
+    for line in body.lines() {
+        let line = line.trim();
+        let Some((lhs, rhs)) = line.split_once("=>") else {
+            continue;
+        };
+        if !lhs.trim_start().starts_with("nr::") {
+            continue;
+        }
+        let rhs = rhs.trim().trim_end_matches(',').trim();
+        let constant = rhs
+            .strip_prefix("Ok(")
+            .and_then(|r| r.strip_suffix(')'))
+            .is_some_and(|v| !v.is_empty() && v.chars().all(|c| c.is_ascii_digit()));
+        if !constant {
+            continue;
+        }
+        let pattern = lhs.split(" if ").next().unwrap_or(lhs);
+        for name in pattern.split('|') {
+            let name = name.trim().trim_start_matches("nr::").to_lowercase();
+            if let Some(e) = entries.iter().find(|e| e.name == name)
+                && e.status == "implemented"
+            {
+                errors.push(format!(
+                    "`{name}` always answers `{rhs}` but the table lists it as implemented; \
+                     make it real or mark it `// partial:` / `// stub:`"
+                ));
+            }
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("\n"))
+    }
+}
+
 fn render(entries: &[Entry]) -> String {
     let count = |s: &str| entries.iter().filter(|e| e.status == s).count();
     let mut md = String::new();
@@ -104,8 +178,12 @@ pub fn write_table() -> Result<()> {
     Ok(())
 }
 
-/// Fails if `docs/linux-abi.md` does not match the source table.
+/// Fails if `docs/linux-abi.md` does not match the source table, or the
+/// table does not match the dispatch code.
 pub fn check_table() -> Result<()> {
+    let path = workspace_root().join(SOURCE);
+    let src = fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    check_dispatch(&src, &parse(&src)?)?;
     let want = generate()?;
     let path = workspace_root().join(DOC);
     let have = fs::read_to_string(&path).unwrap_or_default();
@@ -136,6 +214,34 @@ mod tests {
             (12, "stubbed", "fails")
         );
         assert!(render(&e).contains("| 12 | `brk` | stubbed | fails |"));
+    }
+
+    const DISPATCH: &str = "mod nr {\n    pub(super) const GETUID: u64 = 102;\n    pub(super) const BRK: u64 = 12; // partial: x\n    pub(super) const PAUSE: u64 = 34;\n}\nfn d() {\n    let result: Result<u64, i64> = match nr {\n        nr::BRK => Ok(0),\n        nr::GETUID | nr::GETGID => Ok(0),\n        nr::PAUSE => pause(p),\n    };\n}\n";
+
+    #[test]
+    fn constant_success_must_not_be_implemented() {
+        let e = parse(DISPATCH).unwrap();
+        let err = check_dispatch(DISPATCH, &e).unwrap_err().to_string();
+        assert!(err.contains("`getuid` always answers `Ok(0)`"), "{err}");
+        assert!(!err.contains("`brk`"), "{err}");
+        assert!(!err.contains("`pause`"), "{err}");
+    }
+
+    #[test]
+    fn every_entry_needs_an_arm() {
+        let src = DISPATCH.replace("nr::PAUSE => pause(p),", "");
+        let e = parse(&src).unwrap();
+        let err = check_dispatch(&src, &e).unwrap_err().to_string();
+        assert!(
+            err.contains("`pause` is in the table but has no dispatch arm"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn real_dispatch_matches_the_table() {
+        let src = fs::read_to_string(workspace_root().join(SOURCE)).unwrap();
+        check_dispatch(&src, &parse(&src).unwrap()).unwrap();
     }
 
     #[test]
