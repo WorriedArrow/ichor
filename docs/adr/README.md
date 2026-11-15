@@ -1,0 +1,29 @@
+# Architecture Decision Records
+
+An ADR records a decision that would be expensive to reverse: the options
+considered, the choice made, and the consequences. ADRs supersede the founding
+brief where they conflict with it.
+
+| ADR | Title | Status |
+|---|---|---|
+| [0001](0001-kernel-architecture.md) | Kernel architecture and the frame crate's API surface | Accepted |
+| [0002](0002-cells-and-capabilities.md) | Cell model and capabilities | Accepted |
+
+## Planned
+
+These are known decisions with deadlines, so a future session knows they are
+owed:
+
+- Side-channel posture and mitigations (before milestone 2 completes)
+- Read-only image format and page sharing (milestone 3)
+- Volume on-disk format; ext4 read/write is a strong candidate (milestone 3)
+- Network stack architecture and the cell switch (milestone 5)
+- Secure Boot signing and measured boot (before milestone 8; needs signing keys from the owner)
+
+## Writing one
+
+Copy the structure of an existing ADR: Context, Decision, Alternatives
+considered, Consequences. Number ADRs sequentially. To change an accepted ADR,
+either amend it in place with a dated "Amended" line in the header (for
+clarifications and pre-authorized steps), or write a new ADR that supersedes it
+(for reversals).
