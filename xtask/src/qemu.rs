@@ -215,6 +215,31 @@ pub struct RunConfig {
     /// they add come first in PCI order (a blank volume ahead of the boot
     /// disk, as instance storage can be).
     pub disk_devices_before: Vec<String>,
+    /// Extra `-machine q35,...` properties (for example `pit=off,hpet=off`:
+    /// legacy timers some cloud VMs lack).
+    pub machine_props: String,
+    /// `-smp` topology beyond the CPU count (for example
+    /// `sockets=2,cores=3`, which gives sparse APIC ids as multi-socket
+    /// cloud hosts do).
+    pub smp_topology: String,
+}
+
+impl RunConfig {
+    fn machine(&self) -> String {
+        if self.machine_props.is_empty() {
+            "q35".into()
+        } else {
+            format!("q35,{}", self.machine_props)
+        }
+    }
+
+    fn smp_arg(&self) -> String {
+        if self.smp_topology.is_empty() {
+            self.smp.to_string()
+        } else {
+            format!("{},{}", self.smp, self.smp_topology)
+        }
+    }
 }
 
 impl RunConfig {
@@ -233,6 +258,8 @@ impl RunConfig {
             disk_image: None,
             disk_nvme_props: String::new(),
             disk_devices_before: Vec::new(),
+            machine_props: String::new(),
+            smp_topology: String::new(),
         }
     }
 }
@@ -460,9 +487,9 @@ pub fn command(cfg: &RunConfig) -> Result<Command> {
         .map(|p| p.to_string_lossy().replace('\\', "/"))
         .map_err(|_| "run directory is outside the workspace".to_string())?;
 
-    cmd.args(["-machine", "q35", "-accel", accel.qemu_name()])
+    cmd.args(["-machine", &cfg.machine(), "-accel", accel.qemu_name()])
         .args(["-cpu", accel.cpu_model()])
-        .args(["-smp", &cfg.smp.to_string()])
+        .args(["-smp", &cfg.smp_arg()])
         .args(["-m", &format!("{}M", cfg.memory_mib)])
         .args(["-nodefaults", "-no-user-config", "-no-reboot"])
         .args(if cfg.window {
@@ -530,9 +557,9 @@ fn disk_command(cfg: &RunConfig, qemu: &Path, fw: &Firmware, img: &Path) -> Resu
         .map_err(|e| format!("copying OVMF vars {}: {e}", fw.vars.display()))?;
     let accel = cfg.accel.resolve();
     let mut cmd = Command::new(qemu);
-    cmd.args(["-machine", "q35", "-accel", accel.qemu_name()])
+    cmd.args(["-machine", &cfg.machine(), "-accel", accel.qemu_name()])
         .args(["-cpu", accel.cpu_model()])
-        .args(["-smp", &cfg.smp.to_string()])
+        .args(["-smp", &cfg.smp_arg()])
         .args(["-m", &format!("{}M", cfg.memory_mib)])
         .args(["-nodefaults", "-no-user-config", "-no-reboot"])
         .args(["-display", "none", "-serial", "stdio"])

@@ -63,6 +63,9 @@ const NSID: u32 = 1;
 /// default I/O timeout. Cloud volumes can stall for seconds; CAP.TO (used
 /// for enabling the controller) is far shorter.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a completion slot may show the right phase with another
+/// command's id before it counts as a stray (not a half-written) entry.
+const STRAY_GRACE: Duration = Duration::from_millis(10);
 
 /// Why the controller could not be brought up.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -313,21 +316,48 @@ impl Nvme {
             .write32(DOORBELLS + 2 * qid * stride, u32::from(q.tail));
 
         let deadline = frame::time::now() + timeout;
+        // When a slot first showed the expected phase with another command's
+        // id (see below).
+        let mut odd_since = None;
         loop {
             let entry = usize::from(q.head) * CQE;
             let dw3 = q.cq.read_u32(entry + 12);
             let phase = dw3 & (1 << 16) != 0;
             if phase == q.phase {
                 core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+                // One command is in flight, so the right phase with another
+                // id is a completion the device is still writing: the phase
+                // half of the dword can land before the id half (QEMU's
+                // emulation has been seen to do this), leaving the previous
+                // lap's id. Re-read the slot instead of taking it. Only if
+                // it stays that way is it a real stray completion (a late
+                // one for a command we gave up on), consumed and logged.
+                if (dw3 & 0xffff) as u16 != cid {
+                    let now = frame::time::now();
+                    let since = *odd_since.get_or_insert(now);
+                    if now < since + STRAY_GRACE && now < deadline {
+                        core::hint::spin_loop();
+                        continue;
+                    }
+                    frame::println!(
+                        "ichor: nvme: stray completion (cid {}) while waiting for cid {cid}",
+                        dw3 & 0xffff
+                    );
+                    odd_since = None;
+                    q.head = (q.head + 1) % q.size;
+                    if q.head == 0 {
+                        q.phase = !q.phase;
+                    }
+                    self.regs
+                        .write32(DOORBELLS + (2 * qid + 1) * stride, u32::from(q.head));
+                    continue;
+                }
                 q.head = (q.head + 1) % q.size;
                 if q.head == 0 {
                     q.phase = !q.phase;
                 }
                 self.regs
                     .write32(DOORBELLS + (2 * qid + 1) * stride, u32::from(q.head));
-                if (dw3 & 0xffff) as u16 != cid {
-                    continue; // Not ours (cannot happen with one in flight).
-                }
                 let status = (dw3 >> 17) & 0x7fff;
                 if status != 0 {
                     frame::println!(

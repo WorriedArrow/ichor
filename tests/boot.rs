@@ -408,6 +408,26 @@ fn cloud_disk_tolerates_blank_volumes_and_small_transfers() {
     ]);
 }
 
+/// A cloud-shaped machine: no PIT and no HPET (the TSC must calibrate from
+/// the ACPI PM timer), two sockets of three cores (sparse APIC ids, as
+/// multi-socket hosts give), 2 GiB, booting the GPT disk from NVMe.
+#[test]
+fn cloud_disk_boots_without_legacy_timers_on_two_sockets() {
+    let out = boot_disk_with("cloud-disk-sockets", "", 6, |cfg| {
+        cfg.memory_mib = 2048;
+        cfg.machine_props = "pit=off,hpet=off".into();
+        cfg.smp_topology = "sockets=2,cores=3,threads=1".into();
+    });
+    out.assert_exit(Exit::Success);
+    out.assert_in_order(&[
+        "from ACPI PM timer",
+        "ichor: smp: 6 CPUs online",
+        "ichor: blk: nvme: GPT disk, Ichor root partition at sector ",
+        "ichor: busybox: all applets passed",
+        "ichor: boot complete; halting",
+    ]);
+}
+
 /// The Phase E benchmarks still build and run (their numbers are printed,
 /// not checked: CI machines vary).
 #[test]
