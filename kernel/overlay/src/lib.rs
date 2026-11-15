@@ -63,6 +63,8 @@ pub enum Kind {
     File,
     Directory,
     Symlink,
+    /// A character device node; the kernel decides what it is from `rdev`.
+    CharDevice,
 }
 
 /// What `stat` reports.
@@ -74,6 +76,9 @@ pub struct Stat {
     pub mode: u32,
     pub size: u64,
     pub nlink: u32,
+    /// Device number (`major << 8 | minor`, Linux's old encoding) of a
+    /// character device; 0 otherwise.
+    pub rdev: u32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -97,6 +102,7 @@ enum Data<'a> {
     File(Vec<u8>),
     Dir(Dir<'a>),
     Symlink(String),
+    Device(u32),
 }
 
 #[derive(Debug)]
@@ -113,6 +119,7 @@ impl Inode<'_> {
             Data::LowerFile(_) | Data::File(_) => Kind::File,
             Data::Dir(_) => Kind::Directory,
             Data::Symlink(_) => Kind::Symlink,
+            Data::Device(_) => Kind::CharDevice,
         }
     }
 }
@@ -303,6 +310,11 @@ impl<'a> Overlay<'a> {
             Data::File(v) => v.len() as u64,
             Data::Dir(_) => 4096,
             Data::Symlink(t) => t.len() as u64,
+            Data::Device(_) => 0,
+        };
+        let rdev = match i.data {
+            Data::Device(d) => d,
+            _ => 0,
         };
         Ok(Stat {
             ino: ino as u64 + 1,
@@ -314,6 +326,7 @@ impl<'a> Overlay<'a> {
             } else {
                 i.nlink
             },
+            rdev,
         })
     }
 
@@ -328,7 +341,7 @@ impl<'a> Overlay<'a> {
                 Ok(n)
             }
             Data::Dir(_) => Err(EISDIR),
-            Data::Symlink(_) => Err(EINVAL),
+            Data::Symlink(_) | Data::Device(_) => Err(EINVAL),
         }
     }
 
@@ -346,7 +359,7 @@ impl<'a> Overlay<'a> {
             Data::LowerFile(n) => *n,
             Data::File(_) => return Ok(()),
             Data::Dir(_) => return Err(EISDIR),
-            Data::Symlink(_) => return Err(EINVAL),
+            Data::Symlink(_) | Data::Device(_) => return Err(EINVAL),
         };
         let size = usize::try_from(node.size()).map_err(|_| EFBIG)?;
         if size > MAX_FILE {
@@ -368,6 +381,9 @@ impl<'a> Overlay<'a> {
         let len = usize::try_from(len).map_err(|_| EFBIG)?;
         if len > MAX_FILE {
             return Err(EFBIG);
+        }
+        if matches!(self.get(ino)?.data, Data::Device(_)) {
+            return Ok(()); // `O_TRUNC` on /dev/null and friends
         }
         if len == 0 && matches!(self.get(ino)?.data, Data::LowerFile(_)) {
             // No need to copy bytes that are about to be dropped.
@@ -448,6 +464,17 @@ impl<'a> Overlay<'a> {
     pub fn mkdir(&mut self, dir: Ino, name: &str, mode: u32) -> Result<Ino, i64> {
         let inode = Inode {
             data: upper_dir(dir, None),
+            mode: mode & 0o7777,
+            nlink: 1,
+            opens: 0,
+        };
+        self.add(dir, name, inode)
+    }
+
+    /// Creates a character device node.
+    pub fn mknod(&mut self, dir: Ino, name: &str, mode: u32, rdev: u32) -> Result<Ino, i64> {
+        let inode = Inode {
+            data: Data::Device(rdev),
             mode: mode & 0o7777,
             nlink: 1,
             opens: 0,
@@ -880,6 +907,19 @@ mod tests {
         assert_eq!(fs.rename(ROOT, "usr", usr, "x"), Err(EINVAL));
         assert_eq!(fs.rename(ROOT, "b", ROOT, "usr"), Err(EISDIR));
         assert_eq!(fs.rename(ROOT, "usr", ROOT, "b"), Err(ENOTDIR));
+    }
+
+    #[test]
+    fn device_nodes() {
+        let mut fs = Overlay::empty(1 << 20);
+        let dev = fs.mkdir(ROOT, "dev", 0o755).unwrap();
+        let null = fs.mknod(dev, "null", 0o666, (1 << 8) | 3).unwrap();
+        let st = fs.stat(null).unwrap();
+        assert_eq!((st.kind, st.rdev, st.size), (Kind::CharDevice, 0x103, 0));
+        assert_eq!(fs.resolve(ROOT, "/dev/null", true).unwrap(), null);
+        assert!(fs.truncate(null, 0).is_ok());
+        assert_eq!(fs.write(null, 0, b"x"), Err(EINVAL));
+        assert_eq!(fs.readdir(dev).unwrap()[0].2, Kind::CharDevice);
     }
 
     #[test]

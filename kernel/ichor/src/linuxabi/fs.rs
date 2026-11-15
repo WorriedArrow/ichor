@@ -28,6 +28,7 @@ const O_NOFOLLOW: u64 = 0o400_000;
 
 const ENAMETOOLONG: i64 = 36;
 const ESPIPE: i64 = 29;
+const ENXIO: i64 = 6;
 const EPIPE: i64 = 32;
 const ERANGE: i64 = 34;
 
@@ -59,7 +60,7 @@ fn base(p: &LinuxProcess, dirfd: i64, path: &str) -> Result<Ino, i64> {
     }
     match p.fd(dirfd as u64).ok_or(EBADF)? {
         Fd::File(f) => Ok(f.ino),
-        Fd::Console | Fd::Pipe(_) => Err(ENOTDIR),
+        Fd::Console | Fd::Pipe(_) | Fd::Dev(_) => Err(ENOTDIR),
     }
 }
 
@@ -72,7 +73,7 @@ fn path_at(p: &mut LinuxProcess, dirfd: i64, addr: u64) -> Result<(Ino, String),
 fn file(p: &LinuxProcess, fd: u64) -> Result<OpenFile, i64> {
     match p.fd(fd).ok_or(EBADF)? {
         Fd::File(f) => Ok(f),
-        Fd::Console => Err(EINVAL),
+        Fd::Console | Fd::Dev(_) => Err(EINVAL),
         Fd::Pipe(_) => Err(ESPIPE),
     }
 }
@@ -111,7 +112,12 @@ pub(super) fn open(
         match st.kind {
             Kind::Directory if acc != 0 => return Err(EISDIR),
             Kind::Symlink => return Err(ELOOP), // O_NOFOLLOW on a symlink
-            Kind::File if flags & O_DIRECTORY != 0 => return Err(ENOTDIR),
+            Kind::File | Kind::CharDevice if flags & O_DIRECTORY != 0 => return Err(ENOTDIR),
+            Kind::CharDevice => {
+                drop(fs);
+                let fd = crate::dev::open(st.rdev).ok_or(ENXIO)?;
+                return p.install(fd).ok_or(EMFILE);
+            }
             _ => {}
         }
         if flags & O_TRUNC != 0 && acc != 0 && st.kind == Kind::File {
@@ -200,6 +206,14 @@ fn write_file(
 pub(super) fn read(p: &mut LinuxProcess, fd: u64, buf: u64, count: usize) -> Result<u64, i64> {
     match p.fd(fd).ok_or(EBADF)? {
         Fd::Console => Ok(0), // No console input yet: EOF.
+        Fd::Dev(d) => {
+            let mut chunk = alloc::vec![0u8; CHUNK.min(count)];
+            let n = d.read(&mut chunk);
+            if p.copy_to_user(buf, &chunk[..n]) != n {
+                return Err(EFAULT);
+            }
+            Ok(n as u64)
+        }
         Fd::Pipe(e) if e.write => Err(EBADF),
         Fd::Pipe(e) => {
             let mut chunk = alloc::vec![0u8; CHUNK.min(count)];
@@ -225,6 +239,7 @@ pub(super) fn read(p: &mut LinuxProcess, fd: u64, buf: u64, count: usize) -> Res
 pub(super) fn write(p: &mut LinuxProcess, fd: u64, buf: u64, count: usize) -> Result<u64, i64> {
     match p.fd(fd).ok_or(EBADF)? {
         Fd::Console => Ok(console_write(p, buf, count) as u64),
+        Fd::Dev(d) => d.write(count).map(|n| n as u64),
         Fd::Pipe(e) if !e.write => Err(EBADF),
         Fd::Pipe(e) => pipe_write(p, &e, buf, count),
         Fd::File(f) => {
@@ -389,8 +404,11 @@ fn to_stat(s: &Stat) -> [u8; 144] {
         Kind::File => S_IFREG,
         Kind::Directory => S_IFDIR,
         Kind::Symlink => S_IFLNK,
+        Kind::CharDevice => S_IFCHR,
     };
-    stat_bytes(s.ino, kind | s.mode, s.nlink, s.size)
+    let mut st = stat_bytes(s.ino, kind | s.mode, s.nlink, s.size);
+    st[40..48].copy_from_slice(&u64::from(s.rdev).to_le_bytes()); // st_rdev
+    st
 }
 
 fn put_stat(p: &mut LinuxProcess, addr: u64, st: &[u8; 144]) -> Result<u64, i64> {
@@ -405,6 +423,11 @@ pub(super) fn fstat(p: &mut LinuxProcess, fd: u64, addr: u64) -> Result<u64, i64
     let st = match p.fd(fd).ok_or(EBADF)? {
         Fd::Console => stat_bytes(0, S_IFCHR | 0o620, 1, 0),
         Fd::Pipe(_) => stat_bytes(0, S_IFIFO | 0o600, 1, 0),
+        Fd::Dev(d) => {
+            let mut st = stat_bytes(0, S_IFCHR | 0o666, 1, 0);
+            st[40..48].copy_from_slice(&u64::from(d.rdev()).to_le_bytes()); // st_rdev
+            st
+        }
         Fd::File(f) => to_stat(&p.vfs.lock().stat(f.ino)?),
     };
     put_stat(p, addr, &st)
@@ -458,6 +481,7 @@ pub(super) fn getdents64(
     buf: u64,
     count: usize,
 ) -> Result<u64, i64> {
+    const DT_CHR: u8 = 2;
     const DT_DIR: u8 = 4;
     const DT_REG: u8 = 8;
     const DT_LNK: u8 = 10;
@@ -486,6 +510,7 @@ pub(super) fn getdents64(
                     Kind::Directory => DT_DIR,
                     Kind::File => DT_REG,
                     Kind::Symlink => DT_LNK,
+                    Kind::CharDevice => DT_CHR,
                 };
                 (*ino, t, n.as_str())
             }),
@@ -694,6 +719,9 @@ pub(super) fn sendfile(
         }
         match p.fd(out_fd).ok_or(EBADF)? {
             Fd::Console => console_bytes(&buf[..n]),
+            Fd::Dev(d) => {
+                d.write(n)?;
+            }
             Fd::Pipe(e) if !e.write => return Err(EBADF),
             Fd::Pipe(e) => {
                 let entry = p.entry.clone();

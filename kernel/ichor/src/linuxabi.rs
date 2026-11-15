@@ -113,6 +113,7 @@ mod nr {
     pub(super) const DUP3: u64 = 292; // partial: the copy has its own offset
     pub(super) const PIPE2: u64 = 293; // partial: O_CLOEXEC is accepted and ignored
     pub(super) const PRLIMIT64: u64 = 302; // partial: reads limits, ignores new ones
+    pub(super) const GETRANDOM: u64 = 318; // partial: not cryptographic until frame has an entropy source
     pub(super) const RENAMEAT2: u64 = 316; // partial: RENAME_NOREPLACE only
 }
 
@@ -189,6 +190,7 @@ pub(crate) fn dispatch(p: &mut LinuxProcess, ctx: &mut frame::user::UserContext)
         nr::FCHDIR => fs::fchdir(p, a[0]),
         nr::GETCWD => fs::getcwd(p, a[0], a[1]),
         nr::UMASK => fs::umask(p, a[0]),
+        nr::GETRANDOM => getrandom(p, a[0], a[1] as usize),
         nr::PIPE => fs::pipe2(p, a[0], 0),
         nr::PIPE2 => fs::pipe2(p, a[0], a[1]),
         // Descriptors.
@@ -289,6 +291,17 @@ fn console_write(p: &mut LinuxProcess, buf: u64, count: usize) -> usize {
     written
 }
 
+/// `getrandom`: fills `buf` from the kernel generator (`/dev/urandom`).
+fn getrandom(p: &mut LinuxProcess, buf: u64, len: usize) -> Result<u64, i64> {
+    let n = len.min(256 * 1024);
+    let mut b = alloc::vec![0u8; n];
+    crate::dev::random_bytes(&mut b);
+    if p.copy_to_user(buf, &b) != n {
+        return Err(EFAULT);
+    }
+    Ok(n as u64)
+}
+
 /// Prints kernel-held bytes to the console.
 fn console_bytes(b: &[u8]) {
     for &c in b {
@@ -336,6 +349,7 @@ fn fcntl(p: &mut LinuxProcess, fd: u64, cmd: u64, arg: u64) -> Result<u64, i64> 
             Fd::Console => O_RDWR,
             Fd::File(of) => of.flags,
             Fd::Pipe(e) => u64::from(e.write) | if e.nonblock { 0o4000 } else { 0 },
+            Fd::Dev(_) => O_RDWR,
         }),
         _ => Err(EINVAL),
     }

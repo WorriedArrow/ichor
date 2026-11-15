@@ -48,6 +48,8 @@ pub(crate) enum Fd {
     Console,
     File(OpenFile),
     Pipe(PipeEnd),
+    /// A character device other than the console.
+    Dev(crate::dev::Device),
 }
 
 /// A Linux process.
@@ -87,14 +89,14 @@ impl LinuxProcess {
     /// A copy of this process for `fork`: a copy of its memory, the same
     /// open files (each with a new reference), working directory and umask,
     /// and a new pid whose parent is this process.
-    pub(crate) fn fork(&self) -> Option<Self> {
+    pub(crate) fn fork(&mut self) -> Option<Self> {
         let mm = self.mm.fork()?;
         {
             let mut fs = self.vfs.lock();
             fs.open(self.cwd).ok()?;
             for f in self.fds.iter().flatten() {
                 match f {
-                    Fd::Console => {}
+                    Fd::Console | Fd::Dev(_) => {}
                     Fd::File(of) => {
                         let _ = fs.open(of.ino);
                     }
@@ -154,7 +156,7 @@ impl LinuxProcess {
     /// reference on a file's inode, or a reader/writer count on a pipe.
     fn hold(&self, f: &Fd) {
         match f {
-            Fd::Console => {}
+            Fd::Console | Fd::Dev(_) => {}
             Fd::File(of) => {
                 let _ = self.vfs.lock().open(of.ino);
             }
@@ -165,7 +167,7 @@ impl LinuxProcess {
     /// Drops the reference a descriptor held.
     fn release(&self, f: Fd) {
         match f {
-            Fd::Console => {}
+            Fd::Console | Fd::Dev(_) => {}
             Fd::File(of) => self.vfs.lock().close(of.ino),
             Fd::Pipe(e) => e.pipe.drop_end(e.write),
         }
@@ -265,7 +267,7 @@ impl Drop for LinuxProcess {
         let mut fs = self.vfs.lock();
         for f in fds.into_iter().flatten() {
             match f {
-                Fd::Console => {}
+                Fd::Console | Fd::Dev(_) => {}
                 Fd::File(of) => fs.close(of.ino),
                 Fd::Pipe(e) => e.pipe.drop_end(e.write),
             }

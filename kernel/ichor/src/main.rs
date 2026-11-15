@@ -14,6 +14,7 @@ mod alpinetest;
 mod blktest;
 mod busytest;
 mod celltest;
+mod dev;
 mod kcell;
 mod linuxabi;
 mod loader;

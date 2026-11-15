@@ -25,9 +25,9 @@ impl Vfs {
     /// as the lower layer of a fresh root.
     pub(crate) fn mount(bytes: &'static [u8]) -> Result<Vfs, image::Error> {
         let image = Image::mount(bytes)?;
-        Ok(Vfs {
-            fs: Mutex::new(Overlay::new(&image, UPPER_BYTES)?),
-        })
+        let mut fs = Overlay::new(&image, UPPER_BYTES)?;
+        crate::dev::populate(&mut fs);
+        Ok(Vfs { fs: Mutex::new(fs) })
     }
 
     /// Locks the tree.

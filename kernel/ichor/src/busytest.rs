@@ -42,6 +42,14 @@ const RUNS: &[(&[&str], i32)] = &[
         &[
             "sh",
             "-c",
+            "[ \"$(head -c 16 /dev/zero | wc -c)\" -eq 16 ] && echo x >/dev/null && head -c 8 /dev/urandom >/dev/null && echo sh: /dev works",
+        ],
+        0,
+    ),
+    (
+        &[
+            "sh",
+            "-c",
             "trap 'echo sh: trap ran' USR1; kill -USR1 $$; echo sh: after the trap",
         ],
         0,
