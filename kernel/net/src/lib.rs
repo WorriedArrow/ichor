@@ -16,6 +16,7 @@
 extern crate alloc;
 
 pub mod iface;
+pub mod tcp;
 pub mod wire;
 
 pub use core::net::Ipv4Addr;
