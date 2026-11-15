@@ -36,14 +36,24 @@ pub(crate) struct Vfs {
 }
 
 impl Vfs {
-    /// Mounts `bytes` (an Ichor image that lives for the life of the system)
-    /// as the lower layer of a fresh root.
-    pub(crate) fn mount(bytes: &'static [u8]) -> Result<Vfs, image::Error> {
-        let image = Image::mount(bytes)?;
-        let mut fs = Overlay::new(&image, UPPER_BYTES)?;
+    /// Mounts an Ichor image as the lower layer of a fresh root: `metadata`
+    /// (its root hash is checked here) and the source of its chunks, both
+    /// living for the life of the system.
+    pub(crate) fn mount(
+        metadata: &'static [u8],
+        src: &'static (dyn image::ChunkSource + Sync),
+    ) -> Result<Vfs, image::Error> {
+        let image = Image::mount(metadata)?;
+        let mut fs = Overlay::new(&image, src, UPPER_BYTES)?;
         fs.set_clock(realtime);
         crate::dev::populate(&mut fs);
         Ok(Vfs { fs: Mutex::new(fs) })
+    }
+
+    /// Mounts a whole image held in memory (self-tests).
+    pub(crate) fn mount_slice(bytes: &'static [u8]) -> Result<Vfs, image::Error> {
+        let src = alloc::boxed::Box::leak(alloc::boxed::Box::new(image::SliceSource(bytes)));
+        Vfs::mount(bytes, src)
     }
 
     /// The upper layer's budget and use, in bytes (for `statfs`).

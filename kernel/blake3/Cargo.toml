@@ -1,0 +1,13 @@
+[package]
+name = "ichor-blake3"
+description = "BLAKE3 hashing (portable, no_std, host-testable)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "blake3"
+
+[lints]
+workspace = true

@@ -287,7 +287,7 @@ mod tests {
         let image = image::Image::mount(&img).unwrap();
         let motd = image.lookup("/etc/motd").unwrap();
         let mut buf = [0u8; 3];
-        assert_eq!(motd.read_at(0, &mut buf), 3);
+        assert_eq!(motd.read_at(0, &mut buf, &image::SliceSource(&img)), Ok(3));
         assert_eq!(&buf, b"hi\n");
         assert_eq!(image.lookup("/etc").unwrap().mode & 0o777, 0o700);
         assert_eq!(

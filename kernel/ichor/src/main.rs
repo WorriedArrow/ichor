@@ -21,6 +21,7 @@ mod linuxabi;
 mod loader;
 mod locks;
 mod nativeabi;
+mod pagecache;
 mod pipe;
 mod poll;
 mod proc;

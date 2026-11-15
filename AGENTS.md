@@ -157,6 +157,14 @@ Milestones 0-3 are done.
   behind getrandom, /dev/[u]random and AT_RANDOM; `frame::time::wall_clock`
   is UEFI GetTime at boot plus TSC time, behind CLOCK_REALTIME,
   gettimeofday and file times.
+- M4 page cache (Phase C, step 1): image format v2 hashes chunks with
+  BLAKE3, aligns each chunk to a page, and carries a root hash over the
+  metadata, checked at mount. `pagecache.rs` mounts a disk from its
+  metadata alone; lower-file reads fetch one chunk (one aligned device
+  read) at a time through a global, bounded (32 MiB, clock) cache keyed by
+  the *verified* chunk hash, so identical chunks share a page across disks
+  and a bad device byte is EIO. The whole-disk buffer is gone. Not yet:
+  cache pages charged to cells; exec/mmap mapping cached pages.
 - M4 extended state (Phase B, ADR-0008): every CPU loads one XCR0 (x87,
   SSE, AVX, AVX-512 if whole) and threads keep a boxed standard-format
   XSAVE area, restored eagerly before ring 3 and saved with XSAVEOPT
@@ -214,10 +222,9 @@ report at the end of each phase. Do not rewrite `main`.
   console writes, a vDSO; first benchmarks (null syscall, context switch,
   page fault, fork+exec, container start) against Linux before and after.
 
-Carried over from milestone 3: paging the root image in from the device on
-demand (today the kernel reads the whole disk into memory, capped at
-64 MiB), copy-on-write `fork`, `FD_CLOEXEC`, shared file offsets after
-`dup`, and per-cell pid namespaces.
+Carried over from milestone 3: per-cell pid namespaces (paging the root
+image in on demand, copy-on-write `fork`, `FD_CLOEXEC` and shared offsets
+after `dup` are done).
 
 Suggested order for milestone 4:
 
@@ -310,6 +317,7 @@ kernel/vma       user address-space region map for mmap/brk (host-tested)
 kernel/overlay   cell root: image + copy-on-write upper layer (host-tested)
 kernel/csprng    ChaCha20 generator with fast key erasure (host-tested)
 kernel/civil     calendar time to Unix time, for the firmware clock (host-tested)
+kernel/blake3    BLAKE3, portable, checked against the official vectors (host-tested)
 kernel/drivers/virtio-pci  modern virtio PCI transport shared by the virtio drivers
 kernel/drivers/virtio-blk  safe virtio-blk driver over frame's IoMem/DMA
 kernel/drivers/virtio-rng  safe virtio-rng (entropy) driver

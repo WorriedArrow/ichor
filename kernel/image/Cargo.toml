@@ -9,6 +9,9 @@ publish.workspace = true
 [lib]
 name = "image"
 
+[dependencies]
+blake3.workspace = true
+
 [features]
 # The image writer (needs `alloc`). The kernel reader does not.
 builder = []

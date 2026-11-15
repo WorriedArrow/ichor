@@ -1582,7 +1582,7 @@ fn lock_program() -> Vec<u8> {
 }
 
 /// The root image: `/usr/share/motd`, `/etc/motd -> /usr/share/motd`.
-fn root_image() -> &'static [u8] {
+pub(crate) fn root_image() -> &'static [u8] {
     let mut b = image::builder::Builder::new();
     let motd = b.file("motd", MOTD, 0o644);
     let share = b.dir("share", &[motd], 0o755);
@@ -1596,7 +1596,7 @@ fn root_image() -> &'static [u8] {
 pub(crate) fn run() {
     let system = System::new(4096).unwrap_or_else(|| fail("no system cell"));
     let vfs = Arc::new(
-        Vfs::mount(root_image()).unwrap_or_else(|_| fail("could not mount the root image")),
+        Vfs::mount_slice(root_image()).unwrap_or_else(|_| fail("could not mount the root image")),
     );
     let new_process = || {
         let cell = Cell::new(&system.root_account, 128).unwrap_or_else(|| fail("no process cell"));

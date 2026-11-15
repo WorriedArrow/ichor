@@ -7,6 +7,7 @@ name = "ichor"
 version = "0.0.0"
 dependencies = [
  "ichor-abi",
+ "ichor-blake3",
  "ichor-block",
  "ichor-cap",
  "ichor-cell",
@@ -29,6 +30,10 @@ version = "0.0.0"
 
 [[package]]
 name = "ichor-acpi"
+version = "0.0.0"
+
+[[package]]
+name = "ichor-blake3"
 version = "0.0.0"
 
 [[package]]
@@ -77,6 +82,9 @@ dependencies = [
 [[package]]
 name = "ichor-image"
 version = "0.0.0"
+dependencies = [
+ "ichor-blake3",
+]
 
 [[package]]
 name = "ichor-nvme"

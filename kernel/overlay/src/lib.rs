@@ -26,11 +26,12 @@ use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use image::{Image, Node};
+use image::{ChunkSource, Image, Node};
 
 /// Linux errno values.
 pub mod errno {
     pub const ENOENT: i64 = 2;
+    pub const EIO: i64 = 5;
     pub const EEXIST: i64 = 17;
     pub const ENOTDIR: i64 = 20;
     pub const EISDIR: i64 = 21;
@@ -163,6 +164,8 @@ impl Inode<'_> {
 #[derive(Debug)]
 pub struct Overlay<'a> {
     inodes: Vec<Option<Inode<'a>>>,
+    /// Where the lower layer's file data comes from (verified chunks).
+    src: Option<&'a (dyn ChunkSource + Sync)>,
     /// The clock that stamps changes (the kernel installs its own).
     clock: fn() -> Time,
     free: Vec<Ino>,
@@ -206,10 +209,16 @@ fn components(path: &str) -> impl Iterator<Item = String> + '_ {
 }
 
 impl<'a> Overlay<'a> {
-    /// An overlay over `lower` whose upper layer may hold `max_bytes`.
-    pub fn new(lower: &Image<'a>, max_bytes: usize) -> Result<Overlay<'a>, image::Error> {
+    /// An overlay over `lower`, whose file data `src` provides, with an
+    /// upper layer that may hold `max_bytes`.
+    pub fn new(
+        lower: &Image<'a>,
+        src: &'a (dyn ChunkSource + Sync),
+        max_bytes: usize,
+    ) -> Result<Overlay<'a>, image::Error> {
         let root = lower.root()?;
         let mut fs = Overlay::empty(max_bytes);
+        fs.src = Some(src);
         if let Some(Some(r)) = fs.inodes.get_mut(ROOT) {
             r.data = upper_dir(ROOT, Some(root));
             r.mode = root.mode & 0o7777;
@@ -226,6 +235,7 @@ impl<'a> Overlay<'a> {
                 2,
                 Time::default()
             ))],
+            src: None,
             free: Vec::new(),
             clock: || Time::default(),
             used_bytes: 0,
@@ -425,7 +435,7 @@ impl<'a> Overlay<'a> {
     /// Reads file bytes at `offset`; returns how many were read.
     pub fn read(&self, ino: Ino, offset: u64, out: &mut [u8]) -> Result<usize, i64> {
         match &self.get(ino)?.data {
-            Data::LowerFile(n) => Ok(n.read_at(offset, out)),
+            Data::LowerFile(n) => self.read_lower(n, offset, out),
             Data::File(v) => {
                 let start = usize::try_from(offset).unwrap_or(usize::MAX).min(v.len());
                 let n = out.len().min(v.len() - start);
@@ -435,6 +445,11 @@ impl<'a> Overlay<'a> {
             Data::Dir(_) => Err(EISDIR),
             Data::Symlink(_) | Data::Device(_) => Err(EINVAL),
         }
+    }
+
+    fn read_lower(&self, n: &Node<'a>, offset: u64, out: &mut [u8]) -> Result<usize, i64> {
+        let src = self.src.ok_or(EIO)?;
+        n.read_at(offset, out, src).map_err(|_| EIO)
     }
 
     /// The target of a symlink.
@@ -461,7 +476,7 @@ impl<'a> Overlay<'a> {
             return Err(ENOSPC);
         }
         let mut v = alloc::vec![0u8; size];
-        let n = node.read_at(0, &mut v);
+        let n = self.read_lower(&node, 0, &mut v)?;
         v.truncate(n);
         self.used_bytes += v.len();
         self.get_mut(ino)?.data = Data::File(v);
@@ -867,7 +882,8 @@ mod tests {
     fn resolves_like_the_image() {
         let img = lower_image();
         let image = Image::mount(&img).unwrap();
-        let mut fs = Overlay::new(&image, 1 << 20).unwrap();
+        let src = image::SliceSource(&img);
+        let mut fs = Overlay::new(&image, &src, 1 << 20).unwrap();
         let motd = fs.resolve(ROOT, "/etc/motd", true).unwrap();
         assert_eq!(read_all(&fs, motd), b"lower motd\n");
         assert_eq!(fs.resolve(ROOT, "/etc/link", true).unwrap(), motd);
@@ -896,13 +912,14 @@ mod tests {
     fn copy_up_leaves_the_image_untouched() {
         let img = lower_image();
         let image = Image::mount(&img).unwrap();
-        let mut fs = Overlay::new(&image, 1 << 20).unwrap();
+        let src = image::SliceSource(&img);
+        let mut fs = Overlay::new(&image, &src, 1 << 20).unwrap();
         let motd = fs.resolve(ROOT, "/etc/motd", true).unwrap();
         assert_eq!(fs.write(motd, 0, b"UPPER").unwrap(), 5);
         assert_eq!(read_all(&fs, motd), b"UPPER motd\n");
         assert_eq!(fs.used_bytes(), 11);
         // A second overlay over the same image still sees the original.
-        let mut other = Overlay::new(&image, 1 << 20).unwrap();
+        let mut other = Overlay::new(&image, &src, 1 << 20).unwrap();
         let m2 = other.resolve(ROOT, "/etc/motd", true).unwrap();
         assert_eq!(read_all(&other, m2), b"lower motd\n");
         // Writing past the end zero-fills; truncate shrinks.
@@ -917,7 +934,8 @@ mod tests {
     fn create_unlink_and_whiteouts() {
         let img = lower_image();
         let image = Image::mount(&img).unwrap();
-        let mut fs = Overlay::new(&image, 1 << 20).unwrap();
+        let src = image::SliceSource(&img);
+        let mut fs = Overlay::new(&image, &src, 1 << 20).unwrap();
         let etc = fs.resolve(ROOT, "/etc", true).unwrap();
         let f = fs.create(etc, "new", 0o600).unwrap();
         fs.write(f, 0, b"hi").unwrap();
@@ -955,7 +973,8 @@ mod tests {
     fn directories() {
         let img = lower_image();
         let image = Image::mount(&img).unwrap();
-        let mut fs = Overlay::new(&image, 1 << 20).unwrap();
+        let src = image::SliceSource(&img);
+        let mut fs = Overlay::new(&image, &src, 1 << 20).unwrap();
         assert_eq!(fs.rmdir(ROOT, "etc"), Err(ENOTEMPTY));
         let usr = fs.resolve(ROOT, "/usr", true).unwrap();
         fs.rmdir(usr, "bin").unwrap();
@@ -974,7 +993,8 @@ mod tests {
     fn rename_moves_inodes() {
         let img = lower_image();
         let image = Image::mount(&img).unwrap();
-        let mut fs = Overlay::new(&image, 1 << 20).unwrap();
+        let src = image::SliceSource(&img);
+        let mut fs = Overlay::new(&image, &src, 1 << 20).unwrap();
         let etc = fs.resolve(ROOT, "/etc", true).unwrap();
         let motd = fs.lookup(etc, "motd").unwrap();
         // A lower file moves to another directory and keeps its identity.

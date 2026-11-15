@@ -6,18 +6,17 @@
 //! and its bytes match, so a hash collision can never make two different
 //! pages alias.
 //!
-//! The chunk hash is currently a placeholder (FNV-1a spread over 32 bytes,
-//! recorded as hash kind 0 in the header flags). The control plane will
-//! switch to BLAKE3 (hash kind 1) when it starts verifying OCI layers
-//! (milestone 6); readers treat the hash only as a sharing hint.
+//! Chunk hashes are BLAKE3, and `finish` writes the root hash over the
+//! metadata (see the crate docs). Every chunk's data starts on a
+//! `CHUNK_SIZE` boundary.
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
-use crate::{CHUNK_LEN, CHUNK_SIZE, HEADER_LEN, Hash, MAGIC, NODE_LEN, VERSION};
-
-/// Header flag value for the placeholder hash.
-pub const HASH_KIND_PLACEHOLDER: u32 = 0;
+use crate::{
+    CHUNK_LEN, CHUNK_SIZE, HASH_KIND_BLAKE3, HEADER_LEN, Hash, MAGIC, NODE_LEN, ROOT_HASH_AT,
+    VERSION,
+};
 
 /// Identifies a node added to a [`Builder`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,20 +46,9 @@ pub struct Builder {
     data_by_hash: BTreeMap<Hash, Vec<(u64, u64)>>,
 }
 
-/// The placeholder content hash: FNV-1a 64, spread over 32 bytes, mixed
-/// with the length.
+/// A chunk's content hash (BLAKE3).
 pub fn content_hash(bytes: &[u8]) -> Hash {
-    let mut h = [0u8; 32];
-    let mut acc: u64 = 0xcbf2_9ce4_8422_2325;
-    for (i, &b) in bytes.iter().enumerate() {
-        acc = (acc ^ u64::from(b)).wrapping_mul(0x100_0000_01b3);
-        h[i % 32] ^= (acc >> (i % 8)) as u8;
-    }
-    let len = (bytes.len() as u64).to_le_bytes();
-    for (slot, b) in h.iter_mut().zip(len) {
-        *slot ^= b;
-    }
-    h
+    blake3::hash(bytes)
 }
 
 impl Builder {
@@ -87,6 +75,9 @@ impl Builder {
             None => {
                 let off = self.data.len() as u64;
                 self.data.extend_from_slice(page);
+                // The next chunk starts on a page boundary.
+                let padded = self.data.len().next_multiple_of(CHUNK_SIZE as usize);
+                self.data.resize(padded, 0);
                 let region = (off, page.len() as u64);
                 self.data_by_hash.entry(hash).or_default().push(region);
                 region
@@ -170,12 +161,13 @@ impl Builder {
         let dirents_offset = nodes_offset + node_count * NODE_LEN;
         let chunk_table_offset = dirents_offset + dirents_count * 8;
         let strings_offset = chunk_table_offset + chunk_count * CHUNK_LEN;
-        let data_offset = strings_offset + self.strings.len();
+        let data_offset =
+            (strings_offset + self.strings.len()).next_multiple_of(CHUNK_SIZE as usize);
 
         let mut b = Vec::with_capacity(data_offset + self.data.len());
         b.extend_from_slice(MAGIC);
         b.extend_from_slice(&VERSION.to_le_bytes());
-        b.extend_from_slice(&HASH_KIND_PLACEHOLDER.to_le_bytes());
+        b.extend_from_slice(&HASH_KIND_BLAKE3.to_le_bytes());
         for v in [
             node_count,
             nodes_offset,
@@ -189,6 +181,7 @@ impl Builder {
         ] {
             b.extend_from_slice(&(v as u64).to_le_bytes());
         }
+        b.extend_from_slice(&[0u8; 32]); // root hash, filled in below
         for n in &self.nodes {
             for v in [
                 u64::from(n.kind) | (u64::from(n.mode) << 32),
@@ -210,6 +203,9 @@ impl Builder {
             b.extend_from_slice(hash);
         }
         b.extend_from_slice(&self.strings);
+        b.resize(data_offset, 0);
+        let root = crate::metadata_hash(&b);
+        b[ROOT_HASH_AT..HEADER_LEN].copy_from_slice(&root);
         b.extend_from_slice(&self.data);
         b
     }
