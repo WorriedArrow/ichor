@@ -10,7 +10,6 @@
 //! instantiates one tree per resource (memory pages, IO tokens, ...).
 
 use alloc::sync::Arc;
-use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 /// Unlimited, for the root account.
@@ -69,20 +68,26 @@ impl Account {
 
     /// Charges `amount` to this account and up the chain. On failure nothing
     /// is charged (the partial charge is rolled back).
+    ///
+    /// Hot (every page fault charges): it walks the chain by reference, with
+    /// no allocation and no reference-count traffic.
     pub fn charge(self: &Arc<Self>, amount: u64) -> Result<(), ChargeError> {
-        // Reserve against every ancestor, from here up. Record how far we got
-        // so a failure can roll back exactly those.
-        let mut node: Option<Arc<Account>> = Some(self.clone());
-        let mut charged: Vec<Arc<Account>> = Vec::new();
+        // Reserve against every ancestor, from here up. On a refusal, undo
+        // exactly the accounts below the one that refused.
+        let mut node: Option<&Account> = Some(self);
         while let Some(acc) = node {
             if !acc.try_add_used(amount) {
-                for done in &charged {
-                    done.sub_used(amount);
+                let mut undo: Option<&Account> = Some(self);
+                while let Some(u) = undo {
+                    if core::ptr::eq(u, acc) {
+                        break;
+                    }
+                    u.sub_used(amount);
+                    undo = u.parent.as_deref();
                 }
                 return Err(ChargeError::Exceeded);
             }
-            charged.push(acc.clone());
-            node = acc.parent.clone();
+            node = acc.parent.as_deref();
         }
         self.local.fetch_add(amount, Ordering::Relaxed);
         Ok(())
@@ -92,10 +97,10 @@ impl Account {
     pub fn release(self: &Arc<Self>, amount: u64) {
         self.local
             .fetch_sub(amount.min(self.local()), Ordering::Relaxed);
-        let mut node = Some(self.clone());
+        let mut node: Option<&Account> = Some(self);
         while let Some(acc) = node {
             acc.sub_used(amount);
-            node = acc.parent.clone();
+            node = acc.parent.as_deref();
         }
     }
 
@@ -188,6 +193,23 @@ mod tests {
         assert_eq!(root.used(), 300);
         // Nothing leaked from the failed charge.
         assert_eq!(b.used(), 100);
+    }
+
+    #[test]
+    fn refusal_in_the_middle_rolls_back_only_below_it() {
+        let root = Account::root(UNLIMITED);
+        let mid = root.new_child(10);
+        let leaf = mid.new_child(UNLIMITED);
+        leaf.charge(8).unwrap();
+        // mid has 2 left: the leaf's own limit allows 5, mid refuses it.
+        assert_eq!(leaf.charge(5), Err(ChargeError::Exceeded));
+        assert_eq!(
+            (leaf.used(), mid.used(), root.used(), leaf.local()),
+            (8, 8, 8, 8)
+        );
+        leaf.charge(2).unwrap();
+        leaf.release(10);
+        assert_eq!((leaf.used(), mid.used(), root.used()), (0, 0, 0));
     }
 
     #[test]
