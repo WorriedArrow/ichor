@@ -156,6 +156,20 @@ Milestones 0-3 are done.
   behind getrandom, /dev/[u]random and AT_RANDOM; `frame::time::wall_clock`
   is UEFI GetTime at boot plus TSC time, behind CLOCK_REALTIME,
   gettimeofday and file times.
+- M4 identity and apt (Phase D, ADR-0009): per-process credentials, the
+  set*id family, DAC checks in the overlay (`Overlay::set_cred`, installed
+  by `LinuxProcess::fs()` for syscall work only), kill permission, image
+  format v3 with owners and mtimes. Debian's `apt-get install` from the
+  local `/mirror` (hello, jq, libjq1, libonig5; pinned on
+  snapshot.debian.org) passes in CI: milestone 4's acceptance test.
+  prctl, statx, sched_getaffinity, /sys cpu lists, mremap, sysinfo are in.
+  Open: no ptys (/dev/ptmx), no per-cell page-sharing opt-out, the
+  cross-cell isolation test (owner is writing it).
+- Scheduler wake-ups (frame `task.rs`): a task is marked blocked before it
+  is visible on a wait queue, the re-check runs with interrupts off, and a
+  task that does not sleep leaves the queue; the idle loop re-checks before
+  `hlt` when `finish_switch` requeued a woken task locally. These fixed an
+  intermittent SMP hang (pipe- and lock-heavy work under apt/dpkg).
 - M4 Debian (Phase D): xtask fetches the official `debian:bookworm-slim`
   amd64 layer from Docker Hub (anonymous token; pinned by manifest digest,
   verified by the layer digest), builds it once into

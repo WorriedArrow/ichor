@@ -383,6 +383,16 @@ fn idle_loop() -> ! {
         // kick arriving now is held pending until the `sti; hlt` below and
         // cannot be lost.
         schedule_inner(Enqueue::Yielded, true);
+        // A task woken while it was switching out may just have been queued
+        // here by `finish_switch` (no kick: it was this CPU). Halting now
+        // would leave it waiting for an unrelated interrupt; look again.
+        let again = {
+            let g = IrqGuard::new();
+            SCHED.get(&g).need_resched.swap(false, Ordering::Relaxed)
+        };
+        if again {
+            continue;
+        }
         arch::enable_and_halt();
     }
 }
@@ -406,26 +416,48 @@ pub fn exit() -> ! {
     }
 }
 
-/// Blocks the current task until [`Task::wake`]. If `still_needed` returns
-/// false after the task is marked blocked (the wake-up already happened),
-/// returns immediately instead of sleeping.
-fn block_current(still_needed: impl FnOnce() -> bool) {
+/// Blocks the current task until [`Task::wake`]. The task is marked
+/// blocked *before* `publish` makes it visible to wakers (puts it on a wait
+/// queue), so any waker that finds it there can wake it. If `still_needed`
+/// then returns false (the wake-up already happened), `unpublish` takes it
+/// back off and it carries on instead of sleeping.
+///
+/// Interrupts stay off from marking until that decision, so a timer
+/// preemption cannot switch the task out half-blocked: it would not be
+/// requeued (it is "blocked"), and if the condition was already true no
+/// wake would ever come.
+fn block_current(
+    publish: impl FnOnce(Arc<Task>),
+    still_needed: impl FnOnce() -> bool,
+    unpublish: impl FnOnce(&Arc<Task>),
+) {
     crate::irq::assert_not_atomic("block");
     let me = current();
-    me.state.store(TaskState::Blocked as u8, Ordering::SeqCst);
-    if !still_needed() {
-        // Either we undo the block, or a waker already did (it saw us still
-        // on this CPU, so it did not enqueue us). Both leave us runnable
-        // and not queued, so we carry on.
-        let _ = me.state.compare_exchange(
-            TaskState::Blocked as u8,
-            TaskState::Runnable as u8,
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-        );
+    let sleep = {
+        let _g = IrqGuard::new();
+        me.state.store(TaskState::Blocked as u8, Ordering::SeqCst);
+        publish(me.clone());
+        let sleep = still_needed();
+        if !sleep {
+            // Either we undo the block, or a waker already did (it saw us
+            // still on this CPU, so it did not enqueue us). Both leave us
+            // runnable and not queued, so we carry on.
+            let _ = me.state.compare_exchange(
+                TaskState::Blocked as u8,
+                TaskState::Runnable as u8,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            );
+            unpublish(&me);
+        }
+        sleep
+    };
+    if !sleep {
         return;
     }
     drop(me);
+    // A preemption between here and the switch is harmless: we are queued
+    // on the wait queue, so a waker will make us runnable again.
     schedule(Enqueue::Yielded);
 }
 
@@ -558,6 +590,14 @@ fn finish_switch() {
     };
     if let Some(why) = why {
         enqueue(p, why);
+        // The task enqueue chose this CPU for: if what runs here now is the
+        // idle task, it is about to halt (the timer is tickless and idle
+        // arms none), so make it look at the queue again first.
+        let g = IrqGuard::new();
+        let s = SCHED.get(&g);
+        if s.current.lock().as_ref().is_some_and(|t| t.is_idle) {
+            s.need_resched.store(true, Ordering::Relaxed);
+        }
     }
 }
 
@@ -712,16 +752,17 @@ impl WaitQueue {
             if let Some(v) = cond() {
                 return v;
             }
-            let me = current();
-            self.waiters.lock().push_back(me.clone());
-            drop(me);
             // Re-check after queueing so a wake between the check and the
             // queueing is not lost.
             let mut ready = None;
-            block_current(|| {
-                ready = cond();
-                ready.is_none()
-            });
+            block_current(
+                |me| self.waiters.lock().push_back(me),
+                || {
+                    ready = cond();
+                    ready.is_none()
+                },
+                |me| self.unqueue(me),
+            );
             if let Some(v) = ready {
                 return v;
             }
@@ -743,20 +784,34 @@ impl WaitQueue {
             if crate::time::now() >= deadline {
                 return None;
             }
-            let me = current();
-            let id = me.id();
-            self.waiters.lock().push_back(me.clone());
-            add_sleeper(dl, me);
+            let id = current().id();
             let mut ready = None;
-            block_current(|| {
-                ready = cond();
-                ready.is_none() && crate::time::now() < deadline
-            });
+            block_current(
+                |me| {
+                    self.waiters.lock().push_back(me.clone());
+                    add_sleeper(dl, me);
+                },
+                || {
+                    ready = cond();
+                    ready.is_none() && crate::time::now() < deadline
+                },
+                |me| self.unqueue(me),
+            );
             remove_sleeper(dl, id);
+            // A timeout wakes us through the sleeper list, not this queue:
+            // leave it, so a later wake_one is not spent on us.
+            self.unqueue(&current());
             if let Some(v) = ready {
                 return Some(v);
             }
         }
+    }
+
+    /// Takes `me` off the queue (it decided not to sleep, or timed out), so
+    /// a later `wake_one` does not spend its wake-up on a task that is not
+    /// waiting here.
+    fn unqueue(&self, me: &Arc<Task>) {
+        self.waiters.lock().retain(|t| !Arc::ptr_eq(t, me));
     }
 
     /// Wakes one waiter.
