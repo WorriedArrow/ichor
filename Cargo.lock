@@ -16,6 +16,7 @@ dependencies = [
  "ichor-image",
  "ichor-sched",
  "ichor-virtio-blk",
+ "ichor-vma",
 ]
 
 [[package]]
@@ -86,6 +87,10 @@ dependencies = [
  "ichor-block",
  "ichor-frame",
 ]
+
+[[package]]
+name = "ichor-vma"
+version = "0.0.0"
 
 [[package]]
 name = "xtask"

@@ -26,6 +26,7 @@ pub enum Error {
 const EI_NIDENT: usize = 16;
 const PT_LOAD: u32 = 1;
 const PT_INTERP: u32 = 3;
+const PT_PHDR: u32 = 6;
 const PF_X: u32 = 1;
 const PF_W: u32 = 2;
 const PF_R: u32 = 4;
@@ -100,6 +101,14 @@ pub struct LoadPlan {
     /// `[interp_offset, interp_offset+len)` of the interpreter path in the
     /// file, if the binary is dynamically linked.
     pub interp: Option<(u64, u64)>,
+    /// Where the program headers are in memory once loaded (`PT_PHDR`, or
+    /// derived from the `PT_LOAD` covering them), for `AT_PHDR`. Static
+    /// libcs find their TLS template through it.
+    pub phdr_vaddr: Option<u64>,
+    /// Number of program headers (`AT_PHNUM`).
+    pub phnum: u16,
+    /// Size of one program header (`AT_PHENT`).
+    pub phentsize: u16,
     segments: [Segment; MAX_SEGMENTS],
     segment_count: usize,
 }
@@ -163,6 +172,7 @@ pub fn parse(image: &[u8]) -> Result<LoadPlan, Error> {
     }; MAX_SEGMENTS];
     let mut count = 0;
     let mut interp = None;
+    let mut phdr_vaddr = None;
     let mut last_end = 0u64;
 
     for i in 0..phnum {
@@ -177,6 +187,7 @@ pub fn parse(image: &[u8]) -> Result<LoadPlan, Error> {
         let p_memsz = u64_at(image, ph + 40)?;
 
         match p_type {
+            PT_PHDR => phdr_vaddr = Some(p_vaddr),
             PT_INTERP => {
                 let end = p_offset.checked_add(p_filesz).ok_or(Error::BadSegment)?;
                 if end as usize > image.len() || p_filesz == 0 {
@@ -227,11 +238,22 @@ pub fn parse(image: &[u8]) -> Result<LoadPlan, Error> {
     if count == 0 {
         return Err(Error::BadSegment);
     }
+    let phdrs_len = (phnum * phentsize) as u64;
+    let phdr_vaddr = phdr_vaddr.or_else(|| {
+        let phoff = phoff as u64;
+        segments[..count]
+            .iter()
+            .find(|s| phoff >= s.file_offset && phoff + phdrs_len <= s.file_offset + s.file_size)
+            .map(|s| s.vaddr + (phoff - s.file_offset))
+    });
     Ok(LoadPlan {
         machine,
         pie,
         entry,
         interp,
+        phdr_vaddr,
+        phnum: phnum as u16,
+        phentsize: phentsize as u16,
         segments,
         segment_count: count,
     })
@@ -305,6 +327,32 @@ mod tests {
         assert_eq!(data.mem_size, 0x400); // has .bss
         assert_eq!(data.page_range(0x1000), (0x402000, 0x403000));
         assert_eq!(plan.address_span(0x1000), Some((0x401000, 0x403000)));
+        // The headers (at file offset 64) are not inside any PT_LOAD here.
+        assert_eq!(plan.phdr_vaddr, None);
+        assert_eq!((plan.phnum, plan.phentsize), (2, 56));
+    }
+
+    #[test]
+    fn finds_program_headers_in_memory() {
+        // The first PT_LOAD maps the file from offset 0, headers included.
+        let img = elf(
+            ET_EXEC,
+            EM_X86_64,
+            0x401000,
+            &[(PT_LOAD, PF_R | PF_X, 0, 0x400000, 0x300, 0x300)],
+        );
+        assert_eq!(parse(&img).unwrap().phdr_vaddr, Some(0x400040));
+        // PT_PHDR wins when present.
+        let img = elf(
+            ET_EXEC,
+            EM_X86_64,
+            0x401000,
+            &[
+                (PT_PHDR, PF_R, 64, 0x500040, 112, 112),
+                (PT_LOAD, PF_R | PF_X, 0, 0x400000, 0x300, 0x300),
+            ],
+        );
+        assert_eq!(parse(&img).unwrap().phdr_vaddr, Some(0x500040));
     }
 
     #[test]

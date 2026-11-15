@@ -1,0 +1,13 @@
+[package]
+name = "ichor-vma"
+description = "User address-space region bookkeeping for mmap/munmap/mprotect (no_std, host-tested)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "vma"
+
+[lints]
+workspace = true

@@ -114,6 +114,25 @@ impl Asm {
         self.code.extend_from_slice(&disp.to_le_bytes());
     }
 
+    /// `mov [base + disp32], src`
+    pub(crate) fn store(&mut self, base: Reg, disp: i32, src: Reg) {
+        self.rex_w(src.ext(), base.ext());
+        self.code.push(0x89);
+        self.code.push(0x80 | (src.low() << 3) | base.low());
+        if base.low() == 4 {
+            self.code.push(0x24); // SIB for rsp/r12
+        }
+        self.code.extend_from_slice(&disp.to_le_bytes());
+    }
+
+    /// `add dst, imm32`
+    pub(crate) fn add_imm(&mut self, dst: Reg, imm: i32) {
+        self.rex_w(0, dst.ext());
+        self.code.push(0x81);
+        self.code.push(0xC0 | dst.low());
+        self.code.extend_from_slice(&imm.to_le_bytes());
+    }
+
     /// `sub dst, imm32`
     pub(crate) fn sub_imm(&mut self, dst: Reg, imm: i32) {
         self.rex_w(0, dst.ext());

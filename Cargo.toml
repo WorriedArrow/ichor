@@ -13,6 +13,7 @@ members = [
     "kernel/elf",
     "kernel/image",
     "kernel/block",
+    "kernel/vma",
     "kernel/drivers/virtio-blk",
     "kernel/ichor",
     "tests",
@@ -33,6 +34,7 @@ default-members = [
     "kernel/elf",
     "kernel/image",
     "kernel/block",
+    "kernel/vma",
     "tests",
     "xtask",
 ]
@@ -56,6 +58,7 @@ ichor-abi = { path = "kernel/abi" }
 elf = { package = "ichor-elf", path = "kernel/elf" }
 image = { package = "ichor-image", path = "kernel/image" }
 block = { package = "ichor-block", path = "kernel/block" }
+vma = { package = "ichor-vma", path = "kernel/vma" }
 virtio-blk = { package = "ichor-virtio-blk", path = "kernel/drivers/virtio-blk" }
 
 [workspace.lints.rust]

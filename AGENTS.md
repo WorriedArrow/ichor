@@ -54,13 +54,21 @@ Milestones 0-2 are done.
   Every QEMU run attaches `target/qemu/<run>/root.img` (built by xtask with
   the image builder) as a virtio-blk disk; the kernel reads it, verifies a
   300 KiB pattern file, mounts it, and runs `cat` against it.
+- M3 memory: `kernel/vma` (region map, host-tested) and the kernel's
+  `umem` give Linux processes `brk`, `mmap` (anonymous, and private copies
+  of files), `mprotect` and `munmap`, with demand paging from user page
+  faults; syscalls fault user buffers in before copying. The loader builds
+  a real argv/envp/auxv stack (AT_PHDR, AT_RANDOM, ...) and tolerates
+  segments sharing a page. `linuxabi` also has uname, getdents64, dup*,
+  fcntl, ioctl(TIOCGWINSZ), clock_gettime, prlimit64, and signal/futex
+  stubs. A process's memory is freed and its charge returned at exit.
 
 `tests/boot.rs` proves all of this on 1, 4 and 8 vCPUs.
 
-Next for milestone 3: page the root image in from the device on demand
-(today the kernel reads the whole disk into memory, capped at 64 MiB),
-`mmap`/`brk`/`getdents64`/signals stubs and whatever else a static busybox
-traces to, then the busybox QEMU test.
+Next for milestone 3: the busybox QEMU test (waiting on the owner's choice
+of where the static binary comes from), whatever else busybox traces to,
+and paging the root image in from the device on demand (today the kernel
+reads the whole disk into memory, capped at 64 MiB).
 
 ADR-0004 records the side-channel posture; its per-CPU mitigations (VERW,
 IBPB on cross-cell switch, page-table isolation for Meltdown-affected CPUs)
@@ -144,6 +152,7 @@ kernel/abi       native ABI definitions (docs/abi/native.md)
 kernel/elf       ELF64 parsing into load plans (host-tested)
 kernel/image     read-only content-addressed image format (host-tested)
 kernel/block     block-device trait and helpers (host-tested)
+kernel/vma       user address-space region map for mmap/brk (host-tested)
 kernel/drivers/virtio-blk  safe virtio-blk driver over frame's IoMem/DMA
 kernel/ichor     the kernel binary; frame::main!(kmain); kcell/nativeabi tie it together
 xtask/           build/run/test/lint tooling (lib + bin, no dependencies)

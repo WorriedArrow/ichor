@@ -22,6 +22,7 @@ mod runtest;
 mod sched;
 mod selftest;
 mod testprog;
+mod umem;
 mod usertest;
 mod vfs;
 

@@ -50,7 +50,11 @@ pub(crate) fn run() {
 
     let system = System::new(4096).unwrap_or_else(|| fail("no system cell"));
     let cell = Cell::new(&system.root_account, 128).unwrap_or_else(|| fail("no process cell"));
-    let (status, syscalls) = run_linux(&mut LinuxProcess::new(cell, vfs), &cat_program());
+    let (status, syscalls) = run_linux(
+        &mut LinuxProcess::new(cell, vfs),
+        &cat_program(),
+        &["cat", "/etc/motd"],
+    );
     if status != 0 {
         fail("cat from disk: checks failed");
     }
