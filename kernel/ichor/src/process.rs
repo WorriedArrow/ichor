@@ -498,20 +498,17 @@ impl LinuxProcess {
         core::mem::replace(&mut *self.group.mm.lock(), mm)
     }
 
-    /// Copies `data` to user memory at `va`, faulting in demand-paged
-    /// memory first. Returns how many bytes were copied.
+    /// Copies `data` to user memory at `va` with the permissions a user
+    /// store has (faulting pages in, breaking copy-on-write). Returns how
+    /// many bytes were copied.
     pub(crate) fn copy_to_user(&mut self, va: u64, data: &[u8]) -> usize {
-        let mut mm = self.mm();
-        mm.populate(va, data.len(), true);
-        mm.space().copy_to_user(va, data)
+        self.mm().copy_to_user(va, data)
     }
 
-    /// Copies user memory at `va` into `out`, faulting in demand-paged
-    /// memory first. Returns how many bytes were copied.
+    /// Copies user memory at `va` into `out` with the permissions a user
+    /// load has (faulting pages in). Returns how many bytes were copied.
     pub(crate) fn copy_from_user(&mut self, va: u64, out: &mut [u8]) -> usize {
-        let mut mm = self.mm();
-        mm.populate(va, out.len(), false);
-        mm.space().copy_from_user(va, out)
+        self.mm().copy_from_user(va, out)
     }
 
     /// The working directory.

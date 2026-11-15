@@ -420,8 +420,7 @@ fn build_stack(
     if frame_bytes.len() > (stack_size / 2) as usize {
         return Err(LoadError::ArgsTooLong);
     }
-    mm.populate(sp, frame_bytes.len(), true);
-    if mm.space().copy_to_user(sp, &frame_bytes) != frame_bytes.len() {
+    if mm.copy_to_user(sp, &frame_bytes) != frame_bytes.len() {
         return Err(LoadError::OutOfMemory);
     }
     Ok(sp)

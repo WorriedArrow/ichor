@@ -199,51 +199,68 @@ impl VmSpace {
     /// The bytes may change concurrently (another thread in this space), so
     /// this is a snapshot copy, never a borrow.
     pub fn copy_from_user(&self, va: u64, out: &mut [u8]) -> usize {
-        self.walk_user(va, out.len(), |off, pa, poff, len| {
-            let src = core::ptr::with_exposed_provenance::<u8>((phys_to_virt(pa) + poff) as usize);
-            // SAFETY: `pa` is a page mapped in this space (from `translate`),
-            // reachable via the linear map; `len` stays within it; `out` is a
-            // Rust slice that cannot alias user memory.
+        self.copy_user(va, out.len(), false, |off, addr, len| {
+            let src = core::ptr::with_exposed_provenance::<u8>(addr as usize);
+            // SAFETY: `addr..addr+len` lies in the linear-map alias of one
+            // page that `copy_user` found mapped in this space and keeps
+            // mapped (so allocated) until this returns. `out[off..]` holds
+            // at least `len` bytes and, being a Rust slice of kernel memory,
+            // cannot alias an untyped user page.
             unsafe { arch::copy_untyped(out[off..].as_mut_ptr(), src, len) };
-            true
         })
     }
 
     /// Copies `data` into user virtual address `va`, stopping at the first
-    /// page that is not mapped writable. Returns the number copied.
+    /// page that is not mapped writable, exactly where a user write would
+    /// fault. A copy-on-write page is mapped read-only, so the copy stops
+    /// there too; the caller breaks the share (as its write-fault handler
+    /// would) and copies the rest. Returns the number copied.
     pub fn copy_to_user(&self, va: u64, data: &[u8]) -> usize {
-        self.walk_user(va, data.len(), |off, pa, poff, len| {
-            let dst =
-                core::ptr::with_exposed_provenance_mut::<u8>((phys_to_virt(pa) + poff) as usize);
-            // SAFETY: as in `copy_from_user`; the page is writable (checked in
-            // `walk_user`).
+        self.copy_user(va, data.len(), true, |off, addr, len| {
+            let dst = core::ptr::with_exposed_provenance_mut::<u8>(addr as usize);
+            // SAFETY: as in `copy_from_user`, and the page's PTE (read under
+            // the same lock) is writable, so this space's user code could
+            // store to it too.
             unsafe { arch::copy_untyped(dst, data[off..].as_ptr(), len) };
-            true
         })
     }
 
-    /// Walks the user range `[va, va+len)` page by page, calling `f(offset,
-    /// page_phys, page_offset, chunk_len)` for each mapped page. For a write
-    /// (`f` needs the page writable) the caller's closure is only reached for
-    /// writable pages via `translate`'s prot. Stops at the first gap.
-    fn walk_user(
+    /// Walks the user range `[va, va+len)` page by page. For each page it
+    /// takes the space lock, reads the PTE, stops if the page is unmapped
+    /// (or, with `write`, not writable), and calls `f(offset, linear_addr,
+    /// chunk_len)` before dropping the lock. Returns the bytes covered.
+    ///
+    /// Holding the lock across `f` is what makes the copy sound: `map`,
+    /// `unmap_range` and `protect` change this space's PTEs only under it,
+    /// and a page's mapping reference is dropped only after `unmap_range`
+    /// cleared its PTE. So for the whole of `f` the page stays mapped, with
+    /// the permissions checked here, and cannot be freed and reused.
+    fn copy_user(
         &self,
         va: u64,
         len: usize,
-        mut f: impl FnMut(usize, PhysAddr, u64, usize) -> bool,
+        write: bool,
+        mut f: impl FnMut(usize, u64, usize),
     ) -> usize {
         let mut done = 0usize;
         while done < len {
-            let cur = va + done as u64;
-            let page = align_down(cur, super::PAGE_SIZE);
-            let Some((pa, _prot)) = self.translate(page) else {
+            let Some(cur) = va.checked_add(done as u64) else {
                 break;
             };
+            let page = align_down(cur, super::PAGE_SIZE);
             let poff = cur - page;
             let chunk = ((super::PAGE_SIZE - poff) as usize).min(len - done);
-            if !f(done, pa, poff, chunk) {
+            let inner = self.inner.lock();
+            // SAFETY: as in `map`; a read-only walk (it rejects addresses
+            // outside the user half).
+            let Some((pa, prot)) = (unsafe { paging::user_translate(self.root, page) }) else {
+                break;
+            };
+            if write && !prot.write {
                 break;
             }
+            f(done, phys_to_virt(pa) + poff, chunk);
+            drop(inner);
             done += chunk;
         }
         done
