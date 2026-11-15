@@ -66,6 +66,15 @@ Milestones 0-3 are done.
   guard, so a user spinner used to keep its CPU). Tests: clone + futex +
   join, and a shootdown test where a spinning reader must fault after
   another thread's `munmap`, on 1-8 vCPUs.
+- M4 readiness and /proc: `poll.rs` has poll/ppoll/select/pselect6, epoll
+  (create/ctl/wait/pwait; level-triggered, EPOLLONESHOT) and eventfd, over
+  one poll wait queue that pipes and eventfds notify; descriptors can hold
+  any kernel `Object` (`Fd::Object`). `procfs.rs` answers absolute `/proc`
+  paths (open, stat, readlink, access, getdents): self, the calling
+  process's pid dir (cmdline, comm, cwd, exe, fd/, maps, mounts, stat,
+  status), cpuinfo, meminfo, mounts, uptime, version, stat, loadavg,
+  sys/kernel/*. Busybox and Alpine read it; a test ELF checks poll
+  timeouts and wakeups, epoll data and eventfd counts.
 
 - M0/M1: boots as a UEFI app into the higher half; buddy page allocator and
   heap; traps with IST stacks; x2APIC + tickless timer; SMP bring-up; per-CPU
@@ -142,8 +151,9 @@ Suggested order for milestone 4:
    `/dev` (null, zero, full, random, urandom, tty, console) plus `getrandom`.
 3. `PT_INTERP` and PIE: done for musl (Alpine); glibc's `ld-linux` next with
    debian-slim (it needs more of `mmap` with file offsets and `/proc/self`).
-4. `poll`/`epoll`, `/proc` and `/dev` (pipes are done), then Alpine `apk` and
-   debian-slim `apt` against a local mirror.
+4. Done: pipes, `poll`/`epoll`/eventfd, `/proc` (own process only), `/dev`.
+   Next: Alpine `apk` and debian-slim `apt` against a local mirror (needs
+   sockets or a file-backed mirror, more `/proc`, and glibc's `ld-linux`).
 
 ADR-0004 records the side-channel posture; its per-CPU mitigations (VERW,
 IBPB on cross-cell switch, page-table isolation for Meltdown-affected CPUs)

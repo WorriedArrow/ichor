@@ -26,6 +26,14 @@ const RUNS: &[(&[&str], i32)] = &[
         &[
             "sh",
             "-c",
+            "[ \"$(readlink /proc/self/exe)\" = /usr/bin/readlink ] && head -1 /proc/meminfo | grep -q MemTotal && ls /proc/self | grep -q maps && echo alpine: /proc works",
+        ],
+        0,
+    ),
+    (
+        &[
+            "sh",
+            "-c",
             "grep -h ^NAME /etc/os-release | cut -d= -f2 | tr -d '\"'",
         ],
         0,

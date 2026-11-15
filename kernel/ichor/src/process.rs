@@ -58,6 +58,15 @@ pub(crate) enum Fd {
     Pipe(PipeEnd),
     /// A character device other than the console.
     Dev(crate::dev::Device),
+    /// A kernel object: eventfd, epoll instance, ...
+    Object(ObjectEnd),
+}
+
+/// A descriptor's reference to a kernel object.
+#[derive(Clone, Debug)]
+pub(crate) struct ObjectEnd {
+    pub(crate) obj: Arc<dyn crate::poll::Object>,
+    pub(crate) nonblock: bool,
 }
 
 /// A group's files: descriptors, working directory (holding an open
@@ -82,13 +91,15 @@ pub(crate) struct Group {
     threads: SpinLock<Vec<Arc<ProcEntry>>>,
     /// Set by `exit_group` or a fatal signal: the group's wait status.
     exit: SpinLock<Option<u32>>,
+    /// The program's path and argv (NUL-separated), for `/proc`.
+    exe: SpinLock<(alloc::string::String, Vec<u8>)>,
 }
 
 impl Group {
     /// Takes the references a descriptor needs.
     fn hold(&self, f: &Fd) {
         match f {
-            Fd::Console | Fd::Dev(_) => {}
+            Fd::Console | Fd::Dev(_) | Fd::Object(_) => {}
             Fd::File(of) => {
                 let _ = self.vfs.lock().open(of.ino);
             }
@@ -99,10 +110,30 @@ impl Group {
     /// Drops the references a descriptor held.
     fn release(&self, f: Fd) {
         match f {
-            Fd::Console | Fd::Dev(_) => {}
+            Fd::Console | Fd::Dev(_) | Fd::Object(_) => {}
             Fd::File(of) => self.vfs.lock().close(of.ino),
             Fd::Pipe(e) => e.pipe.drop_end(e.write),
         }
+    }
+
+    /// Records the program the process runs (load or `execve`).
+    pub(crate) fn set_exec(&self, path: &str, argv: &[&str]) {
+        let mut cmd = Vec::new();
+        for a in argv {
+            cmd.extend_from_slice(a.as_bytes());
+            cmd.push(0);
+        }
+        *self.exe.lock() = (alloc::string::String::from(path), cmd);
+    }
+
+    /// The program's path (`/proc/<pid>/exe`).
+    pub(crate) fn exe(&self) -> alloc::string::String {
+        self.exe.lock().0.clone()
+    }
+
+    /// The program's argv, NUL-separated (`/proc/<pid>/cmdline`).
+    pub(crate) fn cmdline(&self) -> Vec<u8> {
+        self.exe.lock().1.clone()
     }
 
     /// The threads still running.
@@ -148,7 +179,7 @@ impl Drop for Group {
         let mut fs = self.vfs.lock();
         for f in fds.into_iter().flatten() {
             match f {
-                Fd::Console | Fd::Dev(_) => {}
+                Fd::Console | Fd::Dev(_) | Fd::Object(_) => {}
                 Fd::File(of) => fs.close(of.ino),
                 Fd::Pipe(e) => e.pipe.drop_end(e.write),
             }
@@ -192,6 +223,7 @@ impl LinuxProcess {
             actions: Mutex::new(Actions::new()),
             threads: SpinLock::new(alloc::vec![entry.clone()]),
             exit: SpinLock::new(None),
+            exe: SpinLock::new(Default::default()),
         });
         Some(Self {
             entry,
@@ -218,6 +250,7 @@ impl LinuxProcess {
             self.group.hold(f);
         }
         let actions = self.group.actions.lock().clone();
+        let exe = self.group.exe.lock().clone();
         let entry = proc::register(self.group.tgid, None);
         let group = Arc::new(Group {
             tgid: entry.pid,
@@ -228,6 +261,7 @@ impl LinuxProcess {
             actions: Mutex::new(actions),
             threads: SpinLock::new(alloc::vec![entry.clone()]),
             exit: SpinLock::new(None),
+            exe: SpinLock::new(exe),
         });
         Some(Self {
             entry,

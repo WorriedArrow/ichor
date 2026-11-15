@@ -169,6 +169,37 @@ impl Mm {
         self.brk = va;
     }
 
+    /// Pages the process currently owns.
+    pub(crate) fn resident_pages(&self) -> usize {
+        self.pages.len()
+    }
+
+    /// `/proc/<pid>/maps`: one line per region.
+    pub(crate) fn maps(&self) -> alloc::string::String {
+        use core::fmt::Write;
+        let mut s = alloc::string::String::new();
+        let brk_end = page_up(self.brk).unwrap_or(self.brk);
+        for r in self.regions.regions() {
+            let label = if r.start >= self.brk_start && r.end <= brk_end && self.brk_start != 0 {
+                "[heap]"
+            } else if r.end == 0x7fff_f000_0000 {
+                "[stack]"
+            } else {
+                ""
+            };
+            let _ = writeln!(
+                s,
+                "{:08x}-{:08x} {}{}{}p 00000000 00:00 0 {label}",
+                r.start,
+                r.end,
+                if r.prot.read { 'r' } else { '-' },
+                if r.prot.write { 'w' } else { '-' },
+                if r.prot.exec { 'x' } else { '-' },
+            );
+        }
+        s
+    }
+
     /// A free, page-aligned range of `len` bytes in the mmap area.
     pub(crate) fn find_free(&self, len: u64) -> Option<u64> {
         self.regions.find_free(len)

@@ -27,6 +27,7 @@ mod nr {
     pub(super) const STAT: u64 = 4;
     pub(super) const FSTAT: u64 = 5;
     pub(super) const LSTAT: u64 = 6;
+    pub(super) const POLL: u64 = 7;
     pub(super) const LSEEK: u64 = 8;
     pub(super) const MMAP: u64 = 9; // partial: anonymous, and private copies of files
     pub(super) const MPROTECT: u64 = 10;
@@ -42,6 +43,7 @@ mod nr {
     pub(super) const WRITEV: u64 = 20;
     pub(super) const ACCESS: u64 = 21; // partial: existence only (every process is root)
     pub(super) const PIPE: u64 = 22;
+    pub(super) const SELECT: u64 = 23;
     pub(super) const SCHED_YIELD: u64 = 24;
     pub(super) const MADVISE: u64 = 28; // stub: advice is ignored
     pub(super) const PAUSE: u64 = 34;
@@ -94,11 +96,14 @@ mod nr {
     pub(super) const GETTID: u64 = 186;
     pub(super) const TKILL: u64 = 200;
     pub(super) const FUTEX: u64 = 202; // partial: private semantics only (no PI, no FUTEX_FD)
+    pub(super) const EPOLL_CREATE: u64 = 213;
     pub(super) const GETDENTS64: u64 = 217;
     pub(super) const SET_TID_ADDRESS: u64 = 218;
     pub(super) const CLOCK_GETTIME: u64 = 228; // partial: every clock counts from boot
     pub(super) const CLOCK_NANOSLEEP: u64 = 230; // partial: relative sleeps only
     pub(super) const EXIT_GROUP: u64 = 231;
+    pub(super) const EPOLL_WAIT: u64 = 232;
+    pub(super) const EPOLL_CTL: u64 = 233; // partial: EPOLLET is level-triggered
     pub(super) const TGKILL: u64 = 234;
     pub(super) const OPENAT: u64 = 257;
     pub(super) const MKDIRAT: u64 = 258;
@@ -108,8 +113,14 @@ mod nr {
     pub(super) const SYMLINKAT: u64 = 266;
     pub(super) const READLINKAT: u64 = 267;
     pub(super) const FCHMODAT: u64 = 268;
+    pub(super) const PSELECT6: u64 = 270; // partial: the signal mask is ignored
+    pub(super) const PPOLL: u64 = 271; // partial: the signal mask is ignored
     pub(super) const FACCESSAT: u64 = 269; // partial: existence only (every process is root)
     pub(super) const SET_ROBUST_LIST: u64 = 273; // stub: robust lists are not walked at exit
+    pub(super) const EPOLL_PWAIT: u64 = 281; // partial: the signal mask is ignored
+    pub(super) const EVENTFD: u64 = 284;
+    pub(super) const EVENTFD2: u64 = 290;
+    pub(super) const EPOLL_CREATE1: u64 = 291;
     pub(super) const DUP3: u64 = 292; // partial: the copy has its own offset
     pub(super) const PIPE2: u64 = 293; // partial: O_CLOEXEC is accepted and ignored
     pub(super) const PRLIMIT64: u64 = 302; // partial: reads limits, ignores new ones
@@ -190,6 +201,19 @@ pub(crate) fn dispatch(p: &mut LinuxProcess, ctx: &mut frame::user::UserContext)
         nr::GETCWD => fs::getcwd(p, a[0], a[1]),
         nr::UMASK => fs::umask(p, a[0]),
         nr::GETRANDOM => getrandom(p, a[0], a[1] as usize),
+        // Readiness.
+        nr::POLL => crate::poll::poll(p, a[0], a[1], i(a[2])),
+        nr::PPOLL => crate::poll::ppoll(p, a[0], a[1], a[2]),
+        nr::SELECT => crate::poll::select(p, &a),
+        nr::PSELECT6 => crate::poll::pselect6(p, &a),
+        nr::EPOLL_CREATE => crate::poll::epoll_create(p, 0),
+        nr::EPOLL_CREATE1 => crate::poll::epoll_create(p, a[0]),
+        nr::EPOLL_CTL => crate::poll::epoll_ctl(p, a[0], a[1], a[2], a[3]),
+        nr::EPOLL_WAIT | nr::EPOLL_PWAIT => {
+            crate::poll::epoll_wait(p, a[0], a[1], a[2], i(a[3]) as i32 as i64)
+        }
+        nr::EVENTFD => crate::poll::eventfd(p, a[0], 0),
+        nr::EVENTFD2 => crate::poll::eventfd(p, a[0], a[1]),
         nr::PIPE => fs::pipe2(p, a[0], 0),
         nr::PIPE2 => fs::pipe2(p, a[0], a[1]),
         // Descriptors.
@@ -362,6 +386,7 @@ fn fcntl(p: &mut LinuxProcess, fd: u64, cmd: u64, arg: u64) -> Result<u64, i64> 
             Fd::File(of) => of.flags,
             Fd::Pipe(e) => u64::from(e.write) | if e.nonblock { 0o4000 } else { 0 },
             Fd::Dev(_) => O_RDWR,
+            Fd::Object(o) => O_RDWR | if o.nonblock { 0o4000 } else { 0 },
         }),
         _ => Err(EINVAL),
     }

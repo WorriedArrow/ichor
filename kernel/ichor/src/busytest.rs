@@ -42,6 +42,14 @@ const RUNS: &[(&[&str], i32)] = &[
         &[
             "sh",
             "-c",
+            "grep -q ^Tgid: /proc/self/status && ls /proc/self/fd | grep -q 2 && [ \"$(cat /proc/sys/kernel/ostype)\" = Linux ] && echo sh: /proc works",
+        ],
+        0,
+    ),
+    (
+        &[
+            "sh",
+            "-c",
             "[ \"$(head -c 16 /dev/zero | wc -c)\" -eq 16 ] && echo x >/dev/null && head -c 8 /dev/urandom >/dev/null && echo sh: /dev works",
         ],
         0,

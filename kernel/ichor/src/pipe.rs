@@ -76,6 +76,32 @@ impl Pipe {
         }
         self.readable.wake_all();
         self.writable.wake_all();
+        crate::poll::notify();
+    }
+
+    /// Readiness of the read end (`write` false) or write end, as `poll`
+    /// reports it.
+    pub(crate) fn poll(&self, write: bool) -> u16 {
+        use crate::poll::{POLLERR, POLLHUP, POLLIN, POLLOUT};
+        let s = self.state.lock();
+        if write {
+            if s.readers == 0 {
+                POLLERR
+            } else if CAPACITY - s.buf.len() >= PIPE_BUF {
+                POLLOUT
+            } else {
+                0
+            }
+        } else {
+            let mut r = 0;
+            if !s.buf.is_empty() {
+                r |= POLLIN;
+            }
+            if s.writers == 0 {
+                r |= POLLHUP;
+            }
+            r
+        }
     }
 
     /// Reads up to `out.len()` bytes, blocking until some data is available
@@ -108,6 +134,7 @@ impl Pipe {
             }
         });
         self.writable.wake_all();
+        crate::poll::notify();
         r
     }
 
@@ -147,6 +174,7 @@ impl Pipe {
                 }
             });
             self.readable.wake_all();
+            crate::poll::notify();
             match r {
                 Ok(n) => done += n,
                 Err(e) if done == 0 => return Err(e),

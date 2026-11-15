@@ -29,6 +29,7 @@ mod sys {
     pub(super) const CLOSE: u64 = 3;
     pub(super) const FSTAT: u64 = 5;
     pub(super) const STAT: u64 = 4;
+    pub(super) const POLL: u64 = 7;
     pub(super) const MMAP: u64 = 9;
     pub(super) const MPROTECT: u64 = 10;
     pub(super) const MUNMAP: u64 = 11;
@@ -49,6 +50,11 @@ mod sys {
     pub(super) const RMDIR: u64 = 84;
     pub(super) const UNLINK: u64 = 87;
     pub(super) const GETDENTS64: u64 = 217;
+    pub(super) const EPOLL_WAIT: u64 = 232;
+    pub(super) const EPOLL_CTL: u64 = 233;
+    pub(super) const EVENTFD2: u64 = 290;
+    pub(super) const EPOLL_CREATE1: u64 = 291;
+    pub(super) const PIPE2: u64 = 293;
     pub(super) const EXIT_GROUP: u64 = 231;
 }
 
@@ -75,6 +81,7 @@ pub(crate) fn run_linux(
             fail("could not load the ELF");
         }
     };
+    p.group.set_exec(argv.first().copied().unwrap_or(""), argv);
     let cell = p.cell.clone();
     let leader = p.group.leader.clone();
     let ctx = UserContext::new(loaded.entry, loaded.stack_pointer);
@@ -644,6 +651,124 @@ fn shootdown_program() -> Vec<u8> {
     static_elf(&a.finish(BLOB_VADDR).unwrap_or_else(|| fail("assembler")))
 }
 
+/// Readiness: poll on an empty pipe times out at once; a blocking poll
+/// wakes when a forked child writes 50 ms later; epoll reports the pipe
+/// with its registered data; an eventfd counts. Exits 0 if every check
+/// held, else the number of the failed check.
+fn poll_program() -> Vec<u8> {
+    let mut a = Asm::new();
+    let bad = a.label();
+    let parent = a.label();
+    let x = a.data(b"x");
+    let ts = a.data(&[0, 0, 0, 0, 0, 0, 0, 0, 0x80, 0xf0, 0xfa, 0x02, 0, 0, 0, 0]); // 50 ms
+    let expect = |a: &mut Asm, n: u64, v: i32| {
+        a.mov_imm(Reg::R15, n);
+        a.cmp_imm(Reg::Rax, v);
+        a.jne(bad);
+    };
+    a.mov(Reg::Rbp, Reg::Rsp);
+    a.sub_imm(Reg::Rbp, 4096);
+    // 1: pipe2 -> fds 3 (read) and 4 (write).
+    a.mov(Reg::Rdi, Reg::Rbp);
+    a.mov_imm(Reg::Rsi, 0);
+    a.sys(sys::PIPE2);
+    expect(&mut a, 1, 0);
+    // 2: poll({fd 3, POLLIN}, 1, 0) == 0 (nothing to read yet).
+    a.mov_imm(Reg::Rax, 3 | (1 << 32));
+    a.store(Reg::Rbp, 16, Reg::Rax);
+    a.mov(Reg::Rdi, Reg::Rbp);
+    a.add_imm(Reg::Rdi, 16);
+    a.mov_imm(Reg::Rsi, 1);
+    a.mov_imm(Reg::Rdx, 0);
+    a.sys(sys::POLL);
+    expect(&mut a, 2, 0);
+    // 3: fork; the child sleeps 50 ms, writes one byte, exits.
+    a.sys(sys::FORK);
+    a.cmp_imm(Reg::Rax, 0);
+    a.jne(parent);
+    a.mov_data(Reg::Rdi, ts);
+    a.mov_imm(Reg::Rsi, 0);
+    a.sys(sys::NANOSLEEP);
+    a.mov_imm(Reg::Rdi, 4);
+    a.mov_data(Reg::Rsi, x);
+    a.mov_imm(Reg::Rdx, 1);
+    a.sys(sys::WRITE);
+    a.mov_imm(Reg::Rdi, 0);
+    a.sys(sys::EXIT_GROUP);
+    // Parent: a blocking poll wakes with POLLIN.
+    a.bind(parent);
+    a.mov(Reg::Rdi, Reg::Rbp);
+    a.add_imm(Reg::Rdi, 16);
+    a.mov_imm(Reg::Rsi, 1);
+    a.mov_imm(Reg::Rdx, u64::MAX); // -1: no timeout
+    a.sys(sys::POLL);
+    expect(&mut a, 3, 1);
+    a.load(Reg::Rax, Reg::Rbp, 16);
+    a.mov_imm(Reg::R14, 3 | (1 << 32) | (1 << 48)); // revents = POLLIN
+    a.mov_imm(Reg::R15, 4);
+    a.cmp(Reg::Rax, Reg::R14);
+    a.jne(bad);
+    // 5: epoll_create1 -> 5; add fd 3 with data 0x1234; wait sees it.
+    a.mov_imm(Reg::Rdi, 0);
+    a.sys(sys::EPOLL_CREATE1);
+    expect(&mut a, 5, 5);
+    a.mov_imm(Reg::Rax, 1 | (0x1234 << 32));
+    a.store(Reg::Rbp, 32, Reg::Rax);
+    a.mov_imm(Reg::Rax, 0);
+    a.store(Reg::Rbp, 40, Reg::Rax);
+    a.mov_imm(Reg::Rdi, 5);
+    a.mov_imm(Reg::Rsi, 1); // EPOLL_CTL_ADD
+    a.mov_imm(Reg::Rdx, 3);
+    a.mov(Reg::R10, Reg::Rbp);
+    a.add_imm(Reg::R10, 32);
+    a.sys(sys::EPOLL_CTL);
+    expect(&mut a, 5, 0);
+    a.mov_imm(Reg::Rdi, 5);
+    a.mov(Reg::Rsi, Reg::Rbp);
+    a.add_imm(Reg::Rsi, 64);
+    a.mov_imm(Reg::Rdx, 4);
+    a.mov_imm(Reg::R10, 100);
+    a.sys(sys::EPOLL_WAIT);
+    expect(&mut a, 6, 1);
+    a.load(Reg::Rax, Reg::Rbp, 64);
+    a.mov_imm(Reg::R14, 1 | (0x1234 << 32));
+    a.mov_imm(Reg::R15, 6);
+    a.cmp(Reg::Rax, Reg::R14);
+    a.jne(bad);
+    // 7: eventfd2(0, 0) -> 6; write 3; read gives 3.
+    a.mov_imm(Reg::Rdi, 0);
+    a.mov_imm(Reg::Rsi, 0);
+    a.sys(sys::EVENTFD2);
+    expect(&mut a, 7, 6);
+    a.mov_imm(Reg::Rax, 3);
+    a.store(Reg::Rbp, 96, Reg::Rax);
+    a.mov_imm(Reg::Rdi, 6);
+    a.mov(Reg::Rsi, Reg::Rbp);
+    a.add_imm(Reg::Rsi, 96);
+    a.mov_imm(Reg::Rdx, 8);
+    a.sys(sys::WRITE);
+    expect(&mut a, 7, 8);
+    a.mov_imm(Reg::Rdi, 6);
+    a.mov(Reg::Rsi, Reg::Rbp);
+    a.add_imm(Reg::Rsi, 104);
+    a.mov_imm(Reg::Rdx, 8);
+    a.sys(sys::READ);
+    expect(&mut a, 8, 8);
+    a.load(Reg::Rax, Reg::Rbp, 104);
+    expect(&mut a, 8, 3);
+    // Reap the child.
+    a.mov_imm(Reg::Rdi, u64::MAX);
+    a.mov_imm(Reg::Rsi, 0);
+    a.mov_imm(Reg::Rdx, 0);
+    a.mov_imm(Reg::R10, 0);
+    a.sys(sys::WAIT4);
+    a.mov_imm(Reg::R15, 0);
+    a.bind(bad);
+    a.mov(Reg::Rdi, Reg::R15);
+    a.sys(sys::EXIT_GROUP);
+    static_elf(&a.finish(BLOB_VADDR).unwrap_or_else(|| fail("assembler")))
+}
+
 /// The root image: `/usr/share/motd`, `/etc/motd -> /usr/share/motd`.
 fn root_image() -> &'static [u8] {
     let mut b = image::builder::Builder::new();
@@ -722,4 +847,11 @@ pub(crate) fn run() {
         fail("tlb shootdown");
     }
     println!("ichor: linux: munmap shot down a page another thread was reading (it faulted)");
+
+    let (status, syscalls) = run_linux(new_process(), &poll_program(), None, &["polltest"]);
+    if status != 0 {
+        println!("ichor: linux: polltest failed check {status}");
+        fail("polltest");
+    }
+    println!("ichor: linux: poll timeout and wakeup, epoll, eventfd ok ({syscalls} syscalls)");
 }

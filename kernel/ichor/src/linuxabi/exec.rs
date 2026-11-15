@@ -107,6 +107,7 @@ pub(super) fn execve(
     mm.space().bind_to_current_task();
     drop(p.replace_mm(mm));
     p.group.actions.lock().exec_reset();
+    p.group.set_exec(&path, &argv_refs);
     crate::signal::sync(p);
     *ctx = UserContext::new(loaded.entry, loaded.stack_pointer);
     Ok(())

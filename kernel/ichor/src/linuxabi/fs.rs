@@ -10,7 +10,7 @@ use super::{EBADF, EFAULT, EINVAL, EMFILE, console_bytes, console_write, le_u64}
 use crate::pipe::Pipe;
 use crate::process::{Fd, LinuxProcess, OpenFile, PipeEnd};
 use crate::vfs::{self, Ino, Kind, Stat, errno::*};
-use crate::{proc, signal};
+use crate::{proc, procfs, signal};
 
 pub(super) const AT_FDCWD: i64 = -100;
 const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
@@ -28,6 +28,7 @@ const O_NOFOLLOW: u64 = 0o400_000;
 
 const ENAMETOOLONG: i64 = 36;
 const ESPIPE: i64 = 29;
+const EACCES: i64 = 13;
 const ENXIO: i64 = 6;
 const EPIPE: i64 = 32;
 const ERANGE: i64 = 34;
@@ -60,7 +61,7 @@ fn base(p: &LinuxProcess, dirfd: i64, path: &str) -> Result<Ino, i64> {
     }
     match p.fd(dirfd as u64).ok_or(EBADF)? {
         Fd::File(f) => Ok(f.ino),
-        Fd::Console | Fd::Pipe(_) | Fd::Dev(_) => Err(ENOTDIR),
+        Fd::Console | Fd::Pipe(_) | Fd::Dev(_) | Fd::Object(_) => Err(ENOTDIR),
     }
 }
 
@@ -74,7 +75,7 @@ fn file(p: &LinuxProcess, fd: u64) -> Result<OpenFile, i64> {
     match p.fd(fd).ok_or(EBADF)? {
         Fd::File(f) => Ok(f),
         Fd::Console | Fd::Dev(_) => Err(EINVAL),
-        Fd::Pipe(_) => Err(ESPIPE),
+        Fd::Pipe(_) | Fd::Object(_) => Err(ESPIPE),
     }
 }
 
@@ -90,23 +91,38 @@ pub(super) fn open(
     mode: u64,
 ) -> Result<u64, i64> {
     let (start, path) = path_at(p, dirfd, addr)?;
+    open_path(p, start, &path, flags, mode, 0)
+}
+
+/// `open` on a path string (`/proc` links come back here when followed).
+fn open_path(
+    p: &mut LinuxProcess,
+    start: Ino,
+    path: &str,
+    flags: u64,
+    mode: u64,
+    hops: u32,
+) -> Result<u64, i64> {
     let acc = flags & O_ACCMODE;
     if acc == O_ACCMODE {
         return Err(EINVAL);
+    }
+    if let Some(node) = procfs::lookup(p, path, flags & O_NOFOLLOW == 0) {
+        return open_proc(p, start, node?, flags, mode, hops);
     }
     let umask = p.umask();
     let ino = {
         let mut fs = p.vfs.lock();
         let ino = if flags & O_CREAT != 0 {
-            let (dir, name) = fs.resolve_parent(start, &path)?;
+            let (dir, name) = fs.resolve_parent(start, path)?;
             match fs.lookup(dir, &name) {
                 Ok(_) if flags & O_EXCL != 0 => return Err(EEXIST),
-                Ok(_) => fs.resolve(start, &path, flags & O_NOFOLLOW == 0)?,
+                Ok(_) => fs.resolve(start, path, flags & O_NOFOLLOW == 0)?,
                 Err(ENOENT) => fs.create(dir, &name, mode as u32 & !umask)?,
                 Err(e) => return Err(e),
             }
         } else {
-            fs.resolve(start, &path, flags & O_NOFOLLOW == 0)?
+            fs.resolve(start, path, flags & O_NOFOLLOW == 0)?
         };
         let st = fs.stat(ino)?;
         match st.kind {
@@ -132,6 +148,67 @@ pub(super) fn open(
         flags: flags & (O_ACCMODE | O_APPEND),
     };
     p.install(Fd::File(f)).ok_or(EMFILE)
+}
+
+/// Where a `/proc` link points, as a path to open or stat.
+fn proc_target(target: &str) -> alloc::string::String {
+    if target.starts_with('/') {
+        alloc::string::String::from(target)
+    } else {
+        alloc::format!("/proc/{target}")
+    }
+}
+
+/// Opens a `/proc` node: a snapshot file, a directory, or a followed link.
+fn open_proc(
+    p: &mut LinuxProcess,
+    start: Ino,
+    node: procfs::Node,
+    flags: u64,
+    mode: u64,
+    hops: u32,
+) -> Result<u64, i64> {
+    let obj: alloc::sync::Arc<dyn crate::poll::Object> = match node {
+        procfs::Node::Link(t) => {
+            if hops >= 8 {
+                return Err(ELOOP);
+            }
+            return open_path(p, start, &proc_target(&t), flags, mode, hops + 1);
+        }
+        procfs::Node::Dir(_) if flags & O_ACCMODE != 0 => return Err(EISDIR),
+        procfs::Node::Dir(e) => alloc::sync::Arc::new(procfs::ProcDir::new(e)),
+        procfs::Node::File(_) if flags & O_DIRECTORY != 0 => return Err(ENOTDIR),
+        procfs::Node::File(_) if flags & O_ACCMODE != 0 => return Err(EACCES),
+        procfs::Node::File(d) => alloc::sync::Arc::new(procfs::ProcFile::new(d)),
+    };
+    p.install(Fd::Object(crate::process::ObjectEnd {
+        obj,
+        nonblock: false,
+    }))
+    .ok_or(EMFILE)
+}
+
+/// `stat` of a `/proc` node (following links if `follow`).
+fn stat_proc(p: &mut LinuxProcess, path: &str, follow: bool, hops: u32) -> Result<[u8; 144], i64> {
+    let node = procfs::lookup(p, path, follow).ok_or(ENOENT)??;
+    Ok(match node {
+        procfs::Node::Link(t) if follow => {
+            if hops >= 8 {
+                return Err(ELOOP);
+            }
+            let target = proc_target(&t);
+            if target.starts_with("/proc") {
+                return stat_proc(p, &target, true, hops + 1);
+            }
+            let cwd = p.cwd();
+            let mut fs = p.vfs.lock();
+            let ino = fs.resolve(cwd, &target, true)?;
+            to_stat(&fs.stat(ino)?)
+        }
+        procfs::Node::Link(t) => stat_bytes(0, S_IFLNK | 0o777, 1, t.len() as u64),
+        procfs::Node::Dir(_) => stat_bytes(0, S_IFDIR | 0o555, 2, 0),
+        procfs::Node::File(_) => stat_bytes(0, S_IFREG | 0o444, 1, 0),
+    })
 }
 
 /// Reads from file `f` at `offset` into user memory; returns bytes read.
@@ -206,6 +283,16 @@ fn write_file(
 pub(super) fn read(p: &mut LinuxProcess, fd: u64, buf: u64, count: usize) -> Result<u64, i64> {
     match p.fd(fd).ok_or(EBADF)? {
         Fd::Console => Ok(0), // No console input yet: EOF.
+        Fd::Object(o) => {
+            let entry = p.entry.clone();
+            let bytes = o
+                .obj
+                .read(count, o.nonblock, &|| proc::interrupted(&entry))?;
+            if p.copy_to_user(buf, &bytes) != bytes.len() {
+                return Err(EFAULT);
+            }
+            Ok(bytes.len() as u64)
+        }
         Fd::Dev(d) => {
             let mut chunk = alloc::vec![0u8; CHUNK.min(count)];
             let n = d.read(&mut chunk);
@@ -240,6 +327,16 @@ pub(super) fn write(p: &mut LinuxProcess, fd: u64, buf: u64, count: usize) -> Re
     match p.fd(fd).ok_or(EBADF)? {
         Fd::Console => Ok(console_write(p, buf, count) as u64),
         Fd::Dev(d) => d.write(count).map(|n| n as u64),
+        Fd::Object(o) => {
+            let mut data = alloc::vec![0u8; count.min(CHUNK)];
+            if p.copy_from_user(buf, &mut data) != data.len() {
+                return Err(EFAULT);
+            }
+            let entry = p.entry.clone();
+            o.obj
+                .write(&data, o.nonblock, &|| proc::interrupted(&entry))
+                .map(|n| n as u64)
+        }
         Fd::Pipe(e) if !e.write => Err(EBADF),
         Fd::Pipe(e) => pipe_write(p, &e, buf, count),
         Fd::File(f) => {
@@ -423,6 +520,7 @@ pub(super) fn fstat(p: &mut LinuxProcess, fd: u64, addr: u64) -> Result<u64, i64
     let st = match p.fd(fd).ok_or(EBADF)? {
         Fd::Console => stat_bytes(0, S_IFCHR | 0o620, 1, 0),
         Fd::Pipe(_) => stat_bytes(0, S_IFIFO | 0o600, 1, 0),
+        Fd::Object(o) => stat_bytes(0, o.obj.mode() | 0o600, 1, 0),
         Fd::Dev(d) => {
             let mut st = stat_bytes(0, S_IFCHR | 0o666, 1, 0);
             st[40..48].copy_from_slice(&u64::from(d.rdev()).to_le_bytes()); // st_rdev
@@ -449,6 +547,10 @@ pub(super) fn fstatat(
         }
         return fstat(p, dirfd as u64, out);
     }
+    if path.starts_with("/proc") && procfs::lookup(p, &path, false).is_some() {
+        let st = stat_proc(p, &path, flags & AT_SYMLINK_NOFOLLOW == 0, 0)?;
+        return put_stat(p, out, &st);
+    }
     let start = base(p, dirfd, &path)?;
     let st = {
         let mut fs = p.vfs.lock();
@@ -465,6 +567,9 @@ pub(super) fn stat(p: &mut LinuxProcess, addr: u64, out: u64, follow: bool) -> R
 
 pub(super) fn access(p: &mut LinuxProcess, dirfd: i64, addr: u64, _mode: u64) -> Result<u64, i64> {
     let (start, path) = path_at(p, dirfd, addr)?;
+    if let Some(node) = procfs::lookup(p, &path, true) {
+        return node.map(|_| 0);
+    }
     // Everyone is root in the cell for now, so existence is the test.
     p.vfs.lock().resolve(start, &path, true)?;
     Ok(0)
@@ -487,6 +592,34 @@ pub(super) fn getdents64(
     const DT_REG: u8 = 8;
     const DT_LNK: u8 = 10;
     const HEADER: usize = 19; // d_ino, d_off, d_reclen, d_type
+    if let Some(Fd::Object(o)) = p.fd(fd)
+        && let Some((entries, pos)) = o.obj.dir()
+    {
+        let mut out: Vec<u8> = Vec::new();
+        let mut index = *pos.lock();
+        while let Some((name, dtype)) = entries.get(index as usize) {
+            let reclen = (19 + name.len() + 1).next_multiple_of(8);
+            if out.len() + reclen > count {
+                if out.is_empty() {
+                    return Err(EINVAL);
+                }
+                break;
+            }
+            let start = out.len();
+            out.extend_from_slice(&(index + 1).to_le_bytes()); // d_ino
+            out.extend_from_slice(&(index + 1).to_le_bytes()); // d_off
+            out.extend_from_slice(&(reclen as u16).to_le_bytes());
+            out.push(*dtype);
+            out.extend_from_slice(name.as_bytes());
+            out.resize(start + reclen, 0);
+            index += 1;
+        }
+        if p.copy_to_user(buf, &out) != out.len() {
+            return Err(EFAULT);
+        }
+        *pos.lock() = index;
+        return Ok(out.len() as u64);
+    }
     let f = file(p, fd).map_err(|_| ENOTDIR)?;
     let (me, parent, entries) = {
         let mut fs = p.vfs.lock();
@@ -617,6 +750,16 @@ pub(super) fn readlink(
         return Err(EINVAL);
     }
     let (start, path) = path_at(p, dirfd, addr)?;
+    if let Some(node) = procfs::lookup(p, &path, false) {
+        let procfs::Node::Link(t) = node? else {
+            return Err(EINVAL);
+        };
+        let n = t.len().min(size as usize);
+        if p.copy_to_user(buf, &t.as_bytes()[..n]) != n {
+            return Err(EFAULT);
+        }
+        return Ok(n as u64);
+    }
     let target = {
         let mut fs = p.vfs.lock();
         let ino = fs.resolve(start, &path, false)?;
@@ -721,6 +864,11 @@ pub(super) fn sendfile(
             Fd::Console => console_bytes(&buf[..n]),
             Fd::Dev(d) => {
                 d.write(n)?;
+            }
+            Fd::Object(o) => {
+                let entry = p.entry.clone();
+                o.obj
+                    .write(&buf[..n], o.nonblock, &|| proc::interrupted(&entry))?;
             }
             Fd::Pipe(e) if !e.write => return Err(EBADF),
             Fd::Pipe(e) => {
