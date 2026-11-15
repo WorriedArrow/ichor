@@ -133,6 +133,9 @@ pub(super) fn execve(
     drop(p.replace_mm(mm));
     p.group.actions.lock().exec_reset();
     p.close_on_exec();
+    if let Some(v) = p.group.take_vfork() {
+        v.release(); // the vfork parent goes on
+    }
     p.sig.clear_alt_stack();
     p.group.set_exec(&exe_path, &argv_refs);
     crate::signal::sync(p);

@@ -10,9 +10,12 @@
 //! checked while the task is marked blocked, so it only takes spinlocks: the
 //! descriptors are looked up once, before waiting.
 //!
-//! Partial: `EPOLLET` is treated as level-triggered, the epoll interest
-//! list is fixed at the start of an `epoll_wait`, and the signal-mask
-//! arguments of `ppoll`/`pselect6`/`epoll_pwait` are ignored.
+//! `EPOLLET` entries report an object once per change: pipes and eventfds
+//! count their state changes ([`Object::changes`]), and an edge-triggered
+//! entry stays quiet until the count moves past the one it last reported.
+//! `ppoll`, `pselect6` and `epoll_pwait` install their signal mask for the
+//! wait. Partial: the epoll interest list is fixed at the start of an
+//! `epoll_wait`, and a nested epoll instance never polls ready.
 
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
@@ -64,6 +67,10 @@ pub(crate) trait Object: Send + Sync + Debug {
     ) -> Result<usize, i64>;
     /// Current readiness (`POLL*` bits).
     fn poll(&self) -> u16;
+    /// A count of state changes, for edge-triggered epoll.
+    fn changes(&self) -> u64 {
+        0
+    }
     /// `st_mode` file-type bits for `fstat`.
     fn mode(&self) -> u32 {
         0 // anonymous inode
@@ -92,6 +99,15 @@ pub(crate) fn readiness(fd: &Fd) -> u16 {
         Fd::Console | Fd::File(_) | Fd::Dev(_) => POLLIN | POLLOUT,
         Fd::Pipe(e) => e.pipe.poll(e.write),
         Fd::Object(o) => o.obj.poll(),
+    }
+}
+
+/// How many times what `fd` names has changed state (for `EPOLLET`).
+fn changes(fd: &Fd) -> u64 {
+    match fd {
+        Fd::Console | Fd::File(_) | Fd::Dev(_) => 0,
+        Fd::Pipe(e) => e.pipe.changes(),
+        Fd::Object(o) => o.obj.changes(),
     }
 }
 
@@ -210,13 +226,16 @@ pub(crate) fn poll(p: &mut LinuxProcess, fds: u64, nfds: u64, timeout: i64) -> R
 }
 
 /// `ppoll(fds, nfds, timeout_ts, sigmask, size)`.
-pub(crate) fn ppoll(p: &mut LinuxProcess, fds: u64, nfds: u64, ts: u64) -> Result<u64, i64> {
-    let deadline = if ts == 0 {
+pub(crate) fn ppoll(p: &mut LinuxProcess, a: &[u64; 6]) -> Result<u64, i64> {
+    let deadline = if a[2] == 0 {
         None
     } else {
-        Some(frame::time::now().saturating_add(read_timespec(p, ts)?))
+        Some(frame::time::now().saturating_add(read_timespec(p, a[2])?))
     };
-    do_poll(p, fds, nfds, deadline)
+    crate::signal::begin_wait_mask(p, a[3], a[4])?;
+    let r = do_poll(p, a[0], a[1], deadline);
+    crate::signal::end_wait_mask(p, &r);
+    r
 }
 
 // ---------------------------------------------------------------------------
@@ -315,14 +334,30 @@ pub(crate) fn select(p: &mut LinuxProcess, a: &[u64; 6]) -> Result<u64, i64> {
     do_select(p, a[0], [a[1], a[2], a[3]], deadline)
 }
 
-/// `pselect6(nfds, readfds, writefds, exceptfds, timespec, sigmask)`.
+/// `pselect6(nfds, readfds, writefds, exceptfds, timespec, sig)`, where
+/// `sig` points at `{ const sigset_t *ss; size_t ss_len; }`.
 pub(crate) fn pselect6(p: &mut LinuxProcess, a: &[u64; 6]) -> Result<u64, i64> {
     let deadline = if a[4] == 0 {
         None
     } else {
         Some(frame::time::now().saturating_add(read_timespec(p, a[4])?))
     };
-    do_select(p, a[0], [a[1], a[2], a[3]], deadline)
+    let (ss, len) = if a[5] == 0 {
+        (0, 0)
+    } else {
+        let mut b = [0u8; 16];
+        if p.copy_from_user(a[5], &mut b) != 16 {
+            return Err(EFAULT);
+        }
+        (
+            u64::from_le_bytes(b[0..8].try_into().unwrap_or([0; 8])),
+            u64::from_le_bytes(b[8..16].try_into().unwrap_or([0; 8])),
+        )
+    };
+    crate::signal::begin_wait_mask(p, ss, len)?;
+    let r = do_select(p, a[0], [a[1], a[2], a[3]], deadline);
+    crate::signal::end_wait_mask(p, &r);
+    r
 }
 
 // ---------------------------------------------------------------------------
@@ -333,6 +368,7 @@ pub(crate) fn pselect6(p: &mut LinuxProcess, a: &[u64; 6]) -> Result<u64, i64> {
 #[derive(Debug)]
 pub(crate) struct EventFd {
     count: SpinLock<u64>,
+    changes: core::sync::atomic::AtomicU64,
     semaphore: bool,
     queue: WaitQueue,
 }
@@ -361,8 +397,7 @@ impl Object for EventFd {
                 None
             }
         })?;
-        self.queue.wake_all();
-        notify();
+        self.changed();
         Ok(v.to_le_bytes().to_vec())
     }
 
@@ -394,9 +429,12 @@ impl Object for EventFd {
                 None
             }
         })?;
-        self.queue.wake_all();
-        notify();
+        self.changed();
         Ok(8)
+    }
+
+    fn changes(&self) -> u64 {
+        self.changes.load(core::sync::atomic::Ordering::Acquire)
     }
 
     fn poll(&self) -> u16 {
@@ -412,6 +450,15 @@ impl Object for EventFd {
     }
 }
 
+impl EventFd {
+    fn changed(&self) {
+        self.changes
+            .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+        self.queue.wake_all();
+        notify();
+    }
+}
+
 /// `eventfd2(initval, flags)`.
 pub(crate) fn eventfd(p: &mut LinuxProcess, init: u64, flags: u64) -> Result<u64, i64> {
     const EFD_SEMAPHORE: u64 = 1;
@@ -422,6 +469,7 @@ pub(crate) fn eventfd(p: &mut LinuxProcess, init: u64, flags: u64) -> Result<u64
     }
     let obj = Arc::new(EventFd {
         count: SpinLock::new(init & 0xffff_ffff),
+        changes: core::sync::atomic::AtomicU64::new(0),
         semaphore: flags & EFD_SEMAPHORE != 0,
         queue: WaitQueue::new(),
     });
@@ -446,11 +494,23 @@ fn install(
 // ---------------------------------------------------------------------------
 
 const EPOLLONESHOT: u32 = 1 << 30;
+const EPOLLET: u32 = 1 << 31;
 
-/// An epoll instance: fd -> (events, data, the object at `EPOLL_CTL_ADD`).
+/// One descriptor an epoll instance watches.
+#[derive(Debug, Clone)]
+struct Interest {
+    events: u32,
+    data: u64,
+    /// The object at `EPOLL_CTL_ADD`.
+    fd: Fd,
+    /// `EPOLLET`: the change count last reported.
+    seen: Option<u64>,
+}
+
+/// An epoll instance: fd -> what it watches there.
 #[derive(Debug)]
 pub(crate) struct Epoll {
-    interest: Mutex<BTreeMap<u64, (u32, u64, Fd)>>,
+    interest: Mutex<BTreeMap<u64, Interest>>,
 }
 
 impl Object for Epoll {
@@ -527,23 +587,33 @@ pub(crate) fn epoll_ctl(
     let mut set = epoll.interest.lock();
     match op {
         ADD if set.contains_key(&fd) => Err(EEXIST),
-        ADD => {
-            set.insert(fd, (events, data, target));
+        ADD | MOD if op == ADD || set.contains_key(&fd) => {
+            set.insert(
+                fd,
+                Interest {
+                    events,
+                    data,
+                    fd: target,
+                    seen: None,
+                },
+            );
             Ok(0)
         }
-        MOD => match set.get_mut(&fd) {
-            Some(e) => {
-                *e = (events, data, target);
-                Ok(0)
-            }
-            None => Err(ENOENT),
-        },
+        MOD => Err(ENOENT),
         DEL => set.remove(&fd).map(|_| 0).ok_or(ENOENT),
         _ => Err(EINVAL),
     }
 }
 
-/// `epoll_wait` / `epoll_pwait(epfd, events, maxevents, timeout_ms, ...)`.
+/// `epoll_pwait(epfd, events, maxevents, timeout_ms, sigmask, size)`.
+pub(crate) fn epoll_pwait(p: &mut LinuxProcess, a: &[u64; 6]) -> Result<u64, i64> {
+    crate::signal::begin_wait_mask(p, a[4], a[5])?;
+    let r = epoll_wait(p, a[0], a[1], a[2], a[3] as i32 as i64);
+    crate::signal::end_wait_mask(p, &r);
+    r
+}
+
+/// `epoll_wait(epfd, events, maxevents, timeout_ms)`.
 pub(crate) fn epoll_wait(
     p: &mut LinuxProcess,
     epfd: u64,
@@ -558,21 +628,27 @@ pub(crate) fn epoll_wait(
     let Some(epoll) = ep.as_epoll() else {
         return Err(EINVAL);
     };
-    let watch: Vec<(u64, u32, u64, Fd)> = epoll
+    let watch: Vec<(u64, Interest)> = epoll
         .interest
         .lock()
         .iter()
-        .map(|(&fd, (ev, data, obj))| (fd, *ev, *data, obj.clone()))
+        .map(|(&fd, i)| (fd, i.clone()))
         .collect();
-    let scan = || -> Vec<(u64, u32, u64)> {
+    // (fd, events, data, change count)
+    let scan = || -> Vec<(u64, u32, u64, u64)> {
         let mut hits = Vec::new();
-        for (fd, ev, data, obj) in &watch {
-            if *ev == 0 {
+        for (fd, i) in &watch {
+            if i.events & !EPOLLET == 0 {
                 continue; // a disarmed EPOLLONESHOT entry
             }
-            let r = u32::from(readiness(obj)) & (*ev | u32::from(POLLERR | POLLHUP));
+            // Read the count first: a change after it is reported next time.
+            let n = changes(&i.fd);
+            if i.events & EPOLLET != 0 && i.seen == Some(n) {
+                continue;
+            }
+            let r = u32::from(readiness(&i.fd)) & (i.events | u32::from(POLLERR | POLLHUP));
             if r != 0 {
-                hits.push((*fd, r, *data));
+                hits.push((*fd, r, i.data, n));
                 if hits.len() as u64 == max {
                     break;
                 }
@@ -585,19 +661,23 @@ pub(crate) fn epoll_wait(
         (!h.is_empty()).then_some(h)
     })?
     .unwrap_or_default();
-    // Disarm one-shot entries that fired.
+    // Disarm one-shot entries that fired; remember what edge-triggered
+    // entries reported.
     {
         let mut set = epoll.interest.lock();
-        for (fd, _, _) in &hits {
-            if let Some(e) = set.get_mut(fd)
-                && e.0 & EPOLLONESHOT != 0
-            {
-                e.0 = 0;
+        for (fd, _, _, n) in &hits {
+            if let Some(e) = set.get_mut(fd) {
+                if e.events & EPOLLONESHOT != 0 {
+                    e.events = 0;
+                }
+                if e.events & EPOLLET != 0 {
+                    e.seen = Some(*n);
+                }
             }
         }
     }
     let mut buf = Vec::with_capacity(hits.len() * 12);
-    for (_, r, data) in &hits {
+    for (_, r, data, _) in &hits {
         buf.extend_from_slice(&r.to_le_bytes());
         buf.extend_from_slice(&data.to_le_bytes());
     }

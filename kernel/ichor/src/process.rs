@@ -155,6 +155,37 @@ pub(crate) struct Group {
     exe: SpinLock<(alloc::string::String, Vec<u8>)>,
     /// Resource limits (soft, hard), by `RLIMIT_*`.
     limits: SpinLock<Limits>,
+    /// Set in a `vfork` child: released when it execs or exits.
+    vfork: SpinLock<Option<Arc<Vfork>>>,
+}
+
+/// A `vfork` parent's wait for its child to exec or exit.
+#[derive(Debug)]
+pub(crate) struct Vfork {
+    done: core::sync::atomic::AtomicBool,
+    parent: Arc<ProcEntry>,
+}
+
+impl Vfork {
+    pub(crate) fn new(parent: Arc<ProcEntry>) -> Arc<Vfork> {
+        Arc::new(Vfork {
+            done: core::sync::atomic::AtomicBool::new(false),
+            parent,
+        })
+    }
+
+    /// Lets the parent go on.
+    pub(crate) fn release(&self) {
+        self.done.store(true, core::sync::atomic::Ordering::Release);
+        proc::wake(&self.parent);
+    }
+
+    /// The parent's side: waits for [`Vfork::release`] or `SIGKILL`.
+    pub(crate) fn wait(&self) {
+        proc::wait_killable(&self.parent, || {
+            self.done.load(core::sync::atomic::Ordering::Acquire)
+        });
+    }
 }
 
 /// `RLIM_INFINITY`.
@@ -194,6 +225,16 @@ impl Group {
     /// The program's argv, NUL-separated (`/proc/<pid>/cmdline`).
     pub(crate) fn cmdline(&self) -> Vec<u8> {
         self.exe.lock().1.clone()
+    }
+
+    /// Makes this (new) process a `vfork` child.
+    pub(crate) fn set_vfork(&self, v: Arc<Vfork>) {
+        *self.vfork.lock() = Some(v);
+    }
+
+    /// Takes the `vfork` parent's wait, if any, to release it.
+    pub(crate) fn take_vfork(&self) -> Option<Arc<Vfork>> {
+        self.vfork.lock().take()
     }
 
     /// The process's resource limits.
@@ -250,6 +291,9 @@ impl Drop for Group {
         };
         // Descriptions release their references as they drop.
         drop(fds);
+        if let Some(v) = self.take_vfork() {
+            v.release();
+        }
         crate::locks::release_owner(crate::locks::Owner::Proc(self.tgid));
         self.vfs.lock().close(cwd);
     }
@@ -299,6 +343,7 @@ impl LinuxProcess {
             exit: SpinLock::new(None),
             exe: SpinLock::new(Default::default()),
             limits: SpinLock::new(default_limits()),
+            vfork: SpinLock::new(None),
         });
         Some(Self {
             entry,
@@ -341,6 +386,7 @@ impl LinuxProcess {
             exit: SpinLock::new(None),
             exe: SpinLock::new(exe),
             limits: SpinLock::new(self.group.limits()),
+            vfork: SpinLock::new(None),
         });
         Some(Self {
             entry,

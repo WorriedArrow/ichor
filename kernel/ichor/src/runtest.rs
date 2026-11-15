@@ -65,6 +65,10 @@ mod sys {
     pub(super) const SIGALTSTACK: u64 = 131;
     pub(super) const PRLIMIT64: u64 = 302;
     pub(super) const MADVISE: u64 = 28;
+    pub(super) const RT_SIGPROCMASK: u64 = 14;
+    pub(super) const VFORK: u64 = 58;
+    pub(super) const PPOLL: u64 = 271;
+    pub(super) const EPOLL_PWAIT: u64 = 281;
 }
 
 const MOTD: &[u8] = b"hello from /etc/motd inside an Ichor image\n";
@@ -1169,6 +1173,196 @@ fn shared_program() -> Vec<u8> {
     static_elf(&a.finish(BLOB_VADDR).unwrap_or_else(|| fail("assembler")))
 }
 
+/// Waits done right. An `EPOLLET` pipe entry reports a write once, stays
+/// quiet while the data sits unread, and reports the next write. With
+/// SIGUSR1 blocked and pending, `ppoll` and `epoll_pwait` given an empty
+/// mask are interrupted by it (its handler runs; EINTR), and the blocked
+/// mask is back afterwards, also after a `ppoll` that just times out.
+/// `vfork` returns only once the child (which sleeps 50 ms first) has
+/// exited, so `WNOHANG` reaps it at once. Exits 0, or the failed check.
+fn waits_program() -> Vec<u8> {
+    const EPOLL_CTL_ADD: u64 = 1;
+    const SIGUSR1: u64 = 10;
+    const USR1_BIT: i32 = 1 << 9;
+    const SA_RESTORER: u64 = 0x0400_0000;
+    let mut a = Asm::new();
+    let bad = a.label();
+    let handler = a.label();
+    let restorer = a.label();
+    let parent = a.label();
+    let ms50 = a.data(&[0, 0, 0, 0, 0, 0, 0, 0, 0x80, 0xf0, 0xfa, 0x02, 0, 0, 0, 0]);
+    let sec2 = a.data(&[2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    let zero = a.data(&[0; 16]);
+    let expect = |a: &mut Asm, n: u64, v: i32| {
+        a.mov_imm(Reg::R15, n);
+        a.cmp_imm(Reg::Rax, v);
+        a.jne(bad);
+    };
+    let epoll_wait = |a: &mut Asm| {
+        a.mov_imm(Reg::Rdi, 5);
+        a.mov(Reg::Rsi, Reg::Rbp);
+        a.add_imm(Reg::Rsi, 64);
+        a.mov_imm(Reg::Rdx, 4);
+        a.mov_imm(Reg::R10, 0);
+        a.sys(sys::EPOLL_WAIT);
+    };
+    let write1 = |a: &mut Asm| {
+        a.mov_imm(Reg::Rdi, 4);
+        a.mov(Reg::Rsi, Reg::Rbp);
+        a.mov_imm(Reg::Rdx, 1);
+        a.sys(sys::WRITE);
+    };
+    // The mask now (SIG_BLOCK nothing, old into rbp+216) must be USR1 alone.
+    let mask_is_usr1 = |a: &mut Asm, n: u64| {
+        a.mov_imm(Reg::Rdi, 0);
+        a.mov_imm(Reg::Rsi, 0);
+        a.mov(Reg::Rdx, Reg::Rbp);
+        a.add_imm(Reg::Rdx, 216);
+        a.mov_imm(Reg::R10, 8);
+        a.sys(sys::RT_SIGPROCMASK);
+        a.load(Reg::Rax, Reg::Rbp, 216);
+        expect(a, n, USR1_BIT);
+    };
+    let raise = |a: &mut Asm| {
+        a.sys(sys::GETPID);
+        a.mov(Reg::Rdi, Reg::Rax);
+        a.mov_imm(Reg::Rsi, SIGUSR1);
+        a.sys(sys::KILL);
+    };
+    a.mov(Reg::Rbp, Reg::Rsp);
+    a.sub_imm(Reg::Rbp, 4096);
+    a.mov_imm(Reg::Rax, 0);
+    a.store(Reg::Rbp, 300, Reg::Rax);
+    // 1: pipe (3, 4), epoll 5 watching 3 for EPOLLIN | EPOLLET, data 7.
+    a.mov(Reg::Rdi, Reg::Rbp);
+    a.mov_imm(Reg::Rsi, 0);
+    a.sys(sys::PIPE2);
+    expect(&mut a, 1, 0);
+    a.mov_imm(Reg::Rdi, 0);
+    a.sys(sys::EPOLL_CREATE1);
+    expect(&mut a, 1, 5);
+    a.mov_imm(Reg::Rax, 0x0000_0007_8000_0001);
+    a.store(Reg::Rbp, 16, Reg::Rax);
+    a.mov_imm(Reg::Rax, 0);
+    a.store(Reg::Rbp, 24, Reg::Rax);
+    a.mov_imm(Reg::Rdi, 5);
+    a.mov_imm(Reg::Rsi, EPOLL_CTL_ADD);
+    a.mov_imm(Reg::Rdx, 3);
+    a.mov(Reg::R10, Reg::Rbp);
+    a.add_imm(Reg::R10, 16);
+    a.sys(sys::EPOLL_CTL);
+    expect(&mut a, 1, 0);
+    // 2-4: a write is reported once; unread data is not reported again;
+    // the next write is.
+    write1(&mut a);
+    epoll_wait(&mut a);
+    expect(&mut a, 2, 1);
+    epoll_wait(&mut a);
+    expect(&mut a, 3, 0);
+    write1(&mut a);
+    epoll_wait(&mut a);
+    expect(&mut a, 4, 1);
+    // 5: SIGUSR1 handler (counts at rbp+300), then block it and raise it.
+    a.mov_label(Reg::Rax, handler);
+    a.store(Reg::Rbp, 128, Reg::Rax);
+    a.mov_imm(Reg::Rax, SA_RESTORER);
+    a.store(Reg::Rbp, 136, Reg::Rax);
+    a.mov_label(Reg::Rax, restorer);
+    a.store(Reg::Rbp, 144, Reg::Rax);
+    a.mov_imm(Reg::Rax, 0);
+    a.store(Reg::Rbp, 152, Reg::Rax);
+    a.mov_imm(Reg::Rdi, SIGUSR1);
+    a.mov(Reg::Rsi, Reg::Rbp);
+    a.add_imm(Reg::Rsi, 128);
+    a.mov_imm(Reg::Rdx, 0);
+    a.mov_imm(Reg::R10, 8);
+    a.sys(sys::RT_SIGACTION);
+    expect(&mut a, 5, 0);
+    a.mov_imm(Reg::Rax, USR1_BIT as u64);
+    a.store(Reg::Rbp, 208, Reg::Rax);
+    a.mov_imm(Reg::Rdi, 0); // SIG_BLOCK
+    a.mov(Reg::Rsi, Reg::Rbp);
+    a.add_imm(Reg::Rsi, 208);
+    a.mov_imm(Reg::Rdx, 0);
+    a.mov_imm(Reg::R10, 8);
+    a.sys(sys::RT_SIGPROCMASK);
+    expect(&mut a, 5, 0);
+    raise(&mut a);
+    // 6-7: ppoll(nothing, 2 s, empty mask): the handler runs, EINTR, and
+    // the mask is USR1 again.
+    a.mov_imm(Reg::Rdi, 0);
+    a.mov_imm(Reg::Rsi, 0);
+    a.mov_data(Reg::Rdx, sec2);
+    a.mov_data(Reg::R10, zero);
+    a.mov_imm(Reg::R8, 8);
+    a.sys(sys::PPOLL);
+    expect(&mut a, 6, -4);
+    a.load(Reg::Rax, Reg::Rbp, 300);
+    expect(&mut a, 6, 1);
+    mask_is_usr1(&mut a, 7);
+    // 8-9: the same through epoll_pwait (the pipe's data is not news, so
+    // only the signal can end it).
+    raise(&mut a);
+    a.mov_imm(Reg::Rdi, 5);
+    a.mov(Reg::Rsi, Reg::Rbp);
+    a.add_imm(Reg::Rsi, 64);
+    a.mov_imm(Reg::Rdx, 4);
+    a.mov_imm(Reg::R10, 2000);
+    a.mov_data(Reg::R8, zero);
+    a.mov_imm(Reg::R9, 8);
+    a.sys(sys::EPOLL_PWAIT);
+    expect(&mut a, 8, -4);
+    a.load(Reg::Rax, Reg::Rbp, 300);
+    expect(&mut a, 8, 2);
+    mask_is_usr1(&mut a, 9);
+    // 10: a ppoll that times out restores the mask too.
+    a.mov_imm(Reg::Rdi, 0);
+    a.mov_imm(Reg::Rsi, 0);
+    a.mov_data(Reg::Rdx, zero);
+    a.mov_data(Reg::R10, zero);
+    a.mov_imm(Reg::R8, 8);
+    a.sys(sys::PPOLL);
+    expect(&mut a, 10, 0);
+    mask_is_usr1(&mut a, 10);
+    // 11: vfork; the child sleeps 50 ms and exits 5.
+    a.mov_imm(Reg::Rax, 0);
+    a.store(Reg::Rbp, 400, Reg::Rax);
+    a.sys(sys::VFORK);
+    a.cmp_imm(Reg::Rax, 0);
+    a.jne(parent);
+    a.mov_data(Reg::Rdi, ms50);
+    a.mov_imm(Reg::Rsi, 0);
+    a.sys(sys::NANOSLEEP);
+    a.mov_imm(Reg::Rdi, 5);
+    a.sys(sys::EXIT_GROUP);
+    // 11-12: by the time vfork returns, the child is a zombie with status 5.
+    a.bind(parent);
+    a.mov(Reg::R12, Reg::Rax);
+    a.mov_imm(Reg::Rdi, u64::MAX);
+    a.mov(Reg::Rsi, Reg::Rbp);
+    a.add_imm(Reg::Rsi, 400);
+    a.mov_imm(Reg::Rdx, 1); // WNOHANG
+    a.mov_imm(Reg::R10, 0);
+    a.sys(sys::WAIT4);
+    a.mov_imm(Reg::R15, 11);
+    a.cmp(Reg::Rax, Reg::R12);
+    a.jne(bad);
+    a.load(Reg::Rax, Reg::Rbp, 400);
+    expect(&mut a, 12, 0x500);
+    a.mov_imm(Reg::R15, 0);
+    a.bind(bad);
+    a.mov(Reg::Rdi, Reg::R15);
+    a.sys(sys::EXIT_GROUP);
+    a.bind(handler);
+    a.load(Reg::Rax, Reg::Rbp, 300);
+    a.add_imm(Reg::Rax, 1);
+    a.store(Reg::Rbp, 300, Reg::Rax);
+    a.ret();
+    a.bind(restorer);
+    a.sys(sys::RT_SIGRETURN);
+    static_elf(&a.finish(BLOB_VADDR).unwrap_or_else(|| fail("assembler")))
+}
+
 /// POSIX record locks across fork: the parent write-locks bytes 0..10; the
 /// child's overlapping F_SETLK fails with EAGAIN, F_GETLK names the parent,
 /// a disjoint range locks fine, and F_SETLKW blocks until the parent
@@ -1389,5 +1583,14 @@ pub(crate) fn run() {
     }
     println!(
         "ichor: linux: MAP_SHARED anonymous memory and its futex are shared across fork ({syscalls} syscalls)"
+    );
+
+    let (status, syscalls) = run_linux(new_process(), &waits_program(), None, &["waitstest"]);
+    if status != 0 {
+        println!("ichor: linux: waitstest failed check {status}");
+        fail("waitstest");
+    }
+    println!(
+        "ichor: linux: EPOLLET edges, ppoll/epoll_pwait signal masks, vfork waits for the child ({syscalls} syscalls)"
     );
 }

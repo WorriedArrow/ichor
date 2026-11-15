@@ -280,6 +280,36 @@ pub(crate) fn sigsuspend(p: &mut LinuxProcess, mask: u64, size: u64) -> Result<u
     Err(EINTR)
 }
 
+/// Puts the signal mask at user `addr` (a `sigset_t` of `size` bytes) in
+/// place for a wait (`ppoll`, `pselect6`, `epoll_pwait`); null leaves the
+/// mask alone. Pair with [`end_wait_mask`].
+pub(crate) fn begin_wait_mask(p: &mut LinuxProcess, addr: u64, size: u64) -> Result<(), i64> {
+    if addr == 0 {
+        return Ok(());
+    }
+    if size != 8 {
+        return Err(EINVAL);
+    }
+    let m = read_u64(p, addr)?;
+    p.sig.saved_mask = Some(p.sig.mask);
+    p.sig.mask = m & !UNBLOCKABLE;
+    sync(p);
+    Ok(())
+}
+
+/// Ends a wait's temporary mask. After `EINTR` it stays until the handler
+/// is set up (which saves the original mask in its frame), as on Linux;
+/// otherwise the original comes back now.
+pub(crate) fn end_wait_mask(p: &mut LinuxProcess, r: &Result<u64, i64>) {
+    if *r == Err(EINTR) {
+        return;
+    }
+    if let Some(m) = p.sig.saved_mask.take() {
+        p.sig.mask = m;
+        sync(p);
+    }
+}
+
 /// `pause`.
 pub(crate) fn pause(p: &mut LinuxProcess) -> Result<u64, i64> {
     proc::wait_for_signal(&p.entry);
@@ -353,6 +383,13 @@ pub(crate) fn deliver(
     loop {
         let deliverable = proc::pending(&p.entry) & !p.sig.mask;
         if deliverable == 0 {
+            // A wait's temporary mask (sigsuspend, ppoll, ...) ends here if
+            // no handler took it over; the restored mask may let more in.
+            if let Some(m) = p.sig.saved_mask.take() {
+                p.sig.mask = m;
+                sync(p);
+                continue;
+            }
             if let Some(nr) = restart {
                 restart_syscall(ctx, nr);
             }

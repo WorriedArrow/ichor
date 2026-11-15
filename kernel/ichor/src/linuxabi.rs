@@ -54,7 +54,7 @@ mod nr {
     pub(super) const SENDFILE: u64 = 40;
     pub(super) const CLONE: u64 = 56; // partial: fork, vfork-style and thread clones
     pub(super) const FORK: u64 = 57;
-    pub(super) const VFORK: u64 = 58; // partial: a full copy, the parent does not wait
+    pub(super) const VFORK: u64 = 58; // partial: the child gets a copy-on-write copy, not the parent's memory
     pub(super) const EXECVE: u64 = 59; // partial: static ELF binaries
     pub(super) const EXIT: u64 = 60;
     pub(super) const WAIT4: u64 = 61; // partial: rusage is all zero (no accounting yet)
@@ -125,11 +125,11 @@ mod nr {
     pub(super) const SYMLINKAT: u64 = 266;
     pub(super) const READLINKAT: u64 = 267;
     pub(super) const FCHMODAT: u64 = 268;
-    pub(super) const PSELECT6: u64 = 270; // partial: the signal mask is ignored
-    pub(super) const PPOLL: u64 = 271; // partial: the signal mask is ignored
+    pub(super) const PSELECT6: u64 = 270;
+    pub(super) const PPOLL: u64 = 271;
     pub(super) const FACCESSAT: u64 = 269; // partial: existence only (every process is root)
     pub(super) const UTIMENSAT: u64 = 280;
-    pub(super) const EPOLL_PWAIT: u64 = 281; // partial: the signal mask is ignored
+    pub(super) const EPOLL_PWAIT: u64 = 281; // partial: interest list fixed for the wait; nested epoll never ready
     pub(super) const EVENTFD: u64 = 284;
     pub(super) const EVENTFD2: u64 = 290;
     pub(super) const EPOLL_CREATE1: u64 = 291;
@@ -226,15 +226,14 @@ pub(crate) fn dispatch(p: &mut LinuxProcess, ctx: &mut frame::user::UserContext)
         nr::GETRANDOM => getrandom(p, a[0], a[1] as usize),
         // Readiness.
         nr::POLL => crate::poll::poll(p, a[0], a[1], i(a[2])),
-        nr::PPOLL => crate::poll::ppoll(p, a[0], a[1], a[2]),
+        nr::PPOLL => crate::poll::ppoll(p, &a),
         nr::SELECT => crate::poll::select(p, &a),
         nr::PSELECT6 => crate::poll::pselect6(p, &a),
         nr::EPOLL_CREATE => crate::poll::epoll_create(p, 0),
         nr::EPOLL_CREATE1 => crate::poll::epoll_create(p, a[0]),
         nr::EPOLL_CTL => crate::poll::epoll_ctl(p, a[0], a[1], a[2], a[3]),
-        nr::EPOLL_WAIT | nr::EPOLL_PWAIT => {
-            crate::poll::epoll_wait(p, a[0], a[1], a[2], i(a[3]) as i32 as i64)
-        }
+        nr::EPOLL_WAIT => crate::poll::epoll_wait(p, a[0], a[1], a[2], i(a[3]) as i32 as i64),
+        nr::EPOLL_PWAIT => crate::poll::epoll_pwait(p, &a),
         nr::EVENTFD => crate::poll::eventfd(p, a[0], 0),
         nr::EVENTFD2 => crate::poll::eventfd(p, a[0], a[1]),
         nr::PIPE => fs::pipe2(p, a[0], 0),
@@ -492,9 +491,10 @@ fn mmap(p: &mut LinuxProcess, a: &[u64; 6]) -> Result<u64, i64> {
 // ---------------------------------------------------------------------------
 
 /// `fork`, `vfork` and `clone`. Without `CLONE_THREAD` the child is a new
-/// process (a copy-on-write copy; `CLONE_VM | CLONE_VFORK`, as
-/// `posix_spawn` uses, is served the same way, which is correct because the
-/// child only execs or exits). With `CLONE_THREAD` it is a new thread in the
+/// process (a copy-on-write copy; `CLONE_VM | CLONE_VFORK`, as `vfork` and
+/// `posix_spawn` use, is served the same way, which is correct because the
+/// child only execs or exits). With `CLONE_VFORK` the caller waits until
+/// the child has exec'd or exited. With `CLONE_THREAD` it is a new thread in the
 /// caller's process, on `stack`, with TLS `tls` if `CLONE_SETTLS`.
 fn clone(
     p: &mut LinuxProcess,
@@ -569,7 +569,16 @@ fn clone(
         child.clear_tid = child_tid;
     }
     signal::sync(&child);
-    proc::start(child, cctx)
+    let vfork = (flags & CLONE_VFORK != 0 && !thread).then(|| {
+        let v = crate::process::Vfork::new(p.entry.clone());
+        child.group.set_vfork(v.clone());
+        v
+    });
+    let pid = proc::start(child, cctx)?;
+    if let Some(v) = vfork {
+        v.wait();
+    }
+    Ok(pid)
 }
 
 fn wait4(

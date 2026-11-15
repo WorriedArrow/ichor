@@ -298,6 +298,18 @@ pub(crate) fn exit_status(e: &ProcEntry) -> Option<u32> {
 }
 
 /// Sleeps until `e` has a signal it would act on.
+/// Wakes `e` from a wait on its signal queue so it re-checks.
+pub(crate) fn wake(e: &ProcEntry) {
+    e.signals.wake_all();
+}
+
+/// Waits on `e`'s signal queue until `done` holds or `SIGKILL` is pending.
+pub(crate) fn wait_killable(e: &ProcEntry, done: impl Fn() -> bool) {
+    let kill = signal::bit(signal::SIGKILL);
+    e.signals
+        .wait_until(|| (done() || pending(e) & kill != 0).then_some(()));
+}
+
 pub(crate) fn wait_for_signal(e: &ProcEntry) {
     e.signals.wait_until(|| interrupted(e).then_some(()));
 }
@@ -443,10 +455,15 @@ pub(crate) fn run(mut p: LinuxProcess, mut ctx: UserContext) -> (u32, u32) {
         while Arc::strong_count(&group) > 1 {
             frame::task::yield_now();
         }
+        // A vfork parent goes on once the status is visible.
+        let vfork = group.take_vfork();
         // The last thread frees the memory and files; its space is no
         // longer active on any CPU.
         drop(group);
         exited(&leader, group_status);
+        if let Some(v) = vfork {
+            v.release();
+        }
     }
     (status, syscalls)
 }

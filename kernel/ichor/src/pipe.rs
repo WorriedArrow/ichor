@@ -38,6 +38,8 @@ pub(crate) struct Pipe {
     readable: WaitQueue,
     /// Waiters for space (or for the last reader to leave).
     writable: WaitQueue,
+    /// State changes so far (edge-triggered epoll).
+    changes: core::sync::atomic::AtomicU64,
 }
 
 impl Pipe {
@@ -51,6 +53,7 @@ impl Pipe {
             }),
             readable: WaitQueue::new(),
             writable: WaitQueue::new(),
+            changes: core::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -67,6 +70,17 @@ impl Pipe {
         }
         self.readable.wake_all();
         self.writable.wake_all();
+        self.changed();
+    }
+
+    /// State changes so far (data in or out, an end closed).
+    pub(crate) fn changes(&self) -> u64 {
+        self.changes.load(core::sync::atomic::Ordering::Acquire)
+    }
+
+    fn changed(&self) {
+        self.changes
+            .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
         crate::poll::notify();
     }
 
@@ -125,7 +139,7 @@ impl Pipe {
             }
         });
         self.writable.wake_all();
-        crate::poll::notify();
+        self.changed();
         r
     }
 
@@ -165,7 +179,7 @@ impl Pipe {
                 }
             });
             self.readable.wake_all();
-            crate::poll::notify();
+            self.changed();
             match r {
                 Ok(n) => done += n,
                 Err(e) if done == 0 => return Err(e),
