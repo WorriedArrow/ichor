@@ -275,8 +275,15 @@ fn from_lower<'a>(node: Node<'a>, parent: Ino) -> Inode<'a> {
         image::Kind::Directory => upper_dir(parent, Some(node)),
         image::Kind::Symlink => Data::Symlink(node.symlink_target().unwrap_or("").to_string()),
     };
-    // The image format records no owner or times yet: root, epoch.
-    Inode::fresh(data, node.mode & 0o7777, 1, Time::default())
+    // Owners and times as the image recorded them (format v3).
+    let t = Time {
+        sec: node.mtime,
+        nsec: 0,
+    };
+    let mut i = Inode::fresh(data, node.mode & 0o7777, 1, t);
+    i.uid = node.uid;
+    i.gid = node.gid;
+    i
 }
 
 fn check_name(name: &str) -> Result<(), i64> {

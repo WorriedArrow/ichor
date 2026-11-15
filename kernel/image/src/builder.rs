@@ -31,6 +31,9 @@ struct NodeRec {
     count: u64,
     name_off: u64,
     name_len: u64,
+    uid: u32,
+    gid: u32,
+    mtime: u64,
 }
 
 /// Builds an image in memory.
@@ -86,6 +89,16 @@ impl Builder {
         self.chunk_table.push((off, len, hash));
     }
 
+    /// Sets a node's owner, group and modification time (default: root,
+    /// root, the epoch).
+    pub fn set_owner(&mut self, node: NodeId, uid: u32, gid: u32, mtime: u64) {
+        if let Some(n) = self.nodes.get_mut(node.0) {
+            n.uid = uid;
+            n.gid = gid;
+            n.mtime = mtime;
+        }
+    }
+
     fn push_node(&mut self, rec: NodeRec) -> NodeId {
         self.nodes.push(rec);
         NodeId(self.nodes.len() - 1)
@@ -108,6 +121,9 @@ impl Builder {
             count,
             name_off,
             name_len,
+            uid: 0,
+            gid: 0,
+            mtime: 0,
         })
     }
 
@@ -123,6 +139,9 @@ impl Builder {
             count: t_len,
             name_off,
             name_len,
+            uid: 0,
+            gid: 0,
+            mtime: 0,
         })
     }
 
@@ -139,6 +158,9 @@ impl Builder {
             count: children.len() as u64,
             name_off,
             name_len,
+            uid: 0,
+            gid: 0,
+            mtime: 0,
         })
     }
 
@@ -190,6 +212,8 @@ impl Builder {
                 n.count,
                 n.name_off,
                 n.name_len,
+                u64::from(n.uid) | (u64::from(n.gid) << 32),
+                n.mtime,
             ] {
                 b.extend_from_slice(&v.to_le_bytes());
             }

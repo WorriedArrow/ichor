@@ -11,16 +11,26 @@ use std::collections::BTreeMap;
 
 use crate::Result;
 
+/// Owner, group and modification time of an entry.
+#[derive(Debug, Clone, Copy, Default)]
+struct Own {
+    uid: u32,
+    gid: u32,
+    mtime: u64,
+}
+
 /// One entry of the tree being built.
 #[derive(Debug, Clone)]
 enum Entry {
     File {
         data: Vec<u8>,
         mode: u32,
+        own: Own,
     },
-    Symlink(String),
+    Symlink(String, Own),
     Dir {
         mode: u32,
+        own: Own,
         children: BTreeMap<String, Entry>,
     },
 }
@@ -63,6 +73,7 @@ impl Tree {
         Tree {
             root: Entry::Dir {
                 mode: 0o755,
+                own: Own::default(),
                 children: BTreeMap::new(),
             },
         }
@@ -79,6 +90,7 @@ impl Tree {
                 .entry((*p).to_string())
                 .or_insert_with(|| Entry::Dir {
                     mode: 0o755,
+                    own: Own::default(),
                     children: BTreeMap::new(),
                 });
         }
@@ -102,16 +114,32 @@ impl Tree {
     fn put(&mut self, path: &str, e: Entry) -> Result<()> {
         let ps = parts(path);
         let Some((last, dirs)) = ps.split_last() else {
-            // The root itself: keep its mode if it is a directory entry.
-            if let (Entry::Dir { mode, .. }, Entry::Dir { mode: m, .. }) = (&e, &mut self.root) {
+            // The root itself: keep its mode and owner if it is a directory.
+            if let (
+                Entry::Dir { mode, own, .. },
+                Entry::Dir {
+                    mode: m, own: o, ..
+                },
+            ) = (&e, &mut self.root)
+            {
                 *m = *mode;
+                *o = *own;
             }
             return Ok(());
         };
         let parent = self.dir_mut(dirs)?;
         match (parent.get_mut(*last), e) {
-            // A directory entry after its contents: keep them, take the mode.
-            (Some(Entry::Dir { mode, .. }), Entry::Dir { mode: m, .. }) => *mode = m,
+            // A directory entry after its contents: keep them, take the
+            // mode and owner.
+            (
+                Some(Entry::Dir { mode, own, .. }),
+                Entry::Dir {
+                    mode: m, own: o, ..
+                },
+            ) => {
+                *mode = m;
+                *own = o;
+            }
             (_, e) => {
                 parent.insert((*last).to_string(), e);
             }
@@ -177,22 +205,29 @@ impl Tree {
             });
             let link = long_link.take().unwrap_or_else(|| cstr(&h[157..257]));
             let mode = (octal(&h[100..108])? & 0o7777) as u32;
+            let own = Own {
+                uid: octal(&h[108..116])? as u32,
+                gid: octal(&h[116..124])? as u32,
+                mtime: octal(&h[136..148])?,
+            };
             match kind {
                 b'0' | 0 | b'7' => self.put(
                     &name,
                     Entry::File {
                         data: data.to_vec(),
                         mode,
+                        own,
                     },
                 )?,
                 b'5' => self.put(
                     &name,
                     Entry::Dir {
                         mode,
+                        own,
                         children: BTreeMap::new(),
                     },
                 )?,
-                b'2' => self.put(&name, Entry::Symlink(link))?,
+                b'2' => self.put(&name, Entry::Symlink(link, own))?,
                 b'1' => {
                     let target = self
                         .get(&parts(&link))
@@ -220,6 +255,7 @@ impl Tree {
             Entry::File {
                 data: data.to_vec(),
                 mode,
+                own: Own::default(),
             },
         )
     }
@@ -227,14 +263,20 @@ impl Tree {
     /// Builds the Ichor image (padded to whole 4 KiB blocks).
     pub fn image(&self) -> Vec<u8> {
         fn emit(b: &mut image::builder::Builder, name: &str, e: &Entry) -> image::builder::NodeId {
-            match e {
-                Entry::File { data, mode } => b.file(name, data, *mode),
-                Entry::Symlink(t) => b.symlink(name, t),
-                Entry::Dir { mode, children } => {
+            let (id, own) = match e {
+                Entry::File { data, mode, own } => (b.file(name, data, *mode), own),
+                Entry::Symlink(t, own) => (b.symlink(name, t), own),
+                Entry::Dir {
+                    mode,
+                    own,
+                    children,
+                } => {
                     let ids: Vec<_> = children.iter().map(|(n, c)| emit(b, n, c)).collect();
-                    b.dir(name, &ids, *mode)
+                    (b.dir(name, &ids, *mode), own)
                 }
-            }
+            };
+            b.set_owner(id, own.uid, own.gid, own.mtime);
+            id
         }
         let mut b = image::builder::Builder::new();
         let root = emit(&mut b, "/", &self.root);

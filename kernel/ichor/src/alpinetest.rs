@@ -142,6 +142,14 @@ const RUNS: &[(&[&str], i32)] = &[
         ],
         0,
     ),
+    (
+        &[
+            "sh",
+            "-c",
+            "[ \"$(stat -c %U:%G /etc/shadow)\" = root:shadow ] &&              [ \"$(stat -c %Y /etc/alpine-release)\" -gt 1700000000 ] &&              echo alpine: the image carries owners and times",
+        ],
+        0,
+    ),
 ];
 
 fn read(vfs: &Vfs, path: &str) -> Vec<u8> {

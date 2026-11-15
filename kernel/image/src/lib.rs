@@ -29,13 +29,14 @@
 //! # Layout
 //!
 //! ```text
-//! magic "ICHRIMG\0" | version:u32 = 2 | hash kind:u32 = 1 (BLAKE3)
+//! magic "ICHRIMG\0" | version:u32 = 3 | hash kind:u32 = 1 (BLAKE3)
 //! node_count:u64 | nodes_offset:u64
 //! chunk_count:u64 | chunk_table_offset:u64
 //! dirents_offset:u64 | dirents_count:u64
 //! strings_offset:u64 | strings_len:u64
 //! data_offset:u64 | root hash:[u8; 32]
-//! --- nodes[node_count] (48 bytes each) ---
+//! --- nodes[node_count] (64 bytes each: kind, mode, size, first, count,
+//!     name offset, name length, uid:u32, gid:u32, mtime:u64) ---
 //! --- dirents[dirents_count] (u64 child node index each) ---
 //! --- chunk table[chunk_count] (48 bytes each: data offset, length, hash) ---
 //! --- string table (name bytes) ---
@@ -65,14 +66,14 @@ pub type Hash = [u8; 32];
 
 const MAGIC: &[u8; 8] = b"ICHRIMG\0";
 /// Current format version.
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 /// Header hash kind: BLAKE3.
 pub const HASH_KIND_BLAKE3: u32 = 1;
 
 const ROOT_HASH_AT: usize = 8 + 4 + 4 + 8 * 9;
 /// Bytes of the fixed header (the part needed to find the metadata).
 pub const HEADER_LEN: usize = ROOT_HASH_AT + 32;
-const NODE_LEN: usize = 48;
+const NODE_LEN: usize = 64;
 const CHUNK_LEN: usize = 48;
 
 /// Why an image was rejected, or a read failed.
@@ -184,6 +185,11 @@ pub struct Node<'a> {
     kind: Kind,
     /// Mode bits (permissions).
     pub mode: u32,
+    /// Owner and group (cell-local ids; ADR-0009).
+    pub uid: u32,
+    pub gid: u32,
+    /// Modification time, seconds since the epoch.
+    pub mtime: u64,
     size: u64,
     /// For a file: first chunk index and count. For a directory: first child
     /// node index and count. For a symlink: string offset/len of the target.
@@ -393,6 +399,9 @@ impl<'a> Image<'a> {
             index,
             kind,
             mode: u32_at(self.bytes, at + 4)?,
+            uid: u32_at(self.bytes, at + 48)?,
+            gid: u32_at(self.bytes, at + 52)?,
+            mtime: u64_at(self.bytes, at + 56)?,
             size: u64_at(self.bytes, at + 8)?,
             first: u64_at(self.bytes, at + 16)?,
             count: u64_at(self.bytes, at + 24)?,
@@ -485,6 +494,22 @@ mod tests {
 
         assert!(image.lookup("/bin/nope").is_none());
         assert_eq!(image.lookup("/etc").unwrap().kind(), Kind::Directory);
+    }
+
+    #[test]
+    fn nodes_carry_owners_and_times() {
+        let mut bld = Builder::new();
+        let f = bld.file("shadow", b"x", 0o640);
+        bld.set_owner(f, 0, 42, 1_700_000_000);
+        let root = bld.dir("/", &[f], 0o755);
+        let img = bld.finish(root);
+        let image = Image::mount(&img).unwrap();
+        let n = image.lookup("/shadow").unwrap();
+        assert_eq!(
+            (n.uid, n.gid, n.mtime, n.mode),
+            (0, 42, 1_700_000_000, 0o640)
+        );
+        assert_eq!(image.root().unwrap().uid, 0);
     }
 
     #[test]
