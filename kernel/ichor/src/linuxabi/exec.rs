@@ -108,9 +108,7 @@ pub(super) fn execve(
     for t in &others {
         crate::proc::post(t, crate::signal::SIGKILL);
     }
-    while p.group.threads().len() > 1 {
-        frame::task::yield_now();
-    }
+    p.group.wait_threads(1);
 
     let mut mm = Mm::new(p.cell.account()).ok_or(ENOMEM)?;
     let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();

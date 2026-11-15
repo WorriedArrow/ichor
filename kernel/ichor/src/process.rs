@@ -149,6 +149,11 @@ pub(crate) struct Group {
     pub(crate) actions: Mutex<Actions>,
     /// Live threads.
     threads: SpinLock<Vec<Arc<ProcEntry>>>,
+    /// Woken when a thread leaves the group (removed from `threads`, or its
+    /// reference to the group dropped): `execve` and the last thread out
+    /// wait on it. Shared so a leaving thread can wake it after dropping
+    /// its group reference.
+    pub(crate) gone: Arc<frame::task::WaitQueue>,
     /// Set by `exit_group` or a fatal signal: the group's wait status.
     exit: SpinLock<Option<u32>>,
     /// The program's path and argv (NUL-separated), for `/proc`.
@@ -295,6 +300,12 @@ impl Group {
         self.threads.lock().clone()
     }
 
+    /// Sleeps until at most `n` threads are left.
+    pub(crate) fn wait_threads(&self, n: usize) {
+        self.gone
+            .wait_until(|| (self.threads.lock().len() <= n).then_some(()));
+    }
+
     /// Records the group's exit status (the first one wins) and kills its
     /// other threads.
     pub(crate) fn begin_exit(&self, status: u32, me: &ProcEntry) {
@@ -316,10 +327,12 @@ impl Group {
     pub(crate) fn thread_exited(&self, me: &ProcEntry, status: u32) -> Option<u32> {
         let mut t = self.threads.lock();
         t.retain(|e| e.pid != me.pid);
-        if !t.is_empty() {
+        let last = t.is_empty();
+        drop(t);
+        self.gone.wake_all();
+        if !last {
             return None;
         }
-        drop(t);
         Some(self.exit.lock().unwrap_or(status))
     }
 }
@@ -381,6 +394,7 @@ impl LinuxProcess {
             }),
             actions: Mutex::new(Actions::new()),
             threads: SpinLock::new(alloc::vec![entry.clone()]),
+            gone: Arc::new(frame::task::WaitQueue::new()),
             exit: SpinLock::new(None),
             exe: SpinLock::new(Default::default()),
             limits: SpinLock::new(default_limits()),
@@ -426,6 +440,7 @@ impl LinuxProcess {
             files: Mutex::new(Files { fds, cwd, umask }),
             actions: Mutex::new(actions),
             threads: SpinLock::new(alloc::vec![entry.clone()]),
+            gone: Arc::new(frame::task::WaitQueue::new()),
             exit: SpinLock::new(None),
             exe: SpinLock::new(exe),
             limits: SpinLock::new(self.group.limits()),

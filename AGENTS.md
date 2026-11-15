@@ -265,7 +265,9 @@ report at the end of each phase. Do not rewrite `main`.
   `benchmarks_run_and_report`; CI prints a KVM run to the job summary);
   futexes are in 64 hashed buckets; lower-file reads run outside the
   root's tree lock (`Vfs::read`); console output fills the UART FIFO
-  between status polls. Baseline in `docs/benchmarks.md`; Linux reference
+  between status polls; `execve` and the last thread out sleep on
+  `Group::gone` instead of yield loops (the polled block drivers and TLB
+  shootdown acks still spin, by design until interrupt-driven I/O). Baseline in `docs/benchmarks.md`; Linux reference
   numbers not yet. Open: frame's `VmSpace` user copy ignores the page's
   write permission and copies after dropping its lock (owner deciding how
   to handle it; the Mm-lock item waits on it).]

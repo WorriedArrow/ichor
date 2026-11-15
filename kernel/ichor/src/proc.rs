@@ -530,13 +530,16 @@ pub(crate) fn run(mut p: LinuxProcess, mut ctx: UserContext) -> (u32, u32) {
     if entry.pid != entry.tgid {
         TABLE.lock().remove(&entry.pid);
     }
+    let gone = group.gone.clone();
     if let Some(group_status) = last {
         let leader = group.leader.clone();
         // Threads that left just before us may still hold a reference for
         // a moment; the memory and files must be gone before the status is
-        // visible.
+        // visible. Each wakes `gone` after dropping its reference; the
+        // timed re-check covers a reference dropped some other way.
         while Arc::strong_count(&group) > 1 {
-            frame::task::yield_now();
+            let deadline = frame::time::now() + core::time::Duration::from_millis(10);
+            gone.wait_until_deadline(deadline, || (Arc::strong_count(&group) == 1).then_some(()));
         }
         // A vfork parent goes on once the status is visible.
         let vfork = group.take_vfork();
@@ -547,6 +550,10 @@ pub(crate) fn run(mut p: LinuxProcess, mut ctx: UserContext) -> (u32, u32) {
         if let Some(v) = vfork {
             v.release();
         }
+    } else {
+        // Let the last thread out see our reference gone.
+        drop(group);
+        gone.wake_all();
     }
     (status, syscalls)
 }
