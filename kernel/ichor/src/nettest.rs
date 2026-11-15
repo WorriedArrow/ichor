@@ -28,10 +28,22 @@ const PING_IDENT: u16 = 0x1c40;
 
 /// The harness's TCP echo port (0: none).
 static ECHO_PORT: AtomicU32 = AtomicU32::new(0);
+/// The uplink port the harness forwards to a cell (0: none).
+static PUBLISH_PORT: AtomicU32 = AtomicU32::new(0);
 
 /// Sets the TCP echo test's port (`net_echo_port=N`).
 pub(crate) fn set_echo_port(port: u16) {
     ECHO_PORT.store(u32::from(port), Ordering::Relaxed);
+}
+
+/// Sets the published-port test's uplink port (`net_publish=N`).
+pub(crate) fn set_publish_port(port: u16) {
+    PUBLISH_PORT.store(u32::from(port), Ordering::Relaxed);
+}
+
+/// The published-port test's uplink port (0: none).
+pub(crate) fn publish_port() -> u16 {
+    PUBLISH_PORT.load(Ordering::Relaxed) as u16
 }
 
 fn now() -> Duration {
@@ -113,10 +125,19 @@ pub(crate) fn run() {
         }
     );
 
-    let port = ECHO_PORT.load(Ordering::Relaxed) as u16;
+    let port = echo_port();
     if port != 0 {
         tcp_echo(&mut dev, &mut ifc, port);
     }
+    // From here on the device is the cell switch's uplink.
+    crate::switch::set_uplink(dev, ifc);
+    crate::netstack::start();
+    println!("ichor: net: uplink {GUEST} is the cell switch's (NAT for 10.88.0.0/16)");
+}
+
+/// The harness's TCP echo port (0: none).
+pub(crate) fn echo_port() -> u16 {
+    ECHO_PORT.load(Ordering::Relaxed) as u16
 }
 
 /// Sends `ECHO_BYTES` to the harness's echo server and checks they return.
@@ -126,7 +147,7 @@ fn tcp_echo(dev: &mut virtio_net::VirtioNet, ifc: &mut Interface, port: u16) {
         .collect();
     let mut iss = [0u8; 4];
     crate::random::fill(&mut iss);
-    let local = (GUEST, 49152);
+    let local = (GUEST, 40000); // below the NAT's port range
     let remote = (GATEWAY, port);
     let start = now();
     let mut tcp = Tcp::connect(local, remote, u32::from_le_bytes(iss), start);

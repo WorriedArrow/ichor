@@ -124,6 +124,7 @@ fn m1_boots_on_four_cpus() {
         "debian: sockets: refused, EADDRINUSE, 1 MiB each way, half-close, non-blocking connect and accept work",
         "Hello, world!",
         "debian: apt-get installed hello and jq from the local repository",
+        "through the switch; loopback is per cell",
         "ichor: debian: all runs passed",
         "ichor: blk: nvme block size 4096 bytes",
         "ichor: blk: nvme: verified 300 KiB read across multiple requests",
@@ -239,6 +240,7 @@ fn m1_boots_on_one_cpu() {
         "debian: sockets: refused, EADDRINUSE, 1 MiB each way, half-close, non-blocking connect and accept work",
         "Hello, world!",
         "debian: apt-get installed hello and jq from the local repository",
+        "through the switch; loopback is per cell",
         "ichor: debian: all runs passed",
         "ichor: blk: nvme block size 4096 bytes",
         "ichor: blk: nvme: verified 300 KiB read across multiple requests",
@@ -334,6 +336,7 @@ fn m2_scheduler_on_eight_cpus() {
         "debian: sockets: refused, EADDRINUSE, 1 MiB each way, half-close, non-blocking connect and accept work",
         "Hello, world!",
         "debian: apt-get installed hello and jq from the local repository",
+        "through the switch; loopback is per cell",
         "ichor: debian: all runs passed",
         "ichor: blk: nvme block size 4096 bytes",
         "ichor: blk: nvme: verified 300 KiB read across multiple requests",
@@ -439,22 +442,32 @@ fn cloud_disk_boots_without_legacy_timers_on_two_sockets() {
 #[test]
 fn tcp_through_virtio_net_to_a_host_echo_server() {
     use std::io::{Read, Write};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
-    let server = std::thread::spawn(move || {
-        let (mut s, _) = listener.accept().unwrap();
-        let mut buf = vec![0u8; 65536];
-        let mut total = 0usize;
-        loop {
-            match s.read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    s.write_all(&buf[..n]).unwrap();
-                    total += n;
+    // Two clients: the kernel's own TCP, then a Debian cell through the
+    // cell switch's NAT.
+    let totals: Arc<[AtomicUsize; 2]> = Arc::new([AtomicUsize::new(0), AtomicUsize::new(0)]);
+    let seen = totals.clone();
+    std::thread::spawn(move || {
+        for total in seen.iter() {
+            let Ok((mut s, _)) = listener.accept() else {
+                return;
+            };
+            let mut buf = vec![0u8; 65536];
+            loop {
+                match s.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if s.write_all(&buf[..n]).is_err() {
+                            break;
+                        }
+                        total.fetch_add(n, Ordering::SeqCst);
+                    }
                 }
             }
         }
-        total
     });
     let out = boot("net-echo", &format!("net_echo_port={port}"), 2);
     out.assert_exit(Exit::Success);
@@ -462,11 +475,64 @@ fn tcp_through_virtio_net_to_a_host_echo_server() {
         "ichor: net: virtio-net ",
         "ichor: net: gateway 10.0.2.2 is at ",
         "ichor: net: tcp echo of 256 KiB through slirp ok",
+        "ichor: net: uplink 10.0.2.15 is the cell switch's",
+        "through the switch; loopback is per cell",
+        &format!("debian: nat: a cell echoed 256 KiB with 10.0.2.2:{port} through the uplink"),
     ]);
-    assert_eq!(
-        server.join().unwrap(),
-        256 * 1024,
-        "the host saw every byte"
+    for (i, t) in totals.iter().enumerate() {
+        assert_eq!(
+            t.load(Ordering::SeqCst),
+            256 * 1024,
+            "client {i}: the host saw every byte"
+        );
+    }
+}
+
+/// The host reaches a server in a cell through a port published on the
+/// cell switch's uplink (QEMU forwards a host port to the guest's 8080,
+/// published to the cell's port 80).
+#[test]
+fn a_published_port_serves_the_host_from_a_cell() {
+    use std::io::{Read, Write};
+    use std::time::{Duration, Instant};
+    let host_port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let client = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(600);
+        while Instant::now() < deadline {
+            // QEMU accepts as soon as it runs; until the cell listens the
+            // forwarded connection fails and this tries again.
+            if let Ok(mut s) = std::net::TcpStream::connect(("127.0.0.1", host_port)) {
+                let _ = s.set_read_timeout(Some(Duration::from_secs(60)));
+                let mut resp = String::new();
+                if s.write_all(b"GET / HTTP/1.0\r\nHost: ichor\r\n\r\n")
+                    .is_ok()
+                    && s.read_to_string(&mut resp).is_ok()
+                    && resp.contains("hello from an Ichor cell")
+                {
+                    return resp;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        String::new()
+    });
+    let out = ichor_tests::boot_with("net-publish", "net_publish=8080", 2, |c| {
+        c.net_user_opts = format!("hostfwd=tcp:127.0.0.1:{host_port}-:8080");
+    });
+    out.assert_exit(Exit::Success);
+    out.assert_in_order(&[
+        "ichor: net: uplink 10.0.2.15 is the cell switch's",
+        "debian: published: listening on port 80",
+        "debian: published: served a request from 10.0.2.2",
+    ]);
+    let resp = client.join().unwrap();
+    assert!(
+        resp.starts_with("HTTP/1.0 200 OK\r\n"),
+        "response: {resp:?}"
     );
 }
 

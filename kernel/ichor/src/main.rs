@@ -41,6 +41,7 @@ mod runtest;
 mod sched;
 mod selftest;
 mod signal;
+mod switch;
 mod umem;
 mod usertest;
 mod vfs;
@@ -75,6 +76,9 @@ fn kmain(info: BootInfo) -> ! {
     }
     if let Some(port) = cmdline.get("net_echo_port").and_then(|v| v.parse().ok()) {
         nettest::set_echo_port(port);
+    }
+    if let Some(port) = cmdline.get("net_publish").and_then(|v| v.parse().ok()) {
+        nettest::set_publish_port(port);
     }
 
     let image = info.kernel_image();
@@ -138,8 +142,9 @@ fn kmain(info: BootInfo) -> ! {
     celltest::run();
     proctest::run();
     runtest::run();
-    blktest::run();
+    // The network first: the disks' cell tests use its uplink.
     nettest::run();
+    blktest::run();
 
     if cmdline.flag("test_stack_overflow") {
         selftest::stack_overflow();

@@ -9,6 +9,10 @@
 //!   than panic.
 //! - [`iface`]: one IPv4 interface: ARP (request, reply, a cache with
 //!   expiry, packets held until their next hop resolves) and ICMP echo.
+//! - [`tcp`]: the TCP state machine.
+//! - [`switch`]: the cell switch's forwarding decisions (assigned
+//!   addresses, anti-spoofing, token-bucket rate limits).
+//! - [`nat`]: source NAT and published ports at the uplink.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -16,6 +20,8 @@
 extern crate alloc;
 
 pub mod iface;
+pub mod nat;
+pub mod switch;
 pub mod tcp;
 pub mod wire;
 

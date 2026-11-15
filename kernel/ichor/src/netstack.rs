@@ -15,8 +15,13 @@
 //! runs every stack's timers (retransmission, TIME_WAIT), sleeping until
 //! the earliest one or until an operation kicks it.
 //!
-//! Partial (milestone 5 so far): TCP over loopback only (the cell switch
-//! and its ports come next), no UDP, no IPv6.
+//! Each stack is also a port on the cell switch (`switch.rs`), which
+//! assigns it an address in 10.88.0.0/16: segments for any other address
+//! leave through the switch after the stack lock is dropped, and the
+//! switch hands segments for this stack's address to [`Stack::receive`].
+//!
+//! Partial (milestone 5 so far): TCP only (no UDP), no IPv6; socket
+//! buffers are not yet charged to the cell's account.
 
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -28,7 +33,9 @@ use core::time::Duration;
 use frame::sync::SpinLock;
 use frame::task::{TaskOptions, WaitQueue};
 use net::Ipv4Addr;
+use net::iface::Packet;
 use net::tcp::{self, Segment, State, Tcp};
+use net::wire::PROTO_TCP;
 
 use crate::poll::Watchers;
 
@@ -108,11 +115,15 @@ struct Sock {
 
 #[derive(Debug, Default)]
 struct Inner {
+    /// The address the switch assigned (none if the switch was full).
+    addr: Option<Ipv4Addr>,
     socks: BTreeMap<u64, Sock>,
     next_id: u64,
     next_port: u16,
     /// Segments between local addresses, to deliver: (src, dst, segment).
     local: VecDeque<(Ipv4Addr, Ipv4Addr, Vec<u8>)>,
+    /// Segments for the switch, sent once the lock is released.
+    out: Vec<Packet>,
     /// Sockets to wake when the lock is released.
     touched: BTreeSet<u64>,
 }
@@ -121,6 +132,7 @@ struct Inner {
 #[derive(Debug)]
 pub(crate) struct Stack {
     pub(crate) cell: u64,
+    addr: Option<Ipv4Addr>,
     inner: SpinLock<Inner>,
 }
 
@@ -138,12 +150,17 @@ pub(crate) fn stack_for(cell: u64) -> Arc<Stack> {
         stacks
             .entry(cell)
             .or_insert_with(|| {
-                Arc::new(Stack {
-                    cell,
-                    inner: SpinLock::new(Inner {
-                        next_port: *EPHEMERAL.start(),
-                        ..Inner::default()
-                    }),
+                Arc::new_cyclic(|me| {
+                    let addr = crate::switch::attach(cell, me.clone());
+                    Stack {
+                        cell,
+                        addr,
+                        inner: SpinLock::new(Inner {
+                            addr,
+                            next_port: *EPHEMERAL.start(),
+                            ..Inner::default()
+                        }),
+                    }
                 })
             })
             .clone()
@@ -167,9 +184,20 @@ fn start_net_task() {
     }
 }
 
-/// Runs every stack's timers, then sleeps until the next one or a kick.
+/// Starts the net task if no stack has yet (the uplink needs polling).
+pub(crate) fn start() {
+    start_net_task();
+}
+
+/// Runs every stack's timers and polls the uplink, then sleeps until the
+/// next timer, a kick, or the next uplink poll: 1 ms after recent
+/// traffic, 10 ms when idle (the driver is polled, ADR-0010 §5).
 fn net_task() {
+    let mut last_traffic = Duration::ZERO;
     loop {
+        if crate::switch::poll_uplink() {
+            last_traffic = now();
+        }
         let stacks: Vec<Weak<Stack>> = STACKS.lock().values().map(Arc::downgrade).collect();
         let t = now();
         let mut next: Option<Duration> = None;
@@ -178,22 +206,27 @@ fn net_task() {
                 next = Some(next.map_or(n, |m: Duration| m.min(n)));
             }
         }
+        let t = now();
+        if t.saturating_sub(last_traffic) < Duration::from_micros(200) {
+            frame::task::yield_now(); // traffic is flowing: poll again now
+            continue;
+        }
+        let mut wake = next.unwrap_or(t + Duration::from_secs(1));
+        if crate::switch::has_uplink() {
+            let poll = if t.saturating_sub(last_traffic) < Duration::from_secs(1) {
+                Duration::from_millis(1)
+            } else {
+                Duration::from_millis(10)
+            };
+            wake = wake.min(t + poll);
+        }
         let cond = || KICKED.swap(false, Ordering::AcqRel).then_some(());
-        match next {
-            Some(d) if d > now() => {
-                let _ = NET_KICK.wait_until_deadline(d, cond);
-            }
-            Some(_) => frame::task::yield_now(),
-            None => {
-                // Nothing scheduled: wake at least once a second anyway.
-                let _ = NET_KICK.wait_until_deadline(now() + Duration::from_secs(1), cond);
-            }
+        if wake > t {
+            let _ = NET_KICK.wait_until_deadline(wake, cond);
+        } else {
+            frame::task::yield_now();
         }
     }
-}
-
-fn is_local(ip: Ipv4Addr) -> bool {
-    ip.is_loopback()
 }
 
 fn random_iss() -> u32 {
@@ -203,6 +236,26 @@ fn random_iss() -> u32 {
 }
 
 impl Inner {
+    /// Whether `ip` is one of this stack's own addresses.
+    fn is_local(&self, ip: Ipv4Addr) -> bool {
+        ip.is_loopback() || Some(ip) == self.addr
+    }
+
+    /// Queues a segment for `dst`: delivered here if local, else sent
+    /// through the switch.
+    fn route(&mut self, src: Ipv4Addr, dst: Ipv4Addr, seg: Vec<u8>) {
+        if self.is_local(dst) {
+            self.local.push_back((src, dst, seg));
+        } else {
+            self.out.push(Packet {
+                src,
+                dst,
+                protocol: PROTO_TCP,
+                payload: seg,
+            });
+        }
+    }
+
     fn sock(&mut self, id: u64) -> Result<&mut Sock, i64> {
         self.socks.get_mut(&id).ok_or(EINVAL)
     }
@@ -270,11 +323,7 @@ impl Inner {
             }
         }
         for (src, dst, seg) in out {
-            if is_local(dst) {
-                self.local.push_back((src, dst, seg));
-            }
-            // Non-local destinations need the cell switch (next step):
-            // dropped, so the connection times out.
+            self.route(src, dst, seg);
         }
         Ok(())
     }
@@ -375,9 +424,7 @@ impl Inner {
                 let ack = seg.seq.wrapping_add(seg.len());
                 tcp::segment(local, remote, 0, ack, tcp::RST | tcp::ACK, 0, None, &[])
             };
-            if is_local(src) {
-                self.local.push_back((dst, src, rst));
-            }
+            self.route(dst, src, rst);
         }
     }
 
@@ -464,16 +511,38 @@ impl Stack {
     /// Runs `f` on the state, delivers local traffic, and wakes what it
     /// touched.
     fn with<R>(&self, f: impl FnOnce(&mut Inner) -> R) -> R {
-        let (r, woken) = {
+        let (r, woken, out) = {
             let mut i = self.inner.lock();
             let r = f(&mut i);
             i.run_local();
             let w = i.take_touched();
-            (r, w)
+            (r, w, core::mem::take(&mut i.out))
+        };
+        wake_all(woken);
+        crate::switch::send(self.cell, out);
+        kick();
+        r
+    }
+
+    /// The address the switch assigned to this stack.
+    pub(crate) fn addr(&self) -> Option<Ipv4Addr> {
+        self.addr
+    }
+
+    /// A packet the switch delivers to this stack; returns the packets
+    /// the stack sends in response (the switch routes them).
+    pub(crate) fn receive(&self, p: Packet) -> Vec<Packet> {
+        let (woken, out) = {
+            let mut i = self.inner.lock();
+            if p.protocol == PROTO_TCP && Some(p.dst) == i.addr {
+                i.input(p.src, p.dst, &p.payload);
+            }
+            i.run_local();
+            (i.take_touched(), core::mem::take(&mut i.out))
         };
         wake_all(woken);
         kick();
-        r
+        out
     }
 
     /// A new, unbound socket.
@@ -515,7 +584,7 @@ impl Stack {
         if i.sock(id)?.local.is_some() {
             return Err(EINVAL);
         }
-        if !addr.0.is_unspecified() && !is_local(addr.0) {
+        if !addr.0.is_unspecified() && !i.is_local(addr.0) {
             return Err(EADDRNOTAVAIL);
         }
         if addr.1 == 0 {
@@ -558,13 +627,19 @@ impl Stack {
                 Kind::Conn { .. } => return Err(EISCONN),
                 Kind::Listening { .. } => return Err(EINVAL),
             }
-            if !is_local(remote.0) {
+            let loopback = remote.0.is_loopback();
+            if remote.0.is_unspecified() || remote.0.is_broadcast() || remote.0.is_multicast() {
                 return Err(ENETUNREACH);
             }
-            let local_ip = match i.sock(id)?.local {
-                Some((ip, _)) if !ip.is_unspecified() => ip,
-                _ => Ipv4Addr::LOCALHOST,
+            let local_ip = match (i.sock(id)?.local, i.addr) {
+                (Some((ip, _)), _) if !ip.is_unspecified() => ip,
+                _ if loopback => Ipv4Addr::LOCALHOST,
+                (_, Some(a)) => a,
+                (_, None) => return Err(ENETUNREACH),
             };
+            if local_ip.is_loopback() != loopback {
+                return Err(EINVAL); // bound to loopback, connecting out (or the reverse)
+            }
             let port = match i.sock(id)?.local {
                 Some((_, p)) => p,
                 None => i.ephemeral(local_ip, id)?,
@@ -790,7 +865,7 @@ impl Stack {
 
     /// Runs this stack's timers; returns when they next need to run.
     fn run_timers(&self, t: Duration) -> Option<Duration> {
-        let (next, woken) = {
+        let (next, woken, out) = {
             let mut i = self.inner.lock();
             let mut touched = Vec::new();
             for (&id, s) in &mut i.socks {
@@ -811,9 +886,10 @@ impl Stack {
                     _ => None,
                 })
                 .min();
-            (next, i.take_touched())
+            (next, i.take_touched(), core::mem::take(&mut i.out))
         };
         wake_all(woken);
+        crate::switch::send(self.cell, out);
         next
     }
 }

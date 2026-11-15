@@ -5,8 +5,11 @@
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::time::Duration;
 
 use frame::println;
+use frame::sync::SpinLock;
+use frame::task::TaskOptions;
 
 use crate::kcell::{Cell, System};
 use crate::loader;
@@ -166,6 +169,110 @@ close $nb; close $b; close $l;
 print "debian: sockets: refused, EADDRINUSE, 1 MiB each way, half-close, non-blocking connect and accept work\n";
 "#;
 
+/// The server cell of the cross-cell run: `ME PEER PORT`. Accepts one
+/// connection on `PORT`, checks both ends' addresses, reads to EOF and
+/// answers with the peer's address and the byte count.
+const CELL_SERVER: &str = r#"use strict; use warnings; use Socket;
+sub fail { print "debian: cells FAILED (server): @_\n"; exit 1 }
+my ($me, $peer, $port) = @ARGV;
+socket(my $l, AF_INET, SOCK_STREAM, 0) or fail("socket: $!");
+setsockopt($l, SOL_SOCKET, SO_REUSEADDR, 1) or fail("SO_REUSEADDR: $!");
+bind($l, pack_sockaddr_in($port, INADDR_ANY)) or fail("bind: $!");
+listen($l, 8) or fail("listen: $!");
+my $from = accept(my $c, $l) or fail("accept: $!");
+my (undef, $paddr) = unpack_sockaddr_in($from);
+inet_ntoa($paddr) eq $peer or fail("peer is " . inet_ntoa($paddr) . ", not $peer");
+my (undef, $laddr) = unpack_sockaddr_in(getsockname($c));
+inet_ntoa($laddr) eq $me or fail("accepted on " . inet_ntoa($laddr));
+my $n = 0;
+while (1) {
+    my $r = sysread($c, my $buf, 65536);
+    defined $r or fail("read: $!");
+    last if !$r;
+    $n += $r;
+}
+syswrite($c, inet_ntoa($paddr) . " $n\n") or fail("write: $!");
+close $c;
+"#;
+
+/// The client cell of the cross-cell run: `ME SERVER PORT`. Its own
+/// loopback has no listener (stacks are per cell); the server's address
+/// does, through the switch.
+const CELL_CLIENT: &str = r#"use strict; use warnings; use Socket;
+sub fail { print "debian: cells FAILED (client): @_\n"; exit 1 }
+my ($me, $server, $port) = @ARGV;
+socket(my $lo, AF_INET, SOCK_STREAM, 0) or fail("socket: $!");
+connect($lo, pack_sockaddr_in($port, inet_aton("127.0.0.1"))) and fail("the other cell's listener is on my loopback");
+$!{ECONNREFUSED} or fail("loopback: $!");
+my $s;
+for my $try (1 .. 400) {
+    socket($s, AF_INET, SOCK_STREAM, 0) or fail("socket: $!");
+    last if connect($s, pack_sockaddr_in($port, inet_aton($server)));
+    $!{ECONNREFUSED} or fail("connect: $!");
+    close $s; undef $s;
+    select(undef, undef, undef, 0.05);
+}
+defined $s or fail("the server never listened");
+my (undef, $laddr) = unpack_sockaddr_in(getsockname($s));
+inet_ntoa($laddr) eq $me or fail("connected from " . inet_ntoa($laddr));
+my $n = 1 << 20;
+my $data = "x" x $n;
+my $off = 0;
+while ($off < $n) { my $w = syswrite($s, $data, 65536, $off) or fail("write: $!"); $off += $w }
+shutdown($s, 1) or fail("shutdown: $!");
+my $reply = "";
+while (1) { my $r = sysread($s, my $buf, 4096); defined $r or fail("read: $!"); last if !$r; $reply .= $buf }
+$reply eq "$me $n\n" or fail("reply [$reply]");
+print "debian: cells: $me sent 1 MiB to $server through the switch; loopback is per cell\n";
+"#;
+
+/// A cell reaching the host through the uplink's NAT: `HOST PORT`, an echo
+/// server on the test host.
+const NAT_CLIENT: &str = r#"use strict; use warnings; use Socket;
+sub fail { print "debian: nat FAILED: @_\n"; exit 1 }
+my ($host, $port) = @ARGV;
+socket(my $s, AF_INET, SOCK_STREAM, 0) or fail("socket: $!");
+connect($s, pack_sockaddr_in($port, inet_aton($host))) or fail("connect: $!");
+my $n = 256 * 1024;
+my $data = substr(join("", map { chr } 0 .. 250) x (int($n / 251) + 1), 0, $n);
+my $pid = fork() // fail("fork: $!");
+if ($pid == 0) {
+    my $off = 0;
+    while ($off < $n) { my $w = syswrite($s, $data, 65536, $off) or exit 2; $off += $w }
+    shutdown($s, 1) or exit 3;
+    exit 0;
+}
+my $back = "";
+while (1) { my $r = sysread($s, my $buf, 65536); defined $r or fail("read: $!"); last if !$r; $back .= $buf }
+waitpid($pid, 0) == $pid && $? == 0 or fail("writer exited $?");
+$back eq $data or fail("echo returned " . length($back) . " bytes");
+print "debian: nat: a cell echoed 256 KiB with $host:$port through the uplink\n";
+"#;
+
+/// A published port's server: `PORT`. Serves one HTTP/1.0 request.
+const PUBLISHED_SERVER: &str = r#"use strict; use warnings; use Socket;
+sub fail { print "debian: published FAILED: @_\n"; exit 1 }
+my ($port) = @ARGV;
+socket(my $l, AF_INET, SOCK_STREAM, 0) or fail("socket: $!");
+setsockopt($l, SOL_SOCKET, SO_REUSEADDR, 1) or fail("SO_REUSEADDR: $!");
+bind($l, pack_sockaddr_in($port, INADDR_ANY)) or fail("bind: $!");
+listen($l, 8) or fail("listen: $!");
+print "debian: published: listening on port $port\n";
+my $from = accept(my $c, $l) or fail("accept: $!");
+my (undef, $paddr) = unpack_sockaddr_in($from);
+my $req = "";
+while ($req !~ /\r\n\r\n/) {
+    my $r = sysread($c, my $buf, 4096);
+    defined $r && $r or fail("request ended early [$req]");
+    $req .= $buf;
+}
+$req =~ m{^GET / HTTP/1\.[01]\r\n} or fail("request [$req]");
+my $body = "hello from an Ichor cell\n";
+syswrite($c, "HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\nContent-Length: " . length($body) . "\r\n\r\n$body");
+close $c;
+print "debian: published: served a request from " . inet_ntoa($paddr) . "\n";
+"#;
+
 /// `(argv, expected exit code)`: argv[0] is a path under `/usr/bin`.
 const RUNS: &[(&[&str], i32)] = &[
     (
@@ -251,5 +358,110 @@ pub(crate) fn run(vfs: &Arc<Vfs>) {
         }
         println!("ichor: debian: {} ok ({syscalls} syscalls)", argv[0]);
     }
+    network(vfs, &system);
     println!("ichor: debian: all runs passed");
+}
+
+/// Debian's perl with `args` in `cell`, on this task.
+fn perl(vfs: &Arc<Vfs>, cell: Arc<Cell>, script: &str, args: &[String]) -> i32 {
+    let exe = read(vfs, "/usr/bin/perl");
+    let interp = match loader::interp_path(&crate::file::Bytes(&exe)) {
+        Ok(Some(p)) => read(vfs, &p),
+        _ => fail("debian: perl is not dynamically linked"),
+    };
+    let p = LinuxProcess::new(cell, vfs.clone()).unwrap_or_else(|| fail("no process"));
+    let mut argv: Vec<&str> = alloc::vec!["perl", "-e", script];
+    argv.extend(args.iter().map(String::as_str));
+    run_linux(p, &exe, Some(&interp), &argv).0
+}
+
+/// [`perl`] on a task of its own; the slot gets the exit code.
+fn spawn_perl(
+    vfs: &Arc<Vfs>,
+    cell: Arc<Cell>,
+    script: &'static str,
+    args: Vec<String>,
+) -> Arc<SpinLock<Option<i32>>> {
+    let done = Arc::new(SpinLock::new(None));
+    let (vfs, slot) = (vfs.clone(), done.clone());
+    TaskOptions::new(move || {
+        let code = perl(&vfs, cell, script, &args);
+        *slot.lock() = Some(code);
+    })
+    .spawn()
+    .unwrap_or_else(|| fail("debian: no task for a server cell"));
+    done
+}
+
+fn wait_for(slot: &SpinLock<Option<i32>>, what: &str) -> i32 {
+    let deadline = frame::time::now() + Duration::from_secs(120);
+    loop {
+        if let Some(code) = *slot.lock() {
+            return code;
+        }
+        if frame::time::now() > deadline {
+            fail(what);
+        }
+        frame::task::yield_now();
+    }
+}
+
+fn cell_addr(cell: &Cell) -> String {
+    match crate::netstack::stack_for(cell.id()).addr() {
+        Some(a) => alloc::format!("{a}"),
+        None => fail("debian: a cell got no address from the switch"),
+    }
+}
+
+/// Cells on the cell switch: one cell serves another through it; with an
+/// uplink, a cell reaches the test host through NAT (`net_echo_port`) and
+/// serves the host on a published port (`net_publish`).
+fn network(vfs: &Arc<Vfs>, system: &System) {
+    let new_cell =
+        || Cell::new(&system.root_account, CELL_PAGES).unwrap_or_else(|| fail("no debian cell"));
+    let (server, client) = (new_cell(), new_cell());
+    let (sa, ca) = (cell_addr(&server), cell_addr(&client));
+    let port = String::from("7000");
+    let (sid, cid) = (server.id(), client.id());
+    let done = spawn_perl(
+        vfs,
+        server,
+        CELL_SERVER,
+        alloc::vec![sa.clone(), ca.clone(), port.clone()],
+    );
+    if perl(vfs, client, CELL_CLIENT, &[ca, sa, port]) != 0 {
+        fail("debian: cross-cell client");
+    }
+    if wait_for(&done, "debian: the server cell never finished") != 0 {
+        fail("debian: cross-cell server");
+    }
+    let (Some(s), Some(c)) = (crate::switch::stats(sid), crate::switch::stats(cid)) else {
+        fail("debian: no switch counters");
+    };
+    println!(
+        "ichor: debian: switch: server cell sent {} received {} dropped {}; client cell sent {} received {} dropped {}",
+        s.0, s.1, s.2, c.0, c.1, c.2
+    );
+    if !crate::switch::has_uplink() {
+        return;
+    }
+    let echo = crate::nettest::echo_port();
+    if echo != 0 {
+        let gw = String::from("10.0.2.2");
+        if perl(vfs, new_cell(), NAT_CLIENT, &[gw, alloc::format!("{echo}")]) != 0 {
+            fail("debian: NAT client");
+        }
+    }
+    let publish = crate::nettest::publish_port();
+    if publish != 0 {
+        let cell = new_cell();
+        let _ = cell_addr(&cell); // attach it to the switch
+        if !crate::switch::publish(net::wire::PROTO_TCP, publish, cell.id(), 80) {
+            fail("debian: could not publish the port");
+        }
+        if perl(vfs, cell, PUBLISHED_SERVER, &[String::from("80")]) != 0 {
+            fail("debian: published server");
+        }
+        crate::switch::unpublish(net::wire::PROTO_TCP, publish);
+    }
 }

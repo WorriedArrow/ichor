@@ -1,0 +1,265 @@
+//! The cell switch (ADR-0010 §3): every cell's stack is a port with an
+//! address the switch assigns in 10.88.0.0/16; the switch forwards IP
+//! packets between ports by that assignment (anti-spoofing and rate limits
+//! in `net::switch`), and anything bound outside goes to the uplink, a
+//! virtio-net interface, through source NAT and published ports
+//! (`net::nat`).
+//!
+//! Between two cells a packet is handed from one stack to the other as an
+//! owned buffer, inside the call that produced it: no device and no copy
+//! (the cross-cell fast path). [`send`] runs a work queue outside every
+//! stack lock, so a reply that a delivery provokes is routed in the same
+//! call and two stacks never lock each other.
+//!
+//! Lock order: the uplink's lock may be held while taking the table's,
+//! never the reverse; stack locks are never held while taking either.
+
+use alloc::collections::{BTreeMap, VecDeque};
+use alloc::sync::Weak;
+use alloc::vec::Vec;
+use core::time::Duration;
+
+use frame::sync::SpinLock;
+use net::Ipv4Addr;
+use net::iface::{Interface, Packet};
+use net::nat::{self, Nat};
+use net::switch::{PortId, Switch, Verdict};
+use net::wire::{PROTO_TCP, PROTO_UDP};
+
+use crate::netstack::Stack;
+
+/// The cells' subnet.
+pub(crate) const SUBNET: Ipv4Addr = Ipv4Addr::new(10, 88, 0, 0);
+pub(crate) const PREFIX: u8 = 16;
+/// Most packets one [`send`] call routes (a loop guard).
+const MAX_ROUNDS: usize = 100_000;
+
+struct Table {
+    switch: Switch,
+    stacks: BTreeMap<PortId, Weak<Stack>>,
+}
+
+struct Uplink {
+    dev: virtio_net::VirtioNet,
+    ifc: Interface,
+    nat: Nat,
+    last_expire: Duration,
+}
+
+static TABLE: SpinLock<Option<Table>> = SpinLock::new(None);
+static UPLINK: SpinLock<Option<Uplink>> = SpinLock::new(None);
+
+fn now() -> Duration {
+    frame::time::now()
+}
+
+fn with_table<R>(f: impl FnOnce(&mut Table) -> R) -> R {
+    let mut t = TABLE.lock();
+    let t = t.get_or_insert_with(|| Table {
+        switch: Switch::new(SUBNET, PREFIX),
+        stacks: BTreeMap::new(),
+    });
+    f(t)
+}
+
+/// Attaches `stack` as the port of `cell`; returns its assigned address
+/// (the same one again if the cell is already attached).
+pub(crate) fn attach(cell: u64, stack: Weak<Stack>) -> Option<Ipv4Addr> {
+    with_table(|t| {
+        let addr = match t.switch.addr(cell) {
+            Some(a) => a,
+            None => t.switch.attach(cell)?,
+        };
+        t.stacks.insert(cell, stack);
+        Some(addr)
+    })
+}
+
+/// The address assigned to `cell`.
+pub(crate) fn addr_of(cell: u64) -> Option<Ipv4Addr> {
+    with_table(|t| t.switch.addr(cell))
+}
+
+/// Sets `cell`'s rate limits (0: unlimited).
+#[allow(dead_code)] // the control plane's, milestone 6
+pub(crate) fn set_limits(cell: u64, pps: u64, bps: u64) -> bool {
+    with_table(|t| t.switch.set_limits(cell, pps, bps, now()))
+}
+
+/// The switch's counters for `cell`: (sent, received, dropped).
+pub(crate) fn stats(cell: u64) -> Option<(u64, u64, u64)> {
+    with_table(|t| {
+        t.switch
+            .stats(cell)
+            .map(|s| (s.sent, s.received, s.dropped))
+    })
+}
+
+/// Makes `dev`/`ifc` the uplink.
+pub(crate) fn set_uplink(dev: virtio_net::VirtioNet, ifc: Interface) {
+    let nat = Nat::new(ifc.addr);
+    *UPLINK.lock() = Some(Uplink {
+        dev,
+        ifc,
+        nat,
+        last_expire: now(),
+    });
+}
+
+/// Whether there is an uplink.
+pub(crate) fn has_uplink() -> bool {
+    UPLINK.lock().is_some()
+}
+
+/// Publishes `port` (protocol `proto`) on the uplink to `cell`'s
+/// `inside_port`. Fails without an uplink or an attached cell, or if the
+/// port is taken.
+pub(crate) fn publish(proto: u8, port: u16, cell: u64, inside_port: u16) -> bool {
+    let Some(addr) = addr_of(cell) else {
+        return false;
+    };
+    match UPLINK.lock().as_mut() {
+        Some(u) => u.nat.publish(proto, port, (addr, inside_port)),
+        None => false,
+    }
+}
+
+/// Withdraws a published port.
+pub(crate) fn unpublish(proto: u8, port: u16) {
+    if let Some(u) = UPLINK.lock().as_mut() {
+        u.nat.unpublish(proto, port);
+    }
+}
+
+fn ports(proto: u8, data: &[u8]) -> Option<(u16, u16)> {
+    match proto {
+        PROTO_TCP | PROTO_UDP if data.len() >= 8 => Some((
+            u16::from_be_bytes([data[0], data[1]]),
+            u16::from_be_bytes([data[2], data[3]]),
+        )),
+        _ => None,
+    }
+}
+
+fn flags(proto: u8, data: &[u8]) -> u8 {
+    if proto == PROTO_TCP {
+        nat::tcp_flags(data)
+    } else {
+        0
+    }
+}
+
+/// Routes packets that `from`'s stack sent, and every packet their
+/// delivery provokes, until none are left.
+pub(crate) fn send(from: PortId, pkts: Vec<Packet>) {
+    if pkts.is_empty() {
+        return;
+    }
+    let mut queue: VecDeque<(PortId, Packet)> = pkts.into_iter().map(|p| (from, p)).collect();
+    for _ in 0..MAX_ROUNDS {
+        let Some((port, p)) = queue.pop_front() else {
+            return;
+        };
+        let (verdict, target) = with_table(|t| {
+            let v = t
+                .switch
+                .route(port, p.src, p.dst, p.payload.len() + 20, now());
+            let target = match v {
+                Verdict::Deliver(id) => t.stacks.get(&id).and_then(Weak::upgrade),
+                _ => None,
+            };
+            (v, target)
+        });
+        match (verdict, target) {
+            (Verdict::Deliver(id), Some(stack)) => {
+                for out in stack.receive(p) {
+                    queue.push_back((id, out));
+                }
+            }
+            (Verdict::Uplink, _) => uplink_out(p),
+            _ => {}
+        }
+    }
+}
+
+/// Sends a cell's packet out of the uplink, translated.
+fn uplink_out(mut p: Packet) {
+    let mut u = UPLINK.lock();
+    let Some(u) = u.as_mut() else {
+        return;
+    };
+    let Some((sp, dp)) = ports(p.protocol, &p.payload) else {
+        return; // ICMP and others are not translated yet
+    };
+    let t = now();
+    let f = flags(p.protocol, &p.payload);
+    let Some(src) = u.nat.outbound(p.protocol, (p.src, sp), (p.dst, dp), f, t) else {
+        return;
+    };
+    if !nat::rewrite(p.protocol, &mut p.payload, src, (p.dst, dp)) {
+        return;
+    }
+    u.ifc.send(t, p.dst, p.protocol, &p.payload);
+    while let Some(frame) = u.ifc.transmit() {
+        u.dev.transmit(&frame);
+    }
+}
+
+/// Moves the uplink's traffic: transmits what is queued, receives frames,
+/// translates them and delivers them to their cells. Returns whether any
+/// frame arrived (the caller polls again soon while traffic flows).
+pub(crate) fn poll_uplink() -> bool {
+    let mut inbound: Vec<(PortId, Packet)> = Vec::new();
+    let mut any = false;
+    {
+        let mut u = UPLINK.lock();
+        let Some(u) = u.as_mut() else {
+            return false;
+        };
+        let t = now();
+        u.ifc.poll(t);
+        if t.saturating_sub(u.last_expire) > Duration::from_secs(10) {
+            u.nat.expire(t);
+            u.last_expire = t;
+        }
+        for _ in 0..256 {
+            let Some(frame) = u.dev.receive() else {
+                break;
+            };
+            any = true;
+            let Some(mut p) = u.ifc.receive(t, &frame) else {
+                continue;
+            };
+            let Some((sp, dp)) = ports(p.protocol, &p.payload) else {
+                continue;
+            };
+            let f = flags(p.protocol, &p.payload);
+            let Some(inside) = u.nat.inbound(p.protocol, (p.src, sp), dp, f, t) else {
+                continue;
+            };
+            if !nat::rewrite(p.protocol, &mut p.payload, (p.src, sp), inside) {
+                continue;
+            }
+            p.dst = inside.0;
+            let Some(id) = with_table(|tb| {
+                let id = tb.switch.port_of(inside.0)?;
+                tb.switch.received_from_uplink(id);
+                Some(id)
+            }) else {
+                continue;
+            };
+            inbound.push((id, p));
+        }
+        while let Some(frame) = u.ifc.transmit() {
+            u.dev.transmit(&frame);
+        }
+    }
+    for (id, p) in inbound {
+        let stack = with_table(|t| t.stacks.get(&id).and_then(Weak::upgrade));
+        if let Some(stack) = stack {
+            let out = stack.receive(p);
+            send(id, out);
+        }
+    }
+    any
+}

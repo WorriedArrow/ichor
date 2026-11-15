@@ -94,6 +94,22 @@ idle machine does not burn a CPU. Interrupt-driven receive (MSI-X in
 frame) and cloud NICs (ENA, gVNIC) come with milestone 8 and need their
 own frame budget step.
 
+### Amendment (2026-11-15): ports carry IP packets
+
+Both ends of a cell's port are Ichor stacks, so the port carries IPv4
+packets, not Ethernet frames: the switch forwards by assigned IP address
+(`net::switch`), and there is no ARP between cells at all. Proxy ARP is
+therefore unnecessary: a cell cannot broadcast to another, and it never
+sees a packet not addressed to it. Anti-spoofing checks the source IP
+against the port's assignment; MAC addresses and ARP exist only on the
+uplink, which is a real Ethernet interface (`net::iface`). Cells use
+10.88.0.0/16 (the switch is .1); NAT and published ports live in
+`net::nat`. The cross-cell fast path hands the owned segment buffer from
+one stack to the other inside the sending call, with no device and no
+copy. Socket buffers are not yet charged to the cell's account; that,
+UDP, and `AF_UNIX` are the remaining milestone 5 networking pieces
+besides the workloads.
+
 ## Alternatives considered
 
 - **smoltcp.** A mature no_std stack under a permissive license. Rejected

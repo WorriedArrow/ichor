@@ -69,10 +69,22 @@ pub fn boot_disk_with(
 /// Boots the kernel with `cmdline` (plus `qemu_debug_exit`) and returns the
 /// outcome. `name` must be unique per test: it names the run directory.
 pub fn boot(name: &str, cmdline: &str, smp: u32) -> Outcome {
+    boot_with(name, cmdline, smp, |_| {})
+}
+
+/// [`boot`], with `tweak` adjusting the run (for example the user-mode
+/// network's port forwards) before it starts.
+pub fn boot_with(
+    name: &str,
+    cmdline: &str,
+    smp: u32,
+    tweak: impl FnOnce(&mut RunConfig),
+) -> Outcome {
     let mut cfg = RunConfig::new(format!("test-{name}"), kernel());
     cfg.cmdline = format!("qemu_debug_exit {cmdline}");
     cfg.smp = smp;
     cfg.capture = true;
     cfg.timeout = Some(BOOT_TIMEOUT);
+    tweak(&mut cfg);
     run(&cfg).expect("failed to run QEMU")
 }
