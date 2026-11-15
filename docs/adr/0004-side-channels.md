@@ -77,6 +77,19 @@ on shared code and data, of the Flush+Reload kind. Sharing is per-cell
 policy, and a cell can opt out and get private copies. The control plane
 defaults to opt-out for cells marked sensitive.
 
+Implementation (`kernel/ichor/src/pagecache.rs`): a root mounted for an
+opted-out cell (`Vfs::mount_disk_private`) reads through a private cache
+namespace. Its pages are filled and verified from the device like shared
+ones but never looked up by, or handed to, any other namespace; they are
+charged to the cell's account, evicted only by that cell's own pressure
+(so another cell cannot evict them, or observe its own evictions caused
+by them), and freed when the root is dropped. Sharing roots still share
+pages keyed by the verified BLAKE3 hash. The boot self-test
+(`blktest::opt_out`) checks distinct physical pages in both read orders,
+between two opted-out cells, the charge, eviction at the cell's limit, and
+release on drop. Still open: shared-namespace pages are not yet charged to
+an `Image` account (ADR-0002 §4).
+
 ### 5. Known leak: the per-CPU GS base
 
 Ring 3 runs with GS pointing at the kernel's per-CPU block (see the

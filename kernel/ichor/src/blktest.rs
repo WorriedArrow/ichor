@@ -104,6 +104,11 @@ fn mount(name: &str, disk: impl BlockDevice + Send + 'static) -> Mounted {
 /// Checks the root disk's pattern file, then runs `cat /etc/motd` (and, on
 /// virtio-blk, busybox) against the mounted root in a fresh cell.
 fn exercise(name: &str, m: &Mounted, vfs: Arc<Vfs>) {
+    if name == "virtio-blk" {
+        // Before anything else reads the disk, so the opted-out root can
+        // be the first to read a chunk.
+        opt_out(m);
+    }
     check_pattern(name, m);
     println!("ichor: blk: mounted the root image from the {name} disk");
 
@@ -122,6 +127,107 @@ fn exercise(name: &str, m: &Mounted, vfs: Arc<Vfs>) {
     if name == "virtio-blk" {
         crate::busytest::run(&vfs);
     }
+}
+
+/// The physical address of the cache page holding page 0 of `path`.
+fn page0(vfs: &Vfs, path: &str) -> u64 {
+    let ino = vfs
+        .lock()
+        .resolve(crate::vfs::ROOT, path, true)
+        .unwrap_or_else(|_| fail("opt-out: resolve"));
+    vfs.cached_page(ino, 0)
+        .unwrap_or_else(|| fail("opt-out: no cache page"))
+        .phys()
+        .as_u64()
+}
+
+/// Page sharing is per-cell policy (ADR-0004 §4). Mounts the disk as a
+/// sharing root and as roots of two cells that opted out. Reading the same
+/// chunk through a sharing and an opted-out root gives two physical pages
+/// whichever reads first, and the two opted-out cells share with neither;
+/// opted-out pages are charged to their cell, bounded by its limit (its
+/// own pages are evicted, nobody else's), and returned when its root is
+/// dropped.
+fn opt_out(m: &Mounted) {
+    let system = System::new(4096).unwrap_or_else(|| fail("no system cell"));
+    let cell =
+        |limit| Cell::new(&system.root_account, limit).unwrap_or_else(|| fail("opt-out: no cell"));
+    let (a, b, tiny) = (cell(128), cell(128), cell(1));
+    let mount = |acc: Option<&Arc<Cell>>| {
+        let v = match acc {
+            None => Vfs::mount_disk(m),
+            Some(c) => Vfs::mount_disk_private(m, c.account().clone()),
+        };
+        Arc::new(v.unwrap_or_else(|_| fail("opt-out: mount")))
+    };
+    let shared = mount(None);
+    let private = mount(Some(&a));
+    let other = mount(Some(&b));
+    let small = mount(Some(&tiny));
+    let ns = private
+        .private_ns()
+        .unwrap_or_else(|| fail("opt-out: no private namespace"));
+    if shared.private_ns().is_some() {
+        fail("opt-out: a sharing root has a private namespace");
+    }
+
+    // The sharing root reads first, then the opted-out one.
+    let s_motd = page0(&shared, "/usr/share/motd");
+    let p_motd = page0(&private, "/usr/share/motd");
+    // The opted-out root reads first, then the sharing one.
+    let p_pat = page0(&private, "/usr/share/pattern");
+    let s_pat = page0(&shared, "/usr/share/pattern");
+    if s_motd == p_motd || s_pat == p_pat {
+        fail("opt-out: an opted-out root got a shared page");
+    }
+    if page0(&shared, "/usr/share/motd") != s_motd || page0(&private, "/usr/share/pattern") != p_pat
+    {
+        fail("opt-out: a namespace did not keep its own page");
+    }
+    let o_motd = page0(&other, "/usr/share/motd");
+    if o_motd == s_motd || o_motd == p_motd {
+        fail("opt-out: two opted-out cells share a page");
+    }
+    if pagecache::private_pages(ns) != 2 || a.account().used() != 2 || b.account().used() != 1 {
+        fail("opt-out: private pages are not charged to their cell");
+    }
+
+    // A process in the opted-out cell reads through its private namespace.
+    let (status, _) = run_linux(
+        LinuxProcess::new(a.clone(), private.clone()).unwrap_or_else(|| fail("no process")),
+        &cat_program(),
+        None,
+        &["cat", "/etc/motd"],
+    );
+    if status != 0 {
+        fail("opt-out: cat in an opted-out cell failed");
+    }
+    if a.account().used() != pagecache::private_pages(ns) as u64 {
+        fail("opt-out: charge does not match the private pages after a process ran");
+    }
+
+    // A one-page cell keeps one page and evicts its own to read another.
+    let t1 = page0(&small, "/usr/share/motd");
+    let t2 = page0(&small, "/usr/share/pattern");
+    if t1 == s_motd || t2 == s_pat || tiny.account().used() != 1 {
+        fail("opt-out: a cell at its limit did not evict its own page");
+    }
+
+    // Dropping the root frees its namespace and returns the charge.
+    if Arc::strong_count(&private) != 1 {
+        fail("opt-out: the private root is still referenced");
+    }
+    drop(private);
+    if pagecache::private_pages(ns) != 0 || a.account().used() != 0 {
+        fail("opt-out: private pages outlived their root");
+    }
+    drop((other, small));
+    if b.account().used() != 0 || tiny.account().used() != 0 {
+        fail("opt-out: private pages outlived their root");
+    }
+    println!(
+        "ichor: pagecache: opted-out cells read private copies charged to their own account; sharing cells share"
+    );
 }
 
 /// A disk in memory, for the tampering checks.

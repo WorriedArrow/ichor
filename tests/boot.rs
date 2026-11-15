@@ -75,6 +75,7 @@ fn m1_boots_on_four_cpus() {
         "ichor: linux: EPOLLET edges, ppoll/epoll_pwait signal masks, vfork waits for the child",
         "ichor: linux: AVX state is per thread and survives signals",
         "ichor: blk: virtio-blk disk, ",
+        "ichor: pagecache: opted-out cells read private copies charged to their own account; sharing cells share",
         "ichor: blk: virtio-blk: verified 300 KiB read across multiple requests",
         "ichor: blk: mounted the root image from the virtio-blk disk",
         "hello from /etc/motd on the root disk",

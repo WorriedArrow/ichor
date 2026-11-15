@@ -163,8 +163,12 @@ Milestones 0-3 are done.
   local `/mirror` (hello, jq, libjq1, libonig5; pinned on
   snapshot.debian.org) passes in CI: milestone 4's acceptance test.
   prctl, statx, sched_getaffinity, /sys cpu lists, mremap, sysinfo are in.
-  Open: no ptys (/dev/ptmx), no per-cell page-sharing opt-out, the
-  cross-cell isolation test (owner is writing it).
+  Open: no ptys (/dev/ptmx), the cross-cell isolation test (owner is
+  writing it).
+- Page-sharing opt-out (ADR-0004 §4): `Vfs::mount_disk_private` gives a
+  cell's root a private page-cache namespace (`pagecache::View`), charged
+  to the cell's account, evicting only its own pages, freed with the root.
+  `blktest::opt_out` checks it on every boot.
 - Scheduler wake-ups (frame `task.rs`): a task is marked blocked before it
   is visible on a wait queue, the re-check runs with interrupts off, and a
   task that does not sleep leaves the queue; the idle loop re-checks before
@@ -188,7 +192,7 @@ Milestones 0-3 are done.
   lower file map the cache's page copy-on-write (one physical copy of
   busybox/ld-musl for every process). `MAX_ORDER` is back to 10 (4 MiB):
   frame records the largest contiguous request and the boot fails if it
-  exceeds that. Not yet: cache pages charged to cells.
+  exceeds that. Not yet: shared cache pages charged to an image account.
 - M4 upper layer (Phase C, step 2): upper files are paged and sparse (a
   page map, the byte budget counts pages; MAX_FILE 1 TiB of offsets), copy-up
   goes page by page, directories report 2 + subdirectories, and

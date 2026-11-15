@@ -9,18 +9,24 @@
 //! two devices, with the same chunk share one page, and a device that
 //! returns wrong bytes yields EIO instead of corrupt data.
 //!
-//! The cache is global and bounded ([`CAPACITY`] pages) with clock
-//! eviction. The loader and file mappings map cached pages into processes
-//! copy-on-write (see `file.rs`), so a library or executable that many
-//! processes run shares one physical copy. Partial: cache pages are not
-//! charged to the cells that read them.
+//! The shared namespace is global and bounded ([`CAPACITY`] pages) with
+//! clock eviction. The loader and file mappings map cached pages into
+//! processes copy-on-write (see `file.rs`), so a library or executable that
+//! many processes run shares one physical copy; each mapping is charged to
+//! the process that maps it. Sharing is per-root policy (ADR-0004 §4): a
+//! root mounted with a private [`View`] reads through a namespace of its
+//! own, its pages charged to its cell's account and evicted only by its own
+//! pressure. Partial: shared-namespace pages are not charged to the cells
+//! that read them.
 
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, VecDeque};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use block::{BlockDevice, SECTOR_SIZE};
+use cell::Account;
 use frame::mm::UFrame;
 use frame::sync::Mutex;
 use image::{CHUNK_SIZE, ChunkSource, Error, Extent, Hash};
@@ -38,26 +44,85 @@ struct Entry {
     referenced: bool,
 }
 
-struct Cache {
+/// Pages kept by verified hash, with clock eviction.
+struct Pool {
     map: BTreeMap<Hash, Entry>,
     clock: VecDeque<Hash>,
 }
 
+impl Pool {
+    const fn new() -> Pool {
+        Pool {
+            map: BTreeMap::new(),
+            clock: VecDeque::new(),
+        }
+    }
+
+    /// Evicts one page (clock, second chance). False if the pool is empty.
+    fn evict_one(&mut self) -> bool {
+        while let Some(victim) = self.clock.pop_front() {
+            match self.map.get_mut(&victim) {
+                Some(e) if e.referenced => {
+                    e.referenced = false;
+                    self.clock.push_back(victim);
+                }
+                Some(_) => {
+                    self.map.remove(&victim);
+                    return true;
+                }
+                None => {}
+            }
+        }
+        false
+    }
+
+    fn put(&mut self, hash: Hash, frame: UFrame, disk: u64) {
+        self.map.insert(
+            hash,
+            Entry {
+                frame,
+                disk,
+                referenced: false,
+            },
+        );
+        self.clock.push_back(hash);
+    }
+}
+
+/// An opted-out root's own cache: its pages are charged to its cell's
+/// account, and only its own pressure evicts them.
+struct Private {
+    pages: Pool,
+    account: Arc<Account>,
+}
+
+struct Cache {
+    /// The namespace every sharing root reads through, bounded by
+    /// [`CAPACITY`].
+    shared: Pool,
+    /// Private namespaces by id.
+    private: BTreeMap<u64, Private>,
+}
+
 static CACHE: Mutex<Cache> = Mutex::new(Cache {
-    map: BTreeMap::new(),
-    clock: VecDeque::new(),
+    shared: Pool::new(),
+    private: BTreeMap::new(),
 });
 static HITS: AtomicU64 = AtomicU64::new(0);
 static MISSES: AtomicU64 = AtomicU64::new(0);
 static SHARED: AtomicU64 = AtomicU64::new(0);
 static MAPPED: AtomicU64 = AtomicU64::new(0);
 static NEXT_DISK: AtomicU64 = AtomicU64::new(1);
+/// The shared namespace's id; private ones count up from 1.
+const SHARED_NS: u64 = 0;
+static NEXT_NS: AtomicU64 = AtomicU64::new(1);
 
 /// `(pages cached, hits, misses, hits on a page another disk filled,
-/// pages handed out to be mapped into processes)`.
+/// pages handed out to be mapped into processes)`; pages cached counts the
+/// shared namespace only.
 pub(crate) fn stats() -> (usize, u64, u64, u64, u64) {
     (
-        CACHE.lock().map.len(),
+        CACHE.lock().shared.map.len(),
         HITS.load(Ordering::Relaxed),
         MISSES.load(Ordering::Relaxed),
         SHARED.load(Ordering::Relaxed),
@@ -65,9 +130,23 @@ pub(crate) fn stats() -> (usize, u64, u64, u64, u64) {
     )
 }
 
-fn lookup(hash: &Hash, disk: u64) -> Option<UFrame> {
+/// Pages held by private namespace `ns` (0 once it is gone).
+pub(crate) fn private_pages(ns: u64) -> usize {
+    CACHE
+        .lock()
+        .private
+        .get(&ns)
+        .map_or(0, |p| p.pages.map.len())
+}
+
+fn lookup(ns: u64, hash: &Hash, disk: u64) -> Option<UFrame> {
     let mut c = CACHE.lock();
-    let e = c.map.get_mut(hash)?;
+    let pool = if ns == SHARED_NS {
+        &mut c.shared
+    } else {
+        &mut c.private.get_mut(&ns)?.pages
+    };
+    let e = pool.map.get_mut(hash)?;
     e.referenced = true;
     HITS.fetch_add(1, Ordering::Relaxed);
     if e.disk != disk {
@@ -76,38 +155,42 @@ fn lookup(hash: &Hash, disk: u64) -> Option<UFrame> {
     Some(e.frame.clone())
 }
 
-fn insert(hash: Hash, frame: UFrame, disk: u64) {
+fn insert(ns: u64, hash: Hash, frame: UFrame, disk: u64) {
     let mut c = CACHE.lock();
-    if c.map.contains_key(&hash) {
-        return; // another reader filled it meanwhile
-    }
-    while c.map.len() >= CAPACITY {
-        let Some(victim) = c.clock.pop_front() else {
-            break;
-        };
-        let second_chance = c.map.get_mut(&victim).is_some_and(|e| {
-            let r = e.referenced;
-            e.referenced = false;
-            r
-        });
-        if second_chance {
-            c.clock.push_back(victim);
-        } else {
-            c.map.remove(&victim);
+    if ns == SHARED_NS {
+        let pool = &mut c.shared;
+        if pool.map.contains_key(&hash) {
+            return; // another reader filled it meanwhile
         }
+        while pool.map.len() >= CAPACITY && pool.evict_one() {}
+        pool.put(hash, frame, disk);
+        return;
     }
-    c.map.insert(
-        hash,
-        Entry {
-            frame,
-            disk,
-            referenced: false,
-        },
-    );
-    c.clock.push_back(hash);
+    // A namespace already closed caches nothing; the caller still has its
+    // verified frame.
+    let Some(p) = c.private.get_mut(&ns) else {
+        return;
+    };
+    if p.pages.map.contains_key(&hash) {
+        return;
+    }
+    // Make room among the cell's own pages: over the cell's limit (or the
+    // per-namespace cap) it evicts its own, never another namespace's. A
+    // cell with nothing left to evict reads uncached.
+    loop {
+        if p.pages.map.len() < CAPACITY && p.account.charge(1).is_ok() {
+            break;
+        }
+        if !p.pages.evict_one() {
+            return;
+        }
+        p.account.release(1);
+    }
+    p.pages.put(hash, frame, disk);
 }
 
-/// A block device holding an image, as a [`ChunkSource`] through the cache.
+/// A block device holding an image. As a [`ChunkSource`] it reads through
+/// the shared namespace.
 pub(crate) struct Disk {
     id: u64,
     dev: Mutex<Box<dyn BlockDevice + Send>>,
@@ -120,8 +203,9 @@ impl core::fmt::Debug for Disk {
 }
 
 impl Disk {
-    /// Reads chunk `ext` from the device and verifies it.
-    fn fill(&self, ext: &Extent) -> Result<UFrame, Error> {
+    /// Reads chunk `ext` from the device, verifies it, and caches it in
+    /// namespace `ns`.
+    fn fill(&self, ns: u64, ext: &Extent) -> Result<UFrame, Error> {
         let mut buf = alloc::vec![0u8; CHUNK_SIZE as usize];
         let len = usize::try_from(ext.len).map_err(|_| Error::Corrupt)?;
         self.dev
@@ -134,34 +218,100 @@ impl Disk {
         let frame = UFrame::alloc_zeroed().ok_or(Error::Io)?;
         frame.writer().write(&buf[..len]);
         MISSES.fetch_add(1, Ordering::Relaxed);
-        insert(ext.hash, frame.clone(), self.id);
+        insert(ns, ext.hash, frame.clone(), self.id);
         Ok(frame)
     }
-}
 
-/// The verified cache page for chunk `ext` of `disk`, filling it if needed.
-pub(crate) fn frame(disk: &Disk, ext: &Extent) -> Result<UFrame, Error> {
-    MAPPED.fetch_add(1, Ordering::Relaxed);
-    match lookup(&ext.hash, disk.id) {
-        Some(f) => Ok(f),
-        None => disk.fill(ext),
+    /// The verified page for chunk `ext` in namespace `ns`.
+    fn page(&self, ns: u64, ext: &Extent) -> Result<UFrame, Error> {
+        match lookup(ns, &ext.hash, self.id) {
+            Some(f) => Ok(f),
+            None => self.fill(ns, ext),
+        }
     }
-}
 
-impl ChunkSource for Disk {
-    fn read_chunk(&self, ext: &Extent, at: usize, out: &mut [u8]) -> Result<usize, Error> {
+    /// Copies bytes `at..` of chunk `ext`, through namespace `ns`.
+    fn read_in(&self, ns: u64, ext: &Extent, at: usize, out: &mut [u8]) -> Result<usize, Error> {
         let len = usize::try_from(ext.len).map_err(|_| Error::Corrupt)?;
         let n = out.len().min(len.saturating_sub(at));
         if n == 0 {
             return Ok(0);
         }
-        let frame = match lookup(&ext.hash, self.id) {
-            Some(f) => f,
-            None => self.fill(ext)?,
-        };
+        let frame = self.page(ns, ext)?;
         let mut r = frame.reader();
         r.skip(at);
         Ok(r.read(&mut out[..n]))
+    }
+}
+
+impl ChunkSource for Disk {
+    fn read_chunk(&self, ext: &Extent, at: usize, out: &mut [u8]) -> Result<usize, Error> {
+        self.read_in(SHARED_NS, ext, at, out)
+    }
+}
+
+/// How one root reads its disk through the cache: the shared namespace
+/// (pages shared by verified hash with every other sharing root), or a
+/// private namespace of its own (ADR-0004 §4: a cell that opts out of
+/// sharing gets private copies charged to its account, so no page it
+/// reads is shared with, or evicted by, another cell).
+#[derive(Debug)]
+pub(crate) struct View {
+    disk: &'static Disk,
+    ns: u64,
+}
+
+impl View {
+    /// Reads `disk` through the shared namespace.
+    pub(crate) fn shared(disk: &'static Disk) -> View {
+        View {
+            disk,
+            ns: SHARED_NS,
+        }
+    }
+
+    /// Reads `disk` through a new private namespace whose pages are charged
+    /// to `account`. Free it with [`View::close`].
+    pub(crate) fn private(disk: &'static Disk, account: Arc<Account>) -> View {
+        let ns = NEXT_NS.fetch_add(1, Ordering::Relaxed);
+        CACHE.lock().private.insert(
+            ns,
+            Private {
+                pages: Pool::new(),
+                account,
+            },
+        );
+        View { disk, ns }
+    }
+
+    /// The private namespace's id, if this view has one.
+    pub(crate) fn private_ns(&self) -> Option<u64> {
+        (self.ns != SHARED_NS).then_some(self.ns)
+    }
+
+    /// Frees a private namespace's pages and returns their charge. Reads
+    /// through the view still work afterwards, uncached.
+    pub(crate) fn close(&self) {
+        if self.ns == SHARED_NS {
+            return;
+        }
+        let gone = CACHE.lock().private.remove(&self.ns);
+        if let Some(p) = gone {
+            p.account.release(p.pages.map.len() as u64);
+        }
+    }
+
+    /// The verified cache page for chunk `ext`, filling it if needed, to be
+    /// mapped into a process.
+    pub(crate) fn frame(&self, ext: &Extent) -> Result<UFrame, Error> {
+        MAPPED.fetch_add(1, Ordering::Relaxed);
+        self.disk.page(self.ns, ext)
+    }
+}
+
+impl ChunkSource for View {
+    fn read_chunk(&self, ext: &Extent, at: usize, out: &mut [u8]) -> Result<usize, Error> {
+        self.disk.read_in(self.ns, ext, at, out)
     }
 }
 

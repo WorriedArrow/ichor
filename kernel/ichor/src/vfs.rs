@@ -33,8 +33,18 @@ const UPPER_BYTES: usize = 64 << 20;
 #[derive(Debug)]
 pub(crate) struct Vfs {
     fs: Mutex<Overlay<'static>>,
-    /// The disk the lower layer comes from, whose cache pages files map.
-    disk: Option<&'static crate::pagecache::Disk>,
+    /// How the lower layer reads its disk through the page cache (shared or
+    /// a private namespace), whose pages files map.
+    view: Option<&'static crate::pagecache::View>,
+}
+
+impl Drop for Vfs {
+    fn drop(&mut self) {
+        // A private namespace lives as long as its root.
+        if let Some(v) = self.view {
+            v.close();
+        }
+    }
 }
 
 impl Vfs {
@@ -51,22 +61,58 @@ impl Vfs {
         crate::dev::populate(&mut fs);
         Ok(Vfs {
             fs: Mutex::new(fs),
-            disk: None,
+            view: None,
         })
     }
 
-    /// Mounts a disk's image (see [`crate::pagecache::mount_disk`]).
+    /// Mounts a disk's image (see [`crate::pagecache::mount_disk`]),
+    /// sharing cache pages with every other sharing root.
     pub(crate) fn mount_disk(m: &crate::pagecache::Mounted) -> Result<Vfs, image::Error> {
-        let mut vfs = Vfs::mount(m.metadata, m.disk)?;
-        vfs.disk = Some(m.disk);
-        Ok(vfs)
+        Vfs::mount_view(m, crate::pagecache::View::shared(m.disk))
+    }
+
+    /// Mounts a disk's image for a cell that opts out of page sharing: the
+    /// root reads through a private cache namespace charged to `account`
+    /// and freed when the root is dropped (ADR-0004 §4).
+    pub(crate) fn mount_disk_private(
+        m: &crate::pagecache::Mounted,
+        account: alloc::sync::Arc<cell::Account>,
+    ) -> Result<Vfs, image::Error> {
+        Vfs::mount_view(m, crate::pagecache::View::private(m.disk, account))
+    }
+
+    fn mount_view(
+        m: &crate::pagecache::Mounted,
+        view: crate::pagecache::View,
+    ) -> Result<Vfs, image::Error> {
+        // The overlay needs its chunk source for the life of the system:
+        // the view is two words, and a private one's pages are freed when
+        // the root drops.
+        let view: &'static crate::pagecache::View =
+            alloc::boxed::Box::leak(alloc::boxed::Box::new(view));
+        match Vfs::mount(m.metadata, view) {
+            Ok(mut vfs) => {
+                vfs.view = Some(view);
+                Ok(vfs)
+            }
+            Err(e) => {
+                view.close();
+                Err(e)
+            }
+        }
+    }
+
+    /// The private cache namespace this root reads through, if it opted
+    /// out of sharing.
+    pub(crate) fn private_ns(&self) -> Option<u64> {
+        self.view?.private_ns()
     }
 
     /// The verified cache page holding page `index` of `ino`, if `ino` is
     /// an unmodified lower file on a disk.
     pub(crate) fn cached_page(&self, ino: Ino, index: u64) -> Option<frame::mm::UFrame> {
         let ext = self.fs.lock().lower_extent(ino, index)?;
-        crate::pagecache::frame(self.disk?, &ext).ok()
+        self.view?.frame(&ext).ok()
     }
 
     /// Mounts a whole image held in memory (self-tests).

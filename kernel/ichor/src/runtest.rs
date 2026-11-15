@@ -110,6 +110,9 @@ pub(crate) fn run_linux(
     };
     p.group.set_exec(argv.first().copied().unwrap_or(""), argv);
     let cell = p.cell.clone();
+    // A root that opted out of page sharing charges its private cache pages
+    // to the cell too; those are the root's, not the process's.
+    let cache_ns = p.vfs.private_ns();
     let leader = p.group.leader.clone();
     let ctx = UserContext::new(loaded.entry, loaded.stack_pointer);
     let (_, syscalls) = proc::run(p, ctx);
@@ -121,9 +124,10 @@ pub(crate) fn run_linux(
         }
         frame::task::yield_now();
     };
-    if cell.account().used() != 0 {
+    let cached = cache_ns.map_or(0, |ns| crate::pagecache::private_pages(ns) as u64);
+    if cell.account().used() != cached {
         println!(
-            "ichor: runtest: {} pages still charged",
+            "ichor: runtest: {} pages still charged ({cached} private cache pages)",
             cell.account().used()
         );
         fail("process memory was not returned");
