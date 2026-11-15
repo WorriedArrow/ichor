@@ -1,0 +1,108 @@
+//! Pinned downloads of third-party test artifacts (busybox, Alpine, ...).
+//!
+//! Each artifact is fetched from its official upstream with `curl`, checked
+//! against a SHA-256 pinned in this repository, and cached under
+//! `target/<dir>/`. A cached copy is re-hashed on every use. Concurrent
+//! callers (parallel tests) share one download per process, and separate
+//! processes each write their own partial file and rename it into place.
+//! Artifacts are never committed: several are GPL-licensed.
+
+use std::collections::BTreeMap;
+use std::fs;
+use std::process::Command;
+use std::sync::Mutex;
+
+use crate::{Result, sha256, workspace_root};
+
+/// A file to fetch.
+#[derive(Clone, Copy, Debug)]
+pub struct Artifact {
+    /// Cache directory under `target/`.
+    pub dir: &'static str,
+    /// File name in that directory.
+    pub file: &'static str,
+    pub url: &'static str,
+    pub sha256: &'static str,
+    /// Environment variable that points at a local copy instead.
+    pub env: &'static str,
+}
+
+fn check(a: &Artifact, bytes: &[u8], what: &str) -> Result<()> {
+    let got = sha256::hex(&sha256::digest(bytes));
+    if got != a.sha256 {
+        return Err(format!("{what}: SHA-256 is {got}, expected {}", a.sha256));
+    }
+    Ok(())
+}
+
+impl Artifact {
+    /// The artifact's bytes, downloading and caching it if needed.
+    pub fn bytes(&self) -> Result<Vec<u8>> {
+        static DONE: Mutex<BTreeMap<&'static str, Vec<u8>>> = Mutex::new(BTreeMap::new());
+        let mut done = DONE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(b) = done.get(self.url) {
+            return Ok(b.clone());
+        }
+        let b = self.fetch()?;
+        done.insert(self.url, b.clone());
+        Ok(b)
+    }
+
+    fn fetch(&self) -> Result<Vec<u8>> {
+        if let Some(p) = std::env::var_os(self.env) {
+            let b = fs::read(&p).map_err(|e| format!("reading {}: {e}", p.to_string_lossy()))?;
+            check(self, &b, &p.to_string_lossy())?;
+            return Ok(b);
+        }
+        let dir = workspace_root().join("target").join(self.dir);
+        let path = dir.join(self.file);
+        if let Ok(b) = fs::read(&path)
+            && check(self, &b, "cached copy").is_ok()
+        {
+            return Ok(b);
+        }
+        fs::create_dir_all(&dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
+        let partial = dir.join(format!("{}.partial.{}", self.file, std::process::id()));
+        let status = Command::new("curl")
+            .args(["--silent", "--show-error", "--fail", "--location"])
+            .args(["--retry", "3", "--output"])
+            .arg(&partial)
+            .arg(self.url)
+            .status()
+            .map_err(|e| format!("running curl for {}: {e} (or set {})", self.url, self.env))?;
+        if !status.success() {
+            return Err(format!(
+                "downloading {} failed ({status}); set {} to a local copy",
+                self.url, self.env
+            ));
+        }
+        let b = fs::read(&partial).map_err(|e| format!("reading {}: {e}", partial.display()))?;
+        if let Err(e) = check(self, &b, self.url) {
+            let _ = fs::remove_file(&partial);
+            return Err(e);
+        }
+        fs::rename(&partial, &path).map_err(|e| format!("caching {}: {e}", path.display()))?;
+        Ok(b)
+    }
+}
+
+/// The official static busybox 1.35.0 (musl, x86-64) from busybox.net.
+pub const BUSYBOX: Artifact = Artifact {
+    dir: "busybox/1.35.0",
+    file: "busybox",
+    url: "https://busybox.net/downloads/binaries/1.35.0-x86_64-linux-musl/busybox",
+    sha256: "6e123e7f3202a8c1e9b1f94d8941580a25135382b99e8d3e34fb858bba311348",
+    env: "ICHOR_BUSYBOX",
+};
+
+/// Alpine Linux 3.20.3 minirootfs (x86-64). The hash matches Alpine's
+/// published `.sha256` for this release.
+pub const ALPINE_MINIROOTFS: Artifact = Artifact {
+    dir: "alpine/3.20.3",
+    file: "alpine-minirootfs-3.20.3-x86_64.tar.gz",
+    url: "https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86_64/alpine-minirootfs-3.20.3-x86_64.tar.gz",
+    sha256: "d4e6fd67dcf75e40c451560ac7265166c2b72a0f38ddc9aae756a7de3d1efa0c",
+    env: "ICHOR_ALPINE_MINIROOTFS",
+};

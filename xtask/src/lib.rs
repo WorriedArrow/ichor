@@ -7,11 +7,13 @@
 #![forbid(unsafe_code)]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // host tool
 
+pub mod artifact;
 pub mod audit;
 pub mod build;
-pub mod busybox;
+pub mod inflate;
 pub mod linux_abi;
 pub mod qemu;
+pub mod rootfs;
 pub mod sha256;
 
 use std::path::{Path, PathBuf};

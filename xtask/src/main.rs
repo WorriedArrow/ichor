@@ -142,7 +142,8 @@ fn cmd_test(o: &Opts) -> Result<()> {
     // Build the kernel and fetch the test busybox once, then hand both to
     // the integration tests.
     let kernel = build::kernel(o.profile)?;
-    xtask::busybox::bytes()?;
+    xtask::artifact::BUSYBOX.bytes()?;
+    xtask::artifact::ALPINE_MINIROOTFS.bytes()?;
     let mut cmd = cargo();
     cmd.args(["test", "--package", "ichor-tests"]);
     if std::env::var_os("ICHOR_TEST_VERBOSE").is_some() {

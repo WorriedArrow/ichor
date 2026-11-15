@@ -289,6 +289,8 @@ fn prepare_run_dir(cfg: &RunConfig, fw: &Firmware) -> Result<PathBuf> {
         .map_err(|e| format!("writing cmdline: {e}"))?;
     fs::write(dir.join("root.img"), root_image()?)
         .map_err(|e| format!("writing root image: {e}"))?;
+    fs::write(dir.join("alpine.img"), alpine_image()?)
+        .map_err(|e| format!("writing root image: {e}"))?;
     fs::copy(&fw.vars, dir.join("vars.fd"))
         .map_err(|e| format!("copying OVMF vars {}: {e}", fw.vars.display()))?;
     Ok(dir)
@@ -313,7 +315,7 @@ pub const BUSYBOX_APPLETS: &[&str] = &["cat", "echo", "ls", "sh", "true"];
 /// `/etc/motd -> /usr/share/motd`, `/usr/share/pattern`, and a static
 /// busybox at `/bin/busybox` with applet symlinks.
 pub fn root_image() -> Result<Vec<u8>> {
-    let busybox = crate::busybox::bytes()?;
+    let busybox = crate::artifact::BUSYBOX.bytes()?;
     let mut b = image::builder::Builder::new();
     let mut bin = alloc_bin(&mut b, &busybox);
     bin.sort_by(|a, b| a.0.cmp(b.0));
@@ -343,6 +345,15 @@ fn alloc_bin(
         v.push((a, b.symlink(a, "busybox")));
     }
     v
+}
+
+/// Alpine's minirootfs as an Ichor image: the root of a second cell.
+pub fn alpine_image() -> Result<Vec<u8>> {
+    let tgz = crate::artifact::ALPINE_MINIROOTFS.bytes()?;
+    let tar = crate::inflate::gunzip(&tgz)?;
+    let mut t = crate::rootfs::Tree::new();
+    t.add_tar(&tar)?;
+    Ok(t.image())
 }
 
 /// Builds the QEMU command line for a run.
@@ -395,6 +406,13 @@ pub fn command(cfg: &RunConfig) -> Result<Command> {
             drive_path(&dir.join("root.img"))
         ))
         .args(["-device", "virtio-blk-pci,drive=root,disable-legacy=on"])
+        // Alpine's root file system, for a cell that runs its userland.
+        .arg("-drive")
+        .arg(format!(
+            "if=none,id=alpine,format=raw,readonly=on,file={}",
+            drive_path(&dir.join("alpine.img"))
+        ))
+        .args(["-device", "virtio-blk-pci,drive=alpine,disable-legacy=on"])
         // The same image again on an NVMe controller (both read-only).
         .arg("-drive")
         .arg(format!(
