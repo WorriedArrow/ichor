@@ -17,7 +17,7 @@ pub(crate) mod early;
 mod frame;
 mod heap;
 pub(crate) mod kspace;
-mod meta;
+pub(crate) mod meta;
 pub(crate) mod page_alloc;
 mod vmspace;
 

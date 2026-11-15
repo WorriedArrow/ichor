@@ -271,3 +271,47 @@ pub(crate) fn alloc_stack() -> Option<u64> {
     *next_slot += 1;
     Some(bottom + STACK_PAGES * PAGE_SIZE)
 }
+
+/// Base of the kernel MMIO window (ADR-0005).
+const MMIO_BASE: u64 = 0xffff_d000_0000_0000;
+/// Size of the MMIO window (1 TiB).
+const MMIO_SIZE: u64 = 1 << 40;
+/// Next free offset in the MMIO window.
+static MMIO_NEXT: SpinLock<u64> = SpinLock::new(0);
+
+/// Maps physical `[pa, pa + len)` uncached into the MMIO window and returns
+/// the virtual address of `pa`. The caller (`IoMem::map`) has checked the
+/// range is device memory, not RAM.
+pub(crate) fn map_mmio(pa: u64, len: u64) -> Option<u64> {
+    let start = super::align_down(pa, PAGE_SIZE);
+    let end = super::align_up(pa.checked_add(len)?, PAGE_SIZE);
+    let size = end - start;
+    let mut next = MMIO_NEXT.lock();
+    if next.checked_add(size)? > MMIO_SIZE {
+        return None;
+    }
+    let va = MMIO_BASE + *next;
+    let root = PhysAddr::new(KERNEL_ROOT.load(Ordering::Relaxed));
+    let mut alloc = || {
+        let pa = page_alloc::alloc(0, kind::ALLOCATED)?;
+        // SAFETY: a fresh page from the allocator, reachable via the linear
+        // map, about to become a page table.
+        unsafe { paging::zero_page(pa) };
+        Some(pa)
+    };
+    // SAFETY: `root` is the live kernel PML4 and `alloc` yields zeroed,
+    // owned pages, all reachable through the linear map.
+    let mut m = unsafe { Mapper::new(root, false, &mut alloc) };
+    let props = Props {
+        write: true,
+        exec: false,
+        global: true,
+        uncached: true,
+    };
+    // SAFETY: the window range is handed out once (bump allocator under the
+    // lock), so it is unused. The physical range is device MMIO, not RAM, so
+    // no Rust object lives there and the mapping cannot alias one.
+    unsafe { m.map(va, start, size, props) }.ok()?;
+    *next += size;
+    Some(va + (pa - start))
+}

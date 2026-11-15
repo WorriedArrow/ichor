@@ -27,6 +27,8 @@ pub(crate) mod kind {
     pub(crate) const UNTYPED: u8 = 6;
     /// A page-table page of a user address space.
     pub(crate) const PAGE_TABLE: u8 = 7;
+    /// Head of a DMA buffer block (`frame::dma`).
+    pub(crate) const DMA: u8 = 8;
 }
 
 /// Sentinel for "no page" in the `next`/`prev` links.

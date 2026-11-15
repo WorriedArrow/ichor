@@ -41,3 +41,17 @@ pub(super) unsafe fn outl(port: u16, value: u32) {
         asm!("out dx, eax", in("dx") port, in("eax") value, options(nostack, preserves_flags))
     };
 }
+
+/// Reads one 32-bit value from an I/O port.
+///
+/// # Safety
+///
+/// Same contract as [`inb`].
+pub(super) unsafe fn inl(port: u16) -> u32 {
+    let value: u32;
+    // SAFETY: the caller owns the port (function contract).
+    unsafe {
+        asm!("in eax, dx", out("eax") value, in("dx") port, options(nostack, preserves_flags))
+    };
+    value
+}

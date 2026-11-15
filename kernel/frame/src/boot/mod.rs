@@ -205,6 +205,7 @@ pub(crate) extern "sysv64" fn kernel_space_entry() -> ! {
             "one-shot"
         }
     );
+    println!("ichor: frame: pci: {} functions", crate::bus::pci::init());
     let v = arch::cpu::vulnerabilities();
     let yn = |b: bool| if b { "affected" } else { "no" };
     println!(

@@ -10,6 +10,7 @@ brief where they conflict with it.
 | [0002](0002-cells-and-capabilities.md) | Cell model and capabilities | Accepted |
 | [0003](0003-frame-budget-milestone-2.md) | Frame growth for milestone 2 | Accepted |
 | [0004](0004-side-channels.md) | Side-channel posture | Accepted |
+| [0005](0005-device-io.md) | Device I/O in frame (PCI, IoMem, DMA, virtqueues) and the milestone 3 budget | Accepted |
 
 ## Planned
 

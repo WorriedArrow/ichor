@@ -5,6 +5,7 @@ pub mod cpu;
 pub(crate) mod early_console;
 mod io;
 pub mod paging;
+pub(crate) mod pci;
 pub(crate) mod qemu;
 pub(crate) mod regs;
 pub(crate) mod smp;
