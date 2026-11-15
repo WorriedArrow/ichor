@@ -70,6 +70,45 @@ pub fn read_prefix(
     Ok(out)
 }
 
+/// `sectors` sectors of `dev` from `start` on, as a device of its own: a
+/// partition. Reads outside it are refused before they reach `dev`.
+#[derive(Debug)]
+pub struct Slice<D> {
+    dev: D,
+    start: u64,
+    sectors: u64,
+}
+
+impl<D: BlockDevice> Slice<D> {
+    /// The slice, or `dev` back if it does not fit inside it.
+    pub fn new(dev: D, start: u64, sectors: u64) -> Result<Slice<D>, D> {
+        match start.checked_add(sectors) {
+            Some(end) if sectors > 0 && end <= dev.sector_count() => Ok(Slice {
+                dev,
+                start,
+                sectors,
+            }),
+            _ => Err(dev),
+        }
+    }
+
+    /// Where the slice starts on the underlying device.
+    pub fn start(&self) -> u64 {
+        self.start
+    }
+}
+
+impl<D: BlockDevice> BlockDevice for Slice<D> {
+    fn sector_count(&self) -> u64 {
+        self.sectors
+    }
+
+    fn read(&mut self, sector: u64, buf: &mut [u8]) -> Result<(), BlockError> {
+        check(self, sector, buf.len())?;
+        self.dev.read(self.start + sector, buf)
+    }
+}
+
 /// A device backed by memory, for tests.
 #[derive(Debug)]
 pub struct RamDisk {
@@ -118,5 +157,25 @@ mod tests {
         assert_eq!(d.read(0, &mut odd), Err(BlockError::Unaligned));
         assert!(d.read(3, &mut buf).is_ok());
         assert_eq!(read_prefix(&mut d, 5000, 512), Err(BlockError::OutOfRange));
+    }
+
+    #[test]
+    fn slices_offset_and_confine_reads() {
+        let d = disk(10);
+        let want = d.data[3 * SECTOR_SIZE..4 * SECTOR_SIZE].to_vec();
+        let mut s = Slice::new(d, 2, 4).unwrap();
+        assert_eq!(s.sector_count(), 4);
+        let mut buf = [0u8; SECTOR_SIZE];
+        s.read(1, &mut buf).unwrap();
+        assert_eq!(buf.as_slice(), want.as_slice());
+        // Sector 4 of the slice is sector 6 of the disk: outside the slice.
+        assert_eq!(s.read(4, &mut buf), Err(BlockError::OutOfRange));
+        assert_eq!(
+            s.read(3, &mut [0u8; 2 * SECTOR_SIZE]),
+            Err(BlockError::OutOfRange)
+        );
+        assert!(Slice::new(disk(10), 8, 3).is_err());
+        assert!(Slice::new(disk(10), u64::MAX, 2).is_err());
+        assert!(Slice::new(disk(10), 0, 0).is_err());
     }
 }

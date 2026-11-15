@@ -309,6 +309,15 @@ added XSAVE; C the frames tree and request tracking).
 The goal set for this effort is milestone 8, whose acceptance test needs
 cloud accounts and bare-metal hardware from the owner.
 
+Toward milestone 8 so far: `cargo xtask disk-image` writes a single
+bootable GPT disk (FAT32 ESP with `\EFI\BOOT\BOOTX64.EFI` and
+`\ichor\cmdline`, plus an Ichor root partition the kernel finds by type,
+`partition.rs`). `cloud_disk_boots_from_gpt_on_nvme` boots it under OVMF
+from NVMe alone (no vvfat, no other disks) and runs busybox from the root
+partition. Not yet: a network driver (AWS ENA / GCP gVNIC / virtio-net),
+Hyper-V VMBus for Azure, Secure Boot, and the cloud import scripts, which
+need the owner's accounts.
+
 ## Commands
 
 ```bash
@@ -319,6 +328,8 @@ cargo xtask test           # host unit tests, then QEMU integration tests (tests
 cargo xtask lint           # fmt check, clippy (host + UEFI target), forbid check, frame budget
 cargo xtask frame-audit    # frame line and unsafe-site counts against the budget
 cargo xtask run --cmdline "qemu_debug_exit bench" --smp 4 --release   # benchmarks (use KVM for real numbers)
+cargo xtask bench --accel kvm --smp 4   # Ichor vs Linux, same machine and programs (Markdown table)
+cargo xtask disk-image     # target/ichor-disk.img: bootable GPT disk (ESP + Ichor root) for clouds/bare metal
 cargo deny check           # licenses, advisories, sources
 ```
 
@@ -381,12 +392,15 @@ kernel/csprng    ChaCha20 generator with fast key erasure (host-tested)
 kernel/civil     calendar time to Unix time, for the firmware clock (host-tested)
 kernel/blake3    BLAKE3, portable, checked against the official vectors (host-tested)
 kernel/testprog  tiny x86-64 assembler + static-ELF writer for self-test and benchmark programs (host-tested; xtask uses it too)
+kernel/gpt       GUID partition tables: CRC-checked reader (kernel), writer behind `builder` (xtask) (host-tested)
 kernel/drivers/virtio-pci  modern virtio PCI transport shared by the virtio drivers
 kernel/drivers/virtio-blk  safe virtio-blk driver over frame's IoMem/DMA
 kernel/drivers/virtio-rng  safe virtio-rng (entropy) driver
 kernel/drivers/nvme        safe NVMe driver (polled, DMA-trusted)
 xtask/src/artifact.rs      pinned downloads (busybox, Alpine): SHA-256, cache, never committed
 xtask/src/inflate.rs       gzip/DEFLATE decoder; rootfs.rs: tar -> Ichor image
+xtask/src/disk.rs, fat.rs  bootable GPT disk image (FAT32 ESP + Ichor root partition)
+xtask/src/linuxref.rs      Linux reference boot for `cargo xtask bench` (Alpine linux-virt + initramfs)
 kernel/ichor     the kernel binary; frame::main!(kmain); kcell/nativeabi tie it together
 xtask/           build/run/test/lint tooling (lib + bin, no dependencies)
 tests/           QEMU integration tests (host crate using xtask's runner)

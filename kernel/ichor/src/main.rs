@@ -26,6 +26,7 @@ mod loader;
 mod locks;
 mod nativeabi;
 mod pagecache;
+mod partition;
 mod pipe;
 mod poll;
 mod proc;

@@ -203,6 +203,11 @@ pub struct RunConfig {
     pub extra_args: Vec<String>,
     /// Show a window (GTK, serial console in it) instead of serial on stdio.
     pub window: bool,
+    /// Boot this whole-disk image (GPT: ESP + Ichor root, see `disk.rs`)
+    /// from an NVMe controller, as a cloud VM does, instead of the vvfat
+    /// ESP and the separate test disks. `cmdline` is then ignored: the
+    /// image carries its own.
+    pub disk_image: Option<PathBuf>,
 }
 
 impl RunConfig {
@@ -218,6 +223,7 @@ impl RunConfig {
             capture: false,
             extra_args: Vec::new(),
             window: false,
+            disk_image: None,
         }
     }
 }
@@ -429,6 +435,9 @@ pub fn debian_image_path() -> Result<std::path::PathBuf> {
 pub fn command(cfg: &RunConfig) -> Result<Command> {
     let qemu = find_qemu()?;
     let fw = find_firmware(&qemu)?;
+    if let Some(img) = &cfg.disk_image {
+        return disk_command(cfg, &qemu, &fw, img);
+    }
     let dir = prepare_run_dir(cfg, &fw)?;
     let accel = cfg.accel.resolve();
 
@@ -498,6 +507,44 @@ pub fn command(cfg: &RunConfig) -> Result<Command> {
             "-device",
             "nvme,serial=ichor0,drive=nvme0,logical_block_size=4096,physical_block_size=4096",
         ])
+        .args(&cfg.extra_args);
+    Ok(cmd)
+}
+
+/// The QEMU command for booting a whole-disk image: OVMF, the image on an
+/// NVMe controller (512-byte blocks, the boot device), virtio-rng, and
+/// nothing else: what a cloud VM gives the guest, minus the network.
+fn disk_command(cfg: &RunConfig, qemu: &Path, fw: &Firmware, img: &Path) -> Result<Command> {
+    let dir = workspace_root().join("target").join("qemu").join(&cfg.name);
+    fs::create_dir_all(&dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
+    fs::copy(&fw.vars, dir.join("vars.fd"))
+        .map_err(|e| format!("copying OVMF vars {}: {e}", fw.vars.display()))?;
+    let accel = cfg.accel.resolve();
+    let mut cmd = Command::new(qemu);
+    cmd.args(["-machine", "q35", "-accel", accel.qemu_name()])
+        .args(["-cpu", accel.cpu_model()])
+        .args(["-smp", &cfg.smp.to_string()])
+        .args(["-m", &format!("{}M", cfg.memory_mib)])
+        .args(["-nodefaults", "-no-user-config", "-no-reboot"])
+        .args(["-display", "none", "-serial", "stdio"])
+        .args(["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"])
+        .arg("-drive")
+        .arg(format!(
+            "if=pflash,format=raw,unit=0,readonly=on,file={}",
+            drive_path(&fw.code)
+        ))
+        .arg("-drive")
+        .arg(format!(
+            "if=pflash,format=raw,unit=1,file={}",
+            drive_path(&dir.join("vars.fd"))
+        ))
+        .arg("-drive")
+        .arg(format!(
+            "if=none,id=disk,format=raw,readonly=on,file={}",
+            drive_path(img)
+        ))
+        .args(["-device", "nvme,serial=ichor-boot,drive=disk,bootindex=0"])
+        .args(["-device", "virtio-rng-pci,disable-legacy=on"])
         .args(&cfg.extra_args);
     Ok(cmd)
 }

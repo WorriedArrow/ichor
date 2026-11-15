@@ -72,9 +72,24 @@ pub(crate) fn run() {
     }
 }
 
-/// Mounts a disk's image: metadata read and checked against the root hash
-/// now, chunks paged in on demand.
-fn mount(name: &str, disk: impl BlockDevice + Send + 'static) -> Mounted {
+/// Mounts a disk's image: from its Ichor root partition if it has a GPT
+/// (a cloud or bare-metal boot disk), else from its first sector.
+fn mount<D: BlockDevice + Send + 'static>(name: &str, disk: D) -> Mounted {
+    match crate::partition::root(disk) {
+        Ok(part) => {
+            println!(
+                "ichor: blk: {name}: GPT disk, Ichor root partition at sector {}",
+                part.start()
+            );
+            mount_image(name, part)
+        }
+        Err(disk) => mount_image(name, disk),
+    }
+}
+
+/// Mounts the image on `disk`: metadata read and checked against the root
+/// hash now, chunks paged in on demand.
+fn mount_image(name: &str, disk: impl BlockDevice + Send + 'static) -> Mounted {
     let bytes = disk.sector_count().saturating_mul(SECTOR_SIZE as u64);
     let m = pagecache::mount_disk(disk).unwrap_or_else(|e| {
         println!("ichor: blk: {name}: cannot mount: {e:?}");
@@ -101,10 +116,16 @@ fn mount(name: &str, disk: impl BlockDevice + Send + 'static) -> Mounted {
     m
 }
 
-/// Checks the root disk's pattern file, then runs `cat /etc/motd` (and, on
-/// virtio-blk, busybox) against the mounted root in a fresh cell.
+/// Set once the first root disk has had the full checks.
+static FIRST_DONE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Checks the root disk's pattern file, then runs `cat /etc/motd` against
+/// the mounted root in a fresh cell. The first root disk found (virtio-blk
+/// in the QEMU test runs, the GPT boot disk on NVMe in a cloud-style boot)
+/// also gets the page-sharing opt-out check, busybox and the benchmarks.
 fn exercise(name: &str, m: &Mounted, vfs: Arc<Vfs>) {
-    if name == "virtio-blk" {
+    let first = !FIRST_DONE.swap(true, core::sync::atomic::Ordering::Relaxed);
+    if first {
         // Before anything else reads the disk, so the opted-out root can
         // be the first to read a chunk.
         opt_out(m);
@@ -124,7 +145,7 @@ fn exercise(name: &str, m: &Mounted, vfs: Arc<Vfs>) {
         fail("cat from disk: checks failed");
     }
     println!("ichor: blk: cat read /etc/motd from the {name} disk ({syscalls} syscalls)");
-    if name == "virtio-blk" {
+    if first {
         crate::busytest::run(&vfs);
         if crate::bench::enabled() {
             crate::bench::run(m, &vfs, &crate::busytest::read_busybox(&vfs));

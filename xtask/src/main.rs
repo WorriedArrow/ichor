@@ -22,6 +22,9 @@ Commands:
   linux-abi-table  Regenerate docs/linux-abi.md from the Linux syscall table
   bench        Run the benchmarks on Ichor and on a pinned Linux kernel, same
                machine and programs; prints a Markdown table (CI: --smp 4)
+  disk-image   Write target/ichor-disk.img: a bootable GPT disk (FAT32 ESP with
+               ichor.efi, Ichor root partition), for cloud import or bare metal;
+               the kernel command line is --cmdline (default: empty)
   help         Show this message
 
 Options:
@@ -203,6 +206,29 @@ fn cmd_bench(o: &Opts) -> Result<()> {
     Ok(())
 }
 
+/// Writes a bootable GPT disk image. Its command line is `--cmdline` when
+/// given; otherwise empty (no `qemu_debug_exit`: real hardware has no
+/// debug-exit port, and the kernel then halts at the end).
+fn cmd_disk_image(o: &Opts, args: &[String]) -> Result<()> {
+    let cmdline = if args.iter().any(|a| a == "--cmdline") {
+        o.cmdline.clone()
+    } else {
+        String::new()
+    };
+    let kernel = build::kernel(o.profile)?;
+    let img = xtask::disk::image(&kernel, &cmdline)?;
+    let path = xtask::workspace_root()
+        .join("target")
+        .join("ichor-disk.img");
+    std::fs::write(&path, &img).map_err(|e| format!("writing {}: {e}", path.display()))?;
+    println!(
+        "{} ({} MiB, GPT: EFI system partition + Ichor root; cmdline {cmdline:?})",
+        path.display(),
+        img.len() >> 20
+    );
+    Ok(())
+}
+
 /// Crates that only build for the kernel target (they depend on frame).
 const KERNEL_ONLY: &[&str] = &[
     "ichor",
@@ -299,6 +325,7 @@ fn main() -> ExitCode {
         "frame-audit" => audit::check_frame_budget().map(|_| ()),
         "linux-abi-table" => linux_abi::write_table(),
         "bench" => cmd_bench(&o),
+        "disk-image" => cmd_disk_image(&o, rest),
         "help" | "--help" | "-h" => {
             print!("{HELP}");
             Ok(())

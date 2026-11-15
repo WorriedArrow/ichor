@@ -24,7 +24,7 @@
 //! official static busybox: echo, ls, cat, and a shell that forks, execs
 //! and waits.
 
-use ichor_tests::{Exit, boot};
+use ichor_tests::{Exit, boot, boot_disk};
 
 const BOOT_MARKERS: &[&str] = &[
     "ichor: frame: entered from UEFI",
@@ -351,6 +351,27 @@ fn panic_reports_failure_and_stops_other_cpus() {
         "ichor: smp: 2 CPUs online",
         "ichor: KERNEL PANIC: ",
         "test_panic requested",
+    ]);
+}
+
+/// A cloud-style boot: one GPT disk on NVMe (no vvfat ESP, no other
+/// disks), the firmware booting `\EFI\BOOT\BOOTX64.EFI` from its FAT32
+/// ESP with the command line in `\ichor\cmdline`, and the kernel finding
+/// its root in the Ichor root partition and running busybox from it.
+#[test]
+fn cloud_disk_boots_from_gpt_on_nvme() {
+    let out = boot_disk("cloud-disk", "", 2);
+    out.assert_exit(Exit::Success);
+    out.assert_in_order(&[
+        "ichor: cmdline: \"qemu_debug_exit \"",
+        "ichor: blk: no virtio-blk device",
+        "ichor: blk: nvme: GPT disk, Ichor root partition at sector ",
+        "ichor: blk: nvme disk, ",
+        "ichor: blk: nvme: verified 300 KiB read across multiple requests",
+        "ichor: blk: cat read /etc/motd from the nvme disk",
+        "hello from busybox",
+        "ichor: busybox: all applets passed",
+        "ichor: boot complete; halting",
     ]);
 }
 

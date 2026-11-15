@@ -12,6 +12,8 @@
 pub mod artifact;
 pub mod audit;
 pub mod build;
+pub mod disk;
+pub mod fat;
 pub mod inflate;
 pub mod linux_abi;
 pub mod linuxref;

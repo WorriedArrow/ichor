@@ -22,6 +22,8 @@ image = { workspace = true, features = ["builder"] }
 # Builds the benchmark programs for the Linux reference boot, the same
 # bytes the kernel runs (a path crate, no external code).
 testprog.workspace = true
+# Writes the GPT of a bootable disk image (a path crate, no external code).
+gpt = { workspace = true, features = ["builder"] }
 
 [lints]
 workspace = true

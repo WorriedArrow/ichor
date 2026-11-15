@@ -32,6 +32,27 @@ fn kernel() -> PathBuf {
         .clone()
 }
 
+/// Boots a whole GPT disk image (ESP + Ichor root, built by
+/// `xtask::disk::image` with `cmdline` plus `qemu_debug_exit`) from NVMe,
+/// as a cloud VM boots, and returns the outcome.
+pub fn boot_disk(name: &str, cmdline: &str, smp: u32) -> Outcome {
+    let img = xtask::disk::image(&kernel(), &format!("qemu_debug_exit {cmdline}"))
+        .expect("building the disk image");
+    let dir = xtask::workspace_root()
+        .join("target")
+        .join("qemu")
+        .join(format!("test-{name}"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("disk.img");
+    std::fs::write(&path, img).unwrap();
+    let mut cfg = RunConfig::new(format!("test-{name}"), kernel());
+    cfg.smp = smp;
+    cfg.capture = true;
+    cfg.timeout = Some(BOOT_TIMEOUT);
+    cfg.disk_image = Some(path);
+    run(&cfg).expect("failed to run QEMU")
+}
+
 /// Boots the kernel with `cmdline` (plus `qemu_debug_exit`) and returns the
 /// outcome. `name` must be unique per test: it names the run directory.
 pub fn boot(name: &str, cmdline: &str, smp: u32) -> Outcome {

@@ -27,6 +27,7 @@ vma.workspace = true
 overlay.workspace = true
 csprng.workspace = true
 testprog.workspace = true
+gpt.workspace = true
 blake3.workspace = true
 virtio-rng.workspace = true
 

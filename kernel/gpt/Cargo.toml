@@ -1,0 +1,17 @@
+[package]
+name = "ichor-gpt"
+description = "GUID partition tables: CRC-checked reader, and a writer for disk images (no_std, host-testable)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "gpt"
+
+[features]
+# The disk-image writer (xtask). The kernel only reads.
+builder = []
+
+[lints]
+workspace = true

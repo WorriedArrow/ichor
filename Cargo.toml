@@ -19,6 +19,7 @@ members = [
     "kernel/civil",
     "kernel/blake3",
     "kernel/testprog",
+    "kernel/gpt",
     "kernel/drivers/virtio-pci",
     "kernel/drivers/virtio-blk",
     "kernel/drivers/virtio-rng",
@@ -48,6 +49,7 @@ default-members = [
     "kernel/civil",
     "kernel/blake3",
     "kernel/testprog",
+    "kernel/gpt",
     "tests",
     "xtask",
 ]
@@ -77,6 +79,7 @@ csprng = { package = "ichor-csprng", path = "kernel/csprng" }
 civil = { package = "ichor-civil", path = "kernel/civil" }
 blake3 = { package = "ichor-blake3", path = "kernel/blake3" }
 testprog = { package = "ichor-testprog", path = "kernel/testprog" }
+gpt = { package = "ichor-gpt", path = "kernel/gpt" }
 virtio-pci = { package = "ichor-virtio-pci", path = "kernel/drivers/virtio-pci" }
 virtio-rng = { package = "ichor-virtio-rng", path = "kernel/drivers/virtio-rng" }
 virtio-blk = { package = "ichor-virtio-blk", path = "kernel/drivers/virtio-blk" }
