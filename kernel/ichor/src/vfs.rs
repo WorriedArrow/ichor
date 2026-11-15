@@ -39,6 +39,8 @@ pub(crate) struct Vfs {
     view: Option<&'static crate::pagecache::View>,
     /// This root's devpts: its pseudo-terminals by index.
     pub(crate) ptys: crate::pty::Table,
+    /// `AF_UNIX` sockets bound to paths in this root, by socket node.
+    pub(crate) unix: crate::linuxabi::unix::Bound,
 }
 
 impl Drop for Vfs {
@@ -66,6 +68,7 @@ impl Vfs {
             fs: Mutex::new(fs),
             view: None,
             ptys: frame::sync::SpinLock::new(alloc::collections::BTreeMap::new()),
+            unix: frame::sync::SpinLock::new(alloc::collections::BTreeMap::new()),
         })
     }
 

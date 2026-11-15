@@ -33,6 +33,7 @@ const ESPIPE: i64 = 29;
 const EACCES: i64 = 13;
 const EPIPE: i64 = 32;
 const ERANGE: i64 = 34;
+const ENXIO: i64 = 6;
 
 /// Copy chunk for file I/O.
 const CHUNK: usize = 4096;
@@ -145,7 +146,11 @@ fn open_path(
         match st.kind {
             Kind::Directory if acc != 0 => return Err(EISDIR),
             Kind::Symlink => return Err(ELOOP), // O_NOFOLLOW on a symlink
-            Kind::File | Kind::CharDevice if flags & O_DIRECTORY != 0 => return Err(ENOTDIR),
+            Kind::File | Kind::CharDevice | Kind::Socket if flags & O_DIRECTORY != 0 => {
+                return Err(ENOTDIR);
+            }
+            // A socket node is reached with connect, not open (Linux: ENXIO).
+            Kind::Socket => return Err(ENXIO),
             Kind::CharDevice => {
                 drop(fs);
                 let fd = crate::dev::open(p, st.rdev, ino, flags)?;
@@ -509,6 +514,7 @@ const S_IFDIR: u32 = 0o040_000;
 const S_IFLNK: u32 = 0o120_000;
 const S_IFCHR: u32 = 0o020_000;
 const S_IFIFO: u32 = 0o010_000;
+const S_IFSOCK: u32 = 0o140_000;
 
 /// Builds an x86-64 `struct stat` (144 bytes).
 fn stat_bytes(ino: u64, mode: u32, nlink: u32, size: u64) -> [u8; 144] {
@@ -539,6 +545,7 @@ fn to_stat(s: &Stat) -> [u8; 144] {
         Kind::Directory => S_IFDIR,
         Kind::Symlink => S_IFLNK,
         Kind::CharDevice => S_IFCHR,
+        Kind::Socket => S_IFSOCK,
     };
     let mut st = stat_bytes(s.ino, kind | s.mode, s.nlink, s.size);
     st[40..48].copy_from_slice(&u64::from(s.rdev).to_le_bytes()); // st_rdev
@@ -731,6 +738,7 @@ pub(super) fn getdents64(
     const DT_DIR: u8 = 4;
     const DT_REG: u8 = 8;
     const DT_LNK: u8 = 10;
+    const DT_SOCK: u8 = 12;
     const HEADER: usize = 19; // d_ino, d_off, d_reclen, d_type
     if let Some(Fd::Object(o)) = p.fd(fd)
         && let Some((entries, pos)) = o.obj.dir()
@@ -785,6 +793,7 @@ pub(super) fn getdents64(
                     Kind::File => DT_REG,
                     Kind::Symlink => DT_LNK,
                     Kind::CharDevice => DT_CHR,
+                    Kind::Socket => DT_SOCK,
                 };
                 (*ino, t, n.as_str())
             }),

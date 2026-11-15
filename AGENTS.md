@@ -57,7 +57,18 @@ uplink; virtio-net first (polled).
   send, connect/AF_UNSPEC, MSG_TRUNC, msg_name in sendmsg/recvmsg).
   Tested on loopback (Debian perl), across the switch between cells, and
   through the uplink's NAT to a host UDP echo. No ICMP errors yet.
-  Next: `AF_UNIX`, socket buffers charged to the cell.
+- M5 `AF_UNIX` (`linuxabi/unix.rs`): stream, datagram and seqpacket
+  sockets, `socketpair`, path names (a socket node in the cell's root,
+  `overlay::Kind::Socket`, checked for write permission; open is ENXIO)
+  and per-cell abstract names (autobind too), `SCM_RIGHTS` (passes open
+  file descriptions; `MSG_CTRUNC`), `SCM_CREDENTIALS`/`SO_PASSCRED`,
+  `SO_PEERCRED`, and `O_ASYNC`/`F_SETOWN`/`FIOASYNC` posting SIGIO. A
+  descriptor's `UnixSocket` owns an `Endpoint`; closing it shuts the
+  endpoint down outside every lock, so endpoints are cheap to drop inside
+  wait conditions. nginx now runs with its master process and workers.
+  Tests: `scm_rights_program` (runtest) and Debian perl's `UNIX_SCRIPT`.
+  Not yet: `MSG_PEEK`, a collector for `SCM_RIGHTS` cycles.
+  Next: socket buffers charged to the cell.
 
 Milestones 0-4 are done (4's acceptance test: Debian's `apt-get install`
 from a local mirror). Phase E (scalability) is done except the vDSO and

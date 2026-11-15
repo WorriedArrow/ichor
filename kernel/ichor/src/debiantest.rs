@@ -209,6 +209,77 @@ $!{EAGAIN} or fail("empty non-blocking udp read: $!");
 print "debian: udp: datagrams keep boundaries and sources, truncate, connect filters, ports are per protocol\n";
 "#;
 
+/// `AF_UNIX`: a socketpair with credentials and end of file; a stream
+/// server on a path in the root (a socket node, EADDRINUSE, a forked client
+/// sending 300 KB through a half-close, ECONNREFUSED once it is gone);
+/// datagrams between abstract names with sources and truncation.
+const UNIX_SCRIPT: &str = r#"use strict; use warnings; use Socket; use POSIX ();
+sub fail { print "debian: unix FAILED: @_\n"; exit 1 }
+sub sock { socket(my $s, AF_UNIX, $_[0], 0) or fail("socket: $!"); $s }
+my $m;
+socketpair(my $a, my $b, AF_UNIX, SOCK_STREAM, 0) or fail("socketpair: $!");
+syswrite($a, "ping") == 4 or fail("write: $!");
+sysread($b, $m, 100) == 4 && $m eq "ping" or fail("read [$m]");
+my ($cpid, $cuid) = unpack("iII", getsockopt($b, SOL_SOCKET, SO_PEERCRED));
+$cpid == $$ && $cuid == 0 or fail("SO_PEERCRED $cpid $cuid, I am $$");
+unpack("i", getsockopt($a, SOL_SOCKET, SO_TYPE)) == SOCK_STREAM or fail("SO_TYPE");
+readlink("/proc/self/fd/" . fileno($a)) =~ /^socket:\[\d+\]$/ or fail("/proc/self/fd link");
+close $a;
+sysread($b, $m, 100) == 0 or fail("no end of file after the peer closed");
+my $path = "/tmp/ichor-unix.sock";
+unlink $path;
+my $l = sock(SOCK_STREAM);
+bind($l, pack_sockaddr_un($path)) or fail("bind: $!");
+-S $path or fail("no socket node at $path");
+listen($l, 4) or fail("listen: $!");
+my $d = sock(SOCK_STREAM);
+bind($d, pack_sockaddr_un($path)) and fail("a second bind worked");
+$!{EADDRINUSE} or fail("second bind: $!");
+open(my $fh, "<", $path) and fail("open of a socket node worked");
+my $n = 300_000;
+my $pid = fork() // fail("fork: $!");
+if ($pid == 0) {
+    my $c = sock(SOCK_STREAM);
+    connect($c, pack_sockaddr_un($path)) or POSIX::_exit(10);
+    unpack_sockaddr_un(getpeername($c)) eq $path or POSIX::_exit(11);
+    my $data = "y" x $n;
+    my $off = 0;
+    while ($off < $n) { my $w = syswrite($c, $data, 65536, $off) or POSIX::_exit(12); $off += $w }
+    shutdown($c, 1) or POSIX::_exit(13);
+    my $r;
+    sysread($c, $r, 100) == 2 && $r eq "ok" or POSIX::_exit(14);
+    POSIX::_exit(0);
+}
+accept(my $s, $l) or fail("accept: $!");
+my ($ppid) = unpack("iII", getsockopt($s, SOL_SOCKET, SO_PEERCRED));
+$ppid == $pid or fail("peer pid $ppid, not $pid");
+unpack_sockaddr_un(getsockname($s)) eq $path or fail("accepted socket's name");
+my $got = 0;
+while (1) { my $r = sysread($s, my $buf, 65536); defined $r or fail("read: $!"); last if !$r; $got += $r }
+$got == $n or fail("got $got bytes");
+syswrite($s, "ok") == 2 or fail("reply: $!");
+waitpid($pid, 0) == $pid && $? == 0 or fail("client exited " . ($? >> 8));
+close $s; close $l;
+my $e = sock(SOCK_STREAM);
+connect($e, pack_sockaddr_un($path)) and fail("connect after the listener closed");
+$!{ECONNREFUSED} or fail("connect after close: $!");
+unlink $path or fail("unlink: $!");
+my $u1 = sock(SOCK_DGRAM);
+bind($u1, pack_sockaddr_un("\0ichor-test")) or fail("abstract bind: $!");
+my $u2 = sock(SOCK_DGRAM);
+bind($u2, pack_sockaddr_un("\0ichor-test-2")) or fail("abstract bind 2: $!");
+send($u2, "one", 0, pack_sockaddr_un("\0ichor-test")) == 3 or fail("dgram send: $!");
+send($u2, "two!", 0, pack_sockaddr_un("\0ichor-test")) == 4 or fail("dgram send 2: $!");
+my $from = recv($u1, $m, 100, 0) // fail("dgram recv: $!");
+$m eq "one" or fail("dgram [$m]");
+unpack_sockaddr_un($from) =~ /ichor-test-2$/ or fail("dgram source");
+recv($u1, $m, 2, 0) // fail("dgram recv 2: $!");
+$m eq "tw" or fail("dgram truncation [$m]");
+my $u3 = sock(SOCK_STREAM);
+connect($u3, pack_sockaddr_un("\0ichor-test")) and fail("stream connect to a datagram name");
+print "debian: unix: socketpair, path servers, abstract datagrams, SO_PEERCRED and end of file work\n";
+"#;
+
 /// Interval timers: `alarm` interrupts a sleep with SIGALRM and reports
 /// what is left; a periodic `setitimer` (raw syscalls 36/38) keeps firing
 /// and `getitimer` reads it back; disarming stops it.
@@ -416,6 +487,7 @@ const RUNS: &[(&[&str], i32)] = &[
     // TCP sockets on the cell's own stack (loopback).
     (&["perl", "-e", SOCKET_SCRIPT], 0),
     (&["perl", "-e", TIMER_SCRIPT], 0),
+    (&["perl", "-e", UNIX_SCRIPT], 0),
     (
         &[
             "dash",

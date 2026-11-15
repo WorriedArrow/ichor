@@ -22,6 +22,7 @@ pub(crate) const SIGKILL: u32 = 9;
 pub(crate) const SIGSEGV: u32 = 11;
 pub(crate) const SIGPIPE: u32 = 13;
 pub(crate) const SIGALRM: u32 = 14;
+pub(crate) const SIGIO: u32 = 29;
 pub(crate) const SIGCHLD: u32 = 17;
 const SIGSTOP: u32 = 19;
 pub(crate) const NSIG: u32 = 64;

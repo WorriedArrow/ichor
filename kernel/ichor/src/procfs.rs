@@ -229,10 +229,11 @@ fn describe(p: &LinuxProcess, f: &Fd) -> String {
             "pipe:[{:x}]",
             alloc::sync::Arc::as_ptr(&e.pipe) as usize & 0xffff_ffff
         ),
-        Fd::Object(o) => match (o.obj.tty(), o.obj.socket()) {
-            (Some(t), _) => t.path(),
-            (None, Some(s)) => alloc::format!("socket:[{}]", s.inode()),
-            (None, None) => "anon_inode:[eventpoll]".to_string(),
+        Fd::Object(o) => match (o.obj.tty(), o.obj.socket(), o.obj.unix()) {
+            (Some(t), _, _) => t.path(),
+            (None, Some(s), _) => alloc::format!("socket:[{}]", s.inode()),
+            (None, None, Some(u)) => alloc::format!("socket:[{}]", u.inode()),
+            (None, None, None) => "anon_inode:[eventpoll]".to_string(),
         },
     }
 }

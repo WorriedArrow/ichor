@@ -82,7 +82,7 @@ pub(crate) struct Waiters {
 }
 
 impl Waiters {
-    fn wake(&self) {
+    pub(crate) fn wake(&self) {
         self.changes.fetch_add(1, Ordering::AcqRel);
         self.queue.wake_all();
         self.watchers.notify();

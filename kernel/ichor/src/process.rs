@@ -632,6 +632,12 @@ impl LinuxProcess {
         self.place(slot, 0)
     }
 
+    /// Installs an existing open file description (one passed with
+    /// `SCM_RIGHTS`) at the lowest free descriptor.
+    pub(crate) fn install_desc(&mut self, desc: Arc<Description>, cloexec: bool) -> Option<u64> {
+        self.place(Slot { desc, cloexec }, 0)
+    }
+
     /// Duplicates `fd` (same description) to the lowest free descriptor at
     /// or above `min`.
     pub(crate) fn dup_from(&mut self, fd: u64, min: u64, cloexec: bool) -> Option<u64> {

@@ -183,7 +183,7 @@ const NET_INSTALL: &str = "apk add --no-network /mirror/pcre-8.45-r3.apk \
 /// The server cell: nginx and redis until the client cell is done (and,
 /// with `$1` = 1, until the host has fetched a page through the published
 /// port), then a clean shutdown of both.
-const NET_SERVER: &str = "nginx -g 'daemon off; master_process off;' & n=$!; \
+const NET_SERVER: &str = "nginx -g 'daemon off; error_log /tmp/nginx-notice.log notice;' & n=$!; \
      redis-server --port 6379 --save '' --appendonly no --protected-mode no >/tmp/redis.log 2>&1 & r=$!; \
      while [ ! -e /tmp/ichor-net-done ]; do sleep 0.1; done; \
      if [ \"$1\" = 1 ]; then \
@@ -193,6 +193,9 @@ const NET_SERVER: &str = "nginx -g 'daemon off; master_process off;' & n=$!; \
        echo alpine: nginx served the host through the published port; fi; \
      kill $n $r; wait $n; a=$?; wait $r; b=$?; \
      [ $a = 0 ] || [ $a = 143 ]; [ $b = 0 ] || [ $b = 143 ] || { cat /tmp/redis.log; exit 1; }; \
+     w=$(grep -c 'start worker process' /tmp/nginx-notice.log); \
+     [ \"$w\" -ge 1 ] && grep -q 'exit$' /tmp/nginx-notice.log || { cat /tmp/nginx-notice.log; exit 1; }; \
+     echo \"alpine: nginx's master ran $w workers over AF_UNIX channels and stopped them\"; \
      echo alpine: nginx and redis stopped";
 
 /// The client cell: `$1` is the server cell's address.

@@ -97,6 +97,10 @@ pub(crate) trait Object: Send + Sync + Debug {
     fn socket(&self) -> Option<&crate::linuxabi::socket::Socket> {
         None
     }
+    /// This object as an `AF_UNIX` socket.
+    fn unix(&self) -> Option<&crate::linuxabi::unix::UnixSocket> {
+        None
+    }
 }
 
 /// One task sleeping in `poll`/`select`/`epoll_wait`, registered with each
