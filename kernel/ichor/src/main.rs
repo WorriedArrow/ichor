@@ -94,6 +94,13 @@ fn kmain(info: BootInfo) -> ! {
     selftest::timers_on_every_cpu(cpus);
 
     random::init();
+    match frame::cpu::xstate_features() {
+        0 => println!("ichor: xstate: no XSAVE; x87/SSE via FXSAVE"),
+        x => println!(
+            "ichor: xstate: XCR0 {x:#x}, {} bytes per thread (ADR-0008)",
+            frame::cpu::xstate_size()
+        ),
+    }
     match frame::time::wall_clock() {
         Some(t) => println!(
             "ichor: time: wall clock from UEFI, {} s since the epoch",

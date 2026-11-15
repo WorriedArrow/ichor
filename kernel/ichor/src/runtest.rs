@@ -1363,6 +1363,124 @@ fn waits_program() -> Vec<u8> {
     static_elf(&a.finish(BLOB_VADDR).unwrap_or_else(|| fail("assembler")))
 }
 
+/// AVX state is per thread and survives signals (ADR-0008). YMM0 is set to
+/// all ones; a forked child zeroes its own YMM0 and yields while the parent
+/// yields too, and the parent's upper 128 bits must still be ones. A
+/// SIGUSR1 handler checks that its frame's `fpstate` carries the XSAVE
+/// software bytes (`magic`) and YMM0's upper half (at offset 576, the AVX
+/// component), then zeroes YMM0; after `rt_sigreturn` the ones are back.
+/// Exits 0, or the number of the failed check.
+fn avx_program(magic: u64) -> Vec<u8> {
+    const SIGUSR1: u64 = 10;
+    const SA_RESTORER: u64 = 0x0400_0000;
+    const YMM0_ONES: [u8; 4] = [0xc5, 0xfd, 0x76, 0xc0]; // vpcmpeqd ymm0, ymm0, ymm0
+    const YMM0_ZERO: [u8; 4] = [0xc5, 0xfd, 0xef, 0xc0]; // vpxor ymm0, ymm0, ymm0
+    let store_ymm0 = |a: &mut Asm, disp: i32| {
+        a.raw(&[0xc5, 0xfe, 0x7f, 0x85]); // vmovdqu [rbp + disp32], ymm0
+        a.raw(&disp.to_le_bytes());
+    };
+    let mut a = Asm::new();
+    let bad = a.label();
+    let handler = a.label();
+    let restorer = a.label();
+    let parent = a.label();
+    let child_loop = a.label();
+    let parent_loop = a.label();
+    let expect = |a: &mut Asm, n: u64, v: i32| {
+        a.mov_imm(Reg::R15, n);
+        a.cmp_imm(Reg::Rax, v);
+        a.jne(bad);
+    };
+    // The upper 128 bits of the YMM0 stored at rbp+disp are all ones.
+    let upper_ones = |a: &mut Asm, n: u64, disp: i32| {
+        store_ymm0(a, disp);
+        a.load(Reg::Rax, Reg::Rbp, disp + 16);
+        expect(a, n, -1);
+        a.load(Reg::Rax, Reg::Rbp, disp + 24);
+        expect(a, n, -1);
+    };
+    a.mov(Reg::Rbp, Reg::Rsp);
+    a.sub_imm(Reg::Rbp, 4096);
+    a.raw(&YMM0_ONES);
+    // 1: across a fork whose child zeroes its own YMM0.
+    a.sys(sys::FORK);
+    a.cmp_imm(Reg::Rax, 0);
+    a.jne(parent);
+    a.raw(&YMM0_ZERO);
+    a.mov_imm(Reg::R12, 20);
+    a.bind(child_loop);
+    a.sys(sys::SCHED_YIELD);
+    a.add_imm(Reg::R12, -1);
+    a.cmp_imm(Reg::R12, 0);
+    a.jne(child_loop);
+    a.mov_imm(Reg::Rdi, 0);
+    a.sys(sys::EXIT_GROUP);
+    a.bind(parent);
+    a.mov_imm(Reg::R12, 20);
+    a.bind(parent_loop);
+    a.sys(sys::SCHED_YIELD);
+    a.add_imm(Reg::R12, -1);
+    a.cmp_imm(Reg::R12, 0);
+    a.jne(parent_loop);
+    a.mov_imm(Reg::Rdi, u64::MAX);
+    a.mov(Reg::Rsi, Reg::Rbp);
+    a.add_imm(Reg::Rsi, 400);
+    a.mov_imm(Reg::Rdx, 0);
+    a.mov_imm(Reg::R10, 0);
+    a.sys(sys::WAIT4);
+    upper_ones(&mut a, 1, 0);
+    // 2: sigaction(SIGUSR1, handler); the handler leaves 1 at rbp+300 if
+    // its frame was right.
+    a.mov_imm(Reg::Rax, 0);
+    a.store(Reg::Rbp, 300, Reg::Rax);
+    a.mov_label(Reg::Rax, handler);
+    a.store(Reg::Rbp, 128, Reg::Rax);
+    a.mov_imm(Reg::Rax, SA_RESTORER);
+    a.store(Reg::Rbp, 136, Reg::Rax);
+    a.mov_label(Reg::Rax, restorer);
+    a.store(Reg::Rbp, 144, Reg::Rax);
+    a.mov_imm(Reg::Rax, 0);
+    a.store(Reg::Rbp, 152, Reg::Rax);
+    a.mov_imm(Reg::Rdi, SIGUSR1);
+    a.mov(Reg::Rsi, Reg::Rbp);
+    a.add_imm(Reg::Rsi, 128);
+    a.mov_imm(Reg::Rdx, 0);
+    a.mov_imm(Reg::R10, 8);
+    a.sys(sys::RT_SIGACTION);
+    expect(&mut a, 2, 0);
+    a.sys(sys::GETPID);
+    a.mov(Reg::Rdi, Reg::Rax);
+    a.mov_imm(Reg::Rsi, SIGUSR1);
+    a.sys(sys::KILL);
+    // 3: the handler saw the XSAVE frame; 4: YMM0 is whole again.
+    a.load(Reg::Rax, Reg::Rbp, 300);
+    expect(&mut a, 3, 1);
+    upper_ones(&mut a, 4, 32);
+    a.mov_imm(Reg::R15, 0);
+    a.bind(bad);
+    a.mov(Reg::Rdi, Reg::R15);
+    a.sys(sys::EXIT_GROUP);
+    // The handler: rdx = ucontext; fpstate = uc_mcontext (40) + 192.
+    let h_bad = a.label();
+    a.bind(handler);
+    a.load(Reg::Rax, Reg::Rdx, 40 + 192);
+    a.load(Reg::R14, Reg::Rax, 464);
+    a.mov_imm(Reg::R13, magic);
+    a.cmp(Reg::R14, Reg::R13);
+    a.jne(h_bad);
+    a.load(Reg::R14, Reg::Rax, 576);
+    a.cmp_imm(Reg::R14, -1);
+    a.jne(h_bad);
+    a.mov_imm(Reg::R14, 1);
+    a.store(Reg::Rbp, 300, Reg::R14);
+    a.bind(h_bad);
+    a.raw(&YMM0_ZERO);
+    a.ret();
+    a.bind(restorer);
+    a.sys(sys::RT_SIGRETURN);
+    static_elf(&a.finish(BLOB_VADDR).unwrap_or_else(|| fail("assembler")))
+}
+
 /// POSIX record locks across fork: the parent write-locks bytes 0..10; the
 /// child's overlapping F_SETLK fails with EAGAIN, F_GETLK names the parent,
 /// a disjoint range locks fine, and F_SETLKW blocks until the parent
@@ -1593,4 +1711,21 @@ pub(crate) fn run() {
     println!(
         "ichor: linux: EPOLLET edges, ppoll/epoll_pwait signal masks, vfork waits for the child ({syscalls} syscalls)"
     );
+
+    // AVX needs XSAVE with the AVX component; CPUs without it skip this.
+    const AVX: u64 = 1 << 2;
+    if frame::cpu::xstate_features() & AVX != 0 {
+        let size = frame::cpu::xstate_size() as u64;
+        let magic = 0x4650_5853 | ((size + 4) << 32);
+        let (status, syscalls) = run_linux(new_process(), &avx_program(magic), None, &["avxtest"]);
+        if status != 0 {
+            println!("ichor: linux: avxtest failed check {status}");
+            fail("avxtest");
+        }
+        println!(
+            "ichor: linux: AVX state is per thread and survives signals (XSAVE frame, {syscalls} syscalls)"
+        );
+    } else {
+        println!("ichor: linux: no AVX: AVX state test skipped");
+    }
 }

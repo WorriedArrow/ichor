@@ -13,6 +13,7 @@ brief where they conflict with it.
 | [0005](0005-device-io.md) | Device I/O in frame (PCI, IoMem, DMA, virtqueues) and the milestone 3 budget | Accepted |
 | [0006](0006-root-and-volumes.md) | Cell root (image + copy-on-write upper layer) and ext4 volumes | Accepted |
 | [0007](0007-milestone-4-frame.md) | Frame work for milestone 4 (shootdown, atomic user ops, PCID) and its budget | Accepted |
+| [0008](0008-extended-cpu-state.md) | Extended CPU state: XSAVE, saved eagerly | Accepted |
 
 ## Planned
 

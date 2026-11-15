@@ -444,6 +444,38 @@ const SIGMASK: usize = MCONTEXT + 256;
 const INFO_SIZE: u64 = 128;
 const FRAME_SIZE: u64 = 8 + UC_SIZE + INFO_SIZE;
 const REDZONE: u64 = 128;
+/// `uc_flags`: the frame's `fpstate` is an XSAVE area (sw bytes valid).
+const UC_FP_XSTATE: u64 = 1;
+/// `struct _fpx_sw_bytes` markers (ADR-0008 §6).
+const FP_XSTATE_MAGIC1: u32 = 0x4650_5853;
+const FP_XSTATE_MAGIC2: u32 = 0x4650_5845;
+/// Offset of `sw_reserved` in the FXSAVE region.
+const SW_BYTES: usize = 464;
+
+/// The `fpstate` the frame carries: the thread's extended state, plus (with
+/// XSAVE) the software bytes and the trailing `FP_XSTATE_MAGIC2`.
+fn fpstate_image(ctx: &UserContext) -> alloc::vec::Vec<u8> {
+    let mut v = ctx.fpu_state().to_vec();
+    let xfeatures = frame::cpu::xstate_features();
+    if xfeatures != 0 {
+        let size = v.len() as u32;
+        v[SW_BYTES..SW_BYTES + 4].copy_from_slice(&FP_XSTATE_MAGIC1.to_le_bytes());
+        v[SW_BYTES + 4..SW_BYTES + 8].copy_from_slice(&(size + 4).to_le_bytes());
+        v[SW_BYTES + 8..SW_BYTES + 16].copy_from_slice(&xfeatures.to_le_bytes());
+        v[SW_BYTES + 16..SW_BYTES + 20].copy_from_slice(&size.to_le_bytes());
+        v[SW_BYTES + 20..512].fill(0);
+        v.extend_from_slice(&FP_XSTATE_MAGIC2.to_le_bytes());
+    } else {
+        v[SW_BYTES..512].fill(0);
+    }
+    v
+}
+
+/// The most stack one signal frame takes (`AT_MINSIGSTKSZ`): the frame,
+/// the extended state with its magic, and alignment slack.
+pub(crate) fn frame_stack_size() -> u64 {
+    FRAME_SIZE + frame::cpu::xstate_size() as u64 + 4 + 64 + 16
+}
 
 /// The general registers in `struct sigcontext` order (r8..r15, rdi, rsi,
 /// rbp, rbx, rdx, rax, rcx, rsp, rip).
@@ -473,7 +505,8 @@ fn setup_frame(
         Some((base, size)) if act.flags & SA_ONSTACK != 0 && !p.sig.on_alt(ctx.rsp) => base + size,
         _ => ctx.rsp.wrapping_sub(REDZONE),
     };
-    let fpstate = (top.wrapping_sub(512)) & !63;
+    let fp = fpstate_image(ctx);
+    let fpstate = (top.wrapping_sub(fp.len() as u64)) & !63;
     let sp = ((fpstate - FRAME_SIZE + 8) & !15) - 8; // rsp % 16 == 8 at entry
     let uc = sp + 8;
     let info = uc + UC_SIZE;
@@ -482,6 +515,9 @@ fn setup_frame(
     let mut f = alloc::vec![0u8; FRAME_SIZE as usize];
     f[0..8].copy_from_slice(&act.restorer.to_le_bytes());
     let u = 8usize;
+    if frame::cpu::xstate_features() != 0 {
+        f[u..u + 8].copy_from_slice(&UC_FP_XSTATE.to_le_bytes());
+    }
     // uc_stack: the alternate stack as it stood when the signal came.
     let (ss_sp, ss_flags, ss_size) = match p.sig.alt {
         None => (0, SS_DISABLE, 0),
@@ -506,7 +542,7 @@ fn setup_frame(
     f[i + 8..i + 12].copy_from_slice(&code.to_le_bytes()); // si_code
     f[i + 16..i + 24].copy_from_slice(&addr.to_le_bytes()); // si_addr
 
-    if p.copy_to_user(fpstate, &ctx.fpu_state()) != 512 || p.copy_to_user(sp, &f) != f.len() {
+    if p.copy_to_user(fpstate, &fp) != fp.len() || p.copy_to_user(sp, &f) != f.len() {
         return Err(die);
     }
     let mut mask = p.sig.mask | act.mask;
@@ -545,9 +581,34 @@ pub(crate) fn sigreturn(p: &mut LinuxProcess, ctx: &mut UserContext) -> Result<(
     ctx.set_rflags(word(m + 136));
     let fpstate = word(m + 192);
     if fpstate != 0 {
-        let mut fx = [0u8; 512];
+        let mut fx = alloc::vec![0u8; 512];
         if p.copy_from_user(fpstate, &mut fx) != fx.len() {
             return Err(EFAULT);
+        }
+        // The full XSAVE area only if the frame says it holds one, sized as
+        // ours, with the trailing magic; otherwise just the legacy region.
+        let sw = |o: usize| {
+            u32::from_le_bytes(
+                fx[SW_BYTES + o..SW_BYTES + o + 4]
+                    .try_into()
+                    .unwrap_or([0; 4]),
+            )
+        };
+        let size = frame::cpu::xstate_size();
+        let xsave = frame::cpu::xstate_features() != 0
+            && sw(0) == FP_XSTATE_MAGIC1
+            && sw(16) as usize == size
+            && sw(4) as usize == size + 4;
+        if xsave {
+            let mut full = alloc::vec![0u8; size + 4];
+            if p.copy_from_user(fpstate, &mut full) != full.len() {
+                return Err(EFAULT);
+            }
+            let magic2 = u32::from_le_bytes(full[size..size + 4].try_into().unwrap_or([0; 4]));
+            if magic2 == FP_XSTATE_MAGIC2 {
+                fx = full;
+                fx.truncate(size);
+            }
         }
         ctx.set_fpu_state(&fx);
     }

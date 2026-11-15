@@ -181,6 +181,12 @@ impl Asm {
         self.jump(&[0xE9], l);
     }
 
+    /// Raw instruction bytes (for encodings the assembler has no method
+    /// for, such as VEX).
+    pub(crate) fn raw(&mut self, bytes: &[u8]) {
+        self.code.extend_from_slice(bytes);
+    }
+
     /// `je label`
     pub(crate) fn je(&mut self, l: Label) {
         self.jump(&[0x0F, 0x84], l);

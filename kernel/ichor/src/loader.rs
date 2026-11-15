@@ -73,6 +73,7 @@ const AT_HWCAP: u64 = 16;
 const AT_CLKTCK: u64 = 17;
 const AT_SECURE: u64 = 23;
 const AT_RANDOM: u64 = 25;
+const AT_MINSIGSTKSZ: u64 = 51;
 const AT_EXECFN: u64 = 31;
 
 /// Where a position-independent executable is placed.
@@ -312,6 +313,7 @@ fn build_stack(
         (AT_CLKTCK, 100),
         (AT_SECURE, 0),
         (AT_RANDOM, addr(random_at)),
+        (AT_MINSIGSTKSZ, crate::signal::frame_stack_size()),
         (AT_EXECFN, addr(execfn_at)),
         (AT_NULL, 0),
     ]);

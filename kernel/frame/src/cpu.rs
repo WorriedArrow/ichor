@@ -51,6 +51,17 @@ impl fmt::Display for CpuId {
 static ONLINE: AtomicU32 = AtomicU32::new(0);
 
 /// Number of CPUs that have completed bring-up.
+/// The XSAVE components user threads may use (XCR0), or 0 if the CPU has
+/// no XSAVE and only x87/SSE state exists (ADR-0008).
+pub fn xstate_features() -> u64 {
+    crate::arch::xstate::features()
+}
+
+/// Bytes of a thread's extended state as a signal frame carries it.
+pub fn xstate_size() -> usize {
+    crate::arch::xstate::size()
+}
+
 pub fn online_count() -> usize {
     ONLINE.load(Ordering::Acquire) as usize
 }

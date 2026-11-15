@@ -75,9 +75,10 @@ pub(crate) fn enable_nx() -> bool {
 /// Turns on the protections frame relies on once it runs on its own page
 /// tables: WP (read-only kernel pages are read-only to the kernel too),
 /// global pages, SMEP, SMAP and UMIP where supported. Also enables SSE for
-/// user code (every x86-64 CPU has it; the kernel itself is built
-/// soft-float and never touches the FPU, so user FPU state only needs
-/// saving at the ring-3 boundary). Runs on every CPU. Returns what is on.
+/// user code and, where the CPU has XSAVE, the extended state ADR-0008
+/// allows (AVX, AVX-512): the kernel itself is built soft-float and never
+/// touches the FPU, so user state only needs saving at the ring-3
+/// boundary. Runs on every CPU. Returns what is on.
 pub(crate) fn enable_protections() -> Features {
     let f = features();
     // SAFETY: setting WP makes supervisor writes honour read-only mappings.
@@ -104,9 +105,15 @@ pub(crate) fn enable_protections() -> Features {
     if f.umip {
         cr4 |= regs::CR4_UMIP;
     }
-    // SAFETY: the bits set above are accounted for as described; no other bit
-    // changes.
+    let xcr0 = super::xstate::decide();
+    if xcr0 != 0 {
+        cr4 |= regs::CR4_OSXSAVE;
+    }
+    // SAFETY: the bits set above are accounted for as described (OSXSAVE
+    // only makes XSAVE/XSETBV usable, which `decide` checked CPUID for); no
+    // other bit changes.
     unsafe { regs::write_cr4(cr4) };
+    super::xstate::enable(xcr0);
     f
 }
 

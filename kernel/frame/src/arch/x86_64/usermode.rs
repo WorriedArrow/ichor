@@ -38,7 +38,7 @@ const RFLAGS_RESERVED1: u64 = 1 << 1;
 /// A user thread's saved register state. The field order matches the offsets
 /// the entry stubs use (see `usermode_asm`).
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct UserContext {
     pub rax: u64,     // 0
     pub rbx: u64,     // 8
@@ -60,30 +60,8 @@ pub struct UserContext {
     rflags: u64,      // 136
     pub fs_base: u64, // 144
     pub gs_base: u64, // 152
-    /// x87/SSE state (FXSAVE format), saved and restored around ring 3.
-    fpu: FpuState, // 160 (after padding to 16)
-}
-
-/// A thread's x87/SSE register file in FXSAVE format. Only created in the
-/// reset state ([`Default`]) or by `fxsave`, so `fxrstor` of it can never
-/// fault on reserved MXCSR bits.
-#[repr(C, align(16))]
-#[derive(Clone, Copy)]
-struct FpuState([u8; 512]);
-
-impl Default for FpuState {
-    fn default() -> Self {
-        let mut s = [0u8; 512];
-        s[0..2].copy_from_slice(&0x037fu16.to_le_bytes()); // FCW: all masked
-        s[24..28].copy_from_slice(&0x1f80u32.to_le_bytes()); // MXCSR: all masked
-        FpuState(s)
-    }
-}
-
-impl core::fmt::Debug for FpuState {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("FpuState")
-    }
+    /// x87/SSE/AVX state (ADR-0008), saved and restored around ring 3.
+    fpu: super::xstate::ExtState, // 160 (a pointer; the stubs never touch it)
 }
 
 impl UserContext {
@@ -122,29 +100,19 @@ impl UserContext {
         self.rflags = (value & USER_RFLAGS_ALLOWED) | RFLAGS_IF | RFLAGS_RESERVED1;
     }
 
-    /// The x87/SSE state in FXSAVE format (as a signal frame saves it).
-    pub fn fpu_state(&self) -> [u8; 512] {
-        self.fpu.0
+    /// The extended register state as a signal frame saves it: the
+    /// standard-format XSAVE area ([`crate::cpu::xstate_size`] bytes), or a
+    /// 512-byte FXSAVE image on CPUs without XSAVE.
+    pub fn fpu_state(&self) -> &[u8] {
+        self.fpu.bytes()
     }
 
-    /// Replaces the x87/SSE state (`rt_sigreturn`). MXCSR bits the CPU does
-    /// not support are cleared, so the next `fxrstor` cannot fault.
-    pub fn set_fpu_state(&mut self, state: &[u8; 512]) {
-        let mask = match u32::from_le_bytes([
-            self.fpu.0[28],
-            self.fpu.0[29],
-            self.fpu.0[30],
-            self.fpu.0[31],
-        ]) {
-            0 => 0xffbf, // MXCSR_MASK 0 means the architectural default
-            m => m,
-        };
-        let mut s = *state;
-        let mxcsr = u32::from_le_bytes([s[24], s[25], s[26], s[27]]) & mask;
-        s[24..28].copy_from_slice(&mxcsr.to_le_bytes());
-        // Keep this CPU's MXCSR_MASK (read-only to software).
-        s[28..32].copy_from_slice(&self.fpu.0[28..32]);
-        self.fpu.0 = s;
+    /// Replaces the extended state (`rt_sigreturn`) from a full area or
+    /// just the 512-byte legacy region (the other components then return
+    /// to their init state). Bits the restore would fault on (reserved
+    /// MXCSR bits, unknown or compacted XSAVE header bits) are cleared.
+    pub fn set_fpu_state(&mut self, state: &[u8]) {
+        self.fpu.set_from(state);
     }
 }
 
@@ -223,21 +191,14 @@ impl<'a> UserMode<'a> {
         // SAFETY: FS base holds a user TLS pointer; it never affects kernel
         // memory safety.
         unsafe { wrmsr(regs::MSR_FS_BASE, self.ctx.fs_base) };
-        // SAFETY: `fpu` is a 16-byte-aligned 512-byte FXSAVE area holding
-        // the reset state or an earlier `fxsave`, so it is valid to load.
-        unsafe {
-            core::arch::asm!("fxrstor64 [{}]", in(reg) &raw const self.ctx.fpu, options(nostack, readonly, preserves_flags));
-        };
+        // Interrupts stay off from here until the save below, and the kernel
+        // never uses the FPU, so the registers hold only this thread's state.
+        self.ctx.fpu.restore();
         // SAFETY: entry builds a ring-3 `iretq` frame from `ctx` and returns
         // here when the thread traps (the stubs load this kernel stack back).
         // The guard keeps us on this CPU across the round trip.
-        unsafe { ichor_enter_user(core::ptr::from_mut(self.ctx)) };
-        // SAFETY: stores the thread's x87/SSE state into its own aligned
-        // 512-byte area before any other thread can run on this CPU (the
-        // guard above keeps interrupts off; the kernel never uses the FPU).
-        unsafe {
-            core::arch::asm!("fxsave64 [{}]", in(reg) &raw mut self.ctx.fpu, options(nostack, preserves_flags));
-        };
+        unsafe { ichor_enter_user(core::ptr::from_mut(self.ctx).cast::<u8>()) };
+        self.ctx.fpu.save();
         let info = block.event_info.load(Relaxed);
         match block.event_kind.load(Relaxed) {
             1 => UserEvent::Syscall,
@@ -252,7 +213,9 @@ impl<'a> UserMode<'a> {
 }
 
 unsafe extern "sysv64" {
-    fn ichor_enter_user(ctx: *mut UserContext);
+    /// Takes a `*mut UserContext` (the stubs only touch its register
+    /// fields, at the offsets above).
+    fn ichor_enter_user(ctx: *mut u8);
     fn ichor_syscall_entry();
 }
 

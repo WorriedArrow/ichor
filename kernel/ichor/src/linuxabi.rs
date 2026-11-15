@@ -566,7 +566,7 @@ fn clone(
         return Err(ENOSYS);
     }
     let (mut child, mut cctx) = if thread {
-        let mut c = *ctx;
+        let mut c = ctx.clone();
         c.set_return(0);
         c.rsp = stack;
         (p.new_thread(), c)

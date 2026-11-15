@@ -12,6 +12,7 @@ pub(crate) mod smp;
 pub(crate) mod switch;
 pub(crate) mod trap;
 pub(crate) mod usermode;
+pub(crate) mod xstate;
 
 pub use self::trap::TrapFrame;
 pub use self::usermode::{UserContext, UserEvent, UserMode};

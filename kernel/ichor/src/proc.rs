@@ -498,7 +498,7 @@ pub(crate) fn fork(
     stack: u64,
 ) -> Result<(LinuxProcess, UserContext), i64> {
     let child = p.fork().ok_or(EAGAIN)?;
-    let mut cctx = *ctx;
+    let mut cctx = ctx.clone();
     cctx.set_return(0);
     if stack != 0 {
         cctx.rsp = stack;

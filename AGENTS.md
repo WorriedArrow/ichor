@@ -157,6 +157,13 @@ Milestones 0-3 are done.
   behind getrandom, /dev/[u]random and AT_RANDOM; `frame::time::wall_clock`
   is UEFI GetTime at boot plus TSC time, behind CLOCK_REALTIME,
   gettimeofday and file times.
+- M4 extended state (Phase B, ADR-0008): every CPU loads one XCR0 (x87,
+  SSE, AVX, AVX-512 if whole) and threads keep a boxed standard-format
+  XSAVE area, restored eagerly before ring 3 and saved with XSAVEOPT
+  after (FXSAVE on CPUs without XSAVE). `UserContext` is `Clone`, not
+  `Copy`. Signal frames carry the area with Linux's `_fpx_sw_bytes` and
+  `FP_XSTATE_MAGIC2`; sigreturn sanitizes it; the auxv has
+  AT_MINSIGSTKSZ. A test checks YMM upper halves across fork and signals.
 - M4 fd model: descriptors point at shared open file descriptions
   (`process::Description`: offset, status flags, the reference on what it
   names), so `dup`/`dup2`/`dup3`/`F_DUPFD` and `fork` share offset and
@@ -183,7 +190,7 @@ report at the end of each phase. Do not rewrite `main`.
   honest (audit table), ABI statuses checkable by lint. (5) [done] RDSEED/RDRAND +
   virtio-rng into a ChaCha20 CSPRNG for getrandom, /dev/urandom, AT_RANDOM;
   wall clock from UEFI GetTime (no CMOS fallback).
-- **B. XSAVE before glibc.** Document today's FPU handling; enable
+- **B. XSAVE before glibc.** [done: ADR-0008] Document today's FPU handling; enable
   XSAVE/XSAVEOPT, XCR0 per CPU support, per-thread extended state (lazy vs
   eager in an ADR with the security reasoning), XSAVE layout in signal
   frames.
@@ -231,7 +238,8 @@ are owed as multi-cell scheduling lands in milestone 4. Boot logs which apply.
 Frame budget: ADR-0005 sets the milestone 3 ceiling at 8,500 lines / 380
 sites; ADR-0007 raises it to 9,500 / 420 for milestone 4 (TLB shootdown,
 atomic user ops for futexes, PCID). `audit.toml` is at step 6 (5,800 / 250);
-frame is at 5,378 / 238 (A5 added RDSEED/RDRAND and UEFI GetTime).
+frame is at 5,504 / 242 (A5 added RDSEED/RDRAND and UEFI GetTime; B
+added XSAVE).
 
 The goal set for this effort is milestone 8, whose acceptance test needs
 cloud accounts and bare-metal hardware from the owner.

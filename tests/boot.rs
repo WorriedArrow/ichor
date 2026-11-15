@@ -47,6 +47,7 @@ fn m1_boots_on_four_cpus() {
     out.assert_in_order(&[
         "ichor: smp: 4 CPUs online, every CPU took 5 timer interrupts",
         "ichor: random: ChaCha20 seeded",
+        "ichor: xstate: XCR0 ",
         "ichor: time: wall clock from UEFI",
         "ichor: sched: 32 threads finished",
         "ichor: sched: 9 spinners on 4 CPUs all ran (preemption works",
@@ -71,6 +72,7 @@ fn m1_boots_on_four_cpus() {
         "ichor: linux: madvise DONTNEED zero-fills anonymous pages, refills file pages",
         "ichor: linux: MAP_SHARED anonymous memory and its futex are shared across fork",
         "ichor: linux: EPOLLET edges, ppoll/epoll_pwait signal masks, vfork waits for the child",
+        "ichor: linux: AVX state is per thread and survives signals",
         "ichor: blk: virtio-blk disk, ",
         "ichor: blk: virtio-blk: verified 300 KiB read across multiple requests",
         "ichor: blk: mounted the root image from the virtio-blk disk",
@@ -143,6 +145,7 @@ fn m1_boots_on_one_cpu() {
     out.assert_in_order(&[
         "ichor: smp: 1 CPUs online, every CPU took 5 timer interrupts",
         "ichor: random: ChaCha20 seeded",
+        "ichor: xstate: XCR0 ",
         "ichor: time: wall clock from UEFI",
         "ichor: sched: 32 threads finished",
         "ichor: sched: 3 spinners on 1 CPUs all ran (preemption works",
@@ -167,6 +170,7 @@ fn m1_boots_on_one_cpu() {
         "ichor: linux: madvise DONTNEED zero-fills anonymous pages, refills file pages",
         "ichor: linux: MAP_SHARED anonymous memory and its futex are shared across fork",
         "ichor: linux: EPOLLET edges, ppoll/epoll_pwait signal masks, vfork waits for the child",
+        "ichor: linux: AVX state is per thread and survives signals",
         "ichor: blk: virtio-blk disk, ",
         "ichor: blk: virtio-blk: verified 300 KiB read across multiple requests",
         "ichor: blk: mounted the root image from the virtio-blk disk",
@@ -219,6 +223,7 @@ fn m2_scheduler_on_eight_cpus() {
     out.assert_in_order(&[
         "ichor: smp: 8 CPUs online, every CPU took 5 timer interrupts",
         "ichor: random: ChaCha20 seeded",
+        "ichor: xstate: XCR0 ",
         "ichor: time: wall clock from UEFI",
         "ichor: sched: 32 threads finished",
         "ichor: sched: 17 spinners on 8 CPUs all ran (preemption works",
@@ -243,6 +248,7 @@ fn m2_scheduler_on_eight_cpus() {
         "ichor: linux: madvise DONTNEED zero-fills anonymous pages, refills file pages",
         "ichor: linux: MAP_SHARED anonymous memory and its futex are shared across fork",
         "ichor: linux: EPOLLET edges, ppoll/epoll_pwait signal masks, vfork waits for the child",
+        "ichor: linux: AVX state is per thread and survives signals",
         "ichor: blk: virtio-blk disk, ",
         "ichor: blk: virtio-blk: verified 300 KiB read across multiple requests",
         "ichor: blk: mounted the root image from the virtio-blk disk",

@@ -13,6 +13,7 @@ pub(crate) const CR4_UMIP: u64 = 1 << 11;
 pub(crate) const CR4_LA57: u64 = 1 << 12;
 pub(crate) const CR4_SMEP: u64 = 1 << 20;
 pub(crate) const CR4_SMAP: u64 = 1 << 21;
+pub(crate) const CR4_OSXSAVE: u64 = 1 << 18;
 
 pub(crate) const MSR_EFER: u32 = 0xC000_0080;
 pub(crate) const EFER_NXE: u64 = 1 << 11;
