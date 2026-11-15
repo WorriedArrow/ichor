@@ -47,7 +47,7 @@ impl DmaAddr {
 
 impl DmaBuf {
     /// Allocates a zeroed buffer of at least `len` bytes (rounded up to a
-    /// power-of-two number of pages, at most 4 MiB).
+    /// power-of-two number of pages, at most `2^MAX_ORDER` pages).
     pub fn alloc(len: usize) -> Option<DmaBuf> {
         let pages = (len as u64).div_ceil(PAGE_SIZE).max(1);
         let order = pages.next_power_of_two().trailing_zeros();

@@ -54,8 +54,13 @@ const ENVP: &[&str] = &["PATH=/bin:/usr/bin", "HOME=/", "TERM=dumb"];
 /// children it forks run on their own), and checks that all of the cell's
 /// memory came back. Returns the exit code (or minus the signal that killed
 /// it) and the number of syscalls it made.
-pub(crate) fn run_linux(mut p: LinuxProcess, elf: &[u8], argv: &[&str]) -> (i32, u32) {
-    let loaded = match loader::load(&mut p.mm, elf, argv, ENVP) {
+pub(crate) fn run_linux(
+    mut p: LinuxProcess,
+    elf: &[u8],
+    interp: Option<&[u8]>,
+    argv: &[&str],
+) -> (i32, u32) {
+    let loaded = match loader::load(&mut p.mm, elf, interp, argv, ENVP) {
         Ok(l) => l,
         Err(e) => {
             println!("ichor: runtest: load error {e:?}");
@@ -426,7 +431,7 @@ pub(crate) fn run() {
         LinuxProcess::new(cell, vfs.clone()).unwrap_or_else(|| fail("no process"))
     };
 
-    let (status, syscalls) = run_linux(new_process(), &hello_program(), &["hello"]);
+    let (status, syscalls) = run_linux(new_process(), &hello_program(), None, &["hello"]);
     if status != 7 {
         fail("hello did not exit with status 7");
     }
@@ -434,7 +439,7 @@ pub(crate) fn run() {
         "ichor: linux: static ELF ran via the Linux ABI, exited {status} after {syscalls} syscalls"
     );
 
-    let (status, syscalls) = run_linux(new_process(), &cat_program(), &["cat", "/etc/motd"]);
+    let (status, syscalls) = run_linux(new_process(), &cat_program(), None, &["cat", "/etc/motd"]);
     if status != 0 {
         fail("cat: ENOENT, fd number, read or fstat check failed");
     }
@@ -442,7 +447,7 @@ pub(crate) fn run() {
         "ichor: linux: cat read /etc/motd through a symlink in the image ({syscalls} syscalls, checks passed)"
     );
 
-    let (status, syscalls) = run_linux(new_process(), &mem_program(), &["memtest", "a", "b"]);
+    let (status, syscalls) = run_linux(new_process(), &mem_program(), None, &["memtest", "a", "b"]);
     if status != 0 {
         println!("ichor: linux: memtest failed check {status}");
         fail("memtest");
@@ -451,7 +456,7 @@ pub(crate) fn run() {
         "ichor: linux: brk, mmap, mprotect, munmap, uname, getdents64 ok ({syscalls} syscalls, memory returned)"
     );
 
-    let (status, syscalls) = run_linux(new_process(), &fs_program(), &["fstest"]);
+    let (status, syscalls) = run_linux(new_process(), &fs_program(), None, &["fstest"]);
     if status != 0 {
         println!("ichor: linux: fstest failed check {status}");
         fail("fstest");

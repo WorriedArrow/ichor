@@ -18,13 +18,28 @@ use crate::vfs::Vfs;
 const MAX_IMAGE: u64 = 64 << 20;
 
 pub(crate) fn run() {
-    match virtio_blk::probe() {
-        None => println!("ichor: blk: no virtio-blk device"),
-        Some(Err(e)) => {
+    let disks = virtio_blk::probe_all();
+    if disks.is_empty() {
+        println!("ichor: blk: no virtio-blk device");
+    }
+    for d in disks {
+        let mut d = d.unwrap_or_else(|e| {
             println!("ichor: blk: virtio-blk init failed: {e:?}");
-            fail("virtio-blk init");
+            fail("virtio-blk init")
+        });
+        let image = read_image("virtio-blk", &mut d);
+        let vfs =
+            Arc::new(Vfs::mount(image).unwrap_or_else(|_| fail("disk is not an Ichor image")));
+        // A disk carrying a distribution's userland is a container root.
+        let is_alpine = vfs
+            .lock()
+            .resolve(crate::vfs::ROOT, "/etc/alpine-release", true)
+            .is_ok();
+        if is_alpine {
+            crate::alpinetest::run(&vfs);
+        } else {
+            exercise("virtio-blk", image, vfs);
         }
-        Some(Ok(mut d)) => exercise("virtio-blk", &mut d),
     }
     match nvme::probe() {
         None => println!("ichor: blk: no nvme controller"),
@@ -34,14 +49,16 @@ pub(crate) fn run() {
         }
         Some(Ok(mut d)) => {
             println!("ichor: blk: nvme block size {} bytes", d.block_size());
-            exercise("nvme", &mut d);
+            let image = read_image("nvme", &mut d);
+            let vfs =
+                Arc::new(Vfs::mount(image).unwrap_or_else(|_| fail("disk is not an Ichor image")));
+            exercise("nvme", image, vfs);
         }
     }
 }
 
-/// Reads the root image off `disk`, checks the pattern file, mounts it, and
-/// runs `cat /etc/motd` against it in a fresh cell.
-fn exercise(name: &str, disk: &mut impl BlockDevice) {
+/// Reads a whole disk into memory (the lower layer of a root).
+fn read_image(name: &str, disk: &mut impl BlockDevice) -> &'static [u8] {
     let bytes = disk.sector_count().saturating_mul(SECTOR_SIZE as u64);
     println!(
         "ichor: blk: {name} disk, {} sectors ({} KiB)",
@@ -51,15 +68,18 @@ fn exercise(name: &str, disk: &mut impl BlockDevice) {
     if bytes == 0 || bytes > MAX_IMAGE {
         fail("root disk is empty or too large");
     }
-    let image = block::read_prefix(disk, bytes as usize, 64 * 1024)
+    block::read_prefix(disk, bytes as usize, 64 * 1024)
         .unwrap_or_else(|e| {
             println!("ichor: blk: {name} read error {e:?}");
             fail("reading the root disk")
         })
-        .leak();
+        .leak()
+}
+
+/// Checks the root disk's pattern file, then runs `cat /etc/motd` (and, on
+/// virtio-blk, busybox) against the mounted root in a fresh cell.
+fn exercise(name: &str, image: &'static [u8], vfs: Arc<Vfs>) {
     check_pattern(name, image);
-    let vfs =
-        Arc::new(Vfs::mount(image).unwrap_or_else(|_| fail("root disk is not an Ichor image")));
     println!("ichor: blk: mounted the root image from the {name} disk");
 
     let system = System::new(4096).unwrap_or_else(|| fail("no system cell"));
@@ -67,6 +87,7 @@ fn exercise(name: &str, disk: &mut impl BlockDevice) {
     let (status, syscalls) = run_linux(
         LinuxProcess::new(cell, vfs.clone()).unwrap_or_else(|| fail("no process")),
         &cat_program(),
+        None,
         &["cat", "/etc/motd"],
     );
     if status != 0 {

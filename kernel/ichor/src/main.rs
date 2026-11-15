@@ -10,6 +10,7 @@
 
 extern crate alloc;
 
+mod alpinetest;
 mod blktest;
 mod busytest;
 mod celltest;

@@ -22,6 +22,16 @@ mirror.
 
 Milestones 0-3 are done.
 
+- M4 so far: Alpine 3.20.3's own userland runs unmodified in a cell. xtask
+  fetches the minirootfs (pinned SHA-256, `artifact.rs`), gunzips and reads
+  the tar in memory (`inflate.rs`, `rootfs.rs`: no host extraction), and
+  attaches it as a second virtio-blk disk; the kernel mounts every virtio
+  disk and runs the Alpine checks on the one with `/etc/alpine-release`.
+  The loader handles PIEs (fixed bias) and `PT_INTERP` (`ld-musl` loaded
+  in the mmap area, `AT_BASE`), in `execve` too, so Alpine's dynamic
+  busybox shell forks and execs dynamic children. The buddy allocator's
+  largest block is 64 MiB (`MAX_ORDER` 14) so a whole image fits one buffer.
+
 - M0/M1: boots as a UEFI app into the higher half; buddy page allocator and
   heap; traps with IST stacks; x2APIC + tickless timer; SMP bring-up; per-CPU
   data.
@@ -96,7 +106,8 @@ Suggested order for milestone 4:
    shootdown, per-thread contexts).
 2. Copy-on-write fork (frame support for read-only remapping of shared
    untyped pages).
-3. `PT_INTERP` and PIE: load `ld-musl` / `ld-linux` and run dynamic binaries.
+3. `PT_INTERP` and PIE: done for musl (Alpine); glibc's `ld-linux` next with
+   debian-slim (it needs more of `mmap` with file offsets and `/proc/self`).
 4. pipes, `poll`/`epoll`, `/proc` and `/dev`, then Alpine `apk` and
    debian-slim `apt` against a local mirror.
 
@@ -176,7 +187,8 @@ kernel/vma       user address-space region map for mmap/brk (host-tested)
 kernel/overlay   cell root: image + copy-on-write upper layer (host-tested)
 kernel/drivers/virtio-blk  safe virtio-blk driver over frame's IoMem/DMA
 kernel/drivers/nvme        safe NVMe driver (polled, DMA-trusted)
-xtask/src/busybox.rs       fetches + verifies the test busybox (GPL-2.0, never committed)
+xtask/src/artifact.rs      pinned downloads (busybox, Alpine): SHA-256, cache, never committed
+xtask/src/inflate.rs       gzip/DEFLATE decoder; rootfs.rs: tar -> Ichor image
 kernel/ichor     the kernel binary; frame::main!(kmain); kcell/nativeabi tie it together
 xtask/           build/run/test/lint tooling (lib + bin, no dependencies)
 tests/           QEMU integration tests (host crate using xtask's runner)

@@ -123,11 +123,19 @@ pub struct VirtioBlk {
 
 /// Finds and initializes the first virtio-blk device.
 pub fn probe() -> Option<Result<VirtioBlk, InitError>> {
-    let dev = pci::devices().into_iter().find(|d| {
-        d.vendor_id == VENDOR_VIRTIO
-            && matches!(d.device_id, DEVICE_BLK_MODERN | DEVICE_BLK_TRANSITIONAL)
-    })?;
-    Some(VirtioBlk::init(&dev))
+    probe_all().into_iter().next()
+}
+
+/// Finds and initializes every virtio-blk device, in PCI order.
+pub fn probe_all() -> Vec<Result<VirtioBlk, InitError>> {
+    pci::devices()
+        .into_iter()
+        .filter(|d| {
+            d.vendor_id == VENDOR_VIRTIO
+                && matches!(d.device_id, DEVICE_BLK_MODERN | DEVICE_BLK_TRANSITIONAL)
+        })
+        .map(|d| VirtioBlk::init(&d))
+        .collect()
 }
 
 impl VirtioBlk {

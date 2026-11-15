@@ -12,8 +12,10 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
-/// Largest block is `2^MAX_ORDER` pages (4 MiB with 4 KiB pages).
-pub const MAX_ORDER: u8 = 10;
+/// Largest block is `2^MAX_ORDER` pages (64 MiB with 4 KiB pages): enough
+/// for a whole root image read into one buffer, until the page cache reads
+/// images on demand.
+pub const MAX_ORDER: u8 = 14;
 
 /// Per-page storage the allocator threads its free lists through.
 pub trait PageLinks {
@@ -227,24 +229,26 @@ mod tests {
 
     #[test]
     fn add_range_builds_maximal_blocks() {
-        let (b, links) = setup(4096, &[(0, 2048)]);
-        assert_eq!(b.free_pages(), 2048);
+        let max = 1usize << MAX_ORDER;
+        let (b, links) = setup(4 * max, &[(0, 2 * max)]);
+        assert_eq!(b.free_pages(), 2 * max);
         assert_eq!(links.free_order(0), Some(MAX_ORDER));
-        assert_eq!(links.free_order(1024), Some(MAX_ORDER));
+        assert_eq!(links.free_order(max), Some(MAX_ORDER));
         let (b, _) = setup(64, &[(3, 17)]);
         assert_eq!(b.free_pages(), 14);
     }
 
     #[test]
     fn alloc_splits_and_free_merges() {
-        let (mut b, mut l) = setup(1024, &[(0, 1024)]);
+        let max = 1usize << MAX_ORDER;
+        let (mut b, mut l) = setup(max, &[(0, max)]);
         let a = b.alloc(&mut l, 0).unwrap();
-        assert_eq!(b.free_pages(), 1023);
+        assert_eq!(b.free_pages(), max - 1);
         let c = b.alloc(&mut l, 3).unwrap();
         assert_eq!(c % 8, 0);
         b.free(&mut l, a, 0).unwrap();
         b.free(&mut l, c, 3).unwrap();
-        assert_eq!(b.free_pages(), 1024);
+        assert_eq!(b.free_pages(), max);
         assert_eq!(l.free_order(0), Some(MAX_ORDER), "everything merged back");
     }
 

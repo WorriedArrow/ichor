@@ -39,7 +39,7 @@ pub(crate) fn run(vfs: &Arc<Vfs>) {
         let cell =
             Cell::new(&system.root_account, CELL_PAGES).unwrap_or_else(|| fail("no busybox cell"));
         let p = LinuxProcess::new(cell, vfs.clone()).unwrap_or_else(|| fail("no process"));
-        let (code, syscalls) = run_linux(p, &elf, argv);
+        let (code, syscalls) = run_linux(p, &elf, None, argv);
         if code != *want {
             println!("ichor: busybox: {argv:?} exited {code}, expected {want}");
             fail("busybox applet");

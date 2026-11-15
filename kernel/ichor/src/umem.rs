@@ -117,6 +117,11 @@ impl Mm {
         self.brk = va;
     }
 
+    /// A free, page-aligned range of `len` bytes in the mmap area.
+    pub(crate) fn find_free(&self, len: u64) -> Option<u64> {
+        self.regions.find_free(len)
+    }
+
     /// Reserves `[start, end)` with `prot` without allocating pages.
     pub(crate) fn reserve(&mut self, start: u64, end: u64, prot: Prot) -> bool {
         self.regions.insert(start, end, prot)

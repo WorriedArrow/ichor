@@ -11,13 +11,14 @@
 //! a separate mapping of the interpreter) comes with milestone 4.
 
 use alloc::collections::BTreeMap;
+use alloc::string::String;
 use alloc::vec::Vec;
 
 use elf::{LoadPlan, Machine};
 use frame::mm::{PAGE_SIZE, UFrame, UserProt};
 use vma::Prot;
 
-use crate::umem::{MMAP_LO, Mm};
+use crate::umem::Mm;
 
 /// A loaded program ready to run.
 #[derive(Clone, Copy, Debug)]
@@ -58,6 +59,7 @@ const AT_PHDR: u64 = 3;
 const AT_PHENT: u64 = 4;
 const AT_PHNUM: u64 = 5;
 const AT_PAGESZ: u64 = 6;
+const AT_BASE: u64 = 7;
 const AT_ENTRY: u64 = 9;
 const AT_UID: u64 = 11;
 const AT_EUID: u64 = 12;
@@ -70,30 +72,41 @@ const AT_SECURE: u64 = 23;
 const AT_RANDOM: u64 = 25;
 const AT_EXECFN: u64 = 31;
 
-/// Loads `image` into the fresh address space `mm`, with `argv`
-/// and `envp` on the stack.
-pub(crate) fn load(
-    mm: &mut Mm,
-    image: &[u8],
-    argv: &[&str],
-    envp: &[&str],
-) -> Result<Loaded, LoadError> {
-    let plan: LoadPlan = elf::parse(image).map_err(LoadError::Elf)?;
-    if plan.machine != Machine::X86_64 {
-        return Err(LoadError::WrongArch);
-    }
-    if plan.interp.is_some() || plan.pie {
-        // A PIE needs a load bias and relocation; an interpreter needs a
-        // second mapping. Both are milestone 4.
-        return Err(LoadError::Dynamic);
-    }
+/// Where a position-independent executable is placed.
+const PIE_BASE: u64 = 0x5555_5555_4000;
 
+/// The interpreter (`PT_INTERP`) `image` asks for, if any: the path the
+/// caller must read and pass to [`load`].
+pub(crate) fn interp_path(image: &[u8]) -> Result<Option<String>, LoadError> {
+    let plan = elf::parse(image).map_err(LoadError::Elf)?;
+    let Some((off, len)) = plan.interp else {
+        return Ok(None);
+    };
+    let bytes = image
+        .get(off as usize..(off + len) as usize)
+        .ok_or(LoadError::Elf(elf::Error::BadSegment))?;
+    let path = core::str::from_utf8(bytes).map_err(|_| LoadError::Dynamic)?;
+    Ok(Some(String::from(path)))
+}
+
+/// Maps `plan`'s segments at `bias` into `mm`; returns the end of the
+/// highest page.
+fn map_image(mm: &mut Mm, plan: &LoadPlan, image: &[u8], bias: u64) -> Result<u64, LoadError> {
     // Every page the image touches, with the union of its segments' access.
     let mut pages: BTreeMap<u64, Prot> = BTreeMap::new();
     let mut image_end = 0;
-    for seg in plan.segments() {
+    let segs: Vec<elf::Segment> = plan
+        .segments()
+        .iter()
+        .map(|s| {
+            let mut s = *s;
+            s.vaddr = s.vaddr.wrapping_add(bias);
+            s
+        })
+        .collect();
+    for seg in &segs {
         let (start, end) = seg.page_range(PAGE_SIZE);
-        if end > MMAP_LO {
+        if end > STACK_TOP - STACK_SIZE || end < start {
             return Err(LoadError::Map);
         }
         image_end = image_end.max(end);
@@ -114,7 +127,7 @@ pub(crate) fn load(
         let frame = mm.frame(va).ok_or(LoadError::OutOfMemory)?;
         frames.insert(va, frame);
     }
-    for seg in plan.segments() {
+    for seg in &segs {
         let (start, end) = seg.page_range(PAGE_SIZE);
         let mut va = start;
         while va < end {
@@ -127,30 +140,83 @@ pub(crate) fn load(
     // Map only after the bytes are in place.
     for (&va, f) in &frames {
         let prot = pages.get(&va).copied().unwrap_or(Prot::NONE);
-        if prot.accessible()
-            && mm
-                .space()
-                .map(
-                    va,
-                    f,
-                    UserProt {
-                        write: prot.write,
-                        exec: prot.exec,
-                    },
-                )
-                .is_err()
-        {
+        let user = UserProt {
+            write: prot.write,
+            exec: prot.exec,
+        };
+        if prot.accessible() && mm.space().map(va, f, user).is_err() {
             return Err(LoadError::Map);
         }
     }
+    Ok(image_end)
+}
+
+fn parse(image: &[u8]) -> Result<LoadPlan, LoadError> {
+    let plan: LoadPlan = elf::parse(image).map_err(LoadError::Elf)?;
+    if plan.machine != Machine::X86_64 {
+        return Err(LoadError::WrongArch);
+    }
+    Ok(plan)
+}
+
+/// What the entry frame's auxiliary vector reports about the program.
+struct Aux {
+    phdr: Option<u64>,
+    phent: u16,
+    phnum: u16,
+    entry: u64,
+    /// Where the interpreter was loaded (0 without one).
+    base: u64,
+}
+
+/// Loads `image` into the fresh address space `mm`, with `argv` and `envp`
+/// on the stack. A position-independent executable is placed at a fixed
+/// bias. If the image names an interpreter ([`interp_path`]), `interp` must
+/// be that file: it is loaded too, and the process starts there, finding
+/// the program through the auxiliary vector (`AT_PHDR`, `AT_ENTRY`,
+/// `AT_BASE`), as on Linux.
+pub(crate) fn load(
+    mm: &mut Mm,
+    image: &[u8],
+    interp: Option<&[u8]>,
+    argv: &[&str],
+    envp: &[&str],
+) -> Result<Loaded, LoadError> {
+    let plan = parse(image)?;
+    let bias = if plan.pie { PIE_BASE } else { 0 };
+    let image_end = map_image(mm, &plan, image, bias)?;
     mm.set_brk_start(image_end);
+
+    let mut aux = Aux {
+        phdr: plan.phdr_vaddr.map(|p| p + bias),
+        phent: plan.phentsize,
+        phnum: plan.phnum,
+        entry: plan.entry.wrapping_add(bias),
+        base: 0,
+    };
+    let mut start = aux.entry;
+    match (plan.interp.is_some(), interp) {
+        (false, _) => {}
+        (true, None) => return Err(LoadError::Dynamic),
+        (true, Some(ld)) => {
+            let ip = parse(ld)?;
+            if ip.interp.is_some() || !ip.pie {
+                return Err(LoadError::Dynamic); // must be a self-contained ET_DYN
+            }
+            let (lo, hi) = ip.address_span(PAGE_SIZE).ok_or(LoadError::Map)?;
+            let base = mm.find_free(hi - lo).ok_or(LoadError::OutOfMemory)? - lo;
+            map_image(mm, &ip, ld, base)?;
+            aux.base = base;
+            start = ip.entry.wrapping_add(base);
+        }
+    }
 
     if !mm.reserve(STACK_TOP - STACK_SIZE, STACK_TOP, Prot::RW) {
         return Err(LoadError::Map);
     }
-    let stack_pointer = build_stack(mm, &plan, argv, envp)?;
+    let stack_pointer = build_stack(mm, &aux, argv, envp)?;
     Ok(Loaded {
-        entry: plan.entry,
+        entry: start,
         stack_pointer,
     })
 }
@@ -201,12 +267,7 @@ fn random_bytes() -> [u8; 16] {
 /// rsp -> argc, argv[0..argc], NULL, envp[..], NULL, auxv pairs, AT_NULL
 ///        ... padding, random bytes, strings ... STACK_TOP
 /// ```
-fn build_stack(
-    mm: &mut Mm,
-    plan: &LoadPlan,
-    argv: &[&str],
-    envp: &[&str],
-) -> Result<u64, LoadError> {
+fn build_stack(mm: &mut Mm, plan: &Aux, argv: &[&str], envp: &[&str]) -> Result<u64, LoadError> {
     // Strings and blobs go at the top, laid out downwards in `blob`, which
     // is the memory [blob_base, STACK_TOP).
     let mut strings: Vec<u8> = Vec::new();
@@ -230,11 +291,14 @@ fn build_stack(
     let addr = |off: usize| blob_base + off as u64;
 
     let mut auxv: Vec<(u64, u64)> = Vec::new();
-    if let Some(phdr) = plan.phdr_vaddr {
+    if let Some(phdr) = plan.phdr {
         auxv.push((AT_PHDR, phdr));
     }
+    if plan.base != 0 {
+        auxv.push((AT_BASE, plan.base));
+    }
     auxv.extend_from_slice(&[
-        (AT_PHENT, u64::from(plan.phentsize)),
+        (AT_PHENT, u64::from(plan.phent)),
         (AT_PHNUM, u64::from(plan.phnum)),
         (AT_PAGESZ, PAGE_SIZE),
         (AT_ENTRY, plan.entry),
