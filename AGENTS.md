@@ -48,6 +48,11 @@ Milestones 0-3 are done.
   global sleeper list; `WaitQueue::wait_until_deadline` and
   `task::sleep_until` block until a condition or a deadline. `nanosleep`
   uses them (interruptible by signals). Self-tested on every boot.
+- M4 copy-on-write fork (`umem`): parent and child share pages read-only;
+  the first write (fault or kernel copy-in) copies. The child is charged
+  up front. A test ELF checks isolation both ways. Each root gets a `/dev`
+  (`dev.rs`, overlay `mknod`); busybox needed `/dev/null` for background
+  jobs, which faster forks exposed.
 
 - M0/M1: boots as a UEFI app into the higher half; buddy page allocator and
   heap; traps with IST stacks; x2APIC + tickless timer; SMP bring-up; per-CPU
@@ -120,8 +125,8 @@ Suggested order for milestone 4:
 
 1. Done: signals and timed waits. Next: real futexes with threads (`clone`
    with `CLONE_VM|CLONE_THREAD`, TLB shootdown, per-thread contexts).
-2. Copy-on-write fork (frame support for read-only remapping of shared
-   untyped pages).
+2. Done: copy-on-write fork (kernel-side, no frame change) and a minimal
+   `/dev` (null, zero, full, random, urandom, tty, console) plus `getrandom`.
 3. `PT_INTERP` and PIE: done for musl (Alpine); glibc's `ld-linux` next with
    debian-slim (it needs more of `mmap` with file offsets and `/proc/self`).
 4. `poll`/`epoll`, `/proc` and `/dev` (pipes are done), then Alpine `apk` and
@@ -132,9 +137,9 @@ IBPB on cross-cell switch, page-table isolation for Meltdown-affected CPUs)
 are owed as multi-cell scheduling lands in milestone 4. Boot logs which apply.
 
 Frame budget: ADR-0005 sets the milestone 3 ceiling at 8,500 lines / 380
-sites; `audit.toml` is at step 5 (5,100 / 235) and frame is at 5,096 / 226:
-the next frame change (COW, threads, TLB shootdown) needs a milestone 4
-budget ADR first.
+sites; ADR-0007 raises it to 9,500 / 420 for milestone 4 (TLB shootdown,
+atomic user ops for futexes, PCID). `audit.toml` is at step 6 (5,800 / 250);
+frame is at 5,096 / 226.
 
 The goal set for this effort is milestone 8, whose acceptance test needs
 cloud accounts and bare-metal hardware from the owner.

@@ -19,5 +19,9 @@
 #
 # Milestone 3: ADR-0005 sets the ceiling at 8,500 / 380.
 # Step 5 (CPU vulnerability detection, PCI, IoMem, DmaBuf, VirtQueue): 5,100 / 235.
-max_code_lines = 5100
-max_unsafe_sites = 235
+#
+# Milestone 4: ADR-0007 sets the ceiling at 9,500 / 420.
+# Step 6 (timed waits, signal-frame accessors; next: TLB shootdown, atomic
+# user u32 ops for futexes): 5,800 / 250.
+max_code_lines = 5800
+max_unsafe_sites = 250
