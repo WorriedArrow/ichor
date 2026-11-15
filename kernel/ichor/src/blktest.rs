@@ -1,6 +1,7 @@
-//! Milestone 3: the root image comes off a real block device. Finds the
-//! virtio-blk disk, reads the image from it, mounts it, and runs the same
-//! static `cat /etc/motd` ELF against it in a fresh cell.
+//! Milestone 3: the root image comes off real block devices. For each of
+//! the virtio-blk disk and the NVMe namespace, reads the image, verifies a
+//! pattern file spanning many requests, mounts it, and runs the static
+//! `cat /etc/motd` ELF against it in a fresh cell.
 
 use alloc::sync::Arc;
 
@@ -17,36 +18,49 @@ use crate::vfs::Vfs;
 const MAX_IMAGE: u64 = 64 << 20;
 
 pub(crate) fn run() {
-    let mut disk = match virtio_blk::probe() {
-        None => {
-            println!("ichor: blk: no virtio-blk device");
-            return;
-        }
+    match virtio_blk::probe() {
+        None => println!("ichor: blk: no virtio-blk device"),
         Some(Err(e)) => {
             println!("ichor: blk: virtio-blk init failed: {e:?}");
             fail("virtio-blk init");
         }
-        Some(Ok(d)) => d,
-    };
+        Some(Ok(mut d)) => exercise("virtio-blk", &mut d),
+    }
+    match nvme::probe() {
+        None => println!("ichor: blk: no nvme controller"),
+        Some(Err(e)) => {
+            println!("ichor: blk: nvme init failed: {e:?}");
+            fail("nvme init");
+        }
+        Some(Ok(mut d)) => {
+            println!("ichor: blk: nvme block size {} bytes", d.block_size());
+            exercise("nvme", &mut d);
+        }
+    }
+}
+
+/// Reads the root image off `disk`, checks the pattern file, mounts it, and
+/// runs `cat /etc/motd` against it in a fresh cell.
+fn exercise(name: &str, disk: &mut impl BlockDevice) {
     let bytes = disk.sector_count().saturating_mul(SECTOR_SIZE as u64);
     println!(
-        "ichor: blk: virtio-blk disk, {} sectors ({} KiB)",
+        "ichor: blk: {name} disk, {} sectors ({} KiB)",
         disk.sector_count(),
         bytes / 1024
     );
     if bytes == 0 || bytes > MAX_IMAGE {
         fail("root disk is empty or too large");
     }
-    let image = block::read_prefix(&mut disk, bytes as usize, 64 * 1024)
+    let image = block::read_prefix(disk, bytes as usize, 64 * 1024)
         .unwrap_or_else(|e| {
-            println!("ichor: blk: read error {e:?}");
+            println!("ichor: blk: {name} read error {e:?}");
             fail("reading the root disk")
         })
         .leak();
-    check_pattern(image);
+    check_pattern(name, image);
     let vfs =
         Arc::new(Vfs::mount(image).unwrap_or_else(|_| fail("root disk is not an Ichor image")));
-    println!("ichor: blk: mounted the root image from the disk");
+    println!("ichor: blk: mounted the root image from the {name} disk");
 
     let system = System::new(4096).unwrap_or_else(|| fail("no system cell"));
     let cell = Cell::new(&system.root_account, 128).unwrap_or_else(|| fail("no process cell"));
@@ -58,7 +72,7 @@ pub(crate) fn run() {
     if status != 0 {
         fail("cat from disk: checks failed");
     }
-    println!("ichor: blk: cat read /etc/motd from the virtio-blk disk ({syscalls} syscalls)");
+    println!("ichor: blk: cat read /etc/motd from the {name} disk ({syscalls} syscalls)");
 }
 
 /// Must match xtask's `DISK_PATTERN_LEN` and `pattern_byte`.
@@ -70,7 +84,7 @@ fn pattern_byte(i: usize) -> u8 {
 
 /// Checks every byte of `/usr/share/pattern`, which spans several device
 /// requests, so a misordered or short read shows up.
-fn check_pattern(bytes: &[u8]) {
+fn check_pattern(name: &str, bytes: &[u8]) {
     let img =
         image::Image::mount(bytes).unwrap_or_else(|_| fail("root disk is not an Ichor image"));
     let node = img
@@ -95,7 +109,7 @@ fn check_pattern(bytes: &[u8]) {
         at += n;
     }
     println!(
-        "ichor: blk: verified {} KiB read across multiple requests",
+        "ichor: blk: {name}: verified {} KiB read across multiple requests",
         PATTERN_LEN / 1024
     );
 }

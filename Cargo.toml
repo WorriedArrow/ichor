@@ -16,6 +16,7 @@ members = [
     "kernel/vma",
     "kernel/overlay",
     "kernel/drivers/virtio-blk",
+    "kernel/drivers/nvme",
     "kernel/ichor",
     "tests",
     "xtask",
@@ -63,6 +64,7 @@ block = { package = "ichor-block", path = "kernel/block" }
 vma = { package = "ichor-vma", path = "kernel/vma" }
 overlay = { package = "ichor-overlay", path = "kernel/overlay" }
 virtio-blk = { package = "ichor-virtio-blk", path = "kernel/drivers/virtio-blk" }
+nvme = { package = "ichor-nvme", path = "kernel/drivers/nvme" }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

@@ -1,0 +1,17 @@
+[package]
+name = "ichor-nvme"
+description = "NVMe driver (one I/O queue pair, polled); safe code only, DMA-trusted per ADR-0005"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "nvme"
+
+[dependencies]
+frame.workspace = true
+block.workspace = true
+
+[lints]
+workspace = true

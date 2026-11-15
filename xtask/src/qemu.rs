@@ -6,7 +6,7 @@
 //! ```text
 //! esp/EFI/BOOT/BOOTX64.EFI   the kernel
 //! esp/ichor/cmdline          the kernel command line
-//! root.img                   the root image, attached as a virtio-blk disk
+//! root.img                   the root image, attached as virtio-blk and NVMe disks
 //! ```
 //!
 //! OVMF finds `BOOTX64.EFI` through the removable-media boot path, so no boot
@@ -295,8 +295,7 @@ fn prepare_run_dir(cfg: &RunConfig, fw: &Firmware) -> Result<PathBuf> {
 }
 
 /// Text of `/usr/share/motd` on the root disk; tests look for it.
-pub const DISK_MOTD: &str = "hello from /etc/motd on a virtio-blk disk
-";
+pub const DISK_MOTD: &str = "hello from /etc/motd on the root disk\n";
 
 /// Size of `/usr/share/pattern`, large enough that reading the disk takes
 /// several requests and multi-page DMA buffers.
@@ -308,8 +307,7 @@ pub fn pattern_byte(i: usize) -> u8 {
 }
 
 /// The root disk: an Ichor image with `/usr/share/motd`,
-/// `/etc/motd -> /usr/share/motd` and `/usr/share/pattern`, padded to
-/// whole sectors.
+/// `/etc/motd -> /usr/share/motd` and `/usr/share/pattern`.
 pub fn root_image() -> Vec<u8> {
     let mut b = image::builder::Builder::new();
     let motd = b.file("motd", DISK_MOTD.as_bytes(), 0o644);
@@ -321,7 +319,8 @@ pub fn root_image() -> Vec<u8> {
     let etc = b.dir("etc", &[link], 0o755);
     let root = b.dir("/", &[etc, usr], 0o755);
     let mut img = b.finish(root);
-    img.resize(img.len().next_multiple_of(512), 0);
+    // Whole 4 KiB blocks, so it also fits a 4Kn NVMe namespace.
+    img.resize(img.len().next_multiple_of(4096), 0);
     img
 }
 
@@ -375,6 +374,16 @@ pub fn command(cfg: &RunConfig) -> Result<Command> {
             drive_path(&dir.join("root.img"))
         ))
         .args(["-device", "virtio-blk-pci,drive=root,disable-legacy=on"])
+        // The same image again on an NVMe controller (both read-only).
+        .arg("-drive")
+        .arg(format!(
+            "if=none,id=nvme0,format=raw,readonly=on,file={}",
+            drive_path(&dir.join("root.img"))
+        ))
+        .args([
+            "-device",
+            "nvme,serial=ichor0,drive=nvme0,logical_block_size=4096,physical_block_size=4096",
+        ])
         .args(&cfg.extra_args);
     Ok(cmd)
 }

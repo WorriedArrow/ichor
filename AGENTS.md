@@ -50,10 +50,12 @@ Milestones 0-2 are done.
 - M3 device I/O (ADR-0005): frame enumerates PCI and offers `IoMem`
   (bounds-checked MMIO from `PciDevice::map_bar` only), `DmaBuf`/`DmaAddr`
   and a frame-owned split `VirtQueue`. `kernel/block` is the block-device
-  trait; `kernel/drivers/virtio-blk` is a safe, polled virtio-blk driver.
-  Every QEMU run attaches `target/qemu/<run>/root.img` (built by xtask with
-  the image builder) as a virtio-blk disk; the kernel reads it, verifies a
-  300 KiB pattern file, mounts it, and runs `cat` against it.
+  trait; `kernel/drivers/virtio-blk` is a safe, polled virtio-blk driver
+  and `kernel/drivers/nvme` a safe, polled NVMe driver (one I/O queue pair;
+  DMA-trusted per ADR-0005 because it writes PRPs). Every QEMU run attaches
+  `target/qemu/<run>/root.img` (built by xtask with the image builder) as a
+  virtio-blk disk and as a 4 KiB-block NVMe namespace; the kernel reads each,
+  verifies a 300 KiB pattern file, mounts it, and runs `cat` against it.
 - M3 memory: `kernel/vma` (region map, host-tested) and the kernel's
   `umem` give Linux processes `brk`, `mmap` (anonymous, and private copies
   of files), `mprotect` and `munmap`, with demand paging from user page
@@ -121,7 +123,7 @@ Environment overrides: `ICHOR_QEMU`, `ICHOR_OVMF_CODE` + `ICHOR_OVMF_VARS`,
 
 Plain `cargo build` / `cargo test` at the root only touch host crates
 (`default-members`). Crates that depend on frame (`ichor`, `ichor-frame`,
-`ichor-virtio-blk`) are kernel-only: xtask's `KERNEL_ONLY` list keeps them
+`ichor-virtio-blk`, `ichor-nvme`) are kernel-only: xtask's `KERNEL_ONLY` list keeps them
 out of host clippy and tests and lints them for the UEFI target. The kernel and frame build for `x86_64-unknown-uefi`
 through xtask, into `target/kernel` so they never contend for cargo's build
 lock with the host build.
@@ -163,6 +165,7 @@ kernel/block     block-device trait and helpers (host-tested)
 kernel/vma       user address-space region map for mmap/brk (host-tested)
 kernel/overlay   cell root: image + copy-on-write upper layer (host-tested)
 kernel/drivers/virtio-blk  safe virtio-blk driver over frame's IoMem/DMA
+kernel/drivers/nvme        safe NVMe driver (polled, DMA-trusted)
 kernel/ichor     the kernel binary; frame::main!(kmain); kcell/nativeabi tie it together
 xtask/           build/run/test/lint tooling (lib + bin, no dependencies)
 tests/           QEMU integration tests (host crate using xtask's runner)
