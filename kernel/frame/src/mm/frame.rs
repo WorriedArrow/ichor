@@ -158,6 +158,11 @@ impl VmWriter<'_> {
         n
     }
 
+    /// Advances the write position without writing.
+    pub fn skip(&mut self, n: usize) {
+        self.pos = (self.pos + n).min(self.len);
+    }
+
     /// Fills the rest of the range with `byte`.
     pub fn fill(&mut self, byte: u8) {
         let n = self.remaining();

@@ -10,6 +10,7 @@ dependencies = [
  "ichor-cap",
  "ichor-cell",
  "ichor-cmdline",
+ "ichor-elf",
  "ichor-frame",
  "ichor-sched",
 ]

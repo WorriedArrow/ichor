@@ -48,6 +48,7 @@ sched = { package = "ichor-sched", path = "kernel/sched" }
 cap = { package = "ichor-cap", path = "kernel/cap" }
 cell = { package = "ichor-cell", path = "kernel/cell" }
 ichor-abi = { path = "kernel/abi" }
+elf = { package = "ichor-elf", path = "kernel/elf" }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

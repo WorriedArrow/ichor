@@ -17,6 +17,10 @@
 //! Milestone 2 (cells): capabilities isolate cells, rights are enforced,
 //! memory is accounted hierarchically, revocation works, and a native-ABI
 //! ring-3 process can act only on handles its cell holds.
+//!
+//! Milestone 3 (Linux ABI, in progress): a real static Linux x86-64 ELF runs
+//! unmodified in a cell, writing to stdout and exiting through the Linux
+//! syscall personality.
 
 use ichor_tests::{Exit, boot};
 
@@ -45,6 +49,8 @@ fn m1_boots_on_four_cpus() {
         "ichor: user: ring-3 program ran, 1 syscall(s), page fault at 0 handled, isolation ok",
         "ichor: cell: 2 cells isolated, rights enforced, accounting ok",
         "ichor: proc: native process ran, MEM_SIZE ok (4096), forged handle denied (error 2)",
+        "hello from a real Linux ELF running on Ichor",
+        "ichor: linux: static ELF ran via the Linux ABI, exited 7 after 2 syscalls",
         "ichor: boot complete; halting",
     ]);
     // Every page the heap self-test used came back.
@@ -80,6 +86,8 @@ fn m1_boots_on_one_cpu() {
         "ichor: user: ring-3 program ran, 1 syscall(s), page fault at 0 handled, isolation ok",
         "ichor: cell: 2 cells isolated, rights enforced, accounting ok",
         "ichor: proc: native process ran, MEM_SIZE ok (4096), forged handle denied (error 2)",
+        "hello from a real Linux ELF running on Ichor",
+        "ichor: linux: static ELF ran via the Linux ABI, exited 7 after 2 syscalls",
         "ichor: boot complete; halting",
     ]);
 }
@@ -95,6 +103,8 @@ fn m2_scheduler_on_eight_cpus() {
         "ichor: user: ring-3 program ran, 1 syscall(s), page fault at 0 handled, isolation ok",
         "ichor: cell: 2 cells isolated, rights enforced, accounting ok",
         "ichor: proc: native process ran, MEM_SIZE ok (4096), forged handle denied (error 2)",
+        "hello from a real Linux ELF running on Ichor",
+        "ichor: linux: static ELF ran via the Linux ABI, exited 7 after 2 syscalls",
         "ichor: boot complete; halting",
     ]);
 }

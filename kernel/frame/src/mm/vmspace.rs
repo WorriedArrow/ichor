@@ -11,9 +11,9 @@ use alloc::vec::Vec;
 use super::frame::{self, UFrame};
 use super::meta::kind;
 use super::page_alloc;
-use super::{PhysAddr, align_down};
+use super::{PhysAddr, align_down, phys_to_virt};
 use crate::arch::paging::{self, MapError, UserProt};
-use crate::arch::regs;
+use crate::arch::{self, regs};
 use crate::sync::SpinLock;
 
 /// A user address space.
@@ -112,6 +112,61 @@ impl VmSpace {
         if regs::read_cr3() & 0x000f_ffff_ffff_f000 == self.root.as_u64() {
             paging::flush_page(va);
         }
+    }
+
+    /// Copies up to `out.len()` bytes from user virtual address `va` into
+    /// `out`, stopping at the first unmapped page. Returns the number copied.
+    /// The bytes may change concurrently (another thread in this space), so
+    /// this is a snapshot copy, never a borrow.
+    pub fn copy_from_user(&self, va: u64, out: &mut [u8]) -> usize {
+        self.walk_user(va, out.len(), |off, pa, poff, len| {
+            let src = core::ptr::with_exposed_provenance::<u8>((phys_to_virt(pa) + poff) as usize);
+            // SAFETY: `pa` is a page mapped in this space (from `translate`),
+            // reachable via the linear map; `len` stays within it; `out` is a
+            // Rust slice that cannot alias user memory.
+            unsafe { arch::copy_untyped(out[off..].as_mut_ptr(), src, len) };
+            true
+        })
+    }
+
+    /// Copies `data` into user virtual address `va`, stopping at the first
+    /// page that is not mapped writable. Returns the number copied.
+    pub fn copy_to_user(&self, va: u64, data: &[u8]) -> usize {
+        self.walk_user(va, data.len(), |off, pa, poff, len| {
+            let dst =
+                core::ptr::with_exposed_provenance_mut::<u8>((phys_to_virt(pa) + poff) as usize);
+            // SAFETY: as in `copy_from_user`; the page is writable (checked in
+            // `walk_user`).
+            unsafe { arch::copy_untyped(dst, data[off..].as_ptr(), len) };
+            true
+        })
+    }
+
+    /// Walks the user range `[va, va+len)` page by page, calling `f(offset,
+    /// page_phys, page_offset, chunk_len)` for each mapped page. For a write
+    /// (`f` needs the page writable) the caller's closure is only reached for
+    /// writable pages via `translate`'s prot. Stops at the first gap.
+    fn walk_user(
+        &self,
+        va: u64,
+        len: usize,
+        mut f: impl FnMut(usize, PhysAddr, u64, usize) -> bool,
+    ) -> usize {
+        let mut done = 0usize;
+        while done < len {
+            let cur = va + done as u64;
+            let page = align_down(cur, super::PAGE_SIZE);
+            let Some((pa, _prot)) = self.translate(page) else {
+                break;
+            };
+            let poff = cur - page;
+            let chunk = ((super::PAGE_SIZE - poff) as usize).min(len - done);
+            if !f(done, pa, poff, chunk) {
+                break;
+            }
+            done += chunk;
+        }
+        done
     }
 
     /// Makes this address space active and binds it to the current task, so
