@@ -15,6 +15,7 @@ brief where they conflict with it.
 | [0007](0007-milestone-4-frame.md) | Frame work for milestone 4 (shootdown, atomic user ops, PCID) and its budget | Accepted |
 | [0008](0008-extended-cpu-state.md) | Extended CPU state: XSAVE, saved eagerly | Accepted |
 | [0009](0009-identity-model.md) | Identity inside a cell: uids, what uid 0 means, enforcement | Accepted |
+| [0010](0010-network-stack-and-cell-switch.md) | Network stack (own, sans-I/O, per cell) and the cell switch | Accepted |
 
 ## Planned
 
@@ -22,7 +23,6 @@ These are known decisions with deadlines, so a future session knows they are
 owed:
 
 - Read-only image format and page sharing (milestone 3)
-- Network stack architecture and the cell switch (milestone 5)
 - Secure Boot signing and measured boot (before milestone 8; needs signing keys from the owner)
 
 ## Writing one

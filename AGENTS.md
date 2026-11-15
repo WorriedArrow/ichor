@@ -15,12 +15,17 @@ a framekernel. The founding brief is the source of truth until an ADR in
 
 ## Status
 
-**Active milestone: 4.** Its scope is dynamic linking with glibc and musl;
-signals, futex, epoll, full mmap semantics, and `/proc`, ending with Alpine
-and debian-slim shells and package managers running against a local
-mirror.
+**Active milestone: 5.** Network stack, virtio-net, inter-cell switching;
+nginx and redis serve traffic from cells. The design is ADR-0010: our own
+sans-I/O stack in `kernel/net` (host-tested), one stack per cell, an
+in-kernel cell switch with assigned addresses, proxy ARP, anti-spoofing,
+rate limits, a cross-cell fast path, and NAT plus published ports at the
+uplink; virtio-net first (polled).
 
-Milestones 0-3 are done.
+Milestones 0-4 are done (4's acceptance test: Debian's `apt-get install`
+from a local mirror). Phase E (scalability) is done except the vDSO and
+the Mm-lock item, both blocked, and the per-CPU page lists, held back on
+`pcp-page-lists`.
 
 - M4 so far: Alpine 3.20.3's own userland runs unmodified in a cell. xtask
   fetches the minirootfs (pinned SHA-256, `artifact.rs`), gunzips and reads
