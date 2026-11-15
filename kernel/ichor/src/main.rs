@@ -15,6 +15,7 @@ mod blktest;
 mod busytest;
 mod celltest;
 mod cred;
+mod debiantest;
 mod dev;
 mod file;
 mod futex;

@@ -35,8 +35,14 @@ pub(crate) fn run() {
             .lock()
             .resolve(crate::vfs::ROOT, "/etc/alpine-release", true)
             .is_ok();
+        let is_debian = vfs
+            .lock()
+            .resolve(crate::vfs::ROOT, "/etc/debian_version", true)
+            .is_ok();
         if is_alpine {
             crate::alpinetest::run(&vfs);
+        } else if is_debian {
+            crate::debiantest::run(&vfs);
         } else {
             exercise("virtio-blk", &m, vfs);
         }

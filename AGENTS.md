@@ -156,6 +156,13 @@ Milestones 0-3 are done.
   behind getrandom, /dev/[u]random and AT_RANDOM; `frame::time::wall_clock`
   is UEFI GetTime at boot plus TSC time, behind CLOCK_REALTIME,
   gettimeofday and file times.
+- M4 Debian (Phase D): xtask fetches the official `debian:bookworm-slim`
+  amd64 layer from Docker Hub (anonymous token; pinned by manifest digest,
+  verified by the layer digest), builds it once into
+  `target/debian/debian-<digest>-v<format>.img`, and attaches it as a third
+  virtio disk. `debiantest.rs` runs Debian 12's glibc `dash` and coreutils
+  through `ld-linux-x86-64.so.2`. Syscall `int` arguments are read as
+  32-bit signed values (glibc zero-extends them).
 - M4 page cache (Phase C, step 1): image format v2 hashes chunks with
   BLAKE3, aligns each chunk to a page, and carries a root hash over the
   metadata, checked at mount. `pagecache.rs` mounts a disk from its

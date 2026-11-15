@@ -188,7 +188,9 @@ pub(crate) enum Outcome {
 /// Dispatches one Linux syscall, writing the result into `ctx.rax`.
 pub(crate) fn dispatch(p: &mut LinuxProcess, ctx: &mut frame::user::UserContext) -> Outcome {
     let (nr, a) = ctx.syscall_args();
-    let i = |v: u64| v as i64;
+    // A C `int` argument: only the low 32 bits are defined (glibc passes
+    // them zero-extended, musl sign-extended), so read them as Linux does.
+    let i = |v: u64| i64::from(v as u32 as i32);
     let result: Result<u64, i64> = match nr {
         // Files and paths.
         nr::READ => fs::read(p, a[0], a[1], a[2] as usize),
@@ -211,7 +213,7 @@ pub(crate) fn dispatch(p: &mut LinuxProcess, ctx: &mut frame::user::UserContext)
         nr::LSTAT => fs::stat(p, a[0], a[1], false),
         nr::NEWFSTATAT => fs::fstatat(p, i(a[0]), a[1], a[2], a[3]),
         nr::FSTAT => fs::fstat(p, a[0], a[1]),
-        nr::LSEEK => fs::lseek(p, a[0], i(a[1]), a[2]),
+        nr::LSEEK => fs::lseek(p, a[0], a[1] as i64, a[2]), // off_t: 64 bits
         nr::ACCESS => fs::access(p, AT_FDCWD, a[0], a[1], 0),
         nr::FACCESSAT => fs::access(p, i(a[0]), a[1], a[2], 0),
         nr::FACCESSAT2 => fs::access(p, i(a[0]), a[1], a[2], a[3]),
@@ -264,7 +266,7 @@ pub(crate) fn dispatch(p: &mut LinuxProcess, ctx: &mut frame::user::UserContext)
         nr::EPOLL_CREATE => crate::poll::epoll_create(p, 0),
         nr::EPOLL_CREATE1 => crate::poll::epoll_create(p, a[0]),
         nr::EPOLL_CTL => crate::poll::epoll_ctl(p, a[0], a[1], a[2], a[3]),
-        nr::EPOLL_WAIT => crate::poll::epoll_wait(p, a[0], a[1], a[2], i(a[3]) as i32 as i64),
+        nr::EPOLL_WAIT => crate::poll::epoll_wait(p, a[0], a[1], a[2], i(a[3])),
         nr::EPOLL_PWAIT => crate::poll::epoll_pwait(p, &a),
         nr::EVENTFD => crate::poll::eventfd(p, a[0], 0),
         nr::EVENTFD2 => crate::poll::eventfd(p, a[0], a[1]),

@@ -362,6 +362,37 @@ pub fn alpine_image() -> Result<Vec<u8>> {
     Ok(t.image())
 }
 
+/// Debian bookworm-slim (pinned layer) as an Ichor image: the root of a
+/// third cell. Built once per image-format version and cached under
+/// `target/debian/` (it is large), then attached read-only by every run.
+pub fn debian_image_path() -> Result<std::path::PathBuf> {
+    static BUILT: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
+    let mut built = BUILT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(p) = built.as_ref() {
+        return Ok(p.clone());
+    }
+    let a = &crate::artifact::DEBIAN_BOOKWORM_SLIM;
+    let dir = workspace_root().join("target").join(a.dir);
+    let path = dir.join(format!(
+        "debian-{}-v{}.img",
+        &a.sha256[..12],
+        image::VERSION
+    ));
+    if !path.exists() {
+        let tar = crate::inflate::gunzip(&a.bytes()?)?;
+        let mut t = crate::rootfs::Tree::new();
+        t.add_tar(&tar)?;
+        let partial = dir.join(format!("debian.img.partial.{}", std::process::id()));
+        fs::write(&partial, t.image())
+            .map_err(|e| format!("writing {}: {e}", partial.display()))?;
+        fs::rename(&partial, &path).map_err(|e| format!("caching {}: {e}", path.display()))?;
+    }
+    *built = Some(path.clone());
+    Ok(path)
+}
+
 /// Builds the QEMU command line for a run.
 pub fn command(cfg: &RunConfig) -> Result<Command> {
     let qemu = find_qemu()?;
@@ -420,6 +451,13 @@ pub fn command(cfg: &RunConfig) -> Result<Command> {
             drive_path(&dir.join("alpine.img"))
         ))
         .args(["-device", "virtio-blk-pci,drive=alpine,disable-legacy=on"])
+        // Debian's root file system (glibc), for a cell that runs it.
+        .arg("-drive")
+        .arg(format!(
+            "if=none,id=debian,format=raw,readonly=on,file={}",
+            drive_path(&debian_image_path()?)
+        ))
+        .args(["-device", "virtio-blk-pci,drive=debian,disable-legacy=on"])
         // The same image again on an NVMe controller (both read-only).
         .arg("-drive")
         .arg(format!(

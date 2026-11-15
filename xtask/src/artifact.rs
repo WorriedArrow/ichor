@@ -25,6 +25,8 @@ pub struct Artifact {
     pub sha256: &'static str,
     /// Environment variable that points at a local copy instead.
     pub env: &'static str,
+    /// For a registry blob: the URL of an anonymous bearer token to send.
+    pub token_url: Option<&'static str>,
 }
 
 fn check(a: &Artifact, bytes: &[u8], what: &str) -> Result<()> {
@@ -65,10 +67,15 @@ impl Artifact {
         }
         fs::create_dir_all(&dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
         let partial = dir.join(format!("{}.partial.{}", self.file, std::process::id()));
-        let status = Command::new("curl")
-            .args(["--silent", "--show-error", "--fail", "--location"])
+        let mut curl = Command::new("curl");
+        curl.args(["--silent", "--show-error", "--fail", "--location"])
             .args(["--retry", "3", "--output"])
-            .arg(&partial)
+            .arg(&partial);
+        if let Some(t) = self.token_url {
+            curl.arg("--header")
+                .arg(format!("Authorization: Bearer {}", bearer_token(t)?));
+        }
+        let status = curl
             .arg(self.url)
             .status()
             .map_err(|e| format!("running curl for {}: {e} (or set {})", self.url, self.env))?;
@@ -88,6 +95,27 @@ impl Artifact {
     }
 }
 
+/// An anonymous registry token from `url` (a JSON body with `"token"`).
+fn bearer_token(url: &str) -> Result<String> {
+    let out = Command::new("curl")
+        .args(["--silent", "--show-error", "--fail", "--location", url])
+        .output()
+        .map_err(|e| format!("running curl for {url}: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("fetching a registry token from {url} failed"));
+    }
+    let body = String::from_utf8_lossy(&out.stdout);
+    let start = body
+        .find("\"token\"")
+        .and_then(|i| body[i + 7..].find('"').map(|j| i + 7 + j + 1))
+        .ok_or("registry token response has no token")?;
+    let end = body[start..]
+        .find('"')
+        .map(|j| start + j)
+        .ok_or("registry token response is malformed")?;
+    Ok(body[start..end].to_string())
+}
+
 /// The official static busybox 1.35.0 (musl, x86-64) from busybox.net.
 pub const BUSYBOX: Artifact = Artifact {
     dir: "busybox/1.35.0",
@@ -95,6 +123,7 @@ pub const BUSYBOX: Artifact = Artifact {
     url: "https://busybox.net/downloads/binaries/1.35.0-x86_64-linux-musl/busybox",
     sha256: "6e123e7f3202a8c1e9b1f94d8941580a25135382b99e8d3e34fb858bba311348",
     env: "ICHOR_BUSYBOX",
+    token_url: None,
 };
 
 /// An official Alpine 3.20 `main` package (signed by Alpine's keys, which
@@ -107,6 +136,7 @@ const fn alpine_pkg(file: &'static str, url: &'static str, sha256: &'static str)
         url,
         sha256,
         env: "ICHOR_ALPINE_PKGS_UNUSED",
+        token_url: None,
     }
 }
 
@@ -137,4 +167,22 @@ pub const ALPINE_MINIROOTFS: Artifact = Artifact {
     url: "https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86_64/alpine-minirootfs-3.20.3-x86_64.tar.gz",
     sha256: "d4e6fd67dcf75e40c451560ac7265166c2b72a0f38ddc9aae756a7de3d1efa0c",
     env: "ICHOR_ALPINE_MINIROOTFS",
+    token_url: None,
+};
+
+/// Debian 12 (bookworm) slim, the official image's one layer for
+/// linux/amd64, from Docker Hub. Pinned by the image manifest
+/// `sha256:c67e92c8099ba22853ab4cfda7cfb494d253d6012ca82dee98ba8976772af018`
+/// (`library/debian:bookworm-slim`, amd64, as of 2026-11-15), whose only
+/// layer is this blob; registry blobs are content-addressed, so the
+/// layer's digest is its SHA-256.
+pub const DEBIAN_BOOKWORM_SLIM: Artifact = Artifact {
+    dir: "debian/bookworm-slim",
+    file: "layer-dd051e1b8c92.tar.gz",
+    url: "https://registry-1.docker.io/v2/library/debian/blobs/sha256:dd051e1b8c92ff101fa3071ab97ea4924885942f15644e01c3dc095764e863e3",
+    sha256: "dd051e1b8c92ff101fa3071ab97ea4924885942f15644e01c3dc095764e863e3",
+    env: "ICHOR_DEBIAN_LAYER",
+    token_url: Some(
+        "https://auth.docker.io/token?service=registry.docker.io&scope=repository:library/debian:pull",
+    ),
 };
