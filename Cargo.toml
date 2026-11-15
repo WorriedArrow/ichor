@@ -7,6 +7,9 @@ members = [
     "kernel/buddy",
     "kernel/acpi",
     "kernel/sched",
+    "kernel/cap",
+    "kernel/cell",
+    "kernel/abi",
     "kernel/ichor",
     "tests",
     "xtask",
@@ -20,6 +23,9 @@ default-members = [
     "kernel/buddy",
     "kernel/acpi",
     "kernel/sched",
+    "kernel/cap",
+    "kernel/cell",
+    "kernel/abi",
     "tests",
     "xtask",
 ]
@@ -37,6 +43,9 @@ pe = { package = "ichor-pe", path = "kernel/pe" }
 buddy = { package = "ichor-buddy", path = "kernel/buddy" }
 acpi = { package = "ichor-acpi", path = "kernel/acpi" }
 sched = { package = "ichor-sched", path = "kernel/sched" }
+cap = { package = "ichor-cap", path = "kernel/cap" }
+cell = { package = "ichor-cell", path = "kernel/cell" }
+ichor-abi = { path = "kernel/abi" }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

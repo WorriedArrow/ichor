@@ -13,6 +13,10 @@
 //!
 //! Milestone 2 (user mode): a ring-3 program runs in its own address space,
 //! makes a syscall, faults, and is isolated from another address space.
+//!
+//! Milestone 2 (cells): capabilities isolate cells, rights are enforced,
+//! memory is accounted hierarchically, revocation works, and a native-ABI
+//! ring-3 process can act only on handles its cell holds.
 
 use ichor_tests::{Exit, boot};
 
@@ -39,6 +43,8 @@ fn m1_boots_on_four_cpus() {
         "ichor: sched: 32 threads finished, ran on 4 CPUs",
         "ichor: sched: 9 spinners on 4 CPUs all ran (preemption works",
         "ichor: user: ring-3 program ran, 1 syscall(s), page fault at 0 handled, isolation ok",
+        "ichor: cell: 2 cells isolated, rights enforced, accounting ok",
+        "ichor: proc: native process ran, MEM_SIZE ok (4096), forged handle denied (error 2)",
         "ichor: boot complete; halting",
     ]);
     // Every page the heap self-test used came back.
@@ -72,6 +78,8 @@ fn m1_boots_on_one_cpu() {
         "ichor: sched: 32 threads finished, ran on 1 CPUs",
         "ichor: sched: 3 spinners on 1 CPUs all ran (preemption works",
         "ichor: user: ring-3 program ran, 1 syscall(s), page fault at 0 handled, isolation ok",
+        "ichor: cell: 2 cells isolated, rights enforced, accounting ok",
+        "ichor: proc: native process ran, MEM_SIZE ok (4096), forged handle denied (error 2)",
         "ichor: boot complete; halting",
     ]);
 }
@@ -85,6 +93,8 @@ fn m2_scheduler_on_eight_cpus() {
         "ichor: sched: 32 threads finished, ran on ",
         "ichor: sched: 17 spinners on 8 CPUs all ran (preemption works",
         "ichor: user: ring-3 program ran, 1 syscall(s), page fault at 0 handled, isolation ok",
+        "ichor: cell: 2 cells isolated, rights enforced, accounting ok",
+        "ichor: proc: native process ran, MEM_SIZE ok (4096), forged handle denied (error 2)",
         "ichor: boot complete; halting",
     ]);
 }

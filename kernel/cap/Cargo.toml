@@ -1,0 +1,13 @@
+[package]
+name = "ichor-cap"
+description = "Capabilities, rights and capability spaces (no_std, host-testable)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "cap"
+
+[lints]
+workspace = true

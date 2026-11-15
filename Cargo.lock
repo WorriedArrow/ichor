@@ -6,10 +6,17 @@ version = 4
 name = "ichor"
 version = "0.0.0"
 dependencies = [
+ "ichor-abi",
+ "ichor-cap",
+ "ichor-cell",
  "ichor-cmdline",
  "ichor-frame",
  "ichor-sched",
 ]
+
+[[package]]
+name = "ichor-abi"
+version = "0.0.0"
 
 [[package]]
 name = "ichor-acpi"
@@ -17,6 +24,14 @@ version = "0.0.0"
 
 [[package]]
 name = "ichor-buddy"
+version = "0.0.0"
+
+[[package]]
+name = "ichor-cap"
+version = "0.0.0"
+
+[[package]]
+name = "ichor-cell"
 version = "0.0.0"
 
 [[package]]

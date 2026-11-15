@@ -2,6 +2,7 @@
 
 - Status: Accepted
 - Date: 2026-11-14
+- Amended: 2026-11-15 (milestone 2 implementation notes, at the end)
 
 ## Context
 
@@ -231,3 +232,38 @@ the control plane manages.
 - Cross-cell features have to be designed as capability transfers: shared
   volumes, inter-pod networking, and the page sharing that the image format
   relies on. That is the intent.
+
+## Amendment: milestone 2 implementation notes (2026-11-15)
+
+The capability and cell model landed as designed, in safe crates plus a thin
+kernel tie-in:
+
+- **Capabilities** (`kernel/cap`): `Cap<T>` carries an object, a `Rights`
+  mask, and an optional `Arc<RevocationToken>`. `derive` only ever drops
+  rights and needs `DUPLICATE`. Revocation is one atomic flag checked on
+  every use. `CSpace<T>` is a slot table; a `Handle` is a 32-bit index plus a
+  32-bit generation, so a closed handle never resolves again (no ABA). All of
+  this is `#![forbid(unsafe_code)]` and host-tested.
+- **Accounts** (`kernel/cell`): a tree of atomic (limit, used) nodes. A
+  charge reserves against the node and every ancestor and rolls back on
+  failure; a child's limit is clamped to the parent's. A concurrency test
+  confirms charges never exceed the limit. The per-account *children list*
+  from §4 was dropped for now: it needed interior mutability (unsafe), is not
+  required for correct accounting, and can be tracked by the kernel
+  separately when a cgroup tree view needs it.
+- **The kernel tie-in** (`kernel/ichor::kcell`): a `Cell` owns a
+  `SpinLock<CSpace<Object>>`, an `Account`, and a `VmSpace`. `Object` is
+  `Memory(UFrame)` or `Cell`. `alloc_memory` charges the account before
+  installing a capability, so memory is accounted at the point of use.
+- **Native ABI** (`kernel/abi`, dispatched by `kernel/ichor::nativeabi`):
+  version 1 has `VERSION`, `MEM_SIZE`, `HANDLE_DUP`, `HANDLE_CLOSE`, `EXIT`
+  (`docs/abi/native.md`). A process's syscalls act only on its cell's CSpace,
+  so a forged or foreign handle returns `BadHandle`. The Linux personality
+  (§5) and the richer object set (channels, events, cell lifecycle) come in
+  milestones 3–6.
+
+Not yet built from this ADR: the two syscall personalities sharing one entry
+is in place (the dispatcher is chosen per process), but only the native one
+exists; the Linux personality, `/proc`/`/sys`/cgroupfs synthesis, namespace
+nesting, and the hardware isolation posture (§6, the side-channel ADR) are
+milestone 3+ work.

@@ -1,0 +1,13 @@
+[package]
+name = "ichor-abi"
+description = "Ichor native ABI definitions, shared by kernel and user services (no_std)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "ichor_abi"
+
+[lints]
+workspace = true

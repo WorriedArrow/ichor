@@ -10,6 +10,10 @@
 
 extern crate alloc;
 
+mod celltest;
+mod kcell;
+mod nativeabi;
+mod proctest;
 mod sched;
 mod selftest;
 mod usertest;
@@ -75,6 +79,8 @@ fn kmain(info: BootInfo) -> ! {
     selftest::threads();
     selftest::preemption();
     selftest::user_mode();
+    celltest::run();
+    proctest::run();
 
     if cmdline.flag("test_stack_overflow") {
         selftest::stack_overflow();

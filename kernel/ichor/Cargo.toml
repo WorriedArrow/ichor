@@ -15,6 +15,9 @@ bench = false
 frame.workspace = true
 cmdline.workspace = true
 sched.workspace = true
+cap.workspace = true
+cell.workspace = true
+ichor-abi.workspace = true
 
 [lints]
 workspace = true

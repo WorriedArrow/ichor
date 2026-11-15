@@ -15,51 +15,53 @@ a framekernel. The founding brief is the source of truth until an ADR in
 
 ## Status
 
-**Active milestone: 2.** Its scope is the scheduler, kernel threads,
-native-ABI user processes, capabilities, and cells.
+**Active milestone: 3.** Its scope is NVMe / virtio-blk, a read-only image
+format, the VFS, and the ELF loader, ending with a static busybox running in
+a cell through the Linux ABI.
 
-Milestones 0 and 1 are done. The kernel boots as a UEFI application, builds
-its own page tables, and runs in the higher half. It reclaims boot-services
-memory and has a validated buddy page allocator and a heap. It handles traps
-with IST stacks (stack overflows hit a guard page and are reported), and
-brings up every CPU listed in the ACPI MADT in parallel. Each CPU gets
-x2APIC, a tickless TSC-deadline or one-shot timer, and per-CPU data.
-`tests/boot.rs` proves all of this on 1 and 4 vCPUs, including the panic and
-stack-overflow paths. ADR-0001's amendment records what landed and what
-deviated from the plan.
+Milestones 0-2 are done.
 
-Suggested order for milestone 2 (see ADR-0001 §4.3–4.5 and ADR-0002):
+- M0/M1: boots as a UEFI app into the higher half; buddy page allocator and
+  heap; traps with IST stacks; x2APIC + tickless timer; SMP bring-up; per-CPU
+  data.
+- M2 (scheduler): frame owns tasks, the context switch, atomic-mode tracking
+  and preemption; `kernel/sched` is the injected weighted-fair-share policy.
+  Kernel threads run, block/wake on wait queues, and are preempted.
+- M2 (user mode): typed/untyped frames (`UFrame`, `VmReader`/`VmWriter`),
+  `VmSpace`, and `UserMode::execute` run ring-3 code. A ring-3 program makes
+  a syscall, faults, and is isolated from other address spaces.
+- M2 (cells): `kernel/cap` (rights, revocation, generation-tagged CSpace
+  handles) and `kernel/cell` (hierarchical accounts). The kernel's `kcell`
+  ties CSpace + Account + VmSpace into a `Cell`. `kernel/abi` + the kernel's
+  `nativeabi` dispatcher give native-ABI processes capability syscalls
+  (`docs/abi/native.md`). Self-tests prove isolation, rights, accounting,
+  revocation, and that a ring-3 native process acts only on handles its cell
+  holds.
 
-1. Frame: `Task` and the context switch (callee-saved registers plus the
-   stack pointer). Add the "running on CPU n" atomic so a task can never run
-   on two CPUs, preemption counting, and atomic-mode checks: sleeping while
-   holding an `IrqGuard` or a spinlock must panic. Also scheduler injection
-   through a `Scheduler` trait.
-2. Safe `kernel/sched`: per-CPU run queues, work stealing, and hierarchical
-   fair share. Host-testable policy core plus QEMU tests. The timer handler
-   drives preemption, and IPIs wake idle CPUs (`apic::send_ipi` is ready).
-3. Frame: the typed/untyped frame API (`Frame<M>`, `UFrame`, `Segment`),
-   `VmReader`/`VmWriter` with fallible user copies (exception table, SMAP
-   `stac`/`clac`), `VmSpace` with a cursor API and PCID. Move the slab policy
-   out of frame into a safe crate and add per-CPU caches.
-4. Frame: `UserMode::execute` and `UserContext`, using `syscall`/`sysret`
-   and `swapgs`, with the NMI-in-`swapgs` window handled.
-5. Safe `kernel/cap` (`Cap<T>`, rights, revocation tokens, CSpace with
-   generation-tagged handles) and `kernel/cell` (cells, accounts, the system
-   cell).
-6. Safe `kernel/native-abi` plus `abi/` (the ABI definitions, documented in
-   `docs/abi/`). Add a tiny native-ABI user program, embedded in the image
-   for now, that runs in a cell and makes capability calls. A QEMU test proves
-   that isolation holds: a stale or foreign handle is rejected.
-7. Write the side-channel ADR (it is due before milestone 2 completes).
+`tests/boot.rs` proves all of this on 1, 4 and 8 vCPUs.
 
-Raise `kernel/frame/audit.toml` in steps as frame grows. Milestone 1's
-ceiling was 6,000 lines and 320 sites, and frame is at 2,894 and 150. Going
-past that ceiling needs a new ADR, as ADR-0001 §8 requires.
+The side-channel ADR (due before milestone 2 "completes" per ADR-0001) is
+still owed and now also needs to cover the GS-in-ring-3 info leak noted in
+ADR-0001's user-mode work. Write it early in milestone 3.
 
-The goal set for this effort is milestone 8. Milestone 8's acceptance test
-(booting on AWS, GCP, Azure and one bare-metal machine) needs cloud
-accounts and hardware from the owner. Ask for them when you get there.
+Suggested order for milestone 3 (see the brief and ADR-0001 §4.6):
+
+1. Side-channel ADR (overdue) and the image-format + volume-format ADRs.
+2. A safe block layer trait and a virtio-blk driver (safe, over frame's
+   `IoMem`/DMA types, which milestone 3 adds to frame per a new budget ADR).
+3. The read-only, content-addressed image format (host-testable crate) and
+   the in-kernel VFS with a copy-on-write upper layer.
+4. An ELF loader (`PT_INTERP` later) that maps a static binary into a cell's
+   `VmSpace`, and enough Linux ABI (the process personality, `brk`, `mmap`,
+   `write`, `exit`, `uname`, ...) to run static busybox.
+5. A QEMU test that runs a real static busybox applet in a cell.
+
+Frame budget: ADR-0003 set the milestone 2 ceiling at 7,000 lines / 300
+sites; frame is at 4,310 and 206. Device I/O, IOMMU and DMA in milestone 3
+need their own budget ADR (ADR-0001 §8).
+
+The goal set for this effort is milestone 8, whose acceptance test needs
+cloud accounts and bare-metal hardware from the owner.
 
 ## Commands
 
@@ -110,7 +112,12 @@ kernel/cmdline   command line parser (no_std, host-tested)
 kernel/pe        PE32+ headers + base relocations (no_std, host-tested)
 kernel/buddy     buddy allocator policy over abstract links (no_std, host-tested)
 kernel/acpi      RSDP/XSDT/MADT parsing from byte slices (no_std, host-tested)
-kernel/ichor     the kernel binary; `frame::main!(kmain)`
+kernel/pe,buddy  (above) PE + buddy allocator
+kernel/sched     scheduling policy: group fair-share + work stealing (host-tested)
+kernel/cap       capabilities, rights, revocation, CSpace (host-tested)
+kernel/cell      hierarchical resource accounts (host-tested)
+kernel/abi       native ABI definitions (docs/abi/native.md)
+kernel/ichor     the kernel binary; frame::main!(kmain); kcell/nativeabi tie it together
 xtask/           build/run/test/lint tooling (lib + bin, no dependencies)
 tests/           QEMU integration tests (host crate using xtask's runner)
 docs/adr/        architecture decision records
