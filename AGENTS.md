@@ -22,6 +22,18 @@ in-kernel cell switch with assigned addresses, proxy ARP, anti-spoofing,
 rate limits, a cross-cell fast path, and NAT plus published ports at the
 uplink; virtio-net first (polled).
 
+- M5 so far: `kernel/net` (wire formats, an IPv4 interface with ARP, a
+  TCP state machine tested over a lossy, reordering simulated link),
+  `virtio-net` (polled), and a TCP echo to the host through slirp
+  (`nettest.rs`). `netstack.rs` is the per-cell `Stack` (sockets, ports,
+  connections behind one spinlock; loopback delivered synchronously; the
+  net task runs timers); `linuxabi/socket.rs` gives `AF_INET`
+  `SOCK_STREAM` sockets as poll/epoll-able objects (socket, bind, listen,
+  accept4, connect incl. non-blocking, send*/recv*, shutdown,
+  get/setsockopt, getsockname/getpeername, SIGPIPE). Debian's perl runs a
+  socket session on every boot. Next: the cell switch, NAT and published
+  ports at the uplink, then nginx and redis.
+
 Milestones 0-4 are done (4's acceptance test: Debian's `apt-get install`
 from a local mirror). Phase E (scalability) is done except the vDSO and
 the Mm-lock item, both blocked, and the per-CPU page lists, held back on

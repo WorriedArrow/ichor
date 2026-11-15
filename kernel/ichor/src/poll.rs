@@ -93,6 +93,10 @@ pub(crate) trait Object: Send + Sync + Debug {
     fn dir(&self) -> Option<(&[DirEntry], &SpinLock<u64>)> {
         None
     }
+    /// This object as a socket.
+    fn socket(&self) -> Option<&crate::linuxabi::socket::Socket> {
+        None
+    }
 }
 
 /// One task sleeping in `poll`/`select`/`epoll_wait`, registered with each
@@ -133,6 +137,12 @@ impl Watchers {
         self.0
             .lock()
             .retain(|w| w.strong_count() > 0 && !core::ptr::eq(w.as_ptr(), Arc::as_ptr(p)));
+    }
+}
+
+impl Default for Watchers {
+    fn default() -> Watchers {
+        Watchers::new()
     }
 }
 

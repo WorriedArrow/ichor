@@ -10,6 +10,7 @@
 
 mod exec;
 mod fs;
+pub(crate) mod socket;
 
 use crate::process::{Fd, LinuxProcess};
 use crate::umem;
@@ -56,7 +57,20 @@ mod nr {
     pub(super) const DUP2: u64 = 33;
     pub(super) const GETPID: u64 = 39;
     pub(super) const SENDFILE: u64 = 40;
-    pub(super) const SOCKET: u64 = 41; // partial: no address families yet (EAFNOSUPPORT), until networking
+    pub(super) const SOCKET: u64 = 41; // partial: AF_INET SOCK_STREAM (TCP) only; others EAFNOSUPPORT/ESOCKTNOSUPPORT
+    pub(super) const CONNECT: u64 = 42;
+    pub(super) const ACCEPT: u64 = 43;
+    pub(super) const SENDTO: u64 = 44; // partial: no out-of-band data
+    pub(super) const RECVFROM: u64 = 45; // partial: no MSG_PEEK, no out-of-band data
+    pub(super) const SENDMSG: u64 = 46; // partial: no control messages
+    pub(super) const RECVMSG: u64 = 47; // partial: no MSG_PEEK, no control messages
+    pub(super) const SHUTDOWN: u64 = 48;
+    pub(super) const BIND: u64 = 49; // partial: loopback and INADDR_ANY until the cell switch
+    pub(super) const LISTEN: u64 = 50;
+    pub(super) const GETSOCKNAME: u64 = 51;
+    pub(super) const GETPEERNAME: u64 = 52;
+    pub(super) const SETSOCKOPT: u64 = 54; // partial: SO_REUSEADDR acts; other known options are recorded only
+    pub(super) const GETSOCKOPT: u64 = 55; // partial: SO_ERROR, SO_TYPE, SO_ACCEPTCONN, SO_REUSEADDR; others echo what was set
     pub(super) const CLONE: u64 = 56; // partial: fork, vfork-style and thread clones
     pub(super) const FORK: u64 = 57;
     pub(super) const VFORK: u64 = 58; // partial: the child gets a copy-on-write copy, not the parent's memory
@@ -125,6 +139,7 @@ mod nr {
     pub(super) const PRCTL: u64 = 157; // partial: NAME (per process), CAPBSET_READ, PDEATHSIG, KEEPCAPS, DUMPABLE, NO_NEW_PRIVS
     pub(super) const ARCH_PRCTL: u64 = 158; // partial: ARCH_SET_FS only
     pub(super) const GETTID: u64 = 186;
+    pub(super) const TIME: u64 = 201; // firmware clock at boot plus monotonic time (no NTP)
     pub(super) const TKILL: u64 = 200;
     pub(super) const SCHED_GETAFFINITY: u64 = 204;
     pub(super) const FUTEX: u64 = 202; // partial: shared only within shared anonymous memory; no PI, no FUTEX_FD
@@ -154,6 +169,7 @@ mod nr {
     pub(super) const FACCESSAT: u64 = 269;
     pub(super) const FACCESSAT2: u64 = 439;
     pub(super) const UTIMENSAT: u64 = 280;
+    pub(super) const ACCEPT4: u64 = 288;
     pub(super) const EPOLL_PWAIT: u64 = 281; // partial: interest list fixed for the wait; nested epoll never ready
     pub(super) const EVENTFD: u64 = 284;
     pub(super) const EVENTFD2: u64 = 290;
@@ -259,9 +275,31 @@ pub(crate) fn dispatch(p: &mut LinuxProcess, ctx: &mut frame::user::UserContext)
         nr::FUTIMESAT => fs::futimesat(p, i(a[0]), a[1], a[2]),
         nr::UTIMES => fs::futimesat(p, AT_FDCWD, a[0], a[1]),
         nr::MOUNT | nr::UMOUNT2 => Err(EPERM),
-        // No socket families exist yet: the answer Linux gives for one it
-        // was built without (libc's nscd and syslog paths expect it).
-        nr::SOCKET => Err(97), // EAFNOSUPPORT
+        // Sockets (TCP over the cell's stack).
+        nr::SOCKET => socket::socket(
+            p,
+            a[0] & 0xffff_ffff,
+            a[1] & 0xffff_ffff,
+            a[2] & 0xffff_ffff,
+        ),
+        nr::BIND => socket::bind(p, a[0], a[1], a[2]),
+        nr::LISTEN => socket::listen(p, a[0], a[1]),
+        nr::ACCEPT => socket::accept4(p, a[0], a[1], a[2], 0),
+        nr::ACCEPT4 => socket::accept4(p, a[0], a[1], a[2], a[3] & 0xffff_ffff),
+        nr::CONNECT => socket::connect(p, a[0], a[1], a[2]),
+        nr::GETSOCKNAME => socket::getsockname(p, a[0], a[1], a[2]),
+        nr::GETPEERNAME => socket::getpeername(p, a[0], a[1], a[2]),
+        nr::SETSOCKOPT => {
+            socket::setsockopt(p, a[0], a[1] & 0xffff_ffff, a[2] & 0xffff_ffff, a[3], a[4])
+        }
+        nr::GETSOCKOPT => {
+            socket::getsockopt(p, a[0], a[1] & 0xffff_ffff, a[2] & 0xffff_ffff, a[3], a[4])
+        }
+        nr::SENDTO => socket::sendto(p, &a),
+        nr::RECVFROM => socket::recvfrom(p, &a),
+        nr::SENDMSG => socket::sendmsg(p, a[0], a[1], a[2] & 0xffff_ffff),
+        nr::RECVMSG => socket::recvmsg(p, a[0], a[1], a[2] & 0xffff_ffff),
+        nr::SHUTDOWN => socket::shutdown(p, a[0], a[1] & 0xffff_ffff),
         nr::FLOCK => fs::flock(p, a[0], a[1]),
         nr::STATFS => fs::statfs(p, a[0], a[1]),
         nr::FSTATFS => fs::fstatfs(p, a[0], a[1]),
@@ -303,6 +341,14 @@ pub(crate) fn dispatch(p: &mut LinuxProcess, ctx: &mut frame::user::UserContext)
         nr::UNAME => uname(p, a[0]),
         nr::CLOCK_GETTIME => clock_gettime(p, a[0], a[1]),
         nr::GETTIMEOFDAY => gettimeofday(p, a[0]),
+        nr::TIME => {
+            let secs = crate::vfs::wall_clock().as_secs();
+            if a[0] != 0 && p.copy_to_user(a[0], &secs.to_le_bytes()) != 8 {
+                Err(EFAULT)
+            } else {
+                Ok(secs)
+            }
+        }
         nr::GETRLIMIT => prlimit(p, 0, a[0], 0, a[1]),
         nr::SETRLIMIT => prlimit(p, 0, a[0], a[1], 0),
         nr::PRLIMIT64 => prlimit(p, a[0], a[1], a[2], a[3]),

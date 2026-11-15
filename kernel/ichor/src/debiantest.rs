@@ -84,6 +84,88 @@ $out =~ /\^Ccaught\r\n/ or fail("^C: output [$out]");
 print "debian: pty: openpty, line editing, echo, stty, ^C and hangup work\n";
 "#;
 
+/// The TCP socket script (see `RUNS`): loopback inside the cell's stack.
+const SOCKET_SCRIPT: &str = r#"use strict; use warnings; use Socket; use Fcntl; use POSIX ();
+sub fail { print "debian: sockets FAILED: @_\n"; exit 1 }
+sub tcp { socket(my $s, AF_INET, SOCK_STREAM, 0) or fail("socket: $!"); $s }
+my $lo = inet_aton("127.0.0.1");
+# Nothing listens: the stack answers RST.
+my $c = tcp();
+connect($c, pack_sockaddr_in(1, $lo)) and fail("connect to a closed port worked");
+$!{ECONNREFUSED} or fail("closed port: $!");
+close $c;
+# A listener on an ephemeral port; a second bind to it is refused.
+my $l = tcp();
+setsockopt($l, SOL_SOCKET, SO_REUSEADDR, 1) or fail("SO_REUSEADDR: $!");
+bind($l, pack_sockaddr_in(0, $lo)) or fail("bind: $!");
+listen($l, 16) or fail("listen: $!");
+my ($port) = unpack_sockaddr_in(getsockname($l));
+$port >= 32768 or fail("ephemeral port $port");
+-S $l or fail("fstat: not a socket");
+readlink("/proc/self/fd/" . fileno($l)) =~ /^socket:\[\d+\]$/ or fail("/proc/self/fd link");
+unpack("i", getsockopt($l, SOL_SOCKET, SO_TYPE)) == SOCK_STREAM or fail("SO_TYPE");
+my $d = tcp();
+bind($d, pack_sockaddr_in($port, $lo)) and fail("second bind worked");
+$!{EADDRINUSE} or fail("second bind: $!");
+close $d;
+# 1 MiB up, half-close, 1 MiB back: both directions fill their windows.
+my $n = 1 << 20;
+my $data = substr(join("", map { chr } 0 .. 250) x (int($n / 251) + 1), 0, $n);
+my $pid = fork() // fail("fork: $!");
+if ($pid == 0) {
+    my $s = tcp();
+    connect($s, pack_sockaddr_in($port, $lo)) or POSIX::_exit(10);
+    my $off = 0;
+    while ($off < $n) { my $w = syswrite($s, $data, 65536, $off) or POSIX::_exit(11); $off += $w }
+    shutdown($s, 1) or POSIX::_exit(12);
+    my $back = "";
+    while (1) {
+        my $r = sysread($s, my $buf, 65536);
+        defined $r or POSIX::_exit(13);
+        last if !$r;
+        $back .= $buf;
+    }
+    POSIX::_exit($back eq $data ? 0 : 14);
+}
+my $peer = accept(my $a, $l) or fail("accept: $!");
+my ($pport, $paddr) = unpack_sockaddr_in($peer);
+inet_ntoa($paddr) eq "127.0.0.1" or fail("peer address");
+my ($gport) = unpack_sockaddr_in(getpeername($a));
+$gport == $pport or fail("getpeername $gport != $pport");
+my $got = "";
+while (1) {
+    my $r = sysread($a, my $buf, 65536);
+    defined $r or fail("server read: $!");
+    last if !$r;
+    $got .= $buf;
+}
+$got eq $data or fail("server got " . length($got) . " bytes");
+my $off = 0;
+while ($off < $n) { my $w = syswrite($a, $got, 65536, $off) // fail("server write: $!"); $off += $w }
+close $a;
+waitpid($pid, 0) == $pid or fail("waitpid: $!");
+$? == 0 or fail("client exited " . ($? >> 8));
+# Non-blocking: accept on an empty backlog, connect, select, SO_ERROR.
+fcntl($l, F_SETFL, fcntl($l, F_GETFL, 0) | O_NONBLOCK) or fail("F_SETFL: $!");
+accept(my $z, $l) and fail("non-blocking accept worked");
+$!{EAGAIN} or fail("non-blocking accept: $!");
+my $rin = ""; vec($rin, fileno($l), 1) = 1;
+select(my $rout = $rin, undef, undef, 0) == 0 or fail("idle listener is readable");
+my $nb = tcp();
+fcntl($nb, F_SETFL, O_NONBLOCK) or fail("F_SETFL: $!");
+connect($nb, pack_sockaddr_in($port, $lo)) or $!{EINPROGRESS} or fail("connect: $!");
+my $win = ""; vec($win, fileno($nb), 1) = 1;
+select(undef, my $wout = $win, undef, 5) == 1 or fail("connect never completed");
+unpack("i", getsockopt($nb, SOL_SOCKET, SO_ERROR)) == 0 or fail("SO_ERROR");
+select($rout = $rin, undef, undef, 5) == 1 or fail("listener never readable");
+accept(my $b, $l) or fail("accept after select: $!");
+syswrite($nb, "ping") == 4 or fail("write: $!");
+my $p4 = "";
+sysread($b, $p4, 4) == 4 && $p4 eq "ping" or fail("read back");
+close $nb; close $b; close $l;
+print "debian: sockets: refused, EADDRINUSE, 1 MiB each way, half-close, non-blocking connect and accept work\n";
+"#;
+
 /// `(argv, expected exit code)`: argv[0] is a path under `/usr/bin`.
 const RUNS: &[(&[&str], i32)] = &[
     (
@@ -118,6 +200,8 @@ const RUNS: &[(&[&str], i32)] = &[
     // Debian's perl opens /dev/ptmx and runs dash, tty and stty on the
     // slave (glibc's ttyname, tcgetattr/tcsetattr, ioctls).
     (&["perl", "-e", PTY_SCRIPT], 0),
+    // TCP sockets on the cell's own stack (loopback).
+    (&["perl", "-e", SOCKET_SCRIPT], 0),
     (
         &[
             "dash",

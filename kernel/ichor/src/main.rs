@@ -25,6 +25,7 @@ mod linuxabi;
 mod loader;
 mod locks;
 mod nativeabi;
+mod netstack;
 mod nettest;
 mod pagecache;
 mod partition;

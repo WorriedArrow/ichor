@@ -376,9 +376,14 @@ pub(super) fn write(p: &mut LinuxProcess, fd: u64, buf: u64, count: usize) -> Re
                 return Err(EFAULT);
             }
             let entry = p.entry.clone();
-            o.obj
-                .write(&data, o.nonblock, &|| proc::interrupted(&entry))
-                .map(|n| n as u64)
+            let r = o
+                .obj
+                .write(&data, o.nonblock, &|| proc::interrupted(&entry));
+            // A socket whose peer is gone (only sockets answer EPIPE here).
+            if r == Err(EPIPE) {
+                proc::post(&p.entry, signal::SIGPIPE);
+            }
+            r.map(|n| n as u64)
         }
         Fd::Pipe(e) if !e.write => Err(EBADF),
         Fd::Pipe(e) => pipe_write(p, &e, buf, count),
