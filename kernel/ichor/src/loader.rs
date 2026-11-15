@@ -17,7 +17,6 @@ use elf::{LoadPlan, Machine};
 use frame::mm::{PAGE_SIZE, UFrame, UserProt};
 use vma::Prot;
 
-use crate::kcell::Cell;
 use crate::umem::{MMAP_LO, Mm};
 
 /// A loaded program ready to run.
@@ -71,10 +70,9 @@ const AT_SECURE: u64 = 23;
 const AT_RANDOM: u64 = 25;
 const AT_EXECFN: u64 = 31;
 
-/// Loads `image` into `cell`, recording its memory in `mm`, with `argv`
+/// Loads `image` into the fresh address space `mm`, with `argv`
 /// and `envp` on the stack.
 pub(crate) fn load(
-    cell: &Cell,
     mm: &mut Mm,
     image: &[u8],
     argv: &[&str],
@@ -113,7 +111,7 @@ pub(crate) fn load(
         if !mm.reserve(va, va + PAGE_SIZE, prot) {
             return Err(LoadError::Map);
         }
-        let frame = mm.frame(cell, va).ok_or(LoadError::OutOfMemory)?;
+        let frame = mm.frame(va).ok_or(LoadError::OutOfMemory)?;
         frames.insert(va, frame);
     }
     for seg in plan.segments() {
@@ -130,7 +128,7 @@ pub(crate) fn load(
     for (&va, f) in &frames {
         let prot = pages.get(&va).copied().unwrap_or(Prot::NONE);
         if prot.accessible()
-            && cell
+            && mm
                 .space()
                 .map(
                     va,
@@ -150,7 +148,7 @@ pub(crate) fn load(
     if !mm.reserve(STACK_TOP - STACK_SIZE, STACK_TOP, Prot::RW) {
         return Err(LoadError::Map);
     }
-    let stack_pointer = build_stack(cell, mm, &plan, argv, envp)?;
+    let stack_pointer = build_stack(mm, &plan, argv, envp)?;
     Ok(Loaded {
         entry: plan.entry,
         stack_pointer,
@@ -204,7 +202,6 @@ fn random_bytes() -> [u8; 16] {
 ///        ... padding, random bytes, strings ... STACK_TOP
 /// ```
 fn build_stack(
-    cell: &Cell,
     mm: &mut Mm,
     plan: &LoadPlan,
     argv: &[&str],
@@ -275,8 +272,8 @@ fn build_stack(
     if frame_bytes.len() > (STACK_SIZE / 2) as usize {
         return Err(LoadError::ArgsTooLong);
     }
-    mm.populate(cell, sp, frame_bytes.len(), true);
-    if cell.space().copy_to_user(sp, &frame_bytes) != frame_bytes.len() {
+    mm.populate(sp, frame_bytes.len(), true);
+    if mm.space().copy_to_user(sp, &frame_bytes) != frame_bytes.len() {
         return Err(LoadError::OutOfMemory);
     }
     Ok(sp)

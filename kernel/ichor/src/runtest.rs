@@ -7,11 +7,11 @@ use alloc::vec::Vec;
 
 use frame::power::{ExitStatus, shutdown};
 use frame::println;
-use frame::user::{UserContext, UserEvent, UserMode};
+use frame::user::UserContext;
 
 use crate::kcell::{Cell, System};
-use crate::linuxabi::{self, Outcome};
 use crate::loader;
+use crate::proc;
 use crate::process::LinuxProcess;
 use crate::testprog::{Asm, BLOB_VADDR, Reg, static_elf};
 use crate::vfs::Vfs;
@@ -50,58 +50,34 @@ const HELLO: &[u8] = b"hello from a real Linux ELF running on Ichor\n";
 /// The environment every test program gets.
 const ENVP: &[&str] = &["PATH=/bin:/usr/bin", "HOME=/", "TERM=dumb"];
 
-/// Loads `elf` into `p`'s cell with `argv`, runs it to exit, and frees its
-/// memory; returns the exit status and the number of syscalls it made.
-pub(crate) fn run_linux(p: &mut LinuxProcess, elf: &[u8], argv: &[&str]) -> (i32, u32) {
-    let loaded = match loader::load(&p.cell, &mut p.mm, elf, argv, ENVP) {
+/// Loads `elf` into `p` with `argv`, runs it to exit (on this task; any
+/// children it forks run on their own), and checks that all of the cell's
+/// memory came back. Returns the exit code (or minus the signal that killed
+/// it) and the number of syscalls it made.
+pub(crate) fn run_linux(mut p: LinuxProcess, elf: &[u8], argv: &[&str]) -> (i32, u32) {
+    let loaded = match loader::load(&mut p.mm, elf, argv, ENVP) {
         Ok(l) => l,
         Err(e) => {
             println!("ichor: runtest: load error {e:?}");
             fail("could not load the ELF");
         }
     };
-    p.cell.space().bind_to_current_task();
-    let mut ctx = UserContext::new(loaded.entry, loaded.stack_pointer);
-    let mut syscalls = 0u32;
-    let mut faults = 0u32;
-    let status = loop {
-        match UserMode::new(&mut ctx).execute() {
-            UserEvent::Syscall => {
-                syscalls += 1;
-                if let Outcome::Exit(code) = linuxabi::dispatch(p, &mut ctx) {
-                    break code;
-                }
-            }
-            UserEvent::Exception {
-                vector: 14,
-                error,
-                cr2,
-            } if p.mm.fault(&p.cell, cr2, error & 2 != 0, error & 16 != 0) => {
-                faults += 1;
-            }
-            UserEvent::Exception { vector, cr2, .. } => {
-                frame::mm::activate_kernel_space();
-                println!(
-                    "ichor: runtest: fault vector {vector} cr2 {cr2:#x} rip {:#x}",
-                    ctx.rip
-                );
-                fail("the Linux binary faulted");
-            }
-        }
-        if syscalls > 100_000 || faults > 100_000 {
-            fail("the Linux binary made too many syscalls or faults");
-        }
-    };
-    frame::mm::activate_kernel_space();
-    p.mm.clear(&p.cell);
-    if p.cell.account().used() != 0 {
+    let cell = p.cell.clone();
+    let ctx = UserContext::new(loaded.entry, loaded.stack_pointer);
+    let (status, syscalls) = proc::run(p, ctx);
+    if cell.account().used() != 0 {
         println!(
             "ichor: runtest: {} pages still charged",
-            p.cell.account().used()
+            cell.account().used()
         );
         fail("process memory was not returned");
     }
-    (status, syscalls)
+    let code = if status & 0x7f == 0 {
+        (status >> 8) as i32
+    } else {
+        -((status & 0x7f) as i32)
+    };
+    (code, syscalls)
 }
 
 /// `write(1, msg); exit_group(7)`.
@@ -447,10 +423,10 @@ pub(crate) fn run() {
     );
     let new_process = || {
         let cell = Cell::new(&system.root_account, 128).unwrap_or_else(|| fail("no process cell"));
-        LinuxProcess::new(cell, vfs.clone())
+        LinuxProcess::new(cell, vfs.clone()).unwrap_or_else(|| fail("no process"))
     };
 
-    let (status, syscalls) = run_linux(&mut new_process(), &hello_program(), &["hello"]);
+    let (status, syscalls) = run_linux(new_process(), &hello_program(), &["hello"]);
     if status != 7 {
         fail("hello did not exit with status 7");
     }
@@ -458,7 +434,7 @@ pub(crate) fn run() {
         "ichor: linux: static ELF ran via the Linux ABI, exited {status} after {syscalls} syscalls"
     );
 
-    let (status, syscalls) = run_linux(&mut new_process(), &cat_program(), &["cat", "/etc/motd"]);
+    let (status, syscalls) = run_linux(new_process(), &cat_program(), &["cat", "/etc/motd"]);
     if status != 0 {
         fail("cat: ENOENT, fd number, read or fstat check failed");
     }
@@ -466,7 +442,7 @@ pub(crate) fn run() {
         "ichor: linux: cat read /etc/motd through a symlink in the image ({syscalls} syscalls, checks passed)"
     );
 
-    let (status, syscalls) = run_linux(&mut new_process(), &mem_program(), &["memtest", "a", "b"]);
+    let (status, syscalls) = run_linux(new_process(), &mem_program(), &["memtest", "a", "b"]);
     if status != 0 {
         println!("ichor: linux: memtest failed check {status}");
         fail("memtest");
@@ -475,7 +451,7 @@ pub(crate) fn run() {
         "ichor: linux: brk, mmap, mprotect, munmap, uname, getdents64 ok ({syscalls} syscalls, memory returned)"
     );
 
-    let (status, syscalls) = run_linux(&mut new_process(), &fs_program(), &["fstest"]);
+    let (status, syscalls) = run_linux(new_process(), &fs_program(), &["fstest"]);
     if status != 0 {
         println!("ichor: linux: fstest failed check {status}");
         fail("fstest");

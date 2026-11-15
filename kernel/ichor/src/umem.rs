@@ -1,5 +1,5 @@
-//! A Linux process's memory: the region map (`vma`), the pages the process
-//! owns, and the program break. This is what `mmap`, `munmap`, `mprotect`
+//! A Linux process's memory: its own address space, the region map
+//! (`vma`), the pages the process owns, and the program break. This is what `mmap`, `munmap`, `mprotect`
 //! and `brk` operate on.
 //!
 //! Anonymous memory is demand-paged: a mapping only reserves a region, and
@@ -10,12 +10,12 @@
 //! so its contents survive a later `mprotect` back.
 
 use alloc::collections::BTreeMap;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use frame::mm::{PAGE_SIZE, UFrame, UserProt};
+use cell::Account;
+use frame::mm::{PAGE_SIZE, UFrame, UserProt, VmSpace};
 use vma::{Prot, RegionMap};
-
-use crate::kcell::Cell;
 
 const EINVAL: i64 = 22;
 const ENOMEM: i64 = 12;
@@ -59,8 +59,13 @@ fn page_up(v: u64) -> Option<u64> {
     Some(v.checked_add(PAGE_SIZE - 1)? & !(PAGE_SIZE - 1))
 }
 
-/// A process's address-space bookkeeping.
+/// A process's address space and its bookkeeping. Pages are charged to
+/// `account` (the cell's) and released when unmapped or when the `Mm` is
+/// dropped. Drop it only while its space is not active (switch to the
+/// kernel space first).
 pub(crate) struct Mm {
+    space: VmSpace,
+    account: Arc<Account>,
     regions: RegionMap,
     /// Every page the process owns, mapped or not (`PROT_NONE`).
     pages: BTreeMap<u64, UFrame>,
@@ -69,13 +74,41 @@ pub(crate) struct Mm {
 }
 
 impl Mm {
-    pub(crate) fn new() -> Mm {
-        Mm {
+    /// An empty address space charging `account`.
+    pub(crate) fn new(account: &Arc<Account>) -> Option<Mm> {
+        Some(Mm {
+            space: VmSpace::new()?,
+            account: account.clone(),
             regions: RegionMap::new(MMAP_LO, MMAP_HI),
             pages: BTreeMap::new(),
             brk_start: 0,
             brk: 0,
+        })
+    }
+
+    /// The address space.
+    pub(crate) fn space(&self) -> &VmSpace {
+        &self.space
+    }
+
+    /// A copy of this address space for `fork`: same regions, break and
+    /// contents, in fresh pages (eager copy; copy-on-write sharing needs
+    /// frame support and comes later). `None` if memory runs out.
+    pub(crate) fn fork(&self) -> Option<Mm> {
+        let mut child = Mm::new(&self.account)?;
+        child.regions = self.regions.clone();
+        child.brk_start = self.brk_start;
+        child.brk = self.brk;
+        let mut buf = alloc::vec![0u8; PAGE_SIZE as usize];
+        for (&va, f) in &self.pages {
+            let copy = child.frame(va)?;
+            f.reader().read(&mut buf);
+            copy.writer().write(&buf);
+            if let Some((_, prot)) = self.space.translate(va) {
+                child.space.map(va, &copy, prot).ok()?;
+            }
         }
+        Some(child)
     }
 
     /// Sets where the program break starts (the page after the image).
@@ -91,13 +124,13 @@ impl Mm {
 
     /// The page the process owns at `va`, allocating (and charging) a zeroed
     /// one if there is none. Does not map it.
-    pub(crate) fn frame(&mut self, cell: &Cell, va: u64) -> Option<UFrame> {
+    pub(crate) fn frame(&mut self, va: u64) -> Option<UFrame> {
         if let Some(f) = self.pages.get(&va) {
             return Some(f.clone());
         }
-        cell.account().charge(1).ok()?;
+        self.account.charge(1).ok()?;
         let Some(f) = UFrame::alloc_zeroed() else {
-            cell.account().release(1);
+            self.account.release(1);
             return None;
         };
         self.pages.insert(va, f.clone());
@@ -106,7 +139,7 @@ impl Mm {
 
     /// Handles a user page fault at `addr`. Returns false if the access is
     /// not allowed (the process should get `SIGSEGV`).
-    pub(crate) fn fault(&mut self, cell: &Cell, addr: u64, write: bool, exec: bool) -> bool {
+    pub(crate) fn fault(&mut self, addr: u64, write: bool, exec: bool) -> bool {
         let va = page_down(addr);
         let Some(region) = self.regions.find(va) else {
             return false;
@@ -114,26 +147,26 @@ impl Mm {
         if !region.prot.permits(write, exec) {
             return false;
         }
-        if cell.space().translate(va).is_some() {
+        if self.space.translate(va).is_some() {
             // Present yet faulting: a protection violation the region map
             // does not explain. Never loop on it.
             return false;
         }
-        let Some(f) = self.frame(cell, va) else {
+        let Some(f) = self.frame(va) else {
             return false;
         };
-        cell.space().map(va, &f, user_prot(region.prot)).is_ok()
+        self.space.map(va, &f, user_prot(region.prot)).is_ok()
     }
 
     /// Faults in `[va, va+len)` ahead of a kernel copy, stopping at the
     /// first page the process may not access that way.
-    pub(crate) fn populate(&mut self, cell: &Cell, va: u64, len: usize, write: bool) {
+    pub(crate) fn populate(&mut self, va: u64, len: usize, write: bool) {
         let Some(end) = va.checked_add(len as u64) else {
             return;
         };
         let mut page = page_down(va);
         while page < end {
-            if cell.space().translate(page).is_none() && !self.fault(cell, page, write, false) {
+            if self.space.translate(page).is_none() && !self.fault(page, write, false) {
                 return;
             }
             page += PAGE_SIZE;
@@ -141,25 +174,18 @@ impl Mm {
     }
 
     /// Frees every page in `[start, end)`.
-    fn free_range(&mut self, cell: &Cell, start: u64, end: u64) {
+    fn free_range(&mut self, start: u64, end: u64) {
         let vas: Vec<u64> = self.pages.range(start..end).map(|(&v, _)| v).collect();
         for va in vas {
-            cell.space().unmap(va);
+            self.space.unmap(va);
             self.pages.remove(&va);
-            cell.account().release(1);
+            self.account.release(1);
         }
-    }
-
-    /// Frees everything (process exit).
-    pub(crate) fn clear(&mut self, cell: &Cell) {
-        self.free_range(cell, 0, u64::MAX);
-        self.regions = RegionMap::new(MMAP_LO, MMAP_HI);
     }
 
     /// `mmap`. `file` is `None` for anonymous mappings.
     pub(crate) fn mmap(
         &mut self,
-        cell: &Cell,
         addr: u64,
         len: u64,
         prot: u64,
@@ -190,7 +216,7 @@ impl Mm {
                 if map_flags & MAP_FIXED_NOREPLACE != 0 {
                     return Err(EEXIST);
                 }
-                self.munmap(cell, addr, len)?;
+                self.munmap(addr, len)?;
             }
             addr
         } else {
@@ -217,13 +243,13 @@ impl Mm {
                 let at = (va - start) as usize;
                 let chunk = f.bytes.get(at..f.bytes.len().min(at + PAGE_SIZE as usize));
                 if let Some(chunk) = chunk.filter(|c| !c.is_empty()) {
-                    let Some(frame) = self.frame(cell, va) else {
-                        self.munmap(cell, start, len)?;
+                    let Some(frame) = self.frame(va) else {
+                        self.munmap(start, len)?;
                         return Err(ENOMEM);
                     };
                     frame.writer().write(chunk);
-                    if prot.accessible() && cell.space().map(va, &frame, user_prot(prot)).is_err() {
-                        self.munmap(cell, start, len)?;
+                    if prot.accessible() && self.space.map(va, &frame, user_prot(prot)).is_err() {
+                        self.munmap(start, len)?;
                         return Err(ENOMEM);
                     }
                 }
@@ -234,26 +260,20 @@ impl Mm {
     }
 
     /// `munmap`.
-    pub(crate) fn munmap(&mut self, cell: &Cell, addr: u64, len: u64) -> Result<u64, i64> {
+    pub(crate) fn munmap(&mut self, addr: u64, len: u64) -> Result<u64, i64> {
         let len = vma::page_len(len).ok_or(EINVAL)?;
         if !addr.is_multiple_of(PAGE_SIZE) {
             return Err(EINVAL);
         }
         let end = addr.checked_add(len).ok_or(EINVAL)?;
         for (s, e) in self.regions.remove(addr, end) {
-            self.free_range(cell, s, e);
+            self.free_range(s, e);
         }
         Ok(0)
     }
 
     /// `mprotect`.
-    pub(crate) fn mprotect(
-        &mut self,
-        cell: &Cell,
-        addr: u64,
-        len: u64,
-        prot: u64,
-    ) -> Result<u64, i64> {
+    pub(crate) fn mprotect(&mut self, addr: u64, len: u64, prot: u64) -> Result<u64, i64> {
         let prot = Prot::from_linux(prot).ok_or(EINVAL)?;
         if !addr.is_multiple_of(PAGE_SIZE) {
             return Err(EINVAL);
@@ -268,20 +288,20 @@ impl Mm {
         }
         let vas: Vec<u64> = self.pages.range(addr..end).map(|(&v, _)| v).collect();
         for va in vas {
-            if cell.space().translate(va).is_none() {
+            if self.space.translate(va).is_none() {
                 continue; // Faulted in with the new protection on next use.
             }
             if prot.accessible() {
-                cell.space().protect(va, user_prot(prot));
+                self.space.protect(va, user_prot(prot));
             } else {
-                cell.space().unmap(va); // `pages` keeps the frame.
+                self.space.unmap(va); // `pages` keeps the frame.
             }
         }
         Ok(0)
     }
 
     /// `brk`: returns the new break, or the old one if `addr` is refused.
-    pub(crate) fn brk(&mut self, cell: &Cell, addr: u64) -> u64 {
+    pub(crate) fn brk(&mut self, addr: u64) -> u64 {
         if self.brk_start == 0 || addr < self.brk_start || addr > self.brk_start + BRK_MAX {
             return self.brk;
         }
@@ -294,7 +314,7 @@ impl Mm {
             }
         } else if new_end < old_end {
             for (s, e) in self.regions.remove(new_end, old_end) {
-                self.free_range(cell, s, e);
+                self.free_range(s, e);
             }
         }
         self.brk = addr;
@@ -304,3 +324,10 @@ impl Mm {
 
 /// One past the highest user address.
 pub(crate) const USER_TOP: u64 = 0x0000_7fff_ffff_f000;
+
+impl Drop for Mm {
+    fn drop(&mut self) {
+        // The pages themselves are freed with `pages` and `space`.
+        self.account.release(self.pages.len() as u64);
+    }
+}

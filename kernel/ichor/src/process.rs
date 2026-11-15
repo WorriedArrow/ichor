@@ -11,6 +11,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::kcell::Cell;
+use crate::proc::{self, ProcEntry};
 use crate::umem::Mm;
 use crate::vfs::{Ino, ROOT, Vfs};
 
@@ -39,6 +40,8 @@ pub(crate) enum Fd {
 
 /// A Linux process.
 pub(crate) struct LinuxProcess {
+    /// This process's entry in the process table (its pid).
+    pub(crate) entry: Arc<ProcEntry>,
     pub(crate) cell: Arc<Cell>,
     pub(crate) vfs: Arc<Vfs>,
     pub(crate) mm: Mm,
@@ -49,32 +52,60 @@ pub(crate) struct LinuxProcess {
 }
 
 impl LinuxProcess {
-    /// A process in `cell` with `vfs` as its root, `/` as its working
-    /// directory, and the console on fds 0–2.
-    pub(crate) fn new(cell: Arc<Cell>, vfs: Arc<Vfs>) -> Self {
+    /// A process in `cell` with an empty address space, `vfs` as its root,
+    /// `/` as its working directory, and the console on fds 0–2. `None` if
+    /// memory runs out.
+    pub(crate) fn new(cell: Arc<Cell>, vfs: Arc<Vfs>) -> Option<Self> {
+        let mm = Mm::new(cell.account())?;
         let _ = vfs.lock().open(ROOT);
-        Self {
+        Some(Self {
+            entry: proc::register(0),
             cell,
             vfs,
-            mm: Mm::new(),
+            mm,
             cwd: ROOT,
             umask: 0o022,
             fds: alloc::vec![Some(Fd::Console); 3],
+        })
+    }
+
+    /// A copy of this process for `fork`: a copy of its memory, the same
+    /// open files (each with a new reference), working directory and umask,
+    /// and a new pid whose parent is this process.
+    pub(crate) fn fork(&self) -> Option<Self> {
+        let mm = self.mm.fork()?;
+        {
+            let mut fs = self.vfs.lock();
+            fs.open(self.cwd).ok()?;
+            for f in self.fds.iter().flatten() {
+                if let Fd::File(of) = f {
+                    let _ = fs.open(of.ino);
+                }
+            }
         }
+        Some(Self {
+            entry: proc::register(self.entry.pid),
+            cell: self.cell.clone(),
+            vfs: self.vfs.clone(),
+            mm,
+            cwd: self.cwd,
+            umask: self.umask,
+            fds: self.fds.clone(),
+        })
     }
 
     /// Copies `data` to user memory at `va`, faulting in demand-paged
     /// memory first. Returns how many bytes were copied.
     pub(crate) fn copy_to_user(&mut self, va: u64, data: &[u8]) -> usize {
-        self.mm.populate(&self.cell, va, data.len(), true);
-        self.cell.space().copy_to_user(va, data)
+        self.mm.populate(va, data.len(), true);
+        self.mm.space().copy_to_user(va, data)
     }
 
     /// Copies user memory at `va` into `out`, faulting in demand-paged
     /// memory first. Returns how many bytes were copied.
     pub(crate) fn copy_from_user(&mut self, va: u64, out: &mut [u8]) -> usize {
-        self.mm.populate(&self.cell, va, out.len(), false);
-        self.cell.space().copy_from_user(va, out)
+        self.mm.populate(va, out.len(), false);
+        self.mm.space().copy_from_user(va, out)
     }
 
     /// Changes the working directory to `ino` (a directory).
