@@ -14,7 +14,7 @@ use crate::process::LinuxProcess;
 use crate::runtest::{fail, run_linux};
 use crate::vfs::{ROOT, Vfs};
 
-const CELL_PAGES: u64 = 16384;
+const CELL_PAGES: u64 = 65536;
 
 /// `(argv, expected exit code)`: argv[0] is a path under `/usr/bin`.
 const RUNS: &[(&[&str], i32)] = &[
@@ -33,6 +33,14 @@ const RUNS: &[(&[&str], i32)] = &[
             "ls /usr/bin >/dev/null && [ \"$(id -u)\" = 0 ] && \
              printf 'b\\na\\n' | sort | head -1 | grep -q a && \
              echo debian: coreutils run",
+        ],
+        0,
+    ),
+    (
+        &[
+            "dash",
+            "-c",
+            "export DEBIAN_FRONTEND=noninteractive; apt-get update -q &&              apt-get install -y -q --no-install-recommends hello jq && hello &&              [ \"$(echo '{\"a\":[1,2,3]}' | jq '.a|add')\" = 6 ] && dpkg -s libonig5 >/dev/null &&              echo debian: apt-get installed hello and jq from the local repository",
         ],
         0,
     ),

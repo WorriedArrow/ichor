@@ -375,8 +375,10 @@ pub fn debian_image_path() -> Result<std::path::PathBuf> {
     }
     let a = &crate::artifact::DEBIAN_BOOKWORM_SLIM;
     let dir = workspace_root().join("target").join(a.dir);
+    // Bump MIRROR when the local repository's contents change.
+    const MIRROR: u32 = 1;
     let path = dir.join(format!(
-        "debian-{}-v{}.img",
+        "debian-{}-v{}-m{MIRROR}.img",
         &a.sha256[..12],
         image::VERSION
     ));
@@ -384,6 +386,31 @@ pub fn debian_image_path() -> Result<std::path::PathBuf> {
         let tar = crate::inflate::gunzip(&a.bytes()?)?;
         let mut t = crate::rootfs::Tree::new();
         t.add_tar(&tar)?;
+        // A local repository for `apt` instead of deb.debian.org (there is
+        // no network): the pinned .debs and a Packages index.
+        let mut index = String::new();
+        for d in crate::artifact::DEBIAN_PACKAGES {
+            let bytes = d.artifact.bytes()?;
+            t.add_file(&format!("/mirror/{}", d.artifact.file), &bytes, 0o644)?;
+            index.push_str(&format!(
+                "Package: {}\nVersion: {}\nArchitecture: amd64\nMaintainer: Debian\n\
+                 Depends: {}\nFilename: ./{}\nSize: {}\nSHA256: {}\n\
+                 Description: pinned test package\n\n",
+                d.package,
+                d.version,
+                d.depends,
+                d.artifact.file,
+                bytes.len(),
+                d.artifact.sha256
+            ));
+        }
+        t.add_file("/mirror/Packages", index.as_bytes(), 0o644)?;
+        t.add_file("/etc/apt/sources.list.d/debian.sources", b"", 0o644)?;
+        t.add_file(
+            "/etc/apt/sources.list.d/mirror.list",
+            b"deb [trusted=yes] file:/mirror ./\n",
+            0o644,
+        )?;
         let partial = dir.join(format!("debian.img.partial.{}", std::process::id()));
         fs::write(&partial, t.image())
             .map_err(|e| format!("writing {}: {e}", partial.display()))?;

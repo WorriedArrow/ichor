@@ -186,3 +186,76 @@ pub const DEBIAN_BOOKWORM_SLIM: Artifact = Artifact {
         "https://auth.docker.io/token?service=registry.docker.io&scope=repository:library/debian:pull",
     ),
 };
+
+/// A Debian package for the local `file:` repository, with the control
+/// fields the generated `Packages` index needs. Size and SHA-256 come
+/// from the verified file itself.
+#[derive(Clone, Copy, Debug)]
+pub struct DebianPackage {
+    pub artifact: Artifact,
+    pub package: &'static str,
+    pub version: &'static str,
+    pub depends: &'static str,
+}
+
+const fn deb(
+    package: &'static str,
+    version: &'static str,
+    depends: &'static str,
+    file: &'static str,
+    url: &'static str,
+    sha256: &'static str,
+) -> DebianPackage {
+    DebianPackage {
+        artifact: Artifact {
+            dir: "debian/pool",
+            file,
+            url,
+            sha256,
+            env: "ICHOR_DEBIAN_POOL_UNUSED",
+            token_url: None,
+        },
+        package,
+        version,
+        depends,
+    }
+}
+
+/// Official bookworm (Debian 12) packages, from snapshot.debian.org (a
+/// permanent archive) as of 2026-11-01; versions and dependencies are
+/// those in bookworm's `main/binary-amd64/Packages`. `jq` needs `libjq1`,
+/// which needs `libonig5`, so apt has dependencies to resolve.
+pub const DEBIAN_PACKAGES: &[DebianPackage] = &[
+    deb(
+        "hello",
+        "2.10-3",
+        "libc6 (>= 2.34)",
+        "hello_2.10-3_amd64.deb",
+        "https://snapshot.debian.org/archive/debian/20261101T000000Z/pool/main/h/hello/hello_2.10-3_amd64.deb",
+        "2e6e2f1a0007dc43bc91c273fd36e91e40a4f1c2765a03eca68b70a42103878a",
+    ),
+    deb(
+        "jq",
+        "1.6-2.1+deb12u2",
+        "libjq1 (= 1.6-2.1+deb12u2), libc6 (>= 2.34)",
+        "jq_1.6-2.1+deb12u2_amd64.deb",
+        "https://snapshot.debian.org/archive/debian/20261101T000000Z/pool/main/j/jq/jq_1.6-2.1+deb12u2_amd64.deb",
+        "f2303584378ac85f6d3a9ae8e46412196061681e81610d3b020abe4b5d389eb0",
+    ),
+    deb(
+        "libjq1",
+        "1.6-2.1+deb12u2",
+        "libc6 (>= 2.36), libonig5 (>= 6.8.1)",
+        "libjq1_1.6-2.1+deb12u2_amd64.deb",
+        "https://snapshot.debian.org/archive/debian/20261101T000000Z/pool/main/j/jq/libjq1_1.6-2.1+deb12u2_amd64.deb",
+        "f501b6349a3c2462af59e7a598ebd71e7889de46c9ddf852eb12ebeba7df21a2",
+    ),
+    deb(
+        "libonig5",
+        "6.9.8-1",
+        "libc6 (>= 2.14)",
+        "libonig5_6.9.8-1_amd64.deb",
+        "https://snapshot.debian.org/archive/debian/20261101T000000Z/pool/main/libo/libonig/libonig5_6.9.8-1_amd64.deb",
+        "59ecfce6d88c7c4b09496ce182b3b8303e8e8477664e009b16ae83a09cd12be7",
+    ),
+];
