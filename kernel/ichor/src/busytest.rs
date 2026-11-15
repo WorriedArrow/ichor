@@ -114,7 +114,7 @@ pub(crate) fn run(vfs: &Arc<Vfs>) {
     }
 }
 
-fn read_busybox(vfs: &Arc<Vfs>) -> Vec<u8> {
+pub(crate) fn read_busybox(vfs: &Arc<Vfs>) -> Vec<u8> {
     let mut fs = vfs.lock();
     let ino = fs
         .resolve(ROOT, "/bin/busybox", true)

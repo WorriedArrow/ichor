@@ -354,6 +354,24 @@ fn panic_reports_failure_and_stops_other_cpus() {
     ]);
 }
 
+/// The Phase E benchmarks still build and run (their numbers are printed,
+/// not checked: CI machines vary).
+#[test]
+fn benchmarks_run_and_report() {
+    let out = boot("bench", "bench", 4);
+    out.assert_exit(Exit::Success);
+    out.assert_in_order(&[
+        "ichor: bench: 4 CPUs",
+        "ichor: bench: null syscall: ",
+        "ichor: bench: pipe round trip: ",
+        "ichor: bench: page fault: ",
+        "ichor: bench: fork + wait: ",
+        "ichor: bench: fork + exec + wait: ",
+        "ichor: bench: container start: ",
+        "ichor: bench: done",
+    ]);
+}
+
 #[test]
 fn stack_overflow_hits_the_guard_page() {
     let out = boot("stack-overflow", "test_stack_overflow", 1);

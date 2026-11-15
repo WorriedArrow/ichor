@@ -261,6 +261,8 @@ report at the end of each phase. Do not rewrite `main`.
   across whole user copies, a VFS that does not serialize reads, batched
   console writes, a vDSO; first benchmarks (null syscall, context switch,
   page fault, fork+exec, container start) against Linux before and after.
+  [in progress: `bench.rs` measures all six on Ichor (`bench` flag,
+  `benchmarks_run_and_report`); Linux reference numbers not yet.]
 
 Carried over from milestone 3: per-cell pid namespaces (paging the root
 image in on demand, copy-on-write `fork`, `FD_CLOEXEC` and shared offsets
@@ -300,6 +302,7 @@ cargo xtask run --cmdline "memmap"   # without qemu_debug_exit: halts; Ctrl-C to
 cargo xtask test           # host unit tests, then QEMU integration tests (tests/)
 cargo xtask lint           # fmt check, clippy (host + UEFI target), forbid check, frame budget
 cargo xtask frame-audit    # frame line and unsafe-site counts against the budget
+cargo xtask run --cmdline "qemu_debug_exit bench" --smp 4 --release   # benchmarks (use KVM for real numbers)
 cargo deny check           # licenses, advisories, sources
 ```
 
@@ -333,6 +336,7 @@ comment.
 | `test_stack_overflow` | recurse until the kernel stack hits its guard page |
 | `trace_errors` | log every failing Linux syscall (pid, number, first arguments, errno) |
 | `trace_pid=N` | log every Linux syscall of pid N with its result |
+| `bench` | run the Phase E benchmarks (`bench.rs`) after the root disk's self-tests and print them |
 
 ## Layout
 

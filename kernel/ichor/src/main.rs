@@ -11,6 +11,7 @@
 extern crate alloc;
 
 mod alpinetest;
+mod bench;
 mod blktest;
 mod busytest;
 mod celltest;
@@ -66,6 +67,9 @@ fn kmain(info: BootInfo) -> ! {
     }
     if cmdline.flag("trace_errors") {
         linuxabi::TRACE_ERRORS.store(true, core::sync::atomic::Ordering::Relaxed);
+    }
+    if cmdline.flag("bench") {
+        bench::enable();
     }
 
     let image = info.kernel_image();
