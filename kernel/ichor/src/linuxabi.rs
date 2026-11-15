@@ -8,8 +8,10 @@
 //! User memory is only ever copied (`VmSpace::copy_{from,to}_user`), never
 //! borrowed. Coverage is tracked in `docs/linux-abi.md`.
 
+mod exec;
 mod fs;
 
+use crate::proc;
 use crate::process::{Fd, LinuxProcess, MAX_FDS};
 use crate::umem;
 use fs::AT_FDCWD;
@@ -42,8 +44,14 @@ mod nr {
     pub(super) const MADVISE: u64 = 28; // stub: advice is ignored
     pub(super) const DUP: u64 = 32; // partial: the copy has its own offset
     pub(super) const DUP2: u64 = 33; // partial: the copy has its own offset
-    pub(super) const GETPID: u64 = 39; // partial: always 1
+    pub(super) const GETPID: u64 = 39;
+    pub(super) const SENDFILE: u64 = 40;
+    pub(super) const CLONE: u64 = 56; // partial: fork-like flags only (no threads)
+    pub(super) const FORK: u64 = 57;
+    pub(super) const VFORK: u64 = 58; // partial: a full copy, the parent does not wait
+    pub(super) const EXECVE: u64 = 59; // partial: static ELF binaries
     pub(super) const EXIT: u64 = 60; // partial: ends the whole process (single-threaded)
+    pub(super) const WAIT4: u64 = 61; // partial: no rusage, no process groups
     pub(super) const UNAME: u64 = 63;
     pub(super) const FCNTL: u64 = 72; // partial: F_DUPFD, F_GETFD/SETFD, F_GETFL/SETFL
     pub(super) const FSYNC: u64 = 74; // partial: the upper layer is memory
@@ -69,10 +77,10 @@ mod nr {
     pub(super) const GETGID: u64 = 104; // partial: always 0
     pub(super) const GETEUID: u64 = 107; // partial: always 0
     pub(super) const GETEGID: u64 = 108; // partial: always 0
-    pub(super) const GETPPID: u64 = 110; // partial: always 0
+    pub(super) const GETPPID: u64 = 110;
     pub(super) const SIGALTSTACK: u64 = 131; // stub: accepted, signals are never delivered
     pub(super) const ARCH_PRCTL: u64 = 158; // partial: ARCH_SET_FS only
-    pub(super) const GETTID: u64 = 186; // partial: always 1
+    pub(super) const GETTID: u64 = 186; // partial: the pid (single-threaded)
     pub(super) const FUTEX: u64 = 202; // partial: WAIT/WAKE for one thread
     pub(super) const GETDENTS64: u64 = 217;
     pub(super) const SET_TID_ADDRESS: u64 = 218; // stub: returns TID 1
@@ -145,6 +153,7 @@ pub(crate) fn dispatch(p: &mut LinuxProcess, ctx: &mut frame::user::UserContext)
         nr::TRUNCATE => fs::truncate(p, a[0], a[1]),
         nr::FTRUNCATE => fs::ftruncate(p, a[0], a[1]),
         nr::FSYNC | nr::FDATASYNC => fs::fsync(p, a[0]),
+        nr::SENDFILE => fs::sendfile(p, a[0], a[1], a[2], a[3] as usize),
         nr::GETDENTS64 => fs::getdents64(p, a[0], a[1], a[2] as usize),
         nr::MKDIR => fs::mkdir(p, AT_FDCWD, a[0], a[1]),
         nr::MKDIRAT => fs::mkdir(p, i(a[0]), a[1], a[2]),
@@ -179,9 +188,9 @@ pub(crate) fn dispatch(p: &mut LinuxProcess, ctx: &mut frame::user::UserContext)
         nr::IOCTL => ioctl(p, a[0], a[1], a[2]),
         // Memory.
         nr::MMAP => mmap(p, &a),
-        nr::MPROTECT => p.mm.mprotect(&p.cell, a[0], a[1], a[2]),
-        nr::MUNMAP => p.mm.munmap(&p.cell, a[0], a[1]),
-        nr::BRK => Ok(p.mm.brk(&p.cell, a[0])),
+        nr::MPROTECT => p.mm.mprotect(a[0], a[1], a[2]),
+        nr::MUNMAP => p.mm.munmap(a[0], a[1]),
+        nr::BRK => Ok(p.mm.brk(a[0])),
         nr::MADVISE => Ok(0),
         // Identity, time, limits, signals, threads.
         nr::UNAME => uname(p, a[0]),
@@ -194,12 +203,28 @@ pub(crate) fn dispatch(p: &mut LinuxProcess, ctx: &mut frame::user::UserContext)
         nr::SIGALTSTACK => zero_out(p, a[1], 24),
         nr::FUTEX => futex(p, a[0], a[1]),
         nr::SCHED_YIELD | nr::SET_ROBUST_LIST => Ok(0),
-        nr::GETPID | nr::GETTID => Ok(1),
-        nr::GETPPID | nr::GETUID | nr::GETGID | nr::GETEUID | nr::GETEGID => Ok(0),
+        nr::GETPID | nr::GETTID => Ok(p.entry.pid),
+        nr::GETPPID => Ok(p.entry.ppid()),
+        nr::GETUID | nr::GETGID | nr::GETEUID | nr::GETEGID => Ok(0),
+        // Processes.
+        nr::FORK | nr::VFORK => fork(p, ctx, 0, 0, 0),
+        nr::CLONE => fork(p, ctx, a[0], a[1], a[3]),
+        nr::WAIT4 => wait4(p, i(a[0]), a[1], a[2]),
+        nr::EXECVE => match exec::execve(p, ctx, a[0], a[1], a[2]) {
+            // The context now starts the new program: no return value.
+            Ok(()) => return Outcome::Continue,
+            Err(e) => Err(e),
+        },
         nr::ARCH_PRCTL => arch_prctl(ctx, a[0], a[1]),
         nr::SET_TID_ADDRESS => Ok(1),
         nr::EXIT | nr::EXIT_GROUP => return Outcome::Exit(a[0] as i32),
-        _ => Err(ENOSYS),
+        _ => {
+            frame::println!(
+                "ichor: linux: pid {}: syscall {nr} is not implemented",
+                p.entry.pid
+            );
+            Err(ENOSYS)
+        }
     };
     ctx.set_return(match result {
         Ok(v) => v,
@@ -230,6 +255,13 @@ fn console_write(p: &mut LinuxProcess, buf: u64, count: usize) -> usize {
         written += got;
     }
     written
+}
+
+/// Prints kernel-held bytes to the console.
+fn console_bytes(b: &[u8]) {
+    for &c in b {
+        frame::print!("{}", char::from(c));
+    }
 }
 
 fn le_u64(b: &[u8]) -> u64 {
@@ -283,7 +315,7 @@ fn fcntl(p: &mut LinuxProcess, fd: u64, cmd: u64, arg: u64) -> Result<u64, i64> 
 fn mmap(p: &mut LinuxProcess, a: &[u64; 6]) -> Result<u64, i64> {
     let (addr, len, prot, map_flags, fd, offset) = (a[0], a[1], a[2], a[3], a[4], a[5]);
     if map_flags & umem::flags::MAP_ANONYMOUS != 0 {
-        return p.mm.mmap(&p.cell, addr, len, prot, map_flags, None);
+        return p.mm.mmap(addr, len, prot, map_flags, None);
     }
     if matches!(p.fd(fd).ok_or(EBADF)?, Fd::Console) {
         return Err(ENODEV);
@@ -297,7 +329,55 @@ fn mmap(p: &mut LinuxProcess, a: &[u64; 6]) -> Result<u64, i64> {
         bytes: &bytes,
         offset,
     };
-    p.mm.mmap(&p.cell, addr, len, prot, map_flags, Some(src))
+    p.mm.mmap(addr, len, prot, map_flags, Some(src))
+}
+
+// ---------------------------------------------------------------------------
+// Processes.
+// ---------------------------------------------------------------------------
+
+/// `fork`, `vfork` and `clone` with fork-like flags: the child is a copy
+/// of the caller, on its own task. Thread creation (`CLONE_THREAD`,
+/// `CLONE_VM` without `CLONE_VFORK`) is milestone 4.
+fn fork(
+    p: &mut LinuxProcess,
+    ctx: &frame::user::UserContext,
+    flags: u64,
+    stack: u64,
+    child_tid: u64,
+) -> Result<u64, i64> {
+    const CSIGNAL: u64 = 0xff;
+    const CLONE_VM: u64 = 0x100;
+    const CLONE_VFORK: u64 = 0x4000;
+    const CLONE_CHILD_CLEARTID: u64 = 0x20_0000;
+    const CLONE_CHILD_SETTID: u64 = 0x100_0000;
+    let allowed = CSIGNAL | CLONE_VM | CLONE_VFORK | CLONE_CHILD_CLEARTID | CLONE_CHILD_SETTID;
+    if flags & !allowed != 0 || (flags & CLONE_VM != 0 && flags & CLONE_VFORK == 0) {
+        return Err(ENOSYS);
+    }
+    let (mut child, cctx) = proc::fork(p, ctx, stack)?;
+    if flags & CLONE_CHILD_SETTID != 0 {
+        let tid = (child.entry.pid as u32).to_le_bytes();
+        if child.copy_to_user(child_tid, &tid) != tid.len() {
+            return Err(EFAULT);
+        }
+    }
+    // The child's space was built while ours stays active; starting it on
+    // its own task binds it there.
+    proc::start(child, cctx)
+}
+
+fn wait4(p: &mut LinuxProcess, pid: i64, wstatus: u64, options: u64) -> Result<u64, i64> {
+    const WNOHANG: u64 = 1;
+    match proc::wait(&p.entry, pid, options & WNOHANG != 0)? {
+        None => Ok(0),
+        Some((cpid, status)) => {
+            if wstatus != 0 && p.copy_to_user(wstatus, &status.to_le_bytes()) != 4 {
+                return Err(EFAULT);
+            }
+            Ok(cpid)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

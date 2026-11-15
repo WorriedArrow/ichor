@@ -47,6 +47,11 @@ jobs:
       - name: Install pinned toolchain (rust-toolchain.toml)
         run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
+      - name: Cache the test busybox (hash-checked by xtask on every use)
+        uses: actions/cache@v4
+        with:
+          path: target/busybox
+          key: busybox-1.35.0-6e123e7f3202a8c1
       - run: cargo xtask test
         env:
           ICHOR_TEST_VERBOSE: "1"

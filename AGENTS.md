@@ -15,11 +15,12 @@ a framekernel. The founding brief is the source of truth until an ADR in
 
 ## Status
 
-**Active milestone: 3.** Its scope is NVMe / virtio-blk, a read-only image
-format, the VFS, and the ELF loader, ending with a static busybox running in
-a cell through the Linux ABI.
+**Active milestone: 4.** Its scope is dynamic linking with glibc and musl;
+signals, futex, epoll, full mmap semantics, and `/proc`, ending with Alpine
+and debian-slim shells and package managers running against a local
+mirror.
 
-Milestones 0-2 are done.
+Milestones 0-3 are done.
 
 - M0/M1: boots as a UEFI app into the higher half; buddy page allocator and
   heap; traps with IST stacks; x2APIC + tickless timer; SMP bring-up; per-CPU
@@ -38,7 +39,16 @@ Milestones 0-2 are done.
   revocation, and that a ring-3 native process acts only on handles its cell
   holds.
 
-- M3 so far: `kernel/elf` (load plans), `kernel/image` (read-only,
+- M3 (done): the acceptance test runs the official static busybox 1.35.0
+  (busybox.net musl build; xtask fetches it, pins its SHA-256, caches it in
+  `target/busybox/`, `ICHOR_BUSYBOX` overrides) from the root disk:
+  echo, ls, cat (via sendfile), and `sh -c` with arithmetic, exit codes,
+  and fork + execve + wait4 of `/bin/true`. Processes run on their own
+  kernel tasks (`proc`: pids, zombies, wait4); `fork`/`vfork`/fork-like
+  `clone` copy the address space eagerly; `execve` loads a static ELF from
+  the root. Frame enables SSE on every CPU and saves each user context's
+  FXSAVE state around ring 3 (the kernel is soft-float).
+- M3 pieces: `kernel/elf` (load plans), `kernel/image` (read-only,
   content-addressed image format; `builder` feature is the writer), and in
   the kernel: `loader` (ELF into a cell's `VmSpace`), `vfs` (root mounted
   from an image; `.`/`..`, bounded symlink following), `process` (Linux
@@ -74,30 +84,30 @@ Milestones 0-2 are done.
 
 `tests/boot.rs` proves all of this on 1, 4 and 8 vCPUs.
 
-Next for milestone 3: the busybox QEMU test (waiting on the owner's choice
-of where the static binary comes from), whatever else busybox traces to,
-and paging the root image in from the device on demand (today the kernel
-reads the whole disk into memory, capped at 64 MiB).
+Carried over from milestone 3: paging the root image in from the device on
+demand (today the kernel reads the whole disk into memory, capped at
+64 MiB), copy-on-write `fork`, `FD_CLOEXEC`, shared file offsets after
+`dup`, and per-cell pid namespaces.
+
+Suggested order for milestone 4:
+
+1. Signals (delivery, `sigaction`, `kill`, default actions, `SIGCHLD`) and
+   real futexes with threads (`clone` with `CLONE_VM|CLONE_THREAD`, TLB
+   shootdown, per-thread contexts).
+2. Copy-on-write fork (frame support for read-only remapping of shared
+   untyped pages).
+3. `PT_INTERP` and PIE: load `ld-musl` / `ld-linux` and run dynamic binaries.
+4. pipes, `poll`/`epoll`, `/proc` and `/dev`, then Alpine `apk` and
+   debian-slim `apt` against a local mirror.
 
 ADR-0004 records the side-channel posture; its per-CPU mitigations (VERW,
 IBPB on cross-cell switch, page-table isolation for Meltdown-affected CPUs)
 are owed as multi-cell scheduling lands in milestone 4. Boot logs which apply.
 
-Suggested order for milestone 3 (see the brief and ADR-0001 §4.6):
-
-1. Done: ADR-0006 (overlay root; ext4 volumes, to be built as
-   `kernel/ext4` when volumes attach).
-2. A safe block layer trait and a virtio-blk driver (safe, over frame's
-   `IoMem`/DMA types, which milestone 3 adds to frame per a new budget ADR).
-3. The read-only, content-addressed image format (host-testable crate) and
-   the in-kernel VFS with a copy-on-write upper layer.
-4. An ELF loader (`PT_INTERP` later) that maps a static binary into a cell's
-   `VmSpace`, and enough Linux ABI (the process personality, `brk`, `mmap`,
-   `write`, `exit`, `uname`, ...) to run static busybox.
-5. A QEMU test that runs a real static busybox applet in a cell.
-
 Frame budget: ADR-0005 sets the milestone 3 ceiling at 8,500 lines / 380
-sites; `audit.toml` is at step 5 (5,100 / 235) and frame is at 4,963 / 223.
+sites; `audit.toml` is at step 5 (5,100 / 235) and frame is at 4,994 / 226.
+Milestone 4's frame work (COW, threads, TLB shootdown, signal frames) needs
+its own budget step or ADR.
 
 The goal set for this effort is milestone 8, whose acceptance test needs
 cloud accounts and bare-metal hardware from the owner.
@@ -166,6 +176,7 @@ kernel/vma       user address-space region map for mmap/brk (host-tested)
 kernel/overlay   cell root: image + copy-on-write upper layer (host-tested)
 kernel/drivers/virtio-blk  safe virtio-blk driver over frame's IoMem/DMA
 kernel/drivers/nvme        safe NVMe driver (polled, DMA-trusted)
+xtask/src/busybox.rs       fetches + verifies the test busybox (GPL-2.0, never committed)
 kernel/ichor     the kernel binary; frame::main!(kmain); kcell/nativeabi tie it together
 xtask/           build/run/test/lint tooling (lib + bin, no dependencies)
 tests/           QEMU integration tests (host crate using xtask's runner)

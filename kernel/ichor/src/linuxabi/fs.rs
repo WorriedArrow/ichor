@@ -6,7 +6,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use super::{EBADF, EFAULT, EINVAL, EMFILE, console_write, le_u64};
+use super::{EBADF, EFAULT, EINVAL, EMFILE, console_bytes, console_write, le_u64};
 use crate::process::{Fd, LinuxProcess, OpenFile};
 use crate::vfs::{self, Ino, Kind, Stat, errno::*};
 
@@ -636,4 +636,64 @@ pub(super) fn umask(p: &mut LinuxProcess, mask: u64) -> Result<u64, i64> {
     let old = p.umask;
     p.umask = mask as u32 & 0o777;
     Ok(u64::from(old))
+}
+
+/// `sendfile`: copies from file `in_fd` (at `*offp`, or its offset) to
+/// `out_fd` (the console or a file) inside the kernel.
+pub(super) fn sendfile(
+    p: &mut LinuxProcess,
+    out_fd: u64,
+    in_fd: u64,
+    offp: u64,
+    count: usize,
+) -> Result<u64, i64> {
+    let src = file(p, in_fd)?;
+    let out = p.fd(out_fd).ok_or(EBADF)?;
+    if let Fd::File(o) = out
+        && o.flags & O_ACCMODE == 0
+    {
+        return Err(EBADF);
+    }
+    let mut offset = if offp != 0 {
+        let mut b = [0u8; 8];
+        if p.copy_from_user(offp, &mut b) != 8 {
+            return Err(EFAULT);
+        }
+        u64::from_le_bytes(b)
+    } else {
+        src.offset
+    };
+    let mut buf = alloc::vec![0u8; CHUNK];
+    let mut done = 0usize;
+    while done < count {
+        let want = CHUNK.min(count - done);
+        let n = p.vfs.lock().read(src.ino, offset, &mut buf[..want])?;
+        if n == 0 {
+            break;
+        }
+        match p.fd(out_fd).ok_or(EBADF)? {
+            Fd::Console => console_bytes(&buf[..n]),
+            Fd::File(o) => {
+                let at = if o.flags & O_APPEND != 0 {
+                    p.vfs.lock().stat(o.ino)?.size
+                } else {
+                    o.offset
+                };
+                p.vfs.lock().write(o.ino, at, &buf[..n])?;
+                if let Some(of) = p.file_mut(out_fd) {
+                    of.offset = at + n as u64;
+                }
+            }
+        }
+        offset += n as u64;
+        done += n;
+    }
+    if offp != 0 {
+        if p.copy_to_user(offp, &offset.to_le_bytes()) != 8 {
+            return Err(EFAULT);
+        }
+    } else if let Some(f) = p.file_mut(in_fd) {
+        f.offset = offset;
+    }
+    Ok(done as u64)
 }

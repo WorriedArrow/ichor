@@ -9,8 +9,10 @@
 
 pub mod audit;
 pub mod build;
+pub mod busybox;
 pub mod linux_abi;
 pub mod qemu;
+pub mod sha256;
 
 use std::path::{Path, PathBuf};
 

@@ -65,7 +65,7 @@ fn exercise(name: &str, disk: &mut impl BlockDevice) {
     let system = System::new(4096).unwrap_or_else(|| fail("no system cell"));
     let cell = Cell::new(&system.root_account, 128).unwrap_or_else(|| fail("no process cell"));
     let (status, syscalls) = run_linux(
-        &mut LinuxProcess::new(cell, vfs),
+        LinuxProcess::new(cell, vfs.clone()).unwrap_or_else(|| fail("no process")),
         &cat_program(),
         &["cat", "/etc/motd"],
     );
@@ -73,6 +73,9 @@ fn exercise(name: &str, disk: &mut impl BlockDevice) {
         fail("cat from disk: checks failed");
     }
     println!("ichor: blk: cat read /etc/motd from the {name} disk ({syscalls} syscalls)");
+    if name == "virtio-blk" {
+        crate::busytest::run(&vfs);
+    }
 }
 
 /// Must match xtask's `DISK_PATTERN_LEN` and `pattern_byte`.

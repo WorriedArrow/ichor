@@ -287,7 +287,7 @@ fn prepare_run_dir(cfg: &RunConfig, fw: &Firmware) -> Result<PathBuf> {
         .map_err(|e| format!("copying kernel {}: {e}", cfg.kernel.display()))?;
     fs::write(cfg_dir.join("cmdline"), &cfg.cmdline)
         .map_err(|e| format!("writing cmdline: {e}"))?;
-    fs::write(dir.join("root.img"), root_image())
+    fs::write(dir.join("root.img"), root_image()?)
         .map_err(|e| format!("writing root image: {e}"))?;
     fs::copy(&fw.vars, dir.join("vars.fd"))
         .map_err(|e| format!("copying OVMF vars {}: {e}", fw.vars.display()))?;
@@ -306,10 +306,19 @@ pub fn pattern_byte(i: usize) -> u8 {
     (i.wrapping_mul(31) ^ (i >> 9)) as u8
 }
 
+/// Busybox applets linked into `/bin` on the root disk.
+pub const BUSYBOX_APPLETS: &[&str] = &["cat", "echo", "ls", "sh", "true"];
+
 /// The root disk: an Ichor image with `/usr/share/motd`,
-/// `/etc/motd -> /usr/share/motd` and `/usr/share/pattern`.
-pub fn root_image() -> Vec<u8> {
+/// `/etc/motd -> /usr/share/motd`, `/usr/share/pattern`, and a static
+/// busybox at `/bin/busybox` with applet symlinks.
+pub fn root_image() -> Result<Vec<u8>> {
+    let busybox = crate::busybox::bytes()?;
     let mut b = image::builder::Builder::new();
+    let mut bin = alloc_bin(&mut b, &busybox);
+    bin.sort_by(|a, b| a.0.cmp(b.0));
+    let bin_ids: Vec<_> = bin.into_iter().map(|(_, id)| id).collect();
+    let bin = b.dir("bin", &bin_ids, 0o755);
     let motd = b.file("motd", DISK_MOTD.as_bytes(), 0o644);
     let data: Vec<u8> = (0..DISK_PATTERN_LEN).map(pattern_byte).collect();
     let pattern = b.file("pattern", &data, 0o644);
@@ -317,11 +326,23 @@ pub fn root_image() -> Vec<u8> {
     let usr = b.dir("usr", &[share], 0o755);
     let link = b.symlink("motd", "/usr/share/motd");
     let etc = b.dir("etc", &[link], 0o755);
-    let root = b.dir("/", &[etc, usr], 0o755);
+    let root = b.dir("/", &[bin, etc, usr], 0o755);
     let mut img = b.finish(root);
     // Whole 4 KiB blocks, so it also fits a 4Kn NVMe namespace.
     img.resize(img.len().next_multiple_of(4096), 0);
-    img
+    Ok(img)
+}
+
+/// `/bin` entries: busybox itself and one symlink per applet, by name.
+fn alloc_bin(
+    b: &mut image::builder::Builder,
+    busybox: &[u8],
+) -> Vec<(&'static str, image::builder::NodeId)> {
+    let mut v = vec![("busybox", b.file("busybox", busybox, 0o755))];
+    for &a in BUSYBOX_APPLETS {
+        v.push((a, b.symlink(a, "busybox")));
+    }
+    v
 }
 
 /// Builds the QEMU command line for a run.

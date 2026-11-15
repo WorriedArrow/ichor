@@ -18,9 +18,11 @@
 //! memory is accounted hierarchically, revocation works, and a native-ABI
 //! ring-3 process can act only on handles its cell holds.
 //!
-//! Milestone 3 (in progress): real static Linux x86-64 ELFs run unmodified
-//! in cells through the Linux syscall personality, and read files from a
-//! root image that a safe virtio-blk driver reads off a disk.
+//! Milestone 3: real static Linux x86-64 ELFs run unmodified in cells
+//! through the Linux syscall personality, on a copy-on-write root read off
+//! virtio-blk and NVMe disks by safe drivers. The acceptance test is the
+//! official static busybox: echo, ls, cat, and a shell that forks, execs
+//! and waits.
 
 use ichor_tests::{Exit, boot};
 
@@ -62,6 +64,13 @@ fn m1_boots_on_four_cpus() {
         "ichor: blk: mounted the root image from the virtio-blk disk",
         "hello from /etc/motd on the root disk",
         "ichor: blk: cat read /etc/motd from the virtio-blk disk",
+        "hello from busybox",
+        "ichor: busybox: echo ok",
+        "ichor: busybox: ls ok",
+        "ichor: busybox: cat ok",
+        "sh: 6x7=42",
+        "sh: fork, exec and wait ok",
+        "ichor: busybox: all applets passed",
         "ichor: blk: nvme block size 4096 bytes",
         "ichor: blk: nvme: verified 300 KiB read across multiple requests",
         "ichor: blk: mounted the root image from the nvme disk",
@@ -114,6 +123,13 @@ fn m1_boots_on_one_cpu() {
         "ichor: blk: mounted the root image from the virtio-blk disk",
         "hello from /etc/motd on the root disk",
         "ichor: blk: cat read /etc/motd from the virtio-blk disk",
+        "hello from busybox",
+        "ichor: busybox: echo ok",
+        "ichor: busybox: ls ok",
+        "ichor: busybox: cat ok",
+        "sh: 6x7=42",
+        "sh: fork, exec and wait ok",
+        "ichor: busybox: all applets passed",
         "ichor: blk: nvme block size 4096 bytes",
         "ichor: blk: nvme: verified 300 KiB read across multiple requests",
         "ichor: blk: mounted the root image from the nvme disk",
@@ -146,6 +162,13 @@ fn m2_scheduler_on_eight_cpus() {
         "ichor: blk: mounted the root image from the virtio-blk disk",
         "hello from /etc/motd on the root disk",
         "ichor: blk: cat read /etc/motd from the virtio-blk disk",
+        "hello from busybox",
+        "ichor: busybox: echo ok",
+        "ichor: busybox: ls ok",
+        "ichor: busybox: cat ok",
+        "sh: 6x7=42",
+        "sh: fork, exec and wait ok",
+        "ichor: busybox: all applets passed",
         "ichor: blk: nvme block size 4096 bytes",
         "ichor: blk: nvme: verified 300 KiB read across multiple requests",
         "ichor: blk: mounted the root image from the nvme disk",

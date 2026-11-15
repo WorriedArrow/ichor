@@ -11,11 +11,13 @@
 extern crate alloc;
 
 mod blktest;
+mod busytest;
 mod celltest;
 mod kcell;
 mod linuxabi;
 mod loader;
 mod nativeabi;
+mod proc;
 mod process;
 mod proctest;
 mod runtest;
