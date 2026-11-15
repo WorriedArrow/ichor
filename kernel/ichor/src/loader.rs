@@ -149,8 +149,42 @@ fn map_image(mm: &mut Mm, plan: &LoadPlan, image: &dyn File, bias: u64) -> Resul
             va += PAGE_SIZE;
         }
     }
+    // Whole file pages that belong to one segment alone are mapped lazily,
+    // like `mmap(MAP_PRIVATE)` of the file: they fault in from the page
+    // cache on first touch, so exec costs what the program touches, not
+    // its size. Edge pages (partial, shared by two segments, or bss) are
+    // built below as before.
+    let mut lazy: Vec<(u64, u64, u64, Prot)> = Vec::new(); // start, end, file offset, prot
+    let source = image.mappable();
+    if source.is_some() {
+        for seg in &segs {
+            let Some(file_end) = seg.vaddr.checked_add(seg.file_size) else {
+                continue;
+            };
+            let mut s = seg.vaddr.next_multiple_of(PAGE_SIZE);
+            let mut e = file_end & !(PAGE_SIZE - 1);
+            while s < e && users.get(&s) != Some(&1) {
+                s += PAGE_SIZE;
+            }
+            while e > s && users.get(&(e - PAGE_SIZE)) != Some(&1) {
+                e -= PAGE_SIZE;
+            }
+            let offset = seg.file_offset + (s - seg.vaddr);
+            let exclusive = (s..e)
+                .step_by(PAGE_SIZE as usize)
+                .all(|va| users.get(&va) == Some(&1));
+            if s < e && exclusive && offset.is_multiple_of(PAGE_SIZE) {
+                let prot = pages.get(&s).copied().unwrap_or(Prot::NONE);
+                lazy.push((s, e, offset, prot));
+            }
+        }
+    }
+    let is_lazy = |va: u64| lazy.iter().any(|&(s, e, _, _)| s <= va && va < e);
     let mut frames: BTreeMap<u64, UFrame> = BTreeMap::new();
     for (&va, &prot) in &pages {
+        if is_lazy(va) {
+            continue;
+        }
         if !mm.reserve(va, va + PAGE_SIZE, prot) {
             return Err(LoadError::Map);
         }
@@ -190,6 +224,13 @@ fn map_image(mm: &mut Mm, plan: &LoadPlan, image: &dyn File, bias: u64) -> Resul
         };
         if prot.accessible() && mm.space().map(va, f, user).is_err() {
             return Err(LoadError::Map);
+        }
+    }
+    if let Some(file) = source {
+        for (s, e, offset, prot) in lazy {
+            if !mm.map_file_lazily(s, e, prot, offset, file.clone()) {
+                return Err(LoadError::Map);
+            }
         }
     }
     Ok(image_end)

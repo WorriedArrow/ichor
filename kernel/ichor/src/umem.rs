@@ -314,6 +314,30 @@ impl Mm {
         self.regions.insert(start, end, prot)
     }
 
+    /// Reserves `[start, end)` (page-aligned) as a private mapping of
+    /// `file` from `offset`: pages are filled on first touch (the page
+    /// cache's copy, copy-on-write), as `mmap(MAP_PRIVATE)` of a file does.
+    pub(crate) fn map_file_lazily(
+        &mut self,
+        start: u64,
+        end: u64,
+        prot: Prot,
+        offset: u64,
+        file: Arc<dyn File>,
+    ) -> bool {
+        if !self.regions.insert(start, end, prot) {
+            return false;
+        }
+        self.files.push(FileRange {
+            start,
+            end,
+            base: start,
+            offset,
+            file,
+        });
+        true
+    }
+
     /// The page the process owns at `va`, allocating (and charging) one if
     /// there is none: zeroed, or filled from the file mapped there. Does not
     /// map it.
@@ -322,19 +346,22 @@ impl Mm {
             return Some(f.clone());
         }
         self.account.charge(1).ok()?;
+        let file = self.files.iter().find(|r| r.start <= va && va < r.end);
+        let at = file.map(|r| r.offset + (va - r.base));
+        // A cache page needs no fresh frame (or zeroing one to throw away).
+        if let (Some(r), Some(at)) = (file, at)
+            && let Some(cached) = r.file.cached_page(at / PAGE_SIZE)
+        {
+            // Shared with the cache: read-only until written.
+            self.pages.insert(va, cached.clone());
+            self.cow.insert(va);
+            return Some(cached);
+        }
         let Some(f) = UFrame::alloc_zeroed() else {
             self.account.release(1);
             return None;
         };
-        if let Some(r) = self.files.iter().find(|r| r.start <= va && va < r.end) {
-            let at = r.offset + (va - r.base);
-            if let Some(cached) = r.file.cached_page(at / PAGE_SIZE) {
-                // Shared with the cache: read-only until written.
-                drop(f);
-                self.pages.insert(va, cached.clone());
-                self.cow.insert(va);
-                return Some(cached);
-            }
+        if let (Some(r), Some(at)) = (self.files.iter().find(|r| r.start <= va && va < r.end), at) {
             let mut page = alloc::vec![0u8; PAGE_SIZE as usize];
             let n = r.file.read_at(at, &mut page);
             f.writer().write(&page[..n]);

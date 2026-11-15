@@ -21,6 +21,12 @@ pub(crate) trait File: Send + Sync {
     fn cached_page(&self, _index: u64) -> Option<UFrame> {
         None
     }
+    /// A reference to this file that a mapping can keep for as long as it
+    /// lives, so its pages can be filled on demand (`None`: the caller must
+    /// copy what it needs now, as for bytes it holds).
+    fn mappable(&self) -> Option<Arc<dyn File>> {
+        None
+    }
 }
 
 /// Bytes in memory (self-test programs).
@@ -76,5 +82,13 @@ impl File for VfsFile {
 
     fn cached_page(&self, index: u64) -> Option<UFrame> {
         self.vfs.cached_page(self.ino, index)
+    }
+
+    fn mappable(&self) -> Option<Arc<dyn File>> {
+        // A new open reference: the mapping keeps the file alive (even
+        // after an unlink) independently of this handle.
+        VfsFile::open(&self.vfs, self.ino)
+            .ok()
+            .map(|f| Arc::new(f) as Arc<dyn File>)
     }
 }
