@@ -11,6 +11,7 @@ members = [
     "kernel/cell",
     "kernel/abi",
     "kernel/elf",
+    "kernel/image",
     "kernel/ichor",
     "tests",
     "xtask",
@@ -28,6 +29,7 @@ default-members = [
     "kernel/cell",
     "kernel/abi",
     "kernel/elf",
+    "kernel/image",
     "tests",
     "xtask",
 ]

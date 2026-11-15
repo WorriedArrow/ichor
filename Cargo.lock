@@ -54,6 +54,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ichor-image"
+version = "0.0.0"
+
+[[package]]
 name = "ichor-pe"
 version = "0.0.0"
 
