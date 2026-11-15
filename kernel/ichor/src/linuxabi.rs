@@ -36,7 +36,7 @@ mod nr {
     pub(super) const RT_SIGACTION: u64 = 13;
     pub(super) const RT_SIGPROCMASK: u64 = 14;
     pub(super) const RT_SIGRETURN: u64 = 15;
-    pub(super) const IOCTL: u64 = 16; // partial: TIOCGWINSZ on the console
+    pub(super) const IOCTL: u64 = 16; // partial: no tty ioctls (the console is not a tty); FIONBIO, FIOCLEX/FIONCLEX
     pub(super) const PREAD64: u64 = 17;
     pub(super) const PWRITE64: u64 = 18;
     pub(super) const READV: u64 = 19;
@@ -127,7 +127,6 @@ mod nr {
     pub(super) const PSELECT6: u64 = 270; // partial: the signal mask is ignored
     pub(super) const PPOLL: u64 = 271; // partial: the signal mask is ignored
     pub(super) const FACCESSAT: u64 = 269; // partial: existence only (every process is root)
-    pub(super) const SET_ROBUST_LIST: u64 = 273; // stub: robust lists are not walked at exit
     pub(super) const UTIMENSAT: u64 = 280;
     pub(super) const EPOLL_PWAIT: u64 = 281; // partial: the signal mask is ignored
     pub(super) const EVENTFD: u64 = 284;
@@ -286,7 +285,6 @@ pub(crate) fn dispatch(p: &mut LinuxProcess, ctx: &mut frame::user::UserContext)
             frame::task::yield_now();
             Ok(0)
         }
-        nr::SET_ROBUST_LIST => Ok(0),
         nr::GETPID => Ok(p.group.tgid),
         nr::GETTID => Ok(p.entry.pid),
         nr::GETPPID => Ok(p.entry.ppid()),
@@ -295,7 +293,7 @@ pub(crate) fn dispatch(p: &mut LinuxProcess, ctx: &mut frame::user::UserContext)
         nr::FORK => clone(p, ctx, 17, 0, 0, 0, 0), // SIGCHLD
         nr::VFORK => clone(p, ctx, 0x4000 | 0x100 | 17, 0, 0, 0, 0), // CLONE_VFORK | CLONE_VM
         nr::CLONE => clone(p, ctx, a[0], a[1], a[2], a[3], a[4]),
-        nr::WAIT4 => wait4(p, i(a[0]), a[1], a[2]),
+        nr::WAIT4 => wait4(p, i(a[0]), a[1], a[2], a[3]),
         nr::EXECVE => match exec::execve(p, ctx, a[0], a[1], a[2]) {
             // The context now starts the new program: no return value.
             Ok(()) => return Outcome::Continue,
@@ -369,19 +367,38 @@ fn le_u64(b: &[u8]) -> u64 {
     u64::from_le_bytes(a)
 }
 
+/// `ioctl`. The console is a serial byte sink, not a tty (no termios, no
+/// window size), so every tty request is `ENOTTY`, as for a pipe. The
+/// generic descriptor requests work on everything.
 fn ioctl(p: &mut LinuxProcess, fd: u64, request: u64, arg: u64) -> Result<u64, i64> {
-    const TIOCGWINSZ: u64 = 0x5413;
-    match (p.fd(fd).ok_or(EBADF)?, request) {
-        (Fd::Console, TIOCGWINSZ) => {
-            // struct winsize { rows, cols, xpixel, ypixel: u16 }
-            let mut b = [0u8; 8];
-            b[0..2].copy_from_slice(&24u16.to_le_bytes());
-            b[2..4].copy_from_slice(&80u16.to_le_bytes());
-            if p.copy_to_user(arg, &b) == b.len() {
-                Ok(0)
-            } else {
-                Err(EFAULT)
+    const FIONCLEX: u64 = 0x5450;
+    const FIOCLEX: u64 = 0x5451;
+    const FIONBIO: u64 = 0x5421;
+    let desc = p.desc(fd).ok_or(EBADF)?;
+    match request {
+        FIOCLEX | FIONCLEX => {
+            p.set_cloexec(fd, request == FIOCLEX);
+            Ok(0)
+        }
+        FIONBIO => {
+            let mut b = [0u8; 4];
+            if p.copy_from_user(arg, &mut b) != 4 {
+                return Err(EFAULT);
             }
+            let on = u32::from_le_bytes(b) != 0;
+            match &mut *desc.state() {
+                Fd::File(of) => {
+                    of.flags = if on {
+                        of.flags | fs::O_NONBLOCK
+                    } else {
+                        of.flags & !fs::O_NONBLOCK
+                    };
+                }
+                Fd::Pipe(e) => e.nonblock = on,
+                Fd::Object(o) => o.nonblock = on,
+                Fd::Console | Fd::Dev(_) => {}
+            }
+            Ok(0)
         }
         _ => Err(ENOTTY),
     }
@@ -553,12 +570,25 @@ fn clone(
     proc::start(child, cctx)
 }
 
-fn wait4(p: &mut LinuxProcess, pid: i64, wstatus: u64, options: u64) -> Result<u64, i64> {
+fn wait4(
+    p: &mut LinuxProcess,
+    pid: i64,
+    wstatus: u64,
+    options: u64,
+    rusage: u64,
+) -> Result<u64, i64> {
     const WNOHANG: u64 = 1;
+    /// `sizeof(struct rusage)` on x86-64.
+    const RUSAGE_SIZE: usize = 144;
     match proc::wait(&p.group.leader, &p.entry, pid, options & WNOHANG != 0)? {
         None => Ok(0),
         Some((cpid, status)) => {
             if wstatus != 0 && p.copy_to_user(wstatus, &status.to_le_bytes()) != 4 {
+                return Err(EFAULT);
+            }
+            // No resource accounting yet: report zero usage rather than
+            // leave the caller's buffer as it was.
+            if rusage != 0 && p.copy_to_user(rusage, &[0u8; RUSAGE_SIZE]) != RUSAGE_SIZE {
                 return Err(EFAULT);
             }
             Ok(cpid)
