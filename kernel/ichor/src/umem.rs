@@ -9,6 +9,12 @@
 //! memory a user access would. A page made `PROT_NONE` is unmapped but kept,
 //! so its contents survive a later `mprotect` back.
 //!
+//! Private file mappings are filled on first touch from the file's bytes,
+//! which the mapping keeps (charged to the account) so that a page dropped
+//! by `MADV_DONTNEED` comes back with the file's contents, as on Linux. The
+//! loader's own segments are not file mappings: dropping one of their pages
+//! zero-fills it (partial).
+//!
 //! `fork` is copy-on-write: parent and child map the same pages read-only
 //! and mark them shared; the first write on either side (a fault, or a
 //! kernel copy into user memory) gives that side its own copy. The child
@@ -45,9 +51,46 @@ pub(crate) mod flags {
 
 /// A file mapping's source: the file's bytes from `offset` on (already
 /// read, at most the mapping's length; the rest of the mapping is zero).
-pub(crate) struct FileSource<'a> {
-    pub(crate) bytes: &'a [u8],
+pub(crate) struct FileSource {
+    pub(crate) bytes: Vec<u8>,
     pub(crate) offset: u64,
+}
+
+/// The bytes behind a file mapping, charged to `account` (by the page)
+/// while any mapping still uses them.
+struct Backing {
+    bytes: Vec<u8>,
+    account: Arc<Account>,
+    pages: u64,
+}
+
+impl Drop for Backing {
+    fn drop(&mut self) {
+        self.account.release(self.pages);
+    }
+}
+
+/// `[start, end)` of the address space shows `backing` from `base` on.
+#[derive(Clone)]
+struct FileRange {
+    start: u64,
+    end: u64,
+    base: u64,
+    backing: Arc<Backing>,
+}
+
+/// Linux `madvise` advice values.
+mod advice {
+    pub(super) const NORMAL: u64 = 0;
+    pub(super) const WILLNEED: u64 = 3;
+    pub(super) const DONTNEED: u64 = 4;
+    pub(super) const FREE: u64 = 8;
+    pub(super) const MERGEABLE: u64 = 12;
+    pub(super) const DODUMP: u64 = 17;
+    pub(super) const KEEPONFORK: u64 = 19;
+    pub(super) const PAGEOUT: u64 = 21;
+    pub(super) const POPULATE_READ: u64 = 22;
+    pub(super) const POPULATE_WRITE: u64 = 23;
 }
 
 fn user_prot(p: Prot) -> UserProt {
@@ -78,6 +121,8 @@ pub(crate) struct Mm {
     /// Pages possibly shared with another process after `fork`: mapped
     /// read-only, copied on the first write.
     cow: BTreeSet<u64>,
+    /// File mappings, for filling their pages.
+    files: Vec<FileRange>,
     brk_start: u64,
     brk: u64,
 }
@@ -91,6 +136,7 @@ impl Mm {
             regions: RegionMap::new(MMAP_LO, MMAP_HI),
             pages: BTreeMap::new(),
             cow: BTreeSet::new(),
+            files: Vec::new(),
             brk_start: 0,
             brk: 0,
         })
@@ -107,6 +153,7 @@ impl Mm {
     pub(crate) fn fork(&mut self) -> Option<Mm> {
         let mut child = Mm::new(&self.account)?;
         child.regions = self.regions.clone();
+        child.files = self.files.clone();
         child.brk_start = self.brk_start;
         child.brk = self.brk;
         self.account.charge(self.pages.len() as u64).ok()?;
@@ -210,8 +257,9 @@ impl Mm {
         self.regions.insert(start, end, prot)
     }
 
-    /// The page the process owns at `va`, allocating (and charging) a zeroed
-    /// one if there is none. Does not map it.
+    /// The page the process owns at `va`, allocating (and charging) one if
+    /// there is none: zeroed, or filled from the file mapped there. Does not
+    /// map it.
     pub(crate) fn frame(&mut self, va: u64) -> Option<UFrame> {
         if let Some(f) = self.pages.get(&va) {
             return Some(f.clone());
@@ -221,8 +269,36 @@ impl Mm {
             self.account.release(1);
             return None;
         };
+        if let Some(r) = self.files.iter().find(|r| r.start <= va && va < r.end) {
+            let at = (va - r.base) as usize;
+            let bytes = &r.backing.bytes;
+            if let Some(chunk) = bytes.get(at..bytes.len().min(at + PAGE_SIZE as usize)) {
+                f.writer().write(chunk);
+            }
+        }
         self.pages.insert(va, f.clone());
         Some(f)
+    }
+
+    /// Forgets the file mappings over `[start, end)`.
+    fn trim_files(&mut self, start: u64, end: u64) {
+        let mut kept = Vec::with_capacity(self.files.len());
+        for r in self.files.drain(..) {
+            if r.end <= start || r.start >= end {
+                kept.push(r);
+                continue;
+            }
+            if r.start < start {
+                kept.push(FileRange {
+                    end: start,
+                    ..r.clone()
+                });
+            }
+            if r.end > end {
+                kept.push(FileRange { start: end, ..r });
+            }
+        }
+        self.files = kept;
     }
 
     /// Handles a user page fault at `addr`. Returns false if the access is
@@ -284,7 +360,7 @@ impl Mm {
         len: u64,
         prot: u64,
         map_flags: u64,
-        file: Option<FileSource<'_>>,
+        file: Option<FileSource>,
     ) -> Result<u64, i64> {
         use flags::*;
         let prot = Prot::from_linux(prot).ok_or(EINVAL)?;
@@ -325,30 +401,32 @@ impl Mm {
                 self.regions.find_free(len).ok_or(ENOMEM)?
             }
         };
-        if !self.regions.insert(start, start + len, prot) {
-            return Err(ENOMEM);
-        }
-        if let Some(f) = file {
-            // File mappings are copied in now. A shared mapping is only
-            // allowed read-only, so it cannot miss a write to the file it
-            // would have made; it can miss later writes by others (partial).
-            let mut va = start;
-            while va < start + len {
-                let at = (va - start) as usize;
-                let chunk = f.bytes.get(at..f.bytes.len().min(at + PAGE_SIZE as usize));
-                if let Some(chunk) = chunk.filter(|c| !c.is_empty()) {
-                    let Some(frame) = self.frame(va) else {
-                        self.munmap(start, len)?;
-                        return Err(ENOMEM);
-                    };
-                    frame.writer().write(chunk);
-                    if prot.accessible() && self.space.map(va, &frame, user_prot(prot)).is_err() {
-                        self.munmap(start, len)?;
-                        return Err(ENOMEM);
-                    }
-                }
-                va += PAGE_SIZE;
+        // A file mapping keeps the file's bytes and fills pages as they are
+        // touched. A shared mapping is only allowed read-only, so it cannot
+        // miss a write to the file it would have made; it can miss later
+        // writes by others (partial).
+        let backing = match file {
+            Some(f) => {
+                let pages = page_up(f.bytes.len() as u64).ok_or(ENOMEM)? / PAGE_SIZE;
+                self.account.charge(pages).map_err(|_| ENOMEM)?;
+                Some(Arc::new(Backing {
+                    bytes: f.bytes,
+                    account: self.account.clone(),
+                    pages,
+                }))
             }
+            None => None,
+        };
+        if !self.regions.insert(start, start + len, prot) {
+            return Err(ENOMEM); // `backing` drops and returns its charge
+        }
+        if let Some(backing) = backing {
+            self.files.push(FileRange {
+                start,
+                end: start + len,
+                base: start,
+                backing,
+            });
         }
         Ok(start)
     }
@@ -363,7 +441,37 @@ impl Mm {
         for (s, e) in self.regions.remove(addr, end) {
             self.free_range(s, e);
         }
+        self.trim_files(addr, end);
         Ok(0)
+    }
+
+    /// `madvise`. `MADV_DONTNEED` and `MADV_FREE` drop the pages (the next
+    /// touch sees zeros, or the file's contents for a file mapping);
+    /// `MADV_POPULATE_*` faults them in; the pure hints are accepted and
+    /// change nothing. Advice that would change semantics we do not have
+    /// (`DONTFORK`, `WIPEONFORK`, `REMOVE`, `HWPOISON`, ...) is EINVAL.
+    pub(crate) fn madvise(&mut self, addr: u64, len: u64, advice: u64) -> Result<u64, i64> {
+        use advice::*;
+        if !addr.is_multiple_of(PAGE_SIZE) {
+            return Err(EINVAL);
+        }
+        let len = vma::page_len(len).ok_or(EINVAL)?;
+        let end = addr.checked_add(len).ok_or(EINVAL)?;
+        let file = self.files.iter().any(|r| r.start < end && addr < r.end);
+        match advice {
+            NORMAL..=WILLNEED | MERGEABLE..=DODUMP | KEEPONFORK..=PAGEOUT => {}
+            DONTNEED => self.free_range(addr, end),
+            FREE if !file => self.free_range(addr, end),
+            POPULATE_READ | POPULATE_WRITE => {
+                self.populate(addr, len as usize, advice == POPULATE_WRITE)
+            }
+            _ => return Err(EINVAL),
+        }
+        if self.regions.covered(addr, end) {
+            Ok(0)
+        } else {
+            Err(ENOMEM)
+        }
     }
 
     /// `mprotect`.

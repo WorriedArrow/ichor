@@ -45,7 +45,7 @@ mod nr {
     pub(super) const PIPE: u64 = 22;
     pub(super) const SELECT: u64 = 23;
     pub(super) const SCHED_YIELD: u64 = 24;
-    pub(super) const MADVISE: u64 = 28; // stub: advice is ignored
+    pub(super) const MADVISE: u64 = 28; // partial: DONTNEED on the loaded image's own segments zero-fills
     pub(super) const PAUSE: u64 = 34;
     pub(super) const NANOSLEEP: u64 = 35;
     pub(super) const DUP: u64 = 32;
@@ -256,7 +256,7 @@ pub(crate) fn dispatch(p: &mut LinuxProcess, ctx: &mut frame::user::UserContext)
         nr::MPROTECT => p.mm().mprotect(a[0], a[1], a[2]),
         nr::MUNMAP => p.mm().munmap(a[0], a[1]),
         nr::BRK => Ok(p.mm().brk(a[0])),
-        nr::MADVISE => Ok(0),
+        nr::MADVISE => p.mm().madvise(a[0], a[1], a[2]),
         // Identity, time, limits, signals, threads.
         nr::UNAME => uname(p, a[0]),
         nr::CLOCK_GETTIME => clock_gettime(p, a[1]),
@@ -483,10 +483,7 @@ fn mmap(p: &mut LinuxProcess, a: &[u64; 6]) -> Result<u64, i64> {
         return Err(EACCES);
     }
     let bytes = fs::file_bytes(p, fd, offset, len)?;
-    let src = umem::FileSource {
-        bytes: &bytes,
-        offset,
-    };
+    let src = umem::FileSource { bytes, offset };
     p.mm().mmap(addr, len, prot, map_flags, Some(src))
 }
 

@@ -181,6 +181,11 @@ impl Asm {
         self.jump(&[0xE9], l);
     }
 
+    /// `je label`
+    pub(crate) fn je(&mut self, l: Label) {
+        self.jump(&[0x0F, 0x84], l);
+    }
+
     /// `jbe label` (unsigned <=)
     pub(crate) fn jbe(&mut self, l: Label) {
         self.jump(&[0x0F, 0x86], l);

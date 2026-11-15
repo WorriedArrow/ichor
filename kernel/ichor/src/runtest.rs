@@ -64,6 +64,7 @@ mod sys {
     pub(super) const KILL: u64 = 62;
     pub(super) const SIGALTSTACK: u64 = 131;
     pub(super) const PRLIMIT64: u64 = 302;
+    pub(super) const MADVISE: u64 = 28;
 }
 
 const MOTD: &[u8] = b"hello from /etc/motd inside an Ichor image\n";
@@ -968,6 +969,100 @@ fn limits_program() -> Vec<u8> {
     static_elf(&a.finish(BLOB_VADDR).unwrap_or_else(|| fail("assembler")))
 }
 
+/// `madvise`: `MADV_DONTNEED` on an anonymous page brings it back zeroed
+/// and leaves its neighbour alone; on a written private file mapping it
+/// brings back the file's bytes. A hint is 0, unknown advice EINVAL, an
+/// unaligned address EINVAL, an unmapped range ENOMEM. Exits 0, or the
+/// number of the failed check.
+fn madvise_program() -> Vec<u8> {
+    const PROT_RW: u64 = 3;
+    const PRIVATE_ANON: u64 = 0x22;
+    const PRIVATE: u64 = 0x02;
+    const DONTNEED: u64 = 4;
+    let mut a = Asm::new();
+    let bad = a.label();
+    let motd = a.data(b"/etc/motd\0");
+    let expect = |a: &mut Asm, n: u64, v: i32| {
+        a.mov_imm(Reg::R15, n);
+        a.cmp_imm(Reg::Rax, v);
+        a.jne(bad);
+    };
+    let madvise = |a: &mut Asm, addr: Reg, off: i32, len: u64, advice: u64| {
+        a.mov(Reg::Rdi, addr);
+        a.add_imm(Reg::Rdi, off);
+        a.mov_imm(Reg::Rsi, len);
+        a.mov_imm(Reg::Rdx, advice);
+        a.sys(sys::MADVISE);
+    };
+    // 1: r12 = two anonymous pages, both written.
+    a.mov_imm(Reg::Rdi, 0);
+    a.mov_imm(Reg::Rsi, 8192);
+    a.mov_imm(Reg::Rdx, PROT_RW);
+    a.mov_imm(Reg::R10, PRIVATE_ANON);
+    a.mov_imm(Reg::R8, u64::MAX);
+    a.mov_imm(Reg::R9, 0);
+    a.sys(sys::MMAP);
+    a.mov(Reg::R12, Reg::Rax);
+    a.mov_imm(Reg::R13, 0x4141_4141_4141_4141);
+    a.store(Reg::R12, 0, Reg::R13);
+    a.store(Reg::R12, 4096, Reg::R13);
+    // 2-3: DONTNEED the first: it reads 0, the second is untouched.
+    madvise(&mut a, Reg::R12, 0, 4096, DONTNEED);
+    expect(&mut a, 2, 0);
+    a.load(Reg::Rax, Reg::R12, 0);
+    expect(&mut a, 3, 0);
+    a.load(Reg::Rax, Reg::R12, 4096);
+    a.mov_imm(Reg::R15, 3);
+    a.cmp(Reg::Rax, Reg::R13);
+    a.jne(bad);
+    // 4-6: a hint, bad advice, an unaligned address.
+    madvise(&mut a, Reg::R12, 0, 8192, 1);
+    expect(&mut a, 4, 0);
+    madvise(&mut a, Reg::R12, 0, 8192, 999);
+    expect(&mut a, 5, -22);
+    madvise(&mut a, Reg::R12, 1, 4096, DONTNEED);
+    expect(&mut a, 6, -22);
+    // 7: past the end of the mapping (unmapped): ENOMEM.
+    a.mov(Reg::Rdi, Reg::R12);
+    a.mov_imm(Reg::Rsi, 4096);
+    a.sys(sys::MUNMAP);
+    madvise(&mut a, Reg::R12, 0, 8192, DONTNEED);
+    expect(&mut a, 7, -12);
+    // 8: r14 = a private writable mapping of /etc/motd; r13 = its first 8 bytes.
+    a.mov_data(Reg::Rdi, motd);
+    a.mov_imm(Reg::Rsi, 0);
+    a.sys(sys::OPEN);
+    expect(&mut a, 8, 3);
+    a.mov_imm(Reg::Rdi, 0);
+    a.mov_imm(Reg::Rsi, 4096);
+    a.mov_imm(Reg::Rdx, PROT_RW);
+    a.mov_imm(Reg::R10, PRIVATE);
+    a.mov_imm(Reg::R8, 3);
+    a.mov_imm(Reg::R9, 0);
+    a.sys(sys::MMAP);
+    a.mov(Reg::R14, Reg::Rax);
+    a.load(Reg::R13, Reg::R14, 0);
+    // 9-10: overwrite it, DONTNEED it: the file's bytes are back.
+    a.mov_imm(Reg::Rax, 0);
+    a.store(Reg::R14, 0, Reg::Rax);
+    madvise(&mut a, Reg::R14, 0, 4096, DONTNEED);
+    expect(&mut a, 9, 0);
+    a.load(Reg::Rax, Reg::R14, 0);
+    a.mov_imm(Reg::R15, 10);
+    a.cmp(Reg::Rax, Reg::R13);
+    a.jne(bad);
+    // 11: and they are the file's, not zeros.
+    a.mov(Reg::Rax, Reg::R13);
+    a.mov_imm(Reg::R15, 11);
+    a.cmp_imm(Reg::Rax, 0);
+    a.je(bad);
+    a.mov_imm(Reg::R15, 0);
+    a.bind(bad);
+    a.mov(Reg::Rdi, Reg::R15);
+    a.sys(sys::EXIT_GROUP);
+    static_elf(&a.finish(BLOB_VADDR).unwrap_or_else(|| fail("assembler")))
+}
+
 /// POSIX record locks across fork: the parent write-locks bytes 0..10; the
 /// child's overlapping F_SETLK fails with EAGAIN, F_GETLK names the parent,
 /// a disjoint range locks fine, and F_SETLKW blocks until the parent
@@ -1170,5 +1265,14 @@ pub(crate) fn run() {
     }
     println!(
         "ichor: linux: RLIMIT_NOFILE enforced, SA_ONSTACK handler ran on the sigaltstack ({syscalls} syscalls)"
+    );
+
+    let (status, syscalls) = run_linux(new_process(), &madvise_program(), None, &["madvisetest"]);
+    if status != 0 {
+        println!("ichor: linux: madvisetest failed check {status}");
+        fail("madvisetest");
+    }
+    println!(
+        "ichor: linux: madvise DONTNEED zero-fills anonymous pages, refills file pages ({syscalls} syscalls)"
     );
 }
