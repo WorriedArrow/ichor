@@ -34,6 +34,23 @@ Ichor runs. Each program times its own loop with `clock_gettime` and prints
 an `ichor-bench:` line; the table compares those. CI runs it after the
 tests and puts the table in the job summary.
 
+First comparison, commit `2c2e830` (KVM, 4 vCPUs, 512 MiB, GitHub
+`ubuntu-24.04` runner; one run, so read ratios, not digits):
+
+| Benchmark | Ichor | Linux 6.6 | Ichor / Linux |
+|---|---|---|---|
+| null syscall | 261 ns | 367 ns | 0.71x |
+| pipe round trip | 10.5 us | 17.8 us | 0.59x |
+| page fault | 1961 ns | 1590 ns | 1.23x |
+| fork + wait | 20.7 us | 43.2 us | 0.48x |
+| fork + exec + wait | 307.5 us | 109.9 us | 2.80x |
+
+Reading it: Ichor's cheaper syscalls and switches are partly Linux's
+mitigations (Linux pays for page-table isolation and friends on this CPU;
+Ichor does not yet apply all of ADR-0004's). The clear gaps are exec,
+nearly 3x Linux, and page faults, about 1.2x. Those are the next Phase E
+targets.
+
 Caveats: Linux runs with its default CPU-vulnerability mitigations, which
 Ichor does not all apply yet (ADR-0004). Container start has no Linux
 equivalent here. Numbers from TCG (no KVM, as on a Windows laptop) say
