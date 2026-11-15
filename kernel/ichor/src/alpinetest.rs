@@ -7,8 +7,11 @@
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::time::Duration;
 
 use frame::println;
+use frame::sync::SpinLock;
+use frame::task::TaskOptions;
 
 use crate::kcell::{Cell, System};
 use crate::loader;
@@ -169,6 +172,47 @@ const RUNS: &[(&[&str], i32)] = &[
     ),
 ];
 
+/// Installs milestone 5's servers from the local mirror.
+const NET_INSTALL: &str = "apk add --no-network /mirror/pcre-8.45-r3.apk \
+     /mirror/nginx-1.26.3-r0.apk /mirror/redis-7.2.9-r0.apk >/dev/null && \
+     mkdir -p /srv/www && echo 'hello from nginx in an Ichor cell' >/srv/www/index.html && \
+     printf 'server {\\n listen 80 default_server;\\n root /srv/www;\\n location / { try_files $uri $uri/ =404; }\\n}\\n' \
+       >/etc/nginx/http.d/default.conf && nginx -t 2>/dev/null && \
+     echo alpine: nginx and redis installed from the local mirror";
+
+/// The server cell: nginx and redis until the client cell is done (and,
+/// with `$1` = 1, until the host has fetched a page through the published
+/// port), then a clean shutdown of both.
+const NET_SERVER: &str = "nginx -g 'daemon off; master_process off;' & n=$!; \
+     redis-server --port 6379 --save '' --appendonly no --protected-mode no >/tmp/redis.log 2>&1 & r=$!; \
+     while [ ! -e /tmp/ichor-net-done ]; do sleep 0.1; done; \
+     if [ \"$1\" = 1 ]; then \
+       i=0; until grep -q '^10.0.2.2 ' /var/log/nginx/access.log 2>/dev/null; do \
+         i=$((i+1)); [ $i -gt 1200 ] && { echo alpine: the host never fetched; \
+           tail -5 /var/log/nginx/access.log; tail -20 /var/log/nginx/error.log; kill $n $r; wait; exit 1; }; sleep 0.1; done; \
+       echo alpine: nginx served the host through the published port; fi; \
+     kill $n $r; wait $n; a=$?; wait $r; b=$?; \
+     [ $a = 0 ] || [ $a = 143 ]; [ $b = 0 ] || [ $b = 143 ] || { cat /tmp/redis.log; exit 1; }; \
+     echo alpine: nginx and redis stopped";
+
+/// The client cell: `$1` is the server cell's address.
+const NET_CLIENT: &str = "trap 'touch /tmp/ichor-net-done' EXIT; s=$1; \
+     i=0; until wget -qO /tmp/page http://$s/ 2>/dev/null; do \
+       i=$((i+1)); [ $i -gt 600 ] && { echo alpine: nginx never answered; exit 1; }; sleep 0.1; done; \
+     grep -q 'hello from nginx in an Ichor cell' /tmp/page || { echo alpine: wrong page; exit 1; }; \
+     for k in 1 2 3 4 5; do wget -qO /tmp/page http://$s/ 2>/dev/null && \
+       grep -q 'hello from nginx' /tmp/page || { echo alpine: request $k after the first failed; exit 1; }; done; \
+     wget -q -O /dev/null http://$s/missing 2>/dev/null && { echo alpine: no 404; exit 1; }; \
+     i=0; until [ \"$(redis-cli -h $s ping 2>/dev/null)\" = PONG ]; do \
+       i=$((i+1)); [ $i -gt 600 ] && { echo alpine: redis never answered; exit 1; }; sleep 0.1; done; \
+     redis-cli -h $s set greeting hello >/dev/null && [ \"$(redis-cli -h $s get greeting)\" = hello ] && \
+     [ \"$(redis-cli -h $s incrby n 41)\" = 41 ] && [ \"$(redis-cli -h $s incr n)\" = 42 ] && \
+     [ \"$(redis-cli -h $s rpush l a b c)\" = 3 ] && [ \"$(redis-cli -h $s lrange l 0 -1 | tr '\\n' ,)\" = a,b,c, ] || \
+       { echo alpine: redis commands failed; exit 1; }; \
+     redis-benchmark -h $s -q -n 1000 -c 4 -t set,get 2>&1 | tr '\\r' '\\n' | grep 'requests per second' | \
+       sed 's/^/alpine: redis-benchmark: /'; \
+     echo \"alpine: nginx served six pages and redis answered from cell $s\"";
+
 fn read(vfs: &Vfs, path: &str) -> Vec<u8> {
     let mut fs = vfs.lock();
     let ino = fs
@@ -209,5 +253,83 @@ pub(crate) fn run(vfs: &Arc<Vfs>) {
         }
         println!("ichor: alpine: {} ok ({syscalls} syscalls)", argv[0]);
     }
+    servers(vfs, &busybox, &interp);
     println!("ichor: alpine: all runs passed");
+}
+
+/// Milestone 5: nginx and redis serve traffic from a cell to another cell
+/// through the cell switch, and nginx to the host through a published port
+/// when the harness forwards one (`net_publish`).
+fn servers(vfs: &Arc<Vfs>, busybox: &[u8], interp: &[u8]) {
+    const SERVER_PAGES: u64 = 32768;
+    let system = System::new(SERVER_PAGES * 3).unwrap_or_else(|| fail("no system cell"));
+    let new_cell =
+        || Cell::new(&system.root_account, SERVER_PAGES).unwrap_or_else(|| fail("no server cell"));
+    let sh = |cell: Arc<Cell>, args: &[&str]| -> i32 {
+        let p = LinuxProcess::new(cell, vfs.clone()).unwrap_or_else(|| fail("no process"));
+        let mut argv: Vec<&str> = alloc::vec!["sh", "-c"];
+        argv.extend_from_slice(args);
+        run_linux(p, busybox, Some(interp), &argv).0
+    };
+    if sh(new_cell(), &[NET_INSTALL]) != 0 {
+        fail("alpine: installing nginx and redis");
+    }
+    let (server, client) = (new_cell(), new_cell());
+    let server_id = server.id();
+    let Some(addr) = crate::netstack::stack_for(server_id).addr() else {
+        fail("alpine: the server cell has no address");
+    };
+    let publish = crate::nettest::publish_port();
+    let published = publish != 0
+        && crate::switch::has_uplink()
+        && crate::switch::publish(net::wire::PROTO_TCP, publish, server.id(), 80);
+    let done = Arc::new(SpinLock::new(None));
+    {
+        let (vfs, busybox, interp, slot) =
+            (vfs.clone(), busybox.to_vec(), interp.to_vec(), done.clone());
+        let flag = if published { "1" } else { "0" };
+        TaskOptions::new(move || {
+            let p = LinuxProcess::new(server, vfs).unwrap_or_else(|| fail("no process"));
+            let code = run_linux(
+                p,
+                &busybox,
+                Some(&interp),
+                &["sh", "-c", NET_SERVER, "sh", flag],
+            )
+            .0;
+            *slot.lock() = Some(code);
+        })
+        .spawn()
+        .unwrap_or_else(|| fail("alpine: no task for the server cell"));
+    }
+    let a = alloc::format!("{addr}");
+    if sh(client, &[NET_CLIENT, "sh", &a]) != 0 {
+        fail("alpine: the client cell");
+    }
+    let diag = || {
+        let s = crate::switch::stats(server_id);
+        let u = crate::switch::uplink_stats();
+        println!(
+            "ichor: alpine: server cell switch stats (sent, received, dropped) {s:?}; uplink {u:?}"
+        );
+    };
+    // The script bounds its own waits; this only catches a hang.
+    let deadline = frame::time::now() + Duration::from_secs(600);
+    let code = loop {
+        if let Some(c) = *done.lock() {
+            break c;
+        }
+        if frame::time::now() > deadline {
+            diag();
+            fail("alpine: the server cell never stopped");
+        }
+        frame::task::yield_now();
+    };
+    if published {
+        crate::switch::unpublish(net::wire::PROTO_TCP, publish);
+    }
+    if code != 0 {
+        diag();
+        fail("alpine: the server cell");
+    }
 }

@@ -375,8 +375,11 @@ impl Tcp {
         for (o, b) in out.iter_mut().zip(self.recv_buf.drain(..n)) {
             *o = b;
         }
-        // A window that opens from zero is announced.
-        if was_closed_window && n > 0 {
+        // A window that opens from zero is announced, unless the peer has
+        // finished sending (as Linux, after RCV_SHUTDOWN): nothing more
+        // will come, and the peer may already be gone, so the update would
+        // only draw a RST.
+        if was_closed_window && n > 0 && !self.peer_fin {
             self.ack_now = true;
             self.output(now);
         }
@@ -616,6 +619,9 @@ impl Tcp {
         let in_window = |s: u32| le(self.rcv_nxt, s) && lt(s, self.rcv_nxt.wrapping_add(wnd));
         let acceptable = match (len, wnd) {
             (0, 0) => seg.seq == self.rcv_nxt,
+            // A bare FIN at rcv_nxt needs no window (Linux takes it too),
+            // so a reader with a full buffer still learns of the end.
+            (_, 0) if seg.payload.is_empty() && seg.flags & FIN != 0 => seg.seq == self.rcv_nxt,
             (0, _) => in_window(start),
             (_, 0) => false,
             _ => in_window(start) || in_window(end),
@@ -628,7 +634,13 @@ impl Tcp {
         }
         // 2. RST: exact match resets, otherwise a challenge ACK (RFC 5961).
         if seg.flags & RST != 0 {
-            if seg.seq == self.rcv_nxt {
+            if seg.seq == self.rcv_nxt && self.state == State::TimeWait {
+                // Both sides have finished: the connection ends early, and
+                // the reader still sees its data and EOF, as on Linux,
+                // where TIME_WAIT is no longer the application's socket.
+                self.state = State::Closed;
+                self.time_wait_until = None;
+            } else if seg.seq == self.rcv_nxt {
                 let e = if self.state == State::SynReceived {
                     Error::Refused
                 } else {
@@ -1233,6 +1245,71 @@ mod tests {
             }
         }
         assert_eq!(got, data);
+    }
+
+    /// A slow reader whose buffer is full still takes the peer's FIN, and
+    /// draining the buffer afterwards sends nothing: the peer may already
+    /// be gone, and an update would only draw its stack's RST.
+    #[test]
+    fn a_full_reader_takes_the_fin_and_sends_no_late_window_update() {
+        let mut sim = Sim::new(0, 0, 17, 5);
+        for _ in 0..10 {
+            sim.step();
+        }
+        let data = pattern(BUFFER, 6);
+        let (mut sent, mut closed) = (0, false);
+        for _ in 0..200_000 {
+            let now = sim.now;
+            sent += sim.a.send(&data[sent..], now);
+            if sent == data.len() && !closed {
+                sim.a.close(now);
+                closed = true;
+            }
+            if sim.b.as_ref().unwrap().peer_closed() || !sim.step() {
+                break;
+            }
+        }
+        let now = sim.now;
+        let b = sim.b.as_mut().unwrap();
+        assert!(b.peer_closed(), "the FIN was not taken");
+        assert_eq!(b.readable(), BUFFER);
+        while b.transmit().is_some() {}
+        let mut buf = vec![0u8; 4096];
+        assert_eq!(b.recv(&mut buf, now), 4096);
+        assert!(b.transmit().is_none(), "a window update after the FIN");
+        assert_eq!(&buf[..], &data[..4096]);
+    }
+
+    /// A RST that ends TIME_WAIT is no error: both sides had finished.
+    #[test]
+    fn a_rst_in_time_wait_ends_it_quietly() {
+        let mut sim = Sim::new(0, 0, 13, 3);
+        for _ in 0..10 {
+            sim.step();
+        }
+        let now = sim.now;
+        sim.a.close(now);
+        for _ in 0..100 {
+            if sim.b.as_ref().unwrap().peer_closed() && sim.a.state() == State::FinWait2 {
+                break;
+            }
+            sim.step();
+        }
+        let now = sim.now;
+        sim.b.as_mut().unwrap().close(now);
+        for _ in 0..100 {
+            if sim.a.state() == State::TimeWait {
+                break;
+            }
+            sim.step();
+        }
+        assert_eq!(sim.a.state(), State::TimeWait);
+        let rst = segment(B, A, sim.a.rcv_nxt, 0, RST, 0, None, &[]);
+        let now = sim.now;
+        sim.a
+            .on_segment(&Segment::parse(&rst, B.0, A.0).unwrap(), now);
+        assert!(sim.a.is_closed());
+        assert_eq!(sim.a.error(), None);
     }
 
     #[test]

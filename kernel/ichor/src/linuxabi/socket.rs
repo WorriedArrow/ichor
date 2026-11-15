@@ -50,9 +50,16 @@ const SO_RCVTIMEO: u64 = 20;
 const SO_SNDTIMEO: u64 = 21;
 const SO_ACCEPTCONN: u64 = 30;
 const TCP_NODELAY: u64 = 1;
+/// nginx corks around `sendfile` (`TCP_NOPUSH`); our TCP sends what it
+/// has at once, so corking is recorded and changes nothing.
+const TCP_CORK: u64 = 3;
 const TCP_KEEPIDLE: u64 = 4;
 const TCP_KEEPINTVL: u64 = 5;
 const TCP_KEEPCNT: u64 = 6;
+const TCP_DEFER_ACCEPT: u64 = 9;
+const TCP_QUICKACK: u64 = 12;
+const TCP_USER_TIMEOUT: u64 = 18;
+const TCP_FASTOPEN: u64 = 23;
 
 const MSG_PEEK: u64 = 0x2;
 const MSG_DONTWAIT: u64 = 0x40;
@@ -351,7 +358,15 @@ fn known_option(level: u64, name: u64) -> bool {
         ),
         IPPROTO_TCP => matches!(
             name,
-            TCP_NODELAY | TCP_KEEPIDLE | TCP_KEEPINTVL | TCP_KEEPCNT
+            TCP_NODELAY
+                | TCP_CORK
+                | TCP_KEEPIDLE
+                | TCP_KEEPINTVL
+                | TCP_KEEPCNT
+                | TCP_DEFER_ACCEPT
+                | TCP_QUICKACK
+                | TCP_USER_TIMEOUT
+                | TCP_FASTOPEN
         ),
         _ => false,
     }

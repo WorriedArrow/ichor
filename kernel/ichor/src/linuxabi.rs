@@ -12,6 +12,8 @@ mod exec;
 mod fs;
 pub(crate) mod socket;
 
+use core::time::Duration;
+
 use crate::process::{Fd, LinuxProcess};
 use crate::umem;
 use crate::{proc, signal};
@@ -53,6 +55,9 @@ mod nr {
     pub(super) const MADVISE: u64 = 28; // partial: DONTNEED on the loaded image's own segments zero-fills
     pub(super) const PAUSE: u64 = 34;
     pub(super) const NANOSLEEP: u64 = 35;
+    pub(super) const GETITIMER: u64 = 36; // partial: ITIMER_REAL only
+    pub(super) const ALARM: u64 = 37;
+    pub(super) const SETITIMER: u64 = 38; // partial: ITIMER_REAL only
     pub(super) const DUP: u64 = 32;
     pub(super) const DUP2: u64 = 33;
     pub(super) const GETPID: u64 = 39;
@@ -184,6 +189,7 @@ mod nr {
 
 const EPERM: i64 = 1;
 const EBADF: i64 = 9;
+const ENOMEM: i64 = 12;
 const EACCES: i64 = 13;
 const EFAULT: i64 = 14;
 const ENODEV: i64 = 19;
@@ -362,6 +368,9 @@ pub(crate) fn dispatch(p: &mut LinuxProcess, ctx: &mut frame::user::UserContext)
         nr::RT_SIGSUSPEND => signal::sigsuspend(p, a[0], a[1]),
         nr::PAUSE => signal::pause(p),
         nr::NANOSLEEP => signal::nanosleep(p, a[0], a[1]),
+        nr::GETITIMER => getitimer(p, a[0], a[1]),
+        nr::ALARM => alarm(p, a[0]),
+        nr::SETITIMER => setitimer(p, a[0], a[1], a[2]),
         nr::CLOCK_NANOSLEEP if a[1] == 0 => signal::nanosleep(p, a[2], a[3]),
         nr::CLOCK_NANOSLEEP => Err(EINVAL), // TIMER_ABSTIME
         nr::KILL => signal::kill(p, i(a[0]), a[1]),
@@ -1104,8 +1113,10 @@ fn prlimit(p: &mut LinuxProcess, pid: u64, resource: u64, new: u64, old: u64) ->
         if soft > hard {
             return Err(EINVAL);
         }
-        // The descriptor table holds MAX_FDS entries.
-        if r == RLIMIT_NOFILE && hard > MAX_FDS as u64 {
+        // Raising a hard limit needs CAP_SYS_RESOURCE, which is outside
+        // the cell bounding set (ADR-0009 §3), as in Docker's default; and
+        // the descriptor table holds MAX_FDS entries.
+        if hard > max || (r == RLIMIT_NOFILE && hard > MAX_FDS as u64) {
             return Err(EPERM);
         }
         p.group.set_limit(r, soft, hard);
@@ -1114,6 +1125,86 @@ fn prlimit(p: &mut LinuxProcess, pid: u64, resource: u64, new: u64, old: u64) ->
         put_pair(p, old, cur, max)?;
     }
     Ok(0)
+}
+
+const ITIMER_REAL: u64 = 0;
+
+/// A user `struct itimerval` (interval, then value; `timeval`s).
+fn put_itimerval(
+    p: &mut LinuxProcess,
+    at: u64,
+    (value, interval): (Duration, Duration),
+) -> Result<(), i64> {
+    let mut b = [0u8; 32];
+    for (i, d) in [interval, value].into_iter().enumerate() {
+        b[i * 16..i * 16 + 8].copy_from_slice(&d.as_secs().to_le_bytes());
+        b[i * 16 + 8..i * 16 + 16].copy_from_slice(&u64::from(d.subsec_micros()).to_le_bytes());
+    }
+    if p.copy_to_user(at, &b) != 32 {
+        return Err(EFAULT);
+    }
+    Ok(())
+}
+
+/// Only the real-time timer exists: `ITIMER_VIRTUAL` and `ITIMER_PROF`
+/// (CPU time) are `EINVAL` (partial).
+fn which_real(which: u64) -> Result<(), i64> {
+    if which == ITIMER_REAL {
+        Ok(())
+    } else {
+        Err(EINVAL)
+    }
+}
+
+/// `getitimer(which, curr)`.
+fn getitimer(p: &mut LinuxProcess, which: u64, curr: u64) -> Result<u64, i64> {
+    which_real(which)?;
+    let v = crate::itimer::get(p.cell.id(), p.group.tgid);
+    put_itimerval(p, curr, v).map(|()| 0)
+}
+
+/// `setitimer(which, new, old)`: arms `ITIMER_REAL` (`SIGALRM`).
+fn setitimer(p: &mut LinuxProcess, which: u64, new: u64, old: u64) -> Result<u64, i64> {
+    which_real(which)?;
+    let mut b = [0u8; 32];
+    if new != 0 && p.copy_from_user(new, &mut b) != 32 {
+        return Err(EFAULT);
+    }
+    let tv = |at: usize| -> Result<Duration, i64> {
+        let s = i64::from_le_bytes(b[at..at + 8].try_into().unwrap_or([0; 8]));
+        let us = i64::from_le_bytes(b[at + 8..at + 16].try_into().unwrap_or([0; 8]));
+        if s < 0 || !(0..1_000_000).contains(&us) {
+            return Err(EINVAL);
+        }
+        Ok(Duration::new(s as u64, us as u32 * 1000))
+    };
+    let (interval, value) = (tv(0)?, tv(16)?);
+    let prev = if new == 0 {
+        crate::itimer::get(p.cell.id(), p.group.tgid)
+    } else {
+        crate::itimer::set(p.cell.id(), p.group.tgid, value, interval).ok_or(ENOMEM)?
+    };
+    if old != 0 {
+        put_itimerval(p, old, prev)?;
+    }
+    Ok(0)
+}
+
+/// `alarm(seconds)`: a one-shot `ITIMER_REAL`; returns the seconds the
+/// previous alarm had left, rounded as Linux does.
+fn alarm(p: &mut LinuxProcess, secs: u64) -> Result<u64, i64> {
+    let secs = secs & 0xffff_ffff;
+    let (left, _) = crate::itimer::set(
+        p.cell.id(),
+        p.group.tgid,
+        Duration::from_secs(secs),
+        Duration::ZERO,
+    )
+    .ok_or(ENOMEM)?;
+    if left.is_zero() {
+        return Ok(0);
+    }
+    Ok((left.as_secs() + u64::from(left.subsec_micros() >= 500_000)).max(1))
 }
 
 /// One past the highest user address (the top of the lower canonical half).

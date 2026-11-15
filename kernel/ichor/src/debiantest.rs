@@ -169,6 +169,41 @@ close $nb; close $b; close $l;
 print "debian: sockets: refused, EADDRINUSE, 1 MiB each way, half-close, non-blocking connect and accept work\n";
 "#;
 
+/// Interval timers: `alarm` interrupts a sleep with SIGALRM and reports
+/// what is left; a periodic `setitimer` (raw syscalls 36/38) keeps firing
+/// and `getitimer` reads it back; disarming stops it.
+const TIMER_SCRIPT: &str = r#"use strict; use warnings;
+sub fail { print "debian: timers FAILED: @_\n"; exit 1 }
+my $n = 0;
+$SIG{ALRM} = sub { $n++ };
+alarm(1) == 0 or fail("alarm was armed");
+my $t0 = time;
+select(undef, undef, undef, 10);
+$n == 1 or fail("SIGALRM count $n");
+time - $t0 < 5 or fail("the sleep was not interrupted");
+alarm(30);
+my $left = alarm(0);
+$left >= 29 && $left <= 30 or fail("alarm left $left");
+my $it = pack("q4", 0, 200000, 0, 200000);
+my $none = pack("q4", 0, 0, 0, 0);
+my $zero = 0;
+syscall(38, $zero, $it, $zero) == 0 or fail("setitimer: $!");
+my $cur = pack("q4", 0, 0, 0, 0);
+syscall(36, $zero, $cur) == 0 or fail("getitimer: $!");
+my @c = unpack("q4", $cur);
+$c[0] == 0 && $c[1] == 200000 && $c[2] == 0 && $c[3] > 0 && $c[3] <= 200000 or fail("getitimer: @c");
+$n = 0;
+my $end = time + 20;
+select(undef, undef, undef, 0.5) while $n < 3 && time < $end;
+$n >= 3 or fail("periodic timer fired $n times");
+syscall(38, $zero, $none, $zero) == 0 or fail("disarm: $!");
+$n = 0;
+select(undef, undef, undef, 0.6);
+$n == 0 or fail("disarmed timer fired");
+syscall(38, 1, $it, $zero) == -1 && $!{EINVAL} or fail("ITIMER_VIRTUAL accepted");
+print "debian: alarm and setitimer deliver SIGALRM, getitimer reads back\n";
+"#;
+
 /// The server cell of the cross-cell run: `ME PEER PORT`. Accepts one
 /// connection on `PORT`, checks both ends' addresses, reads to EOF and
 /// answers with the peer's address and the byte count.
@@ -309,6 +344,7 @@ const RUNS: &[(&[&str], i32)] = &[
     (&["perl", "-e", PTY_SCRIPT], 0),
     // TCP sockets on the cell's own stack (loopback).
     (&["perl", "-e", SOCKET_SCRIPT], 0),
+    (&["perl", "-e", TIMER_SCRIPT], 0),
     (
         &[
             "dash",

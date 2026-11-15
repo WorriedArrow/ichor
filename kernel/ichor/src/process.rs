@@ -25,8 +25,12 @@ use crate::signal::{Actions, Signals};
 use crate::umem::Mm;
 use crate::vfs::{Ino, ROOT, Vfs};
 
-/// Most descriptors a process may hold (Linux's default `RLIMIT_NOFILE`).
-pub(crate) const MAX_FDS: usize = 1024;
+/// Most descriptors a process may hold: the hard `RLIMIT_NOFILE` ceiling.
+/// The table grows on demand, so servers that raise their soft limit
+/// (redis asks for 10,032) pay only for the descriptors they open.
+pub(crate) const MAX_FDS: usize = 65536;
+/// The default soft `RLIMIT_NOFILE` (Linux's).
+pub(crate) const DEFAULT_NOFILE: u64 = 1024;
 
 /// An open file on the root.
 ///
@@ -230,7 +234,7 @@ pub(crate) type Limits = [(u64, u64); RLIM_NLIMITS];
 fn default_limits() -> Limits {
     let mut l = [(RLIM_INFINITY, RLIM_INFINITY); RLIM_NLIMITS];
     l[RLIMIT_STACK] = (8 << 20, RLIM_INFINITY);
-    l[RLIMIT_NOFILE] = (MAX_FDS as u64, MAX_FDS as u64);
+    l[RLIMIT_NOFILE] = (DEFAULT_NOFILE, MAX_FDS as u64);
     l
 }
 
@@ -349,6 +353,7 @@ impl Drop for Group {
             v.release();
         }
         crate::locks::release_owner(crate::locks::Owner::Proc(self.tgid));
+        crate::itimer::clear(self.leader.cell, self.tgid);
         self.vfs.lock().close(cwd);
     }
 }
@@ -543,6 +548,15 @@ impl LinuxProcess {
         let files = self.group.files.lock();
         let slot = files.fds.get(usize::try_from(fd).ok()?)?.as_ref()?;
         Some(slot.desc.clone())
+    }
+
+    /// The open descriptor numbers, ascending.
+    pub(crate) fn open_fds(&self) -> Vec<u64> {
+        let files = self.group.files.lock();
+        (0u64..)
+            .zip(files.fds.iter())
+            .filter_map(|(n, s)| s.as_ref().map(|_| n))
+            .collect()
     }
 
     /// A snapshot of what descriptor `fd` names, if open.

@@ -24,6 +24,7 @@ use net::Ipv4Addr;
 use net::iface::{Interface, Packet};
 use net::nat::{self, Nat};
 use net::switch::{PortId, Switch, Verdict};
+use net::tcp;
 use net::wire::{PROTO_TCP, PROTO_UDP};
 
 use crate::netstack::Stack;
@@ -48,6 +49,34 @@ struct Uplink {
 
 static TABLE: SpinLock<Option<Table>> = SpinLock::new(None);
 static UPLINK: SpinLock<Option<Uplink>> = SpinLock::new(None);
+
+/// What the uplink has done with inbound traffic, for diagnostics.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct UplinkStats {
+    /// Frames the device received.
+    pub(crate) frames: u64,
+    /// IP packets translated and handed to a cell.
+    pub(crate) delivered: u64,
+    /// Connection requests refused (nothing published on the port).
+    pub(crate) refused: u64,
+    /// Other packets no mapping claimed (dropped).
+    pub(crate) unmapped: u64,
+    /// Packets cells sent out through NAT.
+    pub(crate) sent: u64,
+}
+
+static UPLINK_STATS: SpinLock<UplinkStats> = SpinLock::new(UplinkStats {
+    frames: 0,
+    delivered: 0,
+    refused: 0,
+    unmapped: 0,
+    sent: 0,
+});
+
+/// The uplink's counters.
+pub(crate) fn uplink_stats() -> UplinkStats {
+    *UPLINK_STATS.lock()
+}
 
 fn now() -> Duration {
     frame::time::now()
@@ -203,6 +232,7 @@ fn uplink_out(mut p: Packet) {
     while let Some(frame) = u.ifc.transmit() {
         u.dev.transmit(&frame);
     }
+    UPLINK_STATS.lock().sent += 1;
 }
 
 /// Moves the uplink's traffic: transmits what is queued, receives frames,
@@ -211,6 +241,7 @@ fn uplink_out(mut p: Packet) {
 pub(crate) fn poll_uplink() -> bool {
     let mut inbound: Vec<(PortId, Packet)> = Vec::new();
     let mut any = false;
+    let mut st = UplinkStats::default();
     {
         let mut u = UPLINK.lock();
         let Some(u) = u.as_mut() else {
@@ -227,6 +258,7 @@ pub(crate) fn poll_uplink() -> bool {
                 break;
             };
             any = true;
+            st.frames += 1;
             let Some(mut p) = u.ifc.receive(t, &frame) else {
                 continue;
             };
@@ -235,6 +267,28 @@ pub(crate) fn poll_uplink() -> bool {
             };
             let f = flags(p.protocol, &p.payload);
             let Some(inside) = u.nat.inbound(p.protocol, (p.src, sp), dp, f, t) else {
+                // A connection request for a port nothing is published
+                // on: refuse it, as a closed port does.
+                if p.protocol == PROTO_TCP
+                    && f & (tcp::SYN | tcp::ACK | tcp::RST) == tcp::SYN
+                    && let Some(seg) = tcp::Segment::parse(&p.payload, p.src, p.dst)
+                {
+                    let ack = seg.seq.wrapping_add(seg.len());
+                    let rst = tcp::segment(
+                        (p.dst, dp),
+                        (p.src, sp),
+                        0,
+                        ack,
+                        tcp::RST | tcp::ACK,
+                        0,
+                        None,
+                        &[],
+                    );
+                    u.ifc.send(t, p.src, PROTO_TCP, &rst);
+                    st.refused += 1;
+                } else {
+                    st.unmapped += 1;
+                }
                 continue;
             };
             if !nat::rewrite(p.protocol, &mut p.payload, (p.src, sp), inside) {
@@ -253,6 +307,14 @@ pub(crate) fn poll_uplink() -> bool {
         while let Some(frame) = u.ifc.transmit() {
             u.dev.transmit(&frame);
         }
+    }
+    if any {
+        st.delivered = inbound.len() as u64;
+        let mut s = UPLINK_STATS.lock();
+        s.frames += st.frames;
+        s.delivered += st.delivered;
+        s.refused += st.refused;
+        s.unmapped += st.unmapped;
     }
     for (id, p) in inbound {
         let stack = with_table(|t| t.stacks.get(&id).and_then(Weak::upgrade));

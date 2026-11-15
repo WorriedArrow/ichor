@@ -31,8 +31,27 @@ uplink; virtio-net first (polled).
   `SOCK_STREAM` sockets as poll/epoll-able objects (socket, bind, listen,
   accept4, connect incl. non-blocking, send*/recv*, shutdown,
   get/setsockopt, getsockname/getpeername, SIGPIPE). Debian's perl runs a
-  socket session on every boot. Next: the cell switch, NAT and published
-  ports at the uplink, then nginx and redis.
+  socket session on every boot. `switch.rs` + `net::switch`/`net::nat`:
+  the cell switch (assigned 10.88.0.0/16 addresses, anti-spoofing, the
+  cross-cell fast path), source NAT and published ports at the uplink; a
+  SYN for an unpublished uplink port gets RST.
+- M5 workloads (`alpinetest::servers`): Alpine's own nginx 1.26 and redis
+  7.2 (pinned packages in the Alpine mirror) run in a server cell; a client
+  cell checks them with wget, redis-cli and redis-benchmark through the
+  switch, and with `net_publish` the host fetches from nginx through the
+  published port (`a_published_port_serves_the_host_from_a_cell`). nginx
+  runs with `master_process off` until `AF_UNIX`/socketpair lands. Needed
+  on the way: TCP_CORK and friends (recorded), `setitimer`/`getitimer`/
+  `alarm` (`itimer.rs`, ITIMER_REAL), a 65,536-entry descriptor ceiling
+  (soft 1024; raising a hard limit is EPERM, CAP_SYS_RESOURCE being outside
+  the cell bounding set), Linux's epoll maxevents bound, and
+  `/proc/sys/net/core/somaxconn`. Load exposed three Linux behaviors we
+  lacked: epoll entries now name their open file description weakly and
+  vanish when it closes (nginx never DELs before `close`; a reused fd
+  number was EEXIST and closed sockets stayed alive); TCP takes a bare FIN
+  against a zero window, sends no window update after the peer's FIN, and
+  ends TIME_WAIT quietly on a RST; the NAT lets a SYN reopen a finished
+  mapping. Next: UDP, `AF_UNIX`, socket buffers charged to the cell.
 
 Milestones 0-4 are done (4's acceptance test: Debian's `apt-get install`
 from a local mirror). Phase E (scalability) is done except the vDSO and
@@ -361,7 +380,10 @@ Useful options: `--release`, `--accel auto|kvm|whpx|hvf|tcg`, `--smp N`,
 qemu args>`.
 
 Environment overrides: `ICHOR_QEMU`, `ICHOR_OVMF_CODE` + `ICHOR_OVMF_VARS`,
-`ICHOR_ACCEL`, `ICHOR_TEST_VERBOSE=1` (echo guest serial during tests), and
+`ICHOR_ACCEL`, `ICHOR_TEST_VERBOSE=1` (echo guest serial during tests),
+`ICHOR_TEST_CMDLINE` (extra kernel options for every test boot, e.g.
+`trace_errors` while chasing a flaky test; load the host with busy loops
+to reproduce timing bugs: 11 parallel QEMUs on TCG are slow), and
 `ICHOR_REQUIRE_KVM=1` (CI sets it: `cargo xtask test` fails unless KVM is
 the accelerator).
 

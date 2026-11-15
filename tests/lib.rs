@@ -19,9 +19,10 @@ pub use xtask::qemu::RunConfig;
 use xtask::qemu::run;
 pub use xtask::qemu::{Exit, Outcome};
 
-/// Generous enough for OVMF under TCG on a slow CI machine. Under KVM a boot
-/// takes about a second.
-pub const BOOT_TIMEOUT: Duration = Duration::from_secs(120);
+/// Generous enough for a full boot (apt-get, nginx and redis in cells)
+/// under TCG while every boot test runs at once on one machine; under KVM a
+/// boot takes seconds. A hang costs this long before it is reported.
+pub const BOOT_TIMEOUT: Duration = Duration::from_secs(300);
 
 fn kernel() -> PathBuf {
     static KERNEL: OnceLock<PathBuf> = OnceLock::new();
@@ -81,7 +82,10 @@ pub fn boot_with(
     tweak: impl FnOnce(&mut RunConfig),
 ) -> Outcome {
     let mut cfg = RunConfig::new(format!("test-{name}"), kernel());
-    cfg.cmdline = format!("qemu_debug_exit {cmdline}");
+    // ICHOR_TEST_CMDLINE adds kernel options to every test boot (say,
+    // `trace_pid=N` while chasing a flaky test).
+    let extra = std::env::var("ICHOR_TEST_CMDLINE").unwrap_or_default();
+    cfg.cmdline = format!("qemu_debug_exit {cmdline} {extra}");
     cfg.smp = smp;
     cfg.capture = true;
     cfg.timeout = Some(BOOT_TIMEOUT);

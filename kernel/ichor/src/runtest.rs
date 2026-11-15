@@ -124,8 +124,19 @@ pub(crate) fn run_linux(
         }
         frame::task::yield_now();
     };
-    let cached = cache_ns.map_or(0, |ns| crate::pagecache::private_pages(ns) as u64);
+    // Orphans the program left (killed, or exiting on their own) may still
+    // be on their way out: give the cell's other processes time to go.
+    let deadline = frame::time::now() + core::time::Duration::from_secs(30);
+    let cached = loop {
+        let cached = cache_ns.map_or(0, |ns| crate::pagecache::private_pages(ns) as u64);
+        if cell.account().used() == cached || frame::time::now() > deadline {
+            break cached;
+        }
+        frame::task::yield_now();
+    };
     if cell.account().used() != cached {
+        let (threads, procs, _) = proc::census(cell.id());
+        println!("ichor: runtest: {procs} processes ({threads} threads) still live in the cell");
         println!(
             "ichor: runtest: {} pages still charged ({cached} private cache pages)",
             cell.account().used()
@@ -911,8 +922,8 @@ fn limits_program() -> Vec<u8> {
     a.mov_imm(Reg::Rsi, 7);
     a.sys(sys::DUP2);
     expect(&mut a, 6, -9);
-    // 7: a hard limit past the table: EPERM.
-    pair(&mut a, 5, 4096);
+    // 7: a hard limit past the table (MAX_FDS, 65,536): EPERM.
+    pair(&mut a, 5, 1 << 20);
     prlimit(&mut a, 0, -1);
     expect(&mut a, 7, -1);
     // 8-9: stack_t at rbp+64: too small is ENOMEM, then 64 KiB 1 MiB down.
