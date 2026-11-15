@@ -60,6 +60,30 @@ pub struct UserContext {
     rflags: u64,      // 136
     pub fs_base: u64, // 144
     pub gs_base: u64, // 152
+    /// x87/SSE state (FXSAVE format), saved and restored around ring 3.
+    fpu: FpuState, // 160 (after padding to 16)
+}
+
+/// A thread's x87/SSE register file in FXSAVE format. Only created in the
+/// reset state ([`Default`]) or by `fxsave`, so `fxrstor` of it can never
+/// fault on reserved MXCSR bits.
+#[repr(C, align(16))]
+#[derive(Clone, Copy)]
+struct FpuState([u8; 512]);
+
+impl Default for FpuState {
+    fn default() -> Self {
+        let mut s = [0u8; 512];
+        s[0..2].copy_from_slice(&0x037fu16.to_le_bytes()); // FCW: all masked
+        s[24..28].copy_from_slice(&0x1f80u32.to_le_bytes()); // MXCSR: all masked
+        FpuState(s)
+    }
+}
+
+impl core::fmt::Debug for FpuState {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("FpuState")
+    }
 }
 
 impl UserContext {
@@ -160,10 +184,21 @@ impl<'a> UserMode<'a> {
         // SAFETY: FS base holds a user TLS pointer; it never affects kernel
         // memory safety.
         unsafe { wrmsr(regs::MSR_FS_BASE, self.ctx.fs_base) };
+        // SAFETY: `fpu` is a 16-byte-aligned 512-byte FXSAVE area holding
+        // the reset state or an earlier `fxsave`, so it is valid to load.
+        unsafe {
+            core::arch::asm!("fxrstor64 [{}]", in(reg) &raw const self.ctx.fpu, options(nostack, readonly, preserves_flags));
+        };
         // SAFETY: entry builds a ring-3 `iretq` frame from `ctx` and returns
         // here when the thread traps (the stubs load this kernel stack back).
         // The guard keeps us on this CPU across the round trip.
         unsafe { ichor_enter_user(core::ptr::from_mut(self.ctx)) };
+        // SAFETY: stores the thread's x87/SSE state into its own aligned
+        // 512-byte area before any other thread can run on this CPU (the
+        // guard above keeps interrupts off; the kernel never uses the FPU).
+        unsafe {
+            core::arch::asm!("fxsave64 [{}]", in(reg) &raw mut self.ctx.fpu, options(nostack, preserves_flags));
+        };
         let info = block.event_info.load(Relaxed);
         match block.event_kind.load(Relaxed) {
             1 => UserEvent::Syscall,

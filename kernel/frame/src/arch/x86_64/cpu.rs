@@ -70,13 +70,21 @@ pub(crate) fn enable_nx() -> bool {
 
 /// Turns on the protections frame relies on once it runs on its own page
 /// tables: WP (read-only kernel pages are read-only to the kernel too),
-/// global pages, SMEP, SMAP and UMIP where supported. Returns what is on.
+/// global pages, SMEP, SMAP and UMIP where supported. Also enables SSE for
+/// user code (every x86-64 CPU has it; the kernel itself is built
+/// soft-float and never touches the FPU, so user FPU state only needs
+/// saving at the ring-3 boundary). Runs on every CPU. Returns what is on.
 pub(crate) fn enable_protections() -> Features {
     let f = features();
     // SAFETY: setting WP makes supervisor writes honour read-only mappings.
     // Frame never writes through a read-only kernel mapping.
     unsafe { regs::write_cr0(regs::read_cr0() | regs::CR0_WP) };
-    let mut cr4 = regs::read_cr4();
+    // SAFETY: MP set and EM/TS clear make x87/SSE instructions execute
+    // instead of trapping (#NM/#UD); kernel code contains none.
+    unsafe {
+        regs::write_cr0((regs::read_cr0() | regs::CR0_MP) & !(regs::CR0_EM | regs::CR0_TS));
+    };
+    let mut cr4 = regs::read_cr4() | regs::CR4_OSFXSR | regs::CR4_OSXMMEXCPT;
     if f.pge {
         cr4 |= regs::CR4_PGE;
     }
