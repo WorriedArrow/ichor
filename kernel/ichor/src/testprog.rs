@@ -57,6 +57,8 @@ pub(crate) struct Asm {
     data: Vec<Vec<u8>>,
     /// (position of imm64, data index)
     data_refs: Vec<(usize, usize)>,
+    /// (position of imm64, label)
+    label_refs: Vec<(usize, usize)>,
 }
 
 impl Asm {
@@ -94,6 +96,13 @@ impl Asm {
         self.mov_imm(dst, 0);
         let pos = self.code.len() - 8;
         self.data_refs.push((pos, d.0));
+    }
+
+    /// `mov dst, <address of label>`
+    pub(crate) fn mov_label(&mut self, dst: Reg, l: Label) {
+        self.mov_imm(dst, 0);
+        let pos = self.code.len() - 8;
+        self.label_refs.push((pos, l.0));
     }
 
     /// `mov dst, src`
@@ -172,6 +181,21 @@ impl Asm {
         self.jump(&[0xE9], l);
     }
 
+    /// `jbe label` (unsigned <=)
+    pub(crate) fn jbe(&mut self, l: Label) {
+        self.jump(&[0x0F, 0x86], l);
+    }
+
+    /// `ja label` (unsigned >)
+    pub(crate) fn ja(&mut self, l: Label) {
+        self.jump(&[0x0F, 0x87], l);
+    }
+
+    /// `ret`
+    pub(crate) fn ret(&mut self) {
+        self.code.push(0xC3);
+    }
+
     pub(crate) fn syscall(&mut self) {
         self.code.extend_from_slice(&[0x0F, 0x05]);
     }
@@ -189,6 +213,10 @@ impl Asm {
             let target = self.labels[l]? as i64;
             let rel = (target - (pos as i64 + 4)) as i32;
             self.code[pos..pos + 4].copy_from_slice(&rel.to_le_bytes());
+        }
+        for &(pos, l) in &self.label_refs {
+            let addr = base + self.labels[l]? as u64;
+            self.code[pos..pos + 8].copy_from_slice(&addr.to_le_bytes());
         }
         let mut offsets = Vec::new();
         let mut at = self.code.len();

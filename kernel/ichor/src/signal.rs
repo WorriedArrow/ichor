@@ -35,6 +35,11 @@ const EFAULT: i64 = 14;
 const SIG_DFL: u64 = 0;
 const SIG_IGN: u64 = 1;
 const SA_RESTORER: u64 = 0x0400_0000;
+const SA_ONSTACK: u64 = 0x0800_0000;
+const SS_ONSTACK: u32 = 1;
+const SS_DISABLE: u32 = 2;
+const SS_AUTODISARM: u32 = 1 << 31;
+const MINSIGSTKSZ: u64 = 2048;
 const SA_RESTART: u64 = 0x1000_0000;
 const SA_NODEFER: u64 = 0x4000_0000;
 const SA_RESETHAND: u64 = 0x8000_0000;
@@ -78,6 +83,8 @@ pub(crate) struct Signals {
     pub(crate) mask: u64,
     /// The mask to restore after `rt_sigsuspend`'s handler.
     saved_mask: Option<u64>,
+    /// The alternate signal stack (`sigaltstack`): base and size.
+    alt: Option<(u64, u64)>,
 }
 
 impl Signals {
@@ -85,7 +92,18 @@ impl Signals {
         Signals {
             mask: 0,
             saved_mask: None,
+            alt: None,
         }
+    }
+
+    /// `execve` and new threads start without an alternate stack.
+    pub(crate) fn clear_alt_stack(&mut self) {
+        self.alt = None;
+    }
+
+    fn on_alt(&self, sp: u64) -> bool {
+        self.alt
+            .is_some_and(|(base, size)| sp > base && sp <= base + size)
     }
 }
 
@@ -413,7 +431,12 @@ fn setup_frame(
     if act.flags & SA_RESTORER == 0 {
         return Err(die); // x86-64 has no kernel-provided trampoline
     }
-    let fpstate = (ctx.rsp.wrapping_sub(REDZONE).wrapping_sub(512)) & !63;
+    // SA_ONSTACK handlers run on the alternate stack, unless already on it.
+    let top = match p.sig.alt {
+        Some((base, size)) if act.flags & SA_ONSTACK != 0 && !p.sig.on_alt(ctx.rsp) => base + size,
+        _ => ctx.rsp.wrapping_sub(REDZONE),
+    };
+    let fpstate = (top.wrapping_sub(512)) & !63;
     let sp = ((fpstate - FRAME_SIZE + 8) & !15) - 8; // rsp % 16 == 8 at entry
     let uc = sp + 8;
     let info = uc + UC_SIZE;
@@ -422,8 +445,14 @@ fn setup_frame(
     let mut f = alloc::vec![0u8; FRAME_SIZE as usize];
     f[0..8].copy_from_slice(&act.restorer.to_le_bytes());
     let u = 8usize;
-    // uc_stack: ss_sp = 0, ss_flags = SS_DISABLE, ss_size = 0.
-    f[u + 24..u + 28].copy_from_slice(&2u32.to_le_bytes());
+    // uc_stack: the alternate stack as it stood when the signal came.
+    let (ss_sp, ss_flags, ss_size) = match p.sig.alt {
+        None => (0, SS_DISABLE, 0),
+        Some((b, s)) => (b, if p.sig.on_alt(ctx.rsp) { SS_ONSTACK } else { 0 }, s),
+    };
+    f[u + 16..u + 24].copy_from_slice(&ss_sp.to_le_bytes());
+    f[u + 24..u + 28].copy_from_slice(&ss_flags.to_le_bytes());
+    f[u + 32..u + 40].copy_from_slice(&ss_size.to_le_bytes());
     let m = u + MCONTEXT;
     for (i, r) in gregs(ctx).iter().enumerate() {
         f[m + i * 8..m + i * 8 + 8].copy_from_slice(&r.to_le_bytes());
@@ -488,4 +517,53 @@ pub(crate) fn sigreturn(p: &mut LinuxProcess, ctx: &mut UserContext) -> Result<(
     p.sig.mask = word(SIGMASK) & !UNBLOCKABLE;
     sync(p);
     Ok(())
+}
+
+/// `sigaltstack(ss, old_ss)` over `stack_t { void *ss_sp; int ss_flags;
+/// size_t ss_size; }`.
+pub(crate) fn sigaltstack(
+    p: &mut LinuxProcess,
+    ctx: &UserContext,
+    ss: u64,
+    old: u64,
+) -> Result<u64, i64> {
+    const EPERM: i64 = 1;
+    const ENOMEM: i64 = 12;
+    let on = p.sig.on_alt(ctx.rsp);
+    if old != 0 {
+        let mut b = [0u8; 24];
+        let (sp, flags, size) = match p.sig.alt {
+            None => (0, SS_DISABLE, 0),
+            Some((s, z)) => (s, if on { SS_ONSTACK } else { 0 }, z),
+        };
+        b[0..8].copy_from_slice(&sp.to_le_bytes());
+        b[8..12].copy_from_slice(&flags.to_le_bytes());
+        b[16..24].copy_from_slice(&size.to_le_bytes());
+        if p.copy_to_user(old, &b) != 24 {
+            return Err(EFAULT);
+        }
+    }
+    if ss != 0 {
+        let mut b = [0u8; 24];
+        if p.copy_from_user(ss, &mut b) != 24 {
+            return Err(EFAULT);
+        }
+        if on {
+            return Err(EPERM); // cannot change the stack we are running on
+        }
+        let sp = u64::from_le_bytes(b[0..8].try_into().unwrap_or([0; 8]));
+        let flags = u32::from_le_bytes(b[8..12].try_into().unwrap_or([0; 4])) & !SS_AUTODISARM;
+        let size = u64::from_le_bytes(b[16..24].try_into().unwrap_or([0; 8]));
+        match flags {
+            SS_DISABLE => p.sig.alt = None,
+            0 | SS_ONSTACK => {
+                if size < MINSIGSTKSZ {
+                    return Err(ENOMEM);
+                }
+                p.sig.alt = Some((sp, size));
+            }
+            _ => return Err(EINVAL),
+        }
+    }
+    Ok(0)
 }

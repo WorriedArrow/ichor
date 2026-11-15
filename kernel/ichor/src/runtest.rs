@@ -58,6 +58,12 @@ mod sys {
     pub(super) const EPOLL_CREATE1: u64 = 291;
     pub(super) const PIPE2: u64 = 293;
     pub(super) const EXIT_GROUP: u64 = 231;
+    pub(super) const RT_SIGACTION: u64 = 13;
+    pub(super) const RT_SIGRETURN: u64 = 15;
+    pub(super) const DUP2: u64 = 33;
+    pub(super) const KILL: u64 = 62;
+    pub(super) const SIGALTSTACK: u64 = 131;
+    pub(super) const PRLIMIT64: u64 = 302;
 }
 
 const MOTD: &[u8] = b"hello from /etc/motd inside an Ichor image\n";
@@ -80,7 +86,7 @@ pub(crate) fn run_linux(
     interp: Option<&[u8]>,
     argv: &[&str],
 ) -> (i32, u32) {
-    let loaded = match loader::load(&mut p.mm(), elf, interp, argv, ENVP) {
+    let loaded = match loader::load(&mut p.mm(), elf, interp, argv, ENVP, 8 << 20) {
         Ok(l) => l,
         Err(e) => {
             println!("ichor: runtest: load error {e:?}");
@@ -818,6 +824,150 @@ pub(crate) fn cloexec_program() -> Vec<u8> {
     static_elf(&a.finish(BLOB_VADDR).unwrap_or_else(|| fail("assembler")))
 }
 
+/// Resource limits and the alternate signal stack. `RLIMIT_NOFILE` (5, 5)
+/// lets fds 3 and 4 open, then `open` fails with EMFILE and `dup2` to 7
+/// with EBADF; a hard limit over the table size is EPERM. A SIGUSR1 handler
+/// installed with `SA_ONSTACK` runs on the `sigaltstack` stack, finds the
+/// stack in its `uc_stack` (flags 0: the interrupted code was not on it),
+/// and cannot replace the stack it runs on (EPERM). Exits 0, or the number of the failed check.
+fn limits_program() -> Vec<u8> {
+    const NOFILE: u64 = 7;
+    const SIGUSR1: u64 = 10;
+    const SA_ONSTACK_RESTORER: u64 = 0x0C00_0000;
+    const ALT_SIZE: i32 = 65536;
+    let mut a = Asm::new();
+    let bad = a.label();
+    let handler = a.label();
+    let restorer = a.label();
+    let motd = a.data(b"/etc/motd\0");
+    let expect = |a: &mut Asm, n: u64, v: i32| {
+        a.mov_imm(Reg::R15, n);
+        a.cmp_imm(Reg::Rax, v);
+        a.jne(bad);
+    };
+    let prlimit = |a: &mut Asm, new: i32, old: i32| {
+        a.mov_imm(Reg::Rdi, 0);
+        a.mov_imm(Reg::Rsi, NOFILE);
+        for (r, off) in [(Reg::Rdx, new), (Reg::R10, old)] {
+            if off < 0 {
+                a.mov_imm(r, 0);
+            } else {
+                a.mov(r, Reg::Rbp);
+                a.add_imm(r, off);
+            }
+        }
+        a.sys(sys::PRLIMIT64);
+    };
+    let pair = |a: &mut Asm, soft: u64, hard: u64| {
+        a.mov_imm(Reg::Rax, soft);
+        a.store(Reg::Rbp, 0, Reg::Rax);
+        a.mov_imm(Reg::Rax, hard);
+        a.store(Reg::Rbp, 8, Reg::Rax);
+    };
+    let altstack = |a: &mut Asm| {
+        a.mov(Reg::Rdi, Reg::Rbp);
+        a.add_imm(Reg::Rdi, 64);
+        a.mov_imm(Reg::Rsi, 0);
+        a.sys(sys::SIGALTSTACK);
+    };
+    a.mov(Reg::Rbp, Reg::Rsp);
+    a.sub_imm(Reg::Rbp, 4096);
+    // 1-2: NOFILE (5, 5) set and read back.
+    pair(&mut a, 5, 5);
+    prlimit(&mut a, 0, -1);
+    expect(&mut a, 1, 0);
+    pair(&mut a, 0, 0);
+    prlimit(&mut a, -1, 0);
+    expect(&mut a, 2, 0);
+    a.load(Reg::Rax, Reg::Rbp, 0);
+    expect(&mut a, 2, 5);
+    // 3-6: fds 3 and 4 open; the next is EMFILE; dup2 past the limit EBADF.
+    for (n, want) in [(3, 3), (4, 4), (5, -24)] {
+        a.mov_data(Reg::Rdi, motd);
+        a.mov_imm(Reg::Rsi, 0);
+        a.sys(sys::OPEN);
+        expect(&mut a, n, want);
+    }
+    a.mov_imm(Reg::Rdi, 0);
+    a.mov_imm(Reg::Rsi, 7);
+    a.sys(sys::DUP2);
+    expect(&mut a, 6, -9);
+    // 7: a hard limit past the table: EPERM.
+    pair(&mut a, 5, 4096);
+    prlimit(&mut a, 0, -1);
+    expect(&mut a, 7, -1);
+    // 8-9: stack_t at rbp+64: too small is ENOMEM, then 64 KiB 1 MiB down.
+    a.mov(Reg::R13, Reg::Rsp);
+    a.sub_imm(Reg::R13, 1 << 20);
+    a.store(Reg::Rbp, 64, Reg::R13);
+    a.mov_imm(Reg::Rax, 0);
+    a.store(Reg::Rbp, 72, Reg::Rax);
+    a.mov_imm(Reg::Rax, 1000);
+    a.store(Reg::Rbp, 80, Reg::Rax);
+    altstack(&mut a);
+    expect(&mut a, 8, -12);
+    a.mov_imm(Reg::Rax, ALT_SIZE as u64);
+    a.store(Reg::Rbp, 80, Reg::Rax);
+    altstack(&mut a);
+    expect(&mut a, 9, 0);
+    // 10: sigaction(SIGUSR1, { handler, SA_ONSTACK | SA_RESTORER, restorer, 0 }).
+    a.mov_label(Reg::Rax, handler);
+    a.store(Reg::Rbp, 128, Reg::Rax);
+    a.mov_imm(Reg::Rax, SA_ONSTACK_RESTORER);
+    a.store(Reg::Rbp, 136, Reg::Rax);
+    a.mov_label(Reg::Rax, restorer);
+    a.store(Reg::Rbp, 144, Reg::Rax);
+    a.mov_imm(Reg::Rax, 0);
+    a.store(Reg::Rbp, 152, Reg::Rax);
+    a.store(Reg::Rbp, 200, Reg::Rax);
+    a.mov_imm(Reg::Rdi, SIGUSR1);
+    a.mov(Reg::Rsi, Reg::Rbp);
+    a.add_imm(Reg::Rsi, 128);
+    a.mov_imm(Reg::Rdx, 0);
+    a.mov_imm(Reg::R10, 8);
+    a.sys(sys::RT_SIGACTION);
+    expect(&mut a, 10, 0);
+    a.sys(sys::GETPID);
+    a.mov(Reg::Rdi, Reg::Rax);
+    a.mov_imm(Reg::Rsi, SIGUSR1);
+    a.sys(sys::KILL);
+    // 11: uc_stack named the alternate stack, with flags 0.
+    a.load(Reg::Rax, Reg::Rbp, 216);
+    a.mov_imm(Reg::R15, 11);
+    a.cmp(Reg::Rax, Reg::R13);
+    a.jne(bad);
+    a.load(Reg::Rax, Reg::Rbp, 224);
+    expect(&mut a, 11, 0);
+    // 12: the handler ran on the alternate stack.
+    a.load(Reg::Rax, Reg::Rbp, 200);
+    a.mov_imm(Reg::R15, 12);
+    a.cmp(Reg::Rax, Reg::R13);
+    a.jbe(bad);
+    a.add_imm(Reg::R13, ALT_SIZE);
+    a.cmp(Reg::Rax, Reg::R13);
+    a.ja(bad);
+    // 13: replacing its stack was EPERM.
+    a.load(Reg::Rax, Reg::Rbp, 208);
+    expect(&mut a, 13, -1);
+    a.mov_imm(Reg::R15, 0);
+    a.bind(bad);
+    a.mov(Reg::Rdi, Reg::R15);
+    a.sys(sys::EXIT_GROUP);
+    // The handler: rbp is the interrupted code's; rdx is the ucontext.
+    a.bind(handler);
+    a.store(Reg::Rbp, 200, Reg::Rsp);
+    a.load(Reg::Rax, Reg::Rdx, 16);
+    a.store(Reg::Rbp, 216, Reg::Rax);
+    a.load(Reg::Rax, Reg::Rdx, 24);
+    a.store(Reg::Rbp, 224, Reg::Rax);
+    altstack(&mut a);
+    a.store(Reg::Rbp, 208, Reg::Rax);
+    a.ret();
+    a.bind(restorer);
+    a.sys(sys::RT_SIGRETURN);
+    static_elf(&a.finish(BLOB_VADDR).unwrap_or_else(|| fail("assembler")))
+}
+
 /// POSIX record locks across fork: the parent write-locks bytes 0..10; the
 /// child's overlapping F_SETLK fails with EAGAIN, F_GETLK names the parent,
 /// a disjoint range locks fine, and F_SETLKW blocks until the parent
@@ -1011,5 +1161,14 @@ pub(crate) fn run() {
     }
     println!(
         "ichor: linux: fcntl record locks: conflict, F_GETLK, F_SETLKW wakeup ok ({syscalls} syscalls)"
+    );
+
+    let (status, syscalls) = run_linux(new_process(), &limits_program(), None, &["limitstest"]);
+    if status != 0 {
+        println!("ichor: linux: limitstest failed check {status}");
+        fail("limitstest");
+    }
+    println!(
+        "ichor: linux: RLIMIT_NOFILE enforced, SA_ONSTACK handler ran on the sigaltstack ({syscalls} syscalls)"
     );
 }

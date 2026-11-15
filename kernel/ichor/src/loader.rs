@@ -49,7 +49,10 @@ pub(crate) enum LoadError {
 
 /// Where the user stack is placed and how big it may grow.
 const STACK_TOP: u64 = 0x7fff_f000_0000;
-const STACK_SIZE: u64 = 8 << 20;
+/// The most stack an image leaves room for (`RLIMIT_STACK` is clamped to
+/// it), and the least a process gets.
+const MAX_STACK: u64 = 1 << 30;
+const MIN_STACK: u64 = 128 << 10;
 /// Most bytes of argv/envp strings plus pointers.
 const MAX_ARGS: usize = 128 * 1024;
 
@@ -106,7 +109,7 @@ fn map_image(mm: &mut Mm, plan: &LoadPlan, image: &[u8], bias: u64) -> Result<u6
         .collect();
     for seg in &segs {
         let (start, end) = seg.page_range(PAGE_SIZE);
-        if end > STACK_TOP - STACK_SIZE || end < start {
+        if end > STACK_TOP - MAX_STACK || end < start {
             return Err(LoadError::Map);
         }
         image_end = image_end.max(end);
@@ -181,7 +184,9 @@ pub(crate) fn load(
     interp: Option<&[u8]>,
     argv: &[&str],
     envp: &[&str],
+    stack_limit: u64,
 ) -> Result<Loaded, LoadError> {
+    let stack_size = stack_limit.clamp(MIN_STACK, MAX_STACK) & !(PAGE_SIZE - 1);
     let plan = parse(image)?;
     let bias = if plan.pie { PIE_BASE } else { 0 };
     let image_end = map_image(mm, &plan, image, bias)?;
@@ -211,10 +216,10 @@ pub(crate) fn load(
         }
     }
 
-    if !mm.reserve(STACK_TOP - STACK_SIZE, STACK_TOP, Prot::RW) {
+    if !mm.reserve(STACK_TOP - stack_size, STACK_TOP, Prot::RW) {
         return Err(LoadError::Map);
     }
-    let stack_pointer = build_stack(mm, &aux, argv, envp)?;
+    let stack_pointer = build_stack(mm, &aux, argv, envp, stack_size)?;
     Ok(Loaded {
         entry: start,
         stack_pointer,
@@ -267,7 +272,13 @@ fn random_bytes() -> [u8; 16] {
 /// rsp -> argc, argv[0..argc], NULL, envp[..], NULL, auxv pairs, AT_NULL
 ///        ... padding, random bytes, strings ... STACK_TOP
 /// ```
-fn build_stack(mm: &mut Mm, plan: &Aux, argv: &[&str], envp: &[&str]) -> Result<u64, LoadError> {
+fn build_stack(
+    mm: &mut Mm,
+    plan: &Aux,
+    argv: &[&str],
+    envp: &[&str],
+    stack_size: u64,
+) -> Result<u64, LoadError> {
     // Strings and blobs go at the top, laid out downwards in `blob`, which
     // is the memory [blob_base, STACK_TOP).
     let mut strings: Vec<u8> = Vec::new();
@@ -333,7 +344,7 @@ fn build_stack(mm: &mut Mm, plan: &Aux, argv: &[&str], envp: &[&str]) -> Result<
     }
     frame_bytes.resize((blob_base - sp) as usize, 0);
     frame_bytes.extend_from_slice(&strings);
-    if frame_bytes.len() > (STACK_SIZE / 2) as usize {
+    if frame_bytes.len() > (stack_size / 2) as usize {
         return Err(LoadError::ArgsTooLong);
     }
     mm.populate(sp, frame_bytes.len(), true);

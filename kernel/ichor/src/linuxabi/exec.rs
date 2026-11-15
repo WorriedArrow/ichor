@@ -114,20 +114,26 @@ pub(super) fn execve(
     let mut mm = Mm::new(p.cell.account()).ok_or(ENOMEM)?;
     let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
     let envp_refs: Vec<&str> = envp.iter().map(String::as_str).collect();
-    let loaded =
-        loader::load(&mut mm, &image, interp.as_deref(), &argv_refs, &envp_refs).map_err(|e| {
-            match e {
-                LoadError::OutOfMemory => ENOMEM,
-                LoadError::ArgsTooLong => E2BIG,
-                _ => ENOEXEC,
-            }
-        })?;
+    let loaded = loader::load(
+        &mut mm,
+        &image,
+        interp.as_deref(),
+        &argv_refs,
+        &envp_refs,
+        p.group.limits()[crate::process::RLIMIT_STACK].0,
+    )
+    .map_err(|e| match e {
+        LoadError::OutOfMemory => ENOMEM,
+        LoadError::ArgsTooLong => E2BIG,
+        _ => ENOEXEC,
+    })?;
 
     // Switch to the new space, then drop the old one (no longer active).
     mm.space().bind_to_current_task();
     drop(p.replace_mm(mm));
     p.group.actions.lock().exec_reset();
     p.close_on_exec();
+    p.sig.clear_alt_stack();
     p.group.set_exec(&exe_path, &argv_refs);
     crate::signal::sync(p);
     *ctx = UserContext::new(loaded.entry, loaded.stack_pointer);

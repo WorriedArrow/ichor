@@ -11,7 +11,7 @@
 mod exec;
 mod fs;
 
-use crate::process::{Fd, LinuxProcess, MAX_FDS};
+use crate::process::{Fd, LinuxProcess};
 use crate::umem;
 use crate::{proc, signal};
 use fs::AT_FDCWD;
@@ -84,6 +84,7 @@ mod nr {
     pub(super) const UMASK: u64 = 95;
     pub(super) const GETTIMEOFDAY: u64 = 96; // partial: time since boot (no RTC yet)
     pub(super) const GETRLIMIT: u64 = 97;
+    pub(super) const SETRLIMIT: u64 = 160; // partial: NOFILE and STACK enforced, others stored
     pub(super) const GETUID: u64 = 102; // partial: always 0
     pub(super) const GETGID: u64 = 104; // partial: always 0
     pub(super) const GETEUID: u64 = 107; // partial: always 0
@@ -95,7 +96,7 @@ mod nr {
     pub(super) const GETPGID: u64 = 121;
     pub(super) const GETSID: u64 = 124;
     pub(super) const RT_SIGSUSPEND: u64 = 130;
-    pub(super) const SIGALTSTACK: u64 = 131; // stub: no alternate stacks yet
+    pub(super) const SIGALTSTACK: u64 = 131;
     pub(super) const MOUNT: u64 = 165; // partial: always EPERM (cells cannot mount)
     pub(super) const UMOUNT2: u64 = 166; // partial: always EPERM (cells cannot mount)
     pub(super) const STATFS: u64 = 137;
@@ -134,7 +135,7 @@ mod nr {
     pub(super) const EPOLL_CREATE1: u64 = 291;
     pub(super) const DUP3: u64 = 292;
     pub(super) const PIPE2: u64 = 293;
-    pub(super) const PRLIMIT64: u64 = 302; // partial: reads limits, ignores new ones
+    pub(super) const PRLIMIT64: u64 = 302; // partial: own process only; NOFILE and STACK enforced, others stored
     pub(super) const GETRANDOM: u64 = 318; // partial: not cryptographic until frame has an entropy source
     pub(super) const RENAMEAT2: u64 = 316; // partial: RENAME_NOREPLACE only
 }
@@ -260,8 +261,9 @@ pub(crate) fn dispatch(p: &mut LinuxProcess, ctx: &mut frame::user::UserContext)
         nr::UNAME => uname(p, a[0]),
         nr::CLOCK_GETTIME => clock_gettime(p, a[1]),
         nr::GETTIMEOFDAY => gettimeofday(p, a[0]),
-        nr::GETRLIMIT => prlimit(p, a[0], a[1]),
-        nr::PRLIMIT64 => prlimit(p, a[1], a[3]),
+        nr::GETRLIMIT => prlimit(p, 0, a[0], 0, a[1]),
+        nr::SETRLIMIT => prlimit(p, 0, a[0], a[1], 0),
+        nr::PRLIMIT64 => prlimit(p, a[0], a[1], a[2], a[3]),
         nr::RT_SIGACTION => signal::sigaction(p, a[0], a[1], a[2], a[3]),
         nr::RT_SIGPROCMASK => signal::sigprocmask(p, a[0], a[1], a[2], a[3]),
         nr::RT_SIGRETURN => match signal::sigreturn(p, ctx) {
@@ -282,7 +284,7 @@ pub(crate) fn dispatch(p: &mut LinuxProcess, ctx: &mut frame::user::UserContext)
         nr::GETPGID => proc::group_of(&p.group.leader, a[0]).map(|g| g.0),
         nr::GETSID => proc::group_of(&p.group.leader, a[0]).map(|g| g.1),
         nr::SETSID => proc::setsid(&p.group.leader),
-        nr::SIGALTSTACK => zero_out(p, a[1], 24),
+        nr::SIGALTSTACK => signal::sigaltstack(p, ctx, a[0], a[1]),
         nr::FUTEX => crate::futex::futex(p, &a),
         nr::SCHED_YIELD => {
             frame::task::yield_now();
@@ -649,34 +651,41 @@ fn gettimeofday(p: &mut LinuxProcess, tv: u64) -> Result<u64, i64> {
     put_pair(p, tv, now.as_secs(), u64::from(now.subsec_micros()))
 }
 
-fn prlimit(p: &mut LinuxProcess, resource: u64, old: u64) -> Result<u64, i64> {
-    const RLIMIT_STACK: u64 = 3;
-    const RLIMIT_NOFILE: u64 = 7;
-    const RLIM_INFINITY: u64 = u64::MAX;
-    let (cur, max) = match resource {
-        RLIMIT_STACK => (8 << 20, RLIM_INFINITY),
-        RLIMIT_NOFILE => (MAX_FDS as u64, MAX_FDS as u64),
-        r if r < 16 => (RLIM_INFINITY, RLIM_INFINITY),
-        _ => return Err(EINVAL),
-    };
-    if old == 0 {
-        return Ok(0);
+/// `prlimit64(pid, resource, new, old)`, `getrlimit`, `setrlimit`. Limits
+/// are per process and survive fork and exec; `RLIMIT_NOFILE` caps
+/// descriptor numbers and `RLIMIT_STACK` sizes the stack at exec. Only the
+/// calling process can be named (partial).
+fn prlimit(p: &mut LinuxProcess, pid: u64, resource: u64, new: u64, old: u64) -> Result<u64, i64> {
+    use crate::process::{MAX_FDS, RLIM_NLIMITS, RLIMIT_NOFILE};
+    const ESRCH: i64 = 3;
+    if pid != 0 && pid != p.group.tgid {
+        return Err(ESRCH);
     }
-    put_pair(p, old, cur, max)
-}
-
-/// Zeroes `len` bytes at `addr` if it is non-null: the "old value" out
-/// parameter of calls whose state is always empty.
-fn zero_out(p: &mut LinuxProcess, addr: u64, len: usize) -> Result<u64, i64> {
-    if addr == 0 {
-        return Ok(0);
+    let r = usize::try_from(resource)
+        .ok()
+        .filter(|&r| r < RLIM_NLIMITS)
+        .ok_or(EINVAL)?;
+    let (cur, max) = p.group.limits()[r];
+    if new != 0 {
+        let mut b = [0u8; 16];
+        if p.copy_from_user(new, &mut b) != 16 {
+            return Err(EFAULT);
+        }
+        let soft = u64::from_le_bytes(b[0..8].try_into().unwrap_or([0; 8]));
+        let hard = u64::from_le_bytes(b[8..16].try_into().unwrap_or([0; 8]));
+        if soft > hard {
+            return Err(EINVAL);
+        }
+        // The descriptor table holds MAX_FDS entries.
+        if r == RLIMIT_NOFILE && hard > MAX_FDS as u64 {
+            return Err(EPERM);
+        }
+        p.group.set_limit(r, soft, hard);
     }
-    let z = alloc::vec![0u8; len];
-    if p.copy_to_user(addr, &z) == len {
-        Ok(0)
-    } else {
-        Err(EFAULT)
+    if old != 0 {
+        put_pair(p, old, cur, max)?;
     }
+    Ok(0)
 }
 
 /// One past the highest user address (the top of the lower canonical half).

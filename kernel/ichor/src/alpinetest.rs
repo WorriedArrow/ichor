@@ -105,6 +105,16 @@ const RUNS: &[(&[&str], i32)] = &[
         ],
         0,
     ),
+    (
+        &[
+            "sh",
+            "-c",
+            "ulimit -n 64 && [ \"$(ulimit -n)\" = 64 ] && ulimit -s 512 && \
+             [ \"$(sh -c 'ulimit -s')\" = 512 ] && ! ulimit -n 4096 2>/dev/null && \
+             echo alpine: ulimit survives fork and exec",
+        ],
+        0,
+    ),
 ];
 
 fn read(vfs: &Vfs, path: &str) -> Vec<u8> {

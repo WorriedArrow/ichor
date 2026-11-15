@@ -153,6 +153,26 @@ pub(crate) struct Group {
     exit: SpinLock<Option<u32>>,
     /// The program's path and argv (NUL-separated), for `/proc`.
     exe: SpinLock<(alloc::string::String, Vec<u8>)>,
+    /// Resource limits (soft, hard), by `RLIMIT_*`.
+    limits: SpinLock<Limits>,
+}
+
+/// `RLIM_INFINITY`.
+pub(crate) const RLIM_INFINITY: u64 = u64::MAX;
+pub(crate) const RLIMIT_STACK: usize = 3;
+pub(crate) const RLIMIT_NOFILE: usize = 7;
+/// Number of Linux resource limits.
+pub(crate) const RLIM_NLIMITS: usize = 16;
+
+/// A process's resource limits. `NOFILE` and `STACK` are enforced; the
+/// others are stored and reported (nothing yet consumes them).
+pub(crate) type Limits = [(u64, u64); RLIM_NLIMITS];
+
+fn default_limits() -> Limits {
+    let mut l = [(RLIM_INFINITY, RLIM_INFINITY); RLIM_NLIMITS];
+    l[RLIMIT_STACK] = (8 << 20, RLIM_INFINITY);
+    l[RLIMIT_NOFILE] = (MAX_FDS as u64, MAX_FDS as u64);
+    l
 }
 
 impl Group {
@@ -174,6 +194,18 @@ impl Group {
     /// The program's argv, NUL-separated (`/proc/<pid>/cmdline`).
     pub(crate) fn cmdline(&self) -> Vec<u8> {
         self.exe.lock().1.clone()
+    }
+
+    /// The process's resource limits.
+    pub(crate) fn limits(&self) -> Limits {
+        *self.limits.lock()
+    }
+
+    /// Replaces one limit.
+    pub(crate) fn set_limit(&self, resource: usize, soft: u64, hard: u64) {
+        if let Some(l) = self.limits.lock().get_mut(resource) {
+            *l = (soft, hard);
+        }
     }
 
     /// The threads still running.
@@ -266,6 +298,7 @@ impl LinuxProcess {
             threads: SpinLock::new(alloc::vec![entry.clone()]),
             exit: SpinLock::new(None),
             exe: SpinLock::new(Default::default()),
+            limits: SpinLock::new(default_limits()),
         });
         Some(Self {
             entry,
@@ -307,6 +340,7 @@ impl LinuxProcess {
             threads: SpinLock::new(alloc::vec![entry.clone()]),
             exit: SpinLock::new(None),
             exe: SpinLock::new(exe),
+            limits: SpinLock::new(self.group.limits()),
         });
         Some(Self {
             entry,
@@ -328,12 +362,14 @@ impl LinuxProcess {
             None,
         );
         self.group.threads.lock().push(entry.clone());
+        let mut sig = self.sig.clone();
+        sig.clear_alt_stack();
         Self {
             entry,
             group: self.group.clone(),
             cell: self.cell.clone(),
             vfs: self.vfs.clone(),
-            sig: self.sig.clone(),
+            sig,
             clear_tid: 0,
         }
     }
@@ -434,9 +470,10 @@ impl LinuxProcess {
     /// Stores `slot` at the lowest free descriptor at or above `min`
     /// (POSIX semantics). `None` if the table is full.
     fn place(&self, slot: Slot, min: usize) -> Option<u64> {
+        let cap = (self.group.limits()[RLIMIT_NOFILE].0 as usize).min(MAX_FDS);
         let mut files = self.group.files.lock();
         let fds = &mut files.fds;
-        if min >= MAX_FDS {
+        if min >= cap {
             return None;
         }
         if fds.len() <= min {
@@ -445,7 +482,7 @@ impl LinuxProcess {
         let i = (min..fds.len())
             .find(|&i| fds.get(i).is_some_and(Option::is_none))
             .unwrap_or(fds.len());
-        if i >= MAX_FDS {
+        if i >= cap {
             return None;
         }
         if i == fds.len() {
@@ -481,7 +518,8 @@ impl LinuxProcess {
         if old == new {
             return Some(new);
         }
-        let n = usize::try_from(new).ok().filter(|&n| n < MAX_FDS)?;
+        let cap = (self.group.limits()[RLIMIT_NOFILE].0 as usize).min(MAX_FDS);
+        let n = usize::try_from(new).ok().filter(|&n| n < cap)?;
         let prev = {
             let mut files = self.group.files.lock();
             if files.fds.len() <= n {
