@@ -6,7 +6,7 @@
 //!
 //! `#!` scripts run their interpreter with the script path as an argument.
 //!
-//! Partial: `FD_CLOEXEC` is not tracked (every descriptor survives).
+//! `FD_CLOEXEC` descriptors close once the new image is in place.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -127,6 +127,7 @@ pub(super) fn execve(
     mm.space().bind_to_current_task();
     drop(p.replace_mm(mm));
     p.group.actions.lock().exec_reset();
+    p.close_on_exec();
     p.group.set_exec(&exe_path, &argv_refs);
     crate::signal::sync(p);
     *ctx = UserContext::new(loaded.entry, loaded.stack_pointer);

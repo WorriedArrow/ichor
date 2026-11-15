@@ -25,6 +25,8 @@ const O_TRUNC: u64 = 0o1000;
 const O_APPEND: u64 = 0o2000;
 const O_DIRECTORY: u64 = 0o200_000;
 const O_NOFOLLOW: u64 = 0o400_000;
+pub(super) const O_NONBLOCK: u64 = 0o4000;
+pub(super) const O_CLOEXEC: u64 = 0o2_000_000;
 
 const ENAMETOOLONG: i64 = 36;
 const ESPIPE: i64 = 29;
@@ -132,7 +134,7 @@ fn open_path(
             Kind::CharDevice => {
                 drop(fs);
                 let fd = crate::dev::open(st.rdev).ok_or(ENXIO)?;
-                return p.install(fd).ok_or(EMFILE);
+                return p.install_flags(fd, flags & O_CLOEXEC != 0).ok_or(EMFILE);
             }
             _ => {}
         }
@@ -145,9 +147,10 @@ fn open_path(
     let f = OpenFile {
         ino,
         offset: 0,
-        flags: flags & (O_ACCMODE | O_APPEND),
+        flags: flags & (O_ACCMODE | O_APPEND | O_NONBLOCK),
     };
-    p.install(Fd::File(f)).ok_or(EMFILE)
+    p.install_flags(Fd::File(f), flags & O_CLOEXEC != 0)
+        .ok_or(EMFILE)
 }
 
 /// Where a `/proc` link points, as a path to open or stat.
@@ -181,10 +184,13 @@ fn open_proc(
         procfs::Node::File(_) if flags & O_ACCMODE != 0 => return Err(EACCES),
         procfs::Node::File(d) => alloc::sync::Arc::new(procfs::ProcFile::new(d)),
     };
-    p.install(Fd::Object(crate::process::ObjectEnd {
-        obj,
-        nonblock: false,
-    }))
+    p.install_flags(
+        Fd::Object(crate::process::ObjectEnd {
+            obj,
+            nonblock: false,
+        }),
+        flags & O_CLOEXEC != 0,
+    )
     .ok_or(EMFILE)
 }
 
@@ -246,18 +252,30 @@ fn read_file(
 }
 
 /// Writes user memory to file `f` at `offset`; returns bytes written.
+/// Writes user memory to file `f` at `offset` (or at its end, for
+/// `O_APPEND`); returns the bytes written and the offset after them. An
+/// append of up to `APPEND_ATOMIC` bytes is one atomic step, so concurrent
+/// appenders (other descriptions too) never interleave within a write.
 fn write_file(
     p: &mut LinuxProcess,
     f: OpenFile,
     offset: u64,
     buf: u64,
     count: usize,
-) -> Result<u64, i64> {
+) -> Result<(u64, u64), i64> {
+    const APPEND_ATOMIC: usize = 1 << 20;
     if f.flags & O_ACCMODE == 0 {
         return Err(EBADF);
     }
-    let mut chunk = alloc::vec![0u8; CHUNK.min(count.max(1))];
+    let append = f.flags & O_APPEND != 0;
+    let step = if append && count <= APPEND_ATOMIC {
+        count.max(1)
+    } else {
+        CHUNK.min(count.max(1))
+    };
+    let mut chunk = alloc::vec![0u8; step];
     let mut done = 0usize;
+    let mut pos = offset;
     while done < count {
         let want = chunk.len().min(count - done);
         let got = p.copy_from_user(buf + done as u64, &mut chunk[..want]);
@@ -267,17 +285,24 @@ fn write_file(
             }
             break;
         }
-        match p
-            .vfs
-            .lock()
-            .write(f.ino, offset + done as u64, &chunk[..got])
-        {
+        let r = if append {
+            p.vfs.lock().append(f.ino, &chunk[..got]).map(|end| {
+                pos = end;
+                got
+            })
+        } else {
+            p.vfs
+                .lock()
+                .write(f.ino, pos, &chunk[..got])
+                .inspect(|&n| pos += n as u64)
+        };
+        match r {
             Ok(n) => done += n,
             Err(e) if done == 0 => return Err(e),
             Err(_) => break,
         }
     }
-    Ok(done as u64)
+    Ok((done as u64, pos))
 }
 
 pub(super) fn read(p: &mut LinuxProcess, fd: u64, buf: u64, count: usize) -> Result<u64, i64> {
@@ -313,11 +338,15 @@ pub(super) fn read(p: &mut LinuxProcess, fd: u64, buf: u64, count: usize) -> Res
             }
             Ok(n as u64)
         }
-        Fd::File(f) => {
-            let n = read_file(p, f, f.offset, buf, count)?;
-            p.with_file(fd, |of| {
-                of.offset += n;
-            });
+        Fd::File(_) => {
+            // Hold the description across the read: its offset is shared.
+            let desc = p.desc(fd).ok_or(EBADF)?;
+            let mut st = desc.state();
+            let Fd::File(of) = &mut *st else {
+                return Err(EBADF);
+            };
+            let n = read_file(p, *of, of.offset, buf, count)?;
+            of.offset += n;
             Ok(n)
         }
     }
@@ -339,16 +368,14 @@ pub(super) fn write(p: &mut LinuxProcess, fd: u64, buf: u64, count: usize) -> Re
         }
         Fd::Pipe(e) if !e.write => Err(EBADF),
         Fd::Pipe(e) => pipe_write(p, &e, buf, count),
-        Fd::File(f) => {
-            let offset = if f.flags & O_APPEND != 0 {
-                p.vfs.lock().stat(f.ino)?.size
-            } else {
-                f.offset
+        Fd::File(_) => {
+            let desc = p.desc(fd).ok_or(EBADF)?;
+            let mut st = desc.state();
+            let Fd::File(of) = &mut *st else {
+                return Err(EBADF);
             };
-            let n = write_file(p, f, offset, buf, count)?;
-            p.with_file(fd, |of| {
-                of.offset = offset + n;
-            });
+            let (n, end) = write_file(p, *of, of.offset, buf, count)?;
+            of.offset = end;
             Ok(n)
         }
     }
@@ -373,7 +400,7 @@ pub(super) fn pwrite(
     off: u64,
 ) -> Result<u64, i64> {
     let f = file(p, fd)?;
-    write_file(p, f, off, buf, count)
+    write_file(p, f, off, buf, count).map(|(n, _)| n)
 }
 
 /// `readv` (`write == false`) and `writev`.
@@ -948,8 +975,6 @@ fn pipe_write(p: &mut LinuxProcess, e: &PipeEnd, buf: u64, count: usize) -> Resu
 
 /// `pipe2`: a new pipe; `[read fd, write fd]` go to `fds` as two `int`s.
 pub(super) fn pipe2(p: &mut LinuxProcess, fds: u64, flags: u64) -> Result<u64, i64> {
-    const O_NONBLOCK: u64 = 0o4000;
-    const O_CLOEXEC: u64 = 0o2_000_000;
     if flags & !(O_NONBLOCK | O_CLOEXEC) != 0 {
         return Err(EINVAL);
     }
@@ -962,8 +987,9 @@ pub(super) fn pipe2(p: &mut LinuxProcess, fds: u64, flags: u64) -> Result<u64, i
             nonblock,
         })
     };
-    let r = p.install(end(false)).ok_or(EMFILE)?;
-    let w = match p.install(end(true)) {
+    let cloexec = flags & O_CLOEXEC != 0;
+    let r = p.install_flags(end(false), cloexec).ok_or(EMFILE)?;
+    let w = match p.install_flags(end(true), cloexec) {
         Some(w) => w,
         None => {
             p.close(r);
@@ -1038,10 +1064,13 @@ pub(super) fn fstatfs(p: &mut LinuxProcess, fd: u64, buf: u64) -> Result<u64, i6
     Ok(0)
 }
 
-/// `flock`: advisory locks are always granted (partial: there is no lock
-/// table yet, so this does not exclude other processes).
-pub(super) fn flock(p: &mut LinuxProcess, fd: u64, _op: u64) -> Result<u64, i64> {
-    p.fd(fd).ok_or(EBADF).map(|_| 0)
+/// `flock`: whole-file advisory locks owned by the open file description.
+pub(super) fn flock(p: &mut LinuxProcess, fd: u64, op: u64) -> Result<u64, i64> {
+    let desc = p.desc(fd).ok_or(EBADF)?;
+    let key = desc.lock_key().ok_or(22i64)?; // EINVAL: not a file
+    let entry = p.entry.clone();
+    crate::locks::flock(key, desc.id(), op, &|| proc::interrupted(&entry))?;
+    Ok(0)
 }
 
 /// The inode a `*at` call names: `path` from `dirfd`, or `dirfd` itself
@@ -1159,5 +1188,109 @@ pub(super) fn futimesat(
     let [a, m] = read_times(p, times, true)?;
     let ino = inode_at(p, dirfd, addr, 0)?;
     p.vfs.lock().set_times(ino, a, m)?;
+    Ok(0)
+}
+
+/// `fcntl` record locks: `F_GETLK`/`F_SETLK`/`F_SETLKW` (owned by the
+/// process) and `F_OFD_*` (owned by the open file description), over a
+/// `struct flock { short l_type, l_whence; off_t l_start, l_len; pid_t l_pid; }`.
+pub(super) fn record_lock(
+    p: &mut LinuxProcess,
+    desc: &alloc::sync::Arc<crate::process::Description>,
+    cmd: u64,
+    arg: u64,
+) -> Result<u64, i64> {
+    use crate::locks::{Owner, Range};
+    const F_RDLCK: u16 = 0;
+    const F_WRLCK: u16 = 1;
+    const F_UNLCK: u16 = 2;
+    let ofd = cmd >= 36;
+    let get = cmd == 5 || cmd == 36;
+    let wait = cmd == 7 || cmd == 38;
+    let (key, offset, size) = {
+        let st = desc.state();
+        let Fd::File(of) = &*st else {
+            return Err(EBADF);
+        };
+        let size = p.vfs.lock().stat(of.ino)?.size;
+        (
+            (alloc::sync::Arc::as_ptr(&p.vfs) as usize, of.ino),
+            of.offset,
+            size,
+        )
+    };
+    let mut b = [0u8; 32];
+    if p.copy_from_user(arg, &mut b) != 32 {
+        return Err(EFAULT);
+    }
+    let ltype = u16::from_le_bytes([b[0], b[1]]);
+    let whence = u16::from_le_bytes([b[2], b[3]]);
+    let lstart = i64::from_le_bytes(b[8..16].try_into().unwrap_or([0; 8]));
+    let llen = i64::from_le_bytes(b[16..24].try_into().unwrap_or([0; 8]));
+    let lpid = i32::from_le_bytes(b[24..28].try_into().unwrap_or([0; 4]));
+    if ofd && lpid != 0 {
+        return Err(EINVAL);
+    }
+    let base: i64 = match whence {
+        0 => 0,
+        1 => offset as i64,
+        2 => size as i64,
+        _ => return Err(EINVAL),
+    };
+    let start = base.checked_add(lstart).ok_or(EINVAL)?;
+    let (start, end) = match llen {
+        0 => (start, u64::MAX),
+        l if l > 0 => (start, start.checked_add(l).ok_or(EINVAL)? as u64),
+        l => (start.checked_add(l).ok_or(EINVAL)?, start as u64),
+    };
+    if start < 0 {
+        return Err(EINVAL);
+    }
+    let r = Range {
+        start: start as u64,
+        end,
+    };
+    let owner = if ofd {
+        Owner::Desc(desc.id())
+    } else {
+        Owner::Proc(p.group.tgid)
+    };
+    let write = match ltype {
+        F_RDLCK => Some(false),
+        F_WRLCK => Some(true),
+        F_UNLCK => None,
+        _ => return Err(EINVAL),
+    };
+    // A lock needs the matching access mode.
+    let acc = match &*desc.state() {
+        Fd::File(of) => of.flags & O_ACCMODE,
+        _ => 0,
+    };
+    if (write == Some(true) && acc == 0) || (write == Some(false) && acc == O_WRONLY) {
+        return Err(EBADF);
+    }
+    if get {
+        let Some(want) = write else {
+            return Err(EINVAL);
+        };
+        let mut out = b;
+        match crate::locks::get_record(key, owner, want, r) {
+            None => out[0..2].copy_from_slice(&F_UNLCK.to_le_bytes()),
+            Some((w, s, e, pid)) => {
+                out[0..2].copy_from_slice(&(if w { F_WRLCK } else { F_RDLCK }).to_le_bytes());
+                out[2..4].copy_from_slice(&0u16.to_le_bytes());
+                out[8..16].copy_from_slice(&(s as i64).to_le_bytes());
+                let len = if e == u64::MAX { 0 } else { (e - s) as i64 };
+                out[16..24].copy_from_slice(&len.to_le_bytes());
+                out[24..28].copy_from_slice(&(pid as i32).to_le_bytes());
+            }
+        }
+        if p.copy_to_user(arg, &out) != 32 {
+            return Err(EFAULT);
+        }
+        return Ok(0);
+    }
+    let entry = p.entry.clone();
+    crate::locks::set_record(key, owner, write, r, wait, &|| proc::interrupted(&entry))?;
     Ok(0)
 }

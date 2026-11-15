@@ -37,6 +37,8 @@ mod sys {
     pub(super) const SCHED_YIELD: u64 = 24;
     pub(super) const NANOSLEEP: u64 = 35;
     pub(super) const GETPID: u64 = 39;
+    pub(super) const EXECVE: u64 = 59;
+    pub(super) const FCNTL: u64 = 72;
     pub(super) const CLONE: u64 = 56;
     pub(super) const FORK: u64 = 57;
     pub(super) const EXIT: u64 = 60;
@@ -773,6 +775,149 @@ fn poll_program() -> Vec<u8> {
     static_elf(&a.finish(BLOB_VADDR).unwrap_or_else(|| fail("assembler")))
 }
 
+/// Close-on-exec: opens a file with and without `O_CLOEXEC` and a pipe with
+/// `O_CLOEXEC`, then execs `/bin/sh`, which checks through `/proc/self/fd`
+/// that only the plain descriptor survived. Needs a root with busybox.
+pub(crate) fn cloexec_program() -> Vec<u8> {
+    const O_CLOEXEC: u64 = 0o2_000_000;
+    let mut a = Asm::new();
+    let motd = a.data(b"/etc/motd\0");
+    let sh = a.data(b"/bin/sh\0");
+    let arg0 = a.data(b"sh\0");
+    let arg1 = a.data(b"-c\0");
+    let arg2 = a.data(
+        b"[ -L /proc/self/fd/4 ] && [ ! -L /proc/self/fd/3 ] && [ ! -L /proc/self/fd/5 ] \
+          && [ ! -L /proc/self/fd/6 ] && echo sh: CLOEXEC descriptors did not survive exec\0",
+    );
+    a.mov(Reg::Rbp, Reg::Rsp);
+    a.sub_imm(Reg::Rbp, 4096);
+    // fd 3: O_CLOEXEC; fd 4: plain; fds 5, 6: pipe2(O_CLOEXEC).
+    for flags in [O_CLOEXEC, 0] {
+        a.mov_data(Reg::Rdi, motd);
+        a.mov_imm(Reg::Rsi, flags);
+        a.sys(sys::OPEN);
+    }
+    a.mov(Reg::Rdi, Reg::Rbp);
+    a.add_imm(Reg::Rdi, 64);
+    a.mov_imm(Reg::Rsi, O_CLOEXEC);
+    a.sys(sys::PIPE2);
+    // argv = { "sh", "-c", script, NULL } at rbp.
+    for (i, d) in [arg0, arg1, arg2].into_iter().enumerate() {
+        a.mov_data(Reg::Rax, d);
+        a.store(Reg::Rbp, (i * 8) as i32, Reg::Rax);
+    }
+    a.mov_imm(Reg::Rax, 0);
+    a.store(Reg::Rbp, 24, Reg::Rax);
+    a.mov_data(Reg::Rdi, sh);
+    a.mov(Reg::Rsi, Reg::Rbp);
+    a.mov_imm(Reg::Rdx, 0);
+    a.sys(sys::EXECVE);
+    // Only reached if execve failed.
+    a.mov_imm(Reg::Rdi, 99);
+    a.sys(sys::EXIT_GROUP);
+    static_elf(&a.finish(BLOB_VADDR).unwrap_or_else(|| fail("assembler")))
+}
+
+/// POSIX record locks across fork: the parent write-locks bytes 0..10; the
+/// child's overlapping F_SETLK fails with EAGAIN, F_GETLK names the parent,
+/// a disjoint range locks fine, and F_SETLKW blocks until the parent
+/// unlocks 50 ms later. Exits 0 if every check held.
+fn lock_program() -> Vec<u8> {
+    const F_GETLK: u64 = 5;
+    const F_SETLK: u64 = 6;
+    const F_SETLKW: u64 = 7;
+    const WR: u64 = 1;
+    const UN: u64 = 2;
+    let mut a = Asm::new();
+    let bad = a.label();
+    let parent = a.label();
+    let path = a.data(b"/lockfile\0");
+    let ts = a.data(&[0, 0, 0, 0, 0, 0, 0, 0, 0x80, 0xf0, 0xfa, 0x02, 0, 0, 0, 0]); // 50 ms
+    let expect = |a: &mut Asm, n: u64, v: i32| {
+        a.mov_imm(Reg::R15, n);
+        a.cmp_imm(Reg::Rax, v);
+        a.jne(bad);
+    };
+    // struct flock at rbp: l_type | l_whence << 16, l_start, l_len, l_pid.
+    let flock = |a: &mut Asm, ty: u64, start: u64, len: u64| {
+        a.mov_imm(Reg::Rax, ty);
+        a.store(Reg::Rbp, 0, Reg::Rax);
+        a.mov_imm(Reg::Rax, start);
+        a.store(Reg::Rbp, 8, Reg::Rax);
+        a.mov_imm(Reg::Rax, len);
+        a.store(Reg::Rbp, 16, Reg::Rax);
+        a.mov_imm(Reg::Rax, 0);
+        a.store(Reg::Rbp, 24, Reg::Rax);
+    };
+    let fcntl = |a: &mut Asm, cmd: u64| {
+        a.mov_imm(Reg::Rdi, 3);
+        a.mov_imm(Reg::Rsi, cmd);
+        a.mov(Reg::Rdx, Reg::Rbp);
+        a.sys(sys::FCNTL);
+    };
+    a.mov(Reg::Rbp, Reg::Rsp);
+    a.sub_imm(Reg::Rbp, 4096);
+    a.sys(sys::GETPID);
+    a.mov(Reg::R12, Reg::Rax);
+    // fd 3 = open("/lockfile", O_CREAT | O_RDWR, 0644)
+    a.mov_data(Reg::Rdi, path);
+    a.mov_imm(Reg::Rsi, 0o102);
+    a.mov_imm(Reg::Rdx, 0o644);
+    a.sys(sys::OPEN);
+    expect(&mut a, 1, 3);
+    flock(&mut a, WR, 0, 10);
+    fcntl(&mut a, F_SETLK);
+    expect(&mut a, 1, 0);
+    a.sys(sys::FORK);
+    a.cmp_imm(Reg::Rax, 0);
+    a.jne(parent);
+    // Child.
+    flock(&mut a, WR, 5, 1);
+    fcntl(&mut a, F_SETLK);
+    expect(&mut a, 2, -11); // EAGAIN
+    flock(&mut a, WR, 5, 1);
+    fcntl(&mut a, F_GETLK);
+    expect(&mut a, 3, 0);
+    a.load(Reg::Rax, Reg::Rbp, 24); // l_pid (and padding, zero)
+    a.mov_imm(Reg::R15, 3);
+    a.cmp(Reg::Rax, Reg::R12);
+    a.jne(bad);
+    flock(&mut a, WR, 20, 10);
+    fcntl(&mut a, F_SETLK);
+    expect(&mut a, 4, 0);
+    flock(&mut a, WR, 0, 1);
+    fcntl(&mut a, F_SETLKW); // blocks until the parent unlocks
+    expect(&mut a, 5, 0);
+    a.mov_imm(Reg::Rdi, 0);
+    a.sys(sys::EXIT_GROUP);
+    // Parent: give the child time to block, unlock, reap it.
+    a.bind(parent);
+    a.mov_data(Reg::Rdi, ts);
+    a.mov_imm(Reg::Rsi, 0);
+    a.sys(sys::NANOSLEEP);
+    flock(&mut a, UN, 0, 10);
+    fcntl(&mut a, F_SETLK);
+    expect(&mut a, 6, 0);
+    a.mov_imm(Reg::Rdi, u64::MAX);
+    a.mov(Reg::Rsi, Reg::Rbp);
+    a.add_imm(Reg::Rsi, 64);
+    a.mov_imm(Reg::Rdx, 0);
+    a.mov_imm(Reg::R10, 0);
+    a.sys(sys::WAIT4);
+    a.load(Reg::Rax, Reg::Rbp, 64);
+    a.mov_imm(Reg::R14, 0xffff_ffff);
+    a.mov_imm(Reg::R15, 7);
+    // The child's exit code is in bits 8..16 of the status: it must be 0.
+    a.mov(Reg::Rdx, Reg::Rax);
+    a.cmp_imm(Reg::Rdx, 0);
+    a.jne(bad);
+    a.mov_imm(Reg::R15, 0);
+    a.bind(bad);
+    a.mov(Reg::Rdi, Reg::R15);
+    a.sys(sys::EXIT_GROUP);
+    static_elf(&a.finish(BLOB_VADDR).unwrap_or_else(|| fail("assembler")))
+}
+
 /// The root image: `/usr/share/motd`, `/etc/motd -> /usr/share/motd`.
 fn root_image() -> &'static [u8] {
     let mut b = image::builder::Builder::new();
@@ -858,4 +1003,13 @@ pub(crate) fn run() {
         fail("polltest");
     }
     println!("ichor: linux: poll timeout and wakeup, epoll, eventfd ok ({syscalls} syscalls)");
+
+    let (status, syscalls) = run_linux(new_process(), &lock_program(), None, &["locktest"]);
+    if status != 0 {
+        println!("ichor: linux: locktest failed check {status}");
+        fail("locktest");
+    }
+    println!(
+        "ichor: linux: fcntl record locks: conflict, F_GETLK, F_SETLKW wakeup ok ({syscalls} syscalls)"
+    );
 }

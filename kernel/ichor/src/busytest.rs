@@ -105,6 +105,13 @@ pub(crate) fn run(vfs: &Arc<Vfs>) {
         println!("ichor: busybox: {} ok ({syscalls} syscalls)", argv[0]);
     }
     println!("ichor: busybox: all applets passed");
+    let cell = Cell::new(&system.root_account, CELL_PAGES).unwrap_or_else(|| fail("no cell"));
+    let p = LinuxProcess::new(cell, vfs.clone()).unwrap_or_else(|| fail("no process"));
+    let (code, _) = run_linux(p, &crate::runtest::cloexec_program(), None, &["cloexec"]);
+    if code != 0 {
+        println!("ichor: busybox: cloexec test exited {code}");
+        fail("close-on-exec");
+    }
 }
 
 fn read_busybox(vfs: &Arc<Vfs>) -> Vec<u8> {

@@ -61,6 +61,36 @@ const RUNS: &[(&[&str], i32)] = &[
         &["sh", "-c", "echo hi > /tmp/f && cat /tmp/f && rm /tmp/f"],
         0,
     ),
+    (
+        &[
+            "sh",
+            "-c",
+            "{ echo out1; echo err >&2; echo out2; } >/tmp/o 2>&1; \
+             [ \"$(wc -l < /tmp/o)\" = 3 ] && [ \"$(sed -n 2p /tmp/o)\" = err ] && \
+             echo 'alpine: 2>&1 shares one offset'",
+        ],
+        0,
+    ),
+    (
+        &[
+            "sh",
+            "-c",
+            "rm -f /tmp/ap; (for i in $(seq 200); do echo aaaaaaaa; done >>/tmp/ap) & \
+             (for i in $(seq 200); do echo bbbbbbbb; done >>/tmp/ap) & wait; \
+             [ \"$(wc -l < /tmp/ap)\" = 400 ] && [ \"$(grep -c a /tmp/ap)\" = 200 ] && \
+             echo alpine: two appenders kept every line",
+        ],
+        0,
+    ),
+    (
+        &[
+            "sh",
+            "-c",
+            "touch /tmp/l; flock -x /tmp/l -c 'flock -n -x /tmp/l -c true'; [ $? = 1 ] && \
+             flock -n /tmp/l -c true && echo alpine: flock excludes, then releases",
+        ],
+        0,
+    ),
 ];
 
 fn read(vfs: &Vfs, path: &str) -> Vec<u8> {

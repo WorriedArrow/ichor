@@ -524,6 +524,14 @@ impl<'a> Overlay<'a> {
         Ok(data.len())
     }
 
+    /// Appends `data` at the current end of the file in one step (so two
+    /// `O_APPEND` writers never overwrite each other); returns the new end.
+    pub fn append(&mut self, ino: Ino, data: &[u8]) -> Result<u64, i64> {
+        let end = self.stat(ino)?.size;
+        self.write(ino, end, data)?;
+        Ok(end + data.len() as u64)
+    }
+
     /// Changes permission bits.
     pub fn chmod(&mut self, ino: Ino, mode: u32) -> Result<(), i64> {
         let now = (self.clock)();

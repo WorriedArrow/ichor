@@ -146,6 +146,18 @@ Milestones 0-3 are done.
   overlay records uid/gid and atime/mtime/ctime; `chown` family and
   `utimensat`/`futimesat`/`utimes` set them (uid 0 semantics until the
   identity ADR). Linux console writes go out as raw bytes.
+- M4 fd model: descriptors point at shared open file descriptions
+  (`process::Description`: offset, status flags, the reference on what it
+  names), so `dup`/`dup2`/`dup3`/`F_DUPFD` and `fork` share offset and
+  flags; file I/O holds the description for the whole operation. Each slot
+  has its own `FD_CLOEXEC` (`O_CLOEXEC`, `*_CLOEXEC`, `F_SETFD`), closed by
+  `execve`. `F_SETFL` sets O_APPEND/O_NONBLOCK; O_APPEND writes are one
+  atomic overlay append (up to 1 MiB per call). `locks.rs`: flock (per
+  description), POSIX record locks (per process, dropped on any close of
+  the file), OFD locks (per description), with blocking variants that a
+  signal interrupts. Tests: `2>&1` ordering, two `>>` appenders, flock,
+  close-on-exec through `/proc/self/fd`, record-lock conflict/F_GETLK/
+  F_SETLKW across fork.
 
 ## Agreed plan (owner, 2026-11-15)
 
@@ -153,7 +165,7 @@ Commit at every green step; every commit must build and pass on its own;
 report at the end of each phase. Do not rewrite `main`.
 
 - **A. Harden what exists.** (1) apk green [done]. (2) CI asserts KVM [done].
-  (3) fd model: open file descriptions shared by dup/fork (offset, status
+  (3) [done] fd model: open file descriptions shared by dup/fork (offset, status
   flags), FD_CLOEXEC/O_CLOEXEC, F_SETFL O_NONBLOCK/O_APPEND, a lock table
   for flock and fcntl F_SETLK/F_SETLKW/F_OFD_*; tests for `2>&1`, `>>` from
   two processes, no fd leak across exec. (4) Every fake-success stub made

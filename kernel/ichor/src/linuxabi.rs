@@ -48,8 +48,8 @@ mod nr {
     pub(super) const MADVISE: u64 = 28; // stub: advice is ignored
     pub(super) const PAUSE: u64 = 34;
     pub(super) const NANOSLEEP: u64 = 35;
-    pub(super) const DUP: u64 = 32; // partial: the copy has its own offset
-    pub(super) const DUP2: u64 = 33; // partial: the copy has its own offset
+    pub(super) const DUP: u64 = 32;
+    pub(super) const DUP2: u64 = 33;
     pub(super) const GETPID: u64 = 39;
     pub(super) const SENDFILE: u64 = 40;
     pub(super) const CLONE: u64 = 56; // partial: fork, vfork-style and thread clones
@@ -60,8 +60,8 @@ mod nr {
     pub(super) const WAIT4: u64 = 61; // partial: no rusage, no process groups
     pub(super) const KILL: u64 = 62; // partial: pid > 0 only (no process groups)
     pub(super) const UNAME: u64 = 63;
-    pub(super) const FCNTL: u64 = 72; // partial: F_DUPFD, F_GETFD/SETFD, F_GETFL/SETFL
-    pub(super) const FLOCK: u64 = 73; // partial: always granted (no lock table yet)
+    pub(super) const FCNTL: u64 = 72; // partial: no F_SETOWN/F_*SIG/leases/seals
+    pub(super) const FLOCK: u64 = 73;
     pub(super) const FSYNC: u64 = 74; // partial: the upper layer is memory
     pub(super) const FDATASYNC: u64 = 75; // partial: the upper layer is memory
     pub(super) const TRUNCATE: u64 = 76;
@@ -133,8 +133,8 @@ mod nr {
     pub(super) const EVENTFD: u64 = 284;
     pub(super) const EVENTFD2: u64 = 290;
     pub(super) const EPOLL_CREATE1: u64 = 291;
-    pub(super) const DUP3: u64 = 292; // partial: the copy has its own offset
-    pub(super) const PIPE2: u64 = 293; // partial: O_CLOEXEC is accepted and ignored
+    pub(super) const DUP3: u64 = 292;
+    pub(super) const PIPE2: u64 = 293;
     pub(super) const PRLIMIT64: u64 = 302; // partial: reads limits, ignores new ones
     pub(super) const GETRANDOM: u64 = 318; // partial: not cryptographic until frame has an entropy source
     pub(super) const RENAMEAT2: u64 = 316; // partial: RENAME_NOREPLACE only
@@ -240,13 +240,13 @@ pub(crate) fn dispatch(p: &mut LinuxProcess, ctx: &mut frame::user::UserContext)
         nr::PIPE => fs::pipe2(p, a[0], 0),
         nr::PIPE2 => fs::pipe2(p, a[0], a[1]),
         // Descriptors.
-        nr::DUP => p.dup_from(a[0], 0).ok_or(EBADF),
-        nr::DUP2 => p.dup_to(a[0], a[1]).ok_or(EBADF),
+        nr::DUP => p.dup_from(a[0], 0, false).ok_or(EMFILE),
+        nr::DUP2 => p.dup_to(a[0], a[1], false).ok_or(EBADF),
         nr::DUP3 => {
             if a[0] == a[1] {
                 Err(EINVAL)
             } else {
-                p.dup_to(a[0], a[1]).ok_or(EBADF)
+                p.dup_to(a[0], a[1], a[2] & fs::O_CLOEXEC != 0).ok_or(EBADF)
             }
         }
         nr::FCNTL => fcntl(p, a[0], a[1], a[2]),
@@ -393,19 +393,53 @@ fn fcntl(p: &mut LinuxProcess, fd: u64, cmd: u64, arg: u64) -> Result<u64, i64> 
     const F_SETFD: u64 = 2;
     const F_GETFL: u64 = 3;
     const F_SETFL: u64 = 4;
+    const F_GETLK: u64 = 5;
+    const F_SETLK: u64 = 6;
+    const F_SETLKW: u64 = 7;
+    const F_OFD_GETLK: u64 = 36;
+    const F_OFD_SETLK: u64 = 37;
+    const F_OFD_SETLKW: u64 = 38;
     const F_DUPFD_CLOEXEC: u64 = 1030;
+    const FD_CLOEXEC: u64 = 1;
     const O_RDWR: u64 = 2;
-    let f = p.fd(fd).ok_or(EBADF)?;
+    const O_APPEND: u64 = 0o2000;
+    let desc = p.desc(fd).ok_or(EBADF)?;
     match cmd {
-        F_DUPFD | F_DUPFD_CLOEXEC => p.dup_from(fd, arg).ok_or(EMFILE),
-        F_GETFD | F_SETFD | F_SETFL => Ok(0),
-        F_GETFL => Ok(match f {
-            Fd::Console => O_RDWR,
-            Fd::File(of) => of.flags,
-            Fd::Pipe(e) => u64::from(e.write) | if e.nonblock { 0o4000 } else { 0 },
-            Fd::Dev(_) => O_RDWR,
-            Fd::Object(o) => O_RDWR | if o.nonblock { 0o4000 } else { 0 },
+        F_DUPFD => p.dup_from(fd, arg, false).ok_or(EMFILE),
+        F_DUPFD_CLOEXEC => p.dup_from(fd, arg, true).ok_or(EMFILE),
+        F_GETFD => Ok(if p.cloexec(fd).ok_or(EBADF)? {
+            FD_CLOEXEC
+        } else {
+            0
         }),
+        F_SETFD => {
+            p.set_cloexec(fd, arg & FD_CLOEXEC != 0);
+            Ok(0)
+        }
+        F_GETFL => Ok(match &*desc.state() {
+            Fd::Console | Fd::Dev(_) => O_RDWR,
+            Fd::File(of) => of.flags,
+            Fd::Pipe(e) => u64::from(e.write) | if e.nonblock { fs::O_NONBLOCK } else { 0 },
+            Fd::Object(o) => O_RDWR | if o.nonblock { fs::O_NONBLOCK } else { 0 },
+        }),
+        F_SETFL => {
+            // Only O_APPEND and O_NONBLOCK can change after open (Linux also
+            // takes O_ASYNC/O_DIRECT/O_NOATIME, which mean nothing here).
+            let nb = arg & fs::O_NONBLOCK != 0;
+            match &mut *desc.state() {
+                Fd::File(of) => {
+                    of.flags = (of.flags & !(O_APPEND | fs::O_NONBLOCK))
+                        | (arg & (O_APPEND | fs::O_NONBLOCK));
+                }
+                Fd::Pipe(e) => e.nonblock = nb,
+                Fd::Object(o) => o.nonblock = nb,
+                Fd::Console | Fd::Dev(_) => {}
+            }
+            Ok(0)
+        }
+        F_GETLK | F_SETLK | F_SETLKW | F_OFD_GETLK | F_OFD_SETLK | F_OFD_SETLKW => {
+            fs::record_lock(p, &desc, cmd, arg)
+        }
         _ => Err(EINVAL),
     }
 }

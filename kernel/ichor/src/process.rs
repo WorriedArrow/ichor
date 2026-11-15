@@ -69,10 +69,70 @@ pub(crate) struct ObjectEnd {
     pub(crate) nonblock: bool,
 }
 
+/// An open file description: what `open`, `pipe`, `eventfd`, ... create.
+/// `dup`, `dup2`, `F_DUPFD` and `fork` share one, so its offset and status
+/// flags (`O_APPEND`, `O_NONBLOCK`) are shared too. It holds the reference
+/// on what it names (an inode's open count, a pipe end) and drops it, and
+/// its `flock`/OFD locks, when the last descriptor goes.
+#[derive(Debug)]
+pub(crate) struct Description {
+    state: Mutex<Fd>,
+    vfs: Arc<Vfs>,
+}
+
+impl Description {
+    /// A description for `fd`, whose reference the caller took.
+    pub(crate) fn new(fd: Fd, vfs: &Arc<Vfs>) -> Arc<Description> {
+        Arc::new(Description {
+            state: Mutex::new(fd),
+            vfs: vfs.clone(),
+        })
+    }
+
+    /// The description's state, locked. File I/O holds it for the whole
+    /// operation, which serializes users of one offset (like Linux's
+    /// `f_pos` lock).
+    pub(crate) fn state(&self) -> MutexGuard<'_, Fd> {
+        self.state.lock()
+    }
+
+    /// Identity for lock ownership.
+    pub(crate) fn id(&self) -> usize {
+        core::ptr::from_ref(self) as usize
+    }
+
+    /// The lock-table key of the file this names, if it is a file.
+    pub(crate) fn lock_key(&self) -> Option<crate::locks::Key> {
+        match &*self.state.lock() {
+            Fd::File(of) => Some((Arc::as_ptr(&self.vfs) as usize, of.ino)),
+            _ => None,
+        }
+    }
+}
+
+impl Drop for Description {
+    fn drop(&mut self) {
+        crate::locks::release_owner(crate::locks::Owner::Desc(self.id()));
+        let st = self.state.lock();
+        match &*st {
+            Fd::Console | Fd::Dev(_) | Fd::Object(_) => {}
+            Fd::File(of) => self.vfs.lock().close(of.ino),
+            Fd::Pipe(e) => e.pipe.drop_end(e.write),
+        }
+    }
+}
+
+/// A descriptor-table slot.
+#[derive(Clone, Debug)]
+struct Slot {
+    desc: Arc<Description>,
+    cloexec: bool,
+}
+
 /// A group's files: descriptors, working directory (holding an open
 /// reference) and umask.
 struct Files {
-    fds: Vec<Option<Fd>>,
+    fds: Vec<Option<Slot>>,
     cwd: Ino,
     umask: u32,
 }
@@ -96,26 +156,6 @@ pub(crate) struct Group {
 }
 
 impl Group {
-    /// Takes the references a descriptor needs.
-    fn hold(&self, f: &Fd) {
-        match f {
-            Fd::Console | Fd::Dev(_) | Fd::Object(_) => {}
-            Fd::File(of) => {
-                let _ = self.vfs.lock().open(of.ino);
-            }
-            Fd::Pipe(e) => e.pipe.add(e.write),
-        }
-    }
-
-    /// Drops the references a descriptor held.
-    fn release(&self, f: Fd) {
-        match f {
-            Fd::Console | Fd::Dev(_) | Fd::Object(_) => {}
-            Fd::File(of) => self.vfs.lock().close(of.ino),
-            Fd::Pipe(e) => e.pipe.drop_end(e.write),
-        }
-    }
-
     /// Records the program the process runs (load or `execve`).
     pub(crate) fn set_exec(&self, path: &str, argv: &[&str]) {
         let mut cmd = Vec::new();
@@ -176,15 +216,10 @@ impl Drop for Group {
             let mut files = self.files.lock();
             (core::mem::take(&mut files.fds), files.cwd)
         };
-        let mut fs = self.vfs.lock();
-        for f in fds.into_iter().flatten() {
-            match f {
-                Fd::Console | Fd::Dev(_) | Fd::Object(_) => {}
-                Fd::File(of) => fs.close(of.ino),
-                Fd::Pipe(e) => e.pipe.drop_end(e.write),
-            }
-        }
-        fs.close(cwd);
+        // Descriptions release their references as they drop.
+        drop(fds);
+        crate::locks::release_owner(crate::locks::Owner::Proc(self.tgid));
+        self.vfs.lock().close(cwd);
     }
 }
 
@@ -216,7 +251,14 @@ impl LinuxProcess {
             vfs: vfs.clone(),
             mm: Mutex::new(mm),
             files: Mutex::new(Files {
-                fds: alloc::vec![Some(Fd::Console); 3],
+                // One console description on 0, 1 and 2, as a terminal is.
+                fds: {
+                    let console = Slot {
+                        desc: Description::new(Fd::Console, &vfs),
+                        cloexec: false,
+                    };
+                    alloc::vec![Some(console.clone()), Some(console.clone()), Some(console)]
+                },
                 cwd: ROOT,
                 umask: 0o022,
             }),
@@ -245,10 +287,8 @@ impl LinuxProcess {
             let f = self.group.files.lock();
             (f.fds.clone(), f.cwd, f.umask)
         };
+        // The child shares the parent's open file descriptions.
         let _ = self.vfs.lock().open(cwd);
-        for f in fds.iter().flatten() {
-            self.group.hold(f);
-        }
         let actions = self.group.actions.lock().clone();
         let exe = self.group.exe.lock().clone();
         let entry = proc::register(self.group.tgid, None);
@@ -338,29 +378,56 @@ impl LinuxProcess {
         }
     }
 
-    /// The descriptor `fd`, if open.
-    pub(crate) fn fd(&self, fd: u64) -> Option<Fd> {
+    /// The descriptor `fd`'s description, if open.
+    pub(crate) fn desc(&self, fd: u64) -> Option<Arc<Description>> {
         let files = self.group.files.lock();
-        files.fds.get(usize::try_from(fd).ok()?).cloned().flatten()
+        let slot = files.fds.get(usize::try_from(fd).ok()?)?.as_ref()?;
+        Some(slot.desc.clone())
     }
 
-    /// Runs `f` on an open file's state (its offset, say).
+    /// A snapshot of what descriptor `fd` names, if open.
+    pub(crate) fn fd(&self, fd: u64) -> Option<Fd> {
+        let d = self.desc(fd)?;
+        let f = d.state().clone();
+        Some(f)
+    }
+
+    /// Runs `f` on an open file's state (its offset, say), shared by every
+    /// descriptor of its description.
     pub(crate) fn with_file<R>(&self, fd: u64, f: impl FnOnce(&mut OpenFile) -> R) -> Option<R> {
-        let mut files = self.group.files.lock();
-        match files.fds.get_mut(usize::try_from(fd).ok()?)? {
-            Some(Fd::File(of)) => Some(f(of)),
+        let d = self.desc(fd)?;
+        let mut st = d.state();
+        match &mut *st {
+            Fd::File(of) => Some(f(of)),
             _ => None,
         }
     }
 
-    /// Stores `f` at the lowest free descriptor at or above `min` (POSIX
-    /// semantics); the caller's reference moves into the table. Hands `f`
-    /// back if the table is full.
-    fn place(&self, f: Fd, min: usize) -> Result<u64, Fd> {
+    /// Whether `fd` closes on exec (`F_GETFD`).
+    pub(crate) fn cloexec(&self, fd: u64) -> Option<bool> {
+        let files = self.group.files.lock();
+        Some(files.fds.get(usize::try_from(fd).ok()?)?.as_ref()?.cloexec)
+    }
+
+    /// Sets `FD_CLOEXEC` (`F_SETFD`); false if `fd` is not open.
+    pub(crate) fn set_cloexec(&self, fd: u64, on: bool) -> bool {
+        let mut files = self.group.files.lock();
+        match usize::try_from(fd).ok().and_then(|i| files.fds.get_mut(i)) {
+            Some(Some(slot)) => {
+                slot.cloexec = on;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Stores `slot` at the lowest free descriptor at or above `min`
+    /// (POSIX semantics). `None` if the table is full.
+    fn place(&self, slot: Slot, min: usize) -> Option<u64> {
         let mut files = self.group.files.lock();
         let fds = &mut files.fds;
         if min >= MAX_FDS {
-            return Err(f);
+            return None;
         }
         if fds.len() <= min {
             fds.resize(min + 1, None);
@@ -369,65 +436,82 @@ impl LinuxProcess {
             .find(|&i| fds.get(i).is_some_and(Option::is_none))
             .unwrap_or(fds.len());
         if i >= MAX_FDS {
-            return Err(f);
+            return None;
         }
         if i == fds.len() {
             fds.push(None);
         }
-        match fds.get_mut(i) {
-            Some(slot) => {
-                *slot = Some(f);
-                Ok(i as u64)
-            }
-            None => Err(f),
-        }
+        *fds.get_mut(i)? = Some(slot);
+        Some(i as u64)
     }
 
-    /// Installs a freshly opened `f` (whose reference the caller took) at
-    /// the lowest free descriptor. On failure the reference is dropped.
-    pub(crate) fn install(&mut self, f: Fd) -> Option<u64> {
-        match self.place(f, 0) {
-            Ok(n) => Some(n),
-            Err(f) => {
-                self.group.release(f);
-                None
-            }
-        }
+    /// Installs a freshly opened `f` (whose reference the caller took) as a
+    /// new description at the lowest free descriptor, with `FD_CLOEXEC` as
+    /// asked (`O_CLOEXEC`). If the table is full the description is
+    /// dropped, releasing the reference.
+    pub(crate) fn install_flags(&mut self, f: Fd, cloexec: bool) -> Option<u64> {
+        let slot = Slot {
+            desc: Description::new(f, &self.vfs),
+            cloexec,
+        };
+        self.place(slot, 0)
     }
 
-    /// Duplicates `fd` to the lowest free descriptor at or above `min`.
-    pub(crate) fn dup_from(&mut self, fd: u64, min: u64) -> Option<u64> {
-        let f = self.fd(fd)?;
+    /// Duplicates `fd` (same description) to the lowest free descriptor at
+    /// or above `min`.
+    pub(crate) fn dup_from(&mut self, fd: u64, min: u64, cloexec: bool) -> Option<u64> {
+        let desc = self.desc(fd)?;
         let min = usize::try_from(min).ok()?;
-        self.group.hold(&f);
-        match self.place(f, min) {
-            Ok(n) => Some(n),
-            Err(f) => {
-                self.group.release(f);
-                None
-            }
-        }
+        self.place(Slot { desc, cloexec }, min)
     }
 
-    /// Makes `new` refer to what `old` refers to (closing `new` first).
-    pub(crate) fn dup_to(&mut self, old: u64, new: u64) -> Option<u64> {
-        let f = self.fd(old)?;
+    /// Makes `new` refer to `old`'s description (closing `new` first).
+    pub(crate) fn dup_to(&mut self, old: u64, new: u64, cloexec: bool) -> Option<u64> {
+        let desc = self.desc(old)?;
         if old == new {
             return Some(new);
         }
         let n = usize::try_from(new).ok().filter(|&n| n < MAX_FDS)?;
-        self.group.hold(&f);
         let prev = {
             let mut files = self.group.files.lock();
             if files.fds.len() <= n {
                 files.fds.resize(n + 1, None);
             }
-            files.fds.get_mut(n)?.replace(f)
+            files.fds.get_mut(n)?.replace(Slot { desc, cloexec })
         };
         if let Some(p) = prev {
-            self.group.release(p);
+            self.closed(p.desc);
         }
         Some(new)
+    }
+
+    /// A descriptor of `desc` went away: POSIX drops this process's record
+    /// locks on the file (the description itself may live on).
+    fn closed(&self, desc: Arc<Description>) {
+        if let Some(key) = desc.lock_key() {
+            crate::locks::release_process_file(self.group.tgid, key);
+        }
+    }
+
+    /// `execve`: closes every `FD_CLOEXEC` descriptor.
+    pub(crate) fn close_on_exec(&mut self) {
+        let gone: Vec<Slot> = {
+            let mut files = self.group.files.lock();
+            files
+                .fds
+                .iter_mut()
+                .filter_map(|s| {
+                    if s.as_ref().is_some_and(|s| s.cloexec) {
+                        s.take()
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
+        for s in gone {
+            self.closed(s.desc);
+        }
     }
 
     /// Closes `fd`. Returns false if it was not open.
@@ -440,8 +524,8 @@ impl LinuxProcess {
                 .and_then(Option::take)
         };
         match taken {
-            Some(f) => {
-                self.group.release(f);
+            Some(s) => {
+                self.closed(s.desc);
                 true
             }
             None => false,

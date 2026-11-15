@@ -425,12 +425,20 @@ pub(crate) fn eventfd(p: &mut LinuxProcess, init: u64, flags: u64) -> Result<u64
         semaphore: flags & EFD_SEMAPHORE != 0,
         queue: WaitQueue::new(),
     });
-    install(p, obj, flags & EFD_NONBLOCK != 0)
+    install(p, obj, flags & EFD_NONBLOCK != 0, flags & EFD_CLOEXEC != 0)
 }
 
-fn install(p: &mut LinuxProcess, obj: Arc<dyn Object>, nonblock: bool) -> Result<u64, i64> {
-    p.install(Fd::Object(crate::process::ObjectEnd { obj, nonblock }))
-        .ok_or(EMFILE)
+fn install(
+    p: &mut LinuxProcess,
+    obj: Arc<dyn Object>,
+    nonblock: bool,
+    cloexec: bool,
+) -> Result<u64, i64> {
+    p.install_flags(
+        Fd::Object(crate::process::ObjectEnd { obj, nonblock }),
+        cloexec,
+    )
+    .ok_or(EMFILE)
 }
 
 // ---------------------------------------------------------------------------
@@ -471,7 +479,7 @@ pub(crate) fn epoll_create(p: &mut LinuxProcess, flags: u64) -> Result<u64, i64>
     let obj = Arc::new(Epoll {
         interest: Mutex::new(BTreeMap::new()),
     });
-    install(p, obj, false)
+    install(p, obj, false, flags & EPOLL_CLOEXEC != 0)
 }
 
 fn epoll_of(p: &LinuxProcess, epfd: u64) -> Result<Arc<dyn Object>, i64> {

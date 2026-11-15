@@ -1,8 +1,9 @@
 //! Pipes: a bounded byte queue between descriptors, with blocking reads and
 //! writes on frame wait queues.
 //!
-//! Every descriptor that refers to an end counts as one reader or writer
-//! (`dup`, `fork` and `close` adjust the counts), which is how a reader
+//! Every open file description of an end counts as one reader or writer
+//! (descriptors made by `dup` or `fork` share it; the count drops when the
+//! description's last descriptor closes), which is how a reader
 //! sees end-of-file once the last writer is gone, and a writer gets `EPIPE`
 //! once the last reader is gone. Writes of up to `PIPE_BUF` bytes are
 //! atomic, as POSIX requires; longer blocking writes complete in pieces.
@@ -51,16 +52,6 @@ impl Pipe {
             readable: WaitQueue::new(),
             writable: WaitQueue::new(),
         })
-    }
-
-    /// Adds a reference to one end (a `dup` or `fork` of a descriptor).
-    pub(crate) fn add(&self, write: bool) {
-        let mut s = self.state.lock();
-        if write {
-            s.writers += 1;
-        } else {
-            s.readers += 1;
-        }
     }
 
     /// Drops a reference to one end, waking the other side so it sees EOF

@@ -19,6 +19,7 @@ mod futex;
 mod kcell;
 mod linuxabi;
 mod loader;
+mod locks;
 mod nativeabi;
 mod pipe;
 mod poll;
