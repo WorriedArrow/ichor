@@ -91,6 +91,20 @@ const RUNS: &[(&[&str], i32)] = &[
         ],
         0,
     ),
+    (
+        &[
+            "sh",
+            "-c",
+            "rm -f /tmp/pg /tmp/ids; \
+             setsid sh -c 'read l </proc/self/stat; echo $l | cut -d\" \" -f1,5,6 >/tmp/ids; \
+             sleep 30 & sleep 30 & echo $$ >/tmp/pg; wait' & \
+             while [ ! -s /tmp/pg ]; do sleep 0.05; done; \
+             kill -s TERM -$(cat /tmp/pg); wait; \
+             set -- $(cat /tmp/ids); [ \"$1\" = \"$2\" ] && [ \"$2\" = \"$3\" ] && \
+             echo alpine: kill -pgid ended the whole group",
+        ],
+        0,
+    ),
 ];
 
 fn read(vfs: &Vfs, path: &str) -> Vec<u8> {

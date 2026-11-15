@@ -37,7 +37,13 @@ pub(crate) struct ProcEntry {
     pub(crate) pid: u64,
     /// The thread group (process) this thread belongs to.
     pub(crate) tgid: u64,
+    /// The cell the process runs in: signals and process-group operations
+    /// never cross it.
+    pub(crate) cell: u64,
     ppid: AtomicU64,
+    /// Process group and session (meaningful on a process's first entry).
+    pgid: AtomicU64,
+    sid: AtomicU64,
     /// The wait status once the process has exited.
     status: SpinLock<Option<u32>>,
     /// Woken whenever one of this process's children exits.
@@ -58,19 +64,121 @@ impl ProcEntry {
     pub(crate) fn ppid(&self) -> u64 {
         self.ppid.load(Ordering::Acquire)
     }
+
+    /// The process group and session.
+    pub(crate) fn group(&self) -> (u64, u64) {
+        (
+            self.pgid.load(Ordering::Acquire),
+            self.sid.load(Ordering::Acquire),
+        )
+    }
+}
+
+/// A process's first entry (which carries its group, session and status),
+/// if `pid` is a live process in `cell`.
+fn process(cell: u64, pid: u64) -> Option<Arc<ProcEntry>> {
+    let t = TABLE.lock();
+    let e = t.get(&pid)?;
+    (e.cell == cell && e.pid == e.tgid).then(|| e.clone())
+}
+
+/// `getpgid` / `getsid` for `pid` (0: `me`).
+pub(crate) fn group_of(me: &ProcEntry, pid: u64) -> Result<(u64, u64), i64> {
+    if pid == 0 {
+        return Ok(me.group());
+    }
+    process(me.cell, pid).map(|e| e.group()).ok_or(ESRCH)
+}
+
+/// `setpgid(pid, pgid)` by process `me` (its first entry), with POSIX's
+/// rules: the target is `me` or a child of `me` in `me`'s session, not a
+/// session leader, and `pgid` is the target's own pid or an existing group
+/// of that session.
+pub(crate) fn setpgid(me: &ProcEntry, pid: u64, pgid: u64) -> Result<(), i64> {
+    const EPERM: i64 = 1;
+    let pid = if pid == 0 { me.pid } else { pid };
+    let pgid = if pgid == 0 { pid } else { pgid };
+    let target = process(me.cell, pid).ok_or(ESRCH)?;
+    if target.pid != me.pid && target.ppid() != me.pid {
+        return Err(ESRCH);
+    }
+    let (_, sid) = target.group();
+    if sid != me.group().1 {
+        return Err(EPERM);
+    }
+    if sid == target.pid {
+        return Err(EPERM); // a session leader cannot move
+    }
+    if pgid != target.pid {
+        let t = TABLE.lock();
+        let exists = t
+            .values()
+            .any(|e| e.cell == me.cell && e.pid == e.tgid && e.group() == (pgid, sid));
+        if !exists {
+            return Err(EPERM);
+        }
+    }
+    target.pgid.store(pgid, Ordering::Release);
+    Ok(())
+}
+
+/// `setsid` by process `me`: a new session and group led by it, unless it
+/// already leads a group.
+pub(crate) fn setsid(me: &ProcEntry) -> Result<u64, i64> {
+    if me.group().0 == me.pid {
+        return Err(1); // EPERM
+    }
+    me.sid.store(me.pid, Ordering::Release);
+    me.pgid.store(me.pid, Ordering::Release);
+    Ok(me.pid)
+}
+
+/// `kill(0)`, `kill(-pgid)`, `kill(-1)`: posts `sig` to every process of
+/// the group (or, for `pgid` `None`, every process in the cell except
+/// `me`). ESRCH if there was none.
+pub(crate) fn send_group(me: &ProcEntry, pgid: Option<u64>, sig: u32) -> Result<(), i64> {
+    let targets: alloc::vec::Vec<u64> = {
+        let t = TABLE.lock();
+        t.values()
+            .filter(|e| e.cell == me.cell && e.pid == e.tgid && e.status.lock().is_none())
+            .filter(|e| match pgid {
+                Some(g) => e.group().0 == g,
+                None => e.tgid != me.tgid,
+            })
+            .map(|e| e.pid)
+            .collect()
+    };
+    if targets.is_empty() {
+        return Err(ESRCH);
+    }
+    for pid in targets {
+        let _ = send(me.cell, pid, sig);
+    }
+    Ok(())
 }
 
 static TABLE: SpinLock<BTreeMap<u64, Arc<ProcEntry>>> = SpinLock::new(BTreeMap::new());
 static NEXT_PID: AtomicU64 = AtomicU64::new(1);
 
-/// Adds a thread with parent process `ppid` (0: none) to the table, as a
-/// new process (`tgid` `None`) or a thread of process `tgid`.
-pub(crate) fn register(ppid: u64, tgid: Option<u64>) -> Arc<ProcEntry> {
+/// Adds a thread of cell `cell` with parent process `ppid` (0: none) to
+/// the table, as a new process (`tgid` `None`) or a thread of process
+/// `tgid`. A new process starts in `group` = (pgid, sid), or in a group and
+/// session of its own.
+pub(crate) fn register(
+    cell: u64,
+    ppid: u64,
+    tgid: Option<u64>,
+    group: Option<(u64, u64)>,
+) -> Arc<ProcEntry> {
     let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
+    let (pgid, sid) = group.unwrap_or((pid, pid));
     let e = Arc::new(ProcEntry {
         pid,
         tgid: tgid.unwrap_or(pid),
+        cell,
         ppid: AtomicU64::new(ppid),
+        pgid: AtomicU64::new(pgid),
+        sid: AtomicU64::new(sid),
         status: SpinLock::new(None),
         children: WaitQueue::new(),
         pending: AtomicU64::new(0),
@@ -130,10 +238,14 @@ pub(crate) fn post(e: &ProcEntry, sig: u32) {
 /// `kill`: posts `sig` to process `pid` (0 only checks that it exists).
 /// It goes to the thread `pid` if that is still running, else to another
 /// running thread of the process.
-pub(crate) fn send(pid: u64, sig: u32) -> Result<(), i64> {
+pub(crate) fn send(cell: u64, pid: u64, sig: u32) -> Result<(), i64> {
     let target = {
         let t = TABLE.lock();
-        let e = t.get(&pid).cloned().ok_or(ESRCH)?;
+        let e = t
+            .get(&pid)
+            .filter(|e| e.cell == cell)
+            .cloned()
+            .ok_or(ESRCH)?;
         if e.status.lock().is_some() {
             return Ok(()); // a zombie
         }
@@ -156,8 +268,13 @@ pub(crate) fn send(pid: u64, sig: u32) -> Result<(), i64> {
 
 /// `tgkill`/`tkill`: posts `sig` to thread `tid` (of process `tgid`, if
 /// given).
-pub(crate) fn send_thread(tgid: Option<u64>, tid: u64, sig: u32) -> Result<(), i64> {
-    let e = TABLE.lock().get(&tid).cloned().ok_or(ESRCH)?;
+pub(crate) fn send_thread(cell: u64, tgid: Option<u64>, tid: u64, sig: u32) -> Result<(), i64> {
+    let e = TABLE
+        .lock()
+        .get(&tid)
+        .filter(|e| e.cell == cell)
+        .cloned()
+        .ok_or(ESRCH)?;
     if tgid.is_some_and(|g| g != e.tgid) || e.task.lock().is_none() {
         return Err(ESRCH);
     }
@@ -227,7 +344,13 @@ pub(crate) fn wait(
         let mut found = None;
         for (&cpid, c) in t.iter() {
             let leader_of_child = c.pid == c.tgid;
-            if !leader_of_child || c.ppid() != leader.pid || (pid > 0 && pid as u64 != cpid) {
+            let wanted = match pid {
+                p if p > 0 => p as u64 == cpid,
+                0 => c.group().0 == leader.group().0,
+                -1 => true,
+                p => c.group().0 == p.unsigned_abs(),
+            };
+            if !leader_of_child || c.ppid() != leader.pid || !wanted {
                 continue;
             }
             any = true;

@@ -244,7 +244,7 @@ impl LinuxProcess {
     pub(crate) fn new(cell: Arc<Cell>, vfs: Arc<Vfs>) -> Option<Self> {
         let mm = Mm::new(cell.account())?;
         let _ = vfs.lock().open(ROOT);
-        let entry = proc::register(0, None);
+        let entry = proc::register(cell.id(), 0, None, None);
         let group = Arc::new(Group {
             tgid: entry.pid,
             leader: entry.clone(),
@@ -291,7 +291,12 @@ impl LinuxProcess {
         let _ = self.vfs.lock().open(cwd);
         let actions = self.group.actions.lock().clone();
         let exe = self.group.exe.lock().clone();
-        let entry = proc::register(self.group.tgid, None);
+        let entry = proc::register(
+            self.cell.id(),
+            self.group.tgid,
+            None,
+            Some(self.group.leader.group()),
+        );
         let group = Arc::new(Group {
             tgid: entry.pid,
             leader: entry.clone(),
@@ -316,7 +321,12 @@ impl LinuxProcess {
     /// A new thread in this process (`clone` with `CLONE_VM |
     /// CLONE_THREAD`): shares everything but its tid and signal mask.
     pub(crate) fn new_thread(&self) -> Self {
-        let entry = proc::register(self.entry.ppid(), Some(self.group.tgid));
+        let entry = proc::register(
+            self.cell.id(),
+            self.entry.ppid(),
+            Some(self.group.tgid),
+            None,
+        );
         self.group.threads.lock().push(entry.clone());
         Self {
             entry,

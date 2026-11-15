@@ -57,8 +57,8 @@ mod nr {
     pub(super) const VFORK: u64 = 58; // partial: a full copy, the parent does not wait
     pub(super) const EXECVE: u64 = 59; // partial: static ELF binaries
     pub(super) const EXIT: u64 = 60;
-    pub(super) const WAIT4: u64 = 61; // partial: no rusage, no process groups
-    pub(super) const KILL: u64 = 62; // partial: pid > 0 only (no process groups)
+    pub(super) const WAIT4: u64 = 61; // partial: rusage is all zero (no accounting yet)
+    pub(super) const KILL: u64 = 62;
     pub(super) const UNAME: u64 = 63;
     pub(super) const FCNTL: u64 = 72; // partial: no F_SETOWN/F_*SIG/leases/seals
     pub(super) const FLOCK: u64 = 73;
@@ -88,12 +88,12 @@ mod nr {
     pub(super) const GETGID: u64 = 104; // partial: always 0
     pub(super) const GETEUID: u64 = 107; // partial: always 0
     pub(super) const GETEGID: u64 = 108; // partial: always 0
-    pub(super) const SETPGID: u64 = 109; // stub: no process groups yet
+    pub(super) const SETPGID: u64 = 109;
     pub(super) const GETPPID: u64 = 110;
-    pub(super) const GETPGRP: u64 = 111; // stub: the pid
-    pub(super) const SETSID: u64 = 112; // stub: the pid
-    pub(super) const GETPGID: u64 = 121; // stub: the pid
-    pub(super) const GETSID: u64 = 124; // stub: the pid
+    pub(super) const GETPGRP: u64 = 111;
+    pub(super) const SETSID: u64 = 112; // partial: no controlling terminals
+    pub(super) const GETPGID: u64 = 121;
+    pub(super) const GETSID: u64 = 124;
     pub(super) const RT_SIGSUSPEND: u64 = 130;
     pub(super) const SIGALTSTACK: u64 = 131; // stub: no alternate stacks yet
     pub(super) const MOUNT: u64 = 165; // partial: always EPERM (cells cannot mount)
@@ -275,10 +275,13 @@ pub(crate) fn dispatch(p: &mut LinuxProcess, ctx: &mut frame::user::UserContext)
         nr::CLOCK_NANOSLEEP if a[1] == 0 => signal::nanosleep(p, a[2], a[3]),
         nr::CLOCK_NANOSLEEP => Err(EINVAL), // TIMER_ABSTIME
         nr::KILL => signal::kill(p, i(a[0]), a[1]),
-        nr::TKILL => signal::tkill(None, a[0], a[1]),
-        nr::TGKILL => signal::tkill(Some(a[0]), a[1], a[2]),
-        nr::SETPGID => Ok(0),
-        nr::GETPGRP | nr::SETSID | nr::GETPGID | nr::GETSID => Ok(p.group.tgid),
+        nr::TKILL => signal::tkill(p, None, a[0], a[1]),
+        nr::TGKILL => signal::tkill(p, Some(a[0]), a[1], a[2]),
+        nr::SETPGID => proc::setpgid(&p.group.leader, a[0], a[1]).map(|()| 0),
+        nr::GETPGRP => Ok(p.group.leader.group().0),
+        nr::GETPGID => proc::group_of(&p.group.leader, a[0]).map(|g| g.0),
+        nr::GETSID => proc::group_of(&p.group.leader, a[0]).map(|g| g.1),
+        nr::SETSID => proc::setsid(&p.group.leader),
         nr::SIGALTSTACK => zero_out(p, a[1], 24),
         nr::FUTEX => crate::futex::futex(p, &a),
         nr::SCHED_YIELD => {

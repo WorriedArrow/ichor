@@ -291,29 +291,31 @@ pub(crate) fn nanosleep(p: &mut LinuxProcess, req: u64, rem: u64) -> Result<u64,
     Err(EINTR)
 }
 
-/// `kill`: process-directed (any thread of `pid` may take it).
+/// `kill`: process-directed (any thread of the target may take it). `pid`
+/// 0 is the caller's process group, `-pgid` another group, -1 every other
+/// process in the cell. Never crosses the cell.
 pub(crate) fn kill(p: &mut LinuxProcess, pid: i64, sig: u64) -> Result<u64, i64> {
-    const EPERM: i64 = 1;
     let sig = u32::try_from(sig)
         .ok()
         .filter(|&s| s <= NSIG)
         .ok_or(EINVAL)?;
-    if pid <= 0 {
-        // Process groups and "every process" need sessions (job control).
-        return Err(EPERM);
+    let me = p.group.leader.clone();
+    match pid {
+        p if p > 0 => proc::send(me.cell, p as u64, sig)?,
+        0 => proc::send_group(&me, Some(me.group().0), sig)?,
+        -1 => proc::send_group(&me, None, sig)?,
+        p => proc::send_group(&me, Some(p.unsigned_abs()), sig)?,
     }
-    let _ = p;
-    proc::send(pid as u64, sig)?;
     Ok(0)
 }
 
 /// `tkill` / `tgkill`: thread-directed.
-pub(crate) fn tkill(tgid: Option<u64>, tid: u64, sig: u64) -> Result<u64, i64> {
+pub(crate) fn tkill(p: &LinuxProcess, tgid: Option<u64>, tid: u64, sig: u64) -> Result<u64, i64> {
     let sig = u32::try_from(sig)
         .ok()
         .filter(|&s| s <= NSIG)
         .ok_or(EINVAL)?;
-    proc::send_thread(tgid, tid, sig)?;
+    proc::send_thread(p.entry.cell, tgid, tid, sig)?;
     Ok(0)
 }
 

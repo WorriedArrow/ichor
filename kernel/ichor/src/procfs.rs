@@ -246,13 +246,14 @@ fn status(p: &LinuxProcess) -> Vec<u8> {
 }
 
 fn stat_process(p: &LinuxProcess) -> Vec<u8> {
+    let (pgid, sid) = p.group.leader.group();
     format!(
         "{} ({}) R {} {} {} 0 -1 0 0 0 0 0 0 0 0 0 20 0 {} 0 0 0 0\n",
         p.group.tgid,
         comm(p),
         p.entry.ppid(),
-        p.group.tgid,
-        p.group.tgid,
+        pgid,
+        sid,
         p.group.threads().len()
     )
     .into_bytes()
