@@ -13,8 +13,8 @@ use crate::kcell::{Cell, System};
 use crate::loader;
 use crate::proc;
 use crate::process::LinuxProcess;
-use crate::testprog::{Asm, BLOB_VADDR, Reg, static_elf};
 use crate::vfs::Vfs;
+use testprog::{Asm, BLOB_VADDR, Reg, static_elf};
 
 pub(crate) fn fail(what: &str) -> ! {
     println!("ichor: runtest FAILED: {what}");

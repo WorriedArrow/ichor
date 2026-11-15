@@ -1,0 +1,13 @@
+[package]
+name = "ichor-testprog"
+description = "A tiny x86-64 assembler and static-ELF writer for test and benchmark programs (no_std, host-testable)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "testprog"
+
+[lints]
+workspace = true

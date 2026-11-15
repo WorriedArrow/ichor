@@ -378,6 +378,7 @@ kernel/overlay   cell root: image + copy-on-write upper layer (host-tested)
 kernel/csprng    ChaCha20 generator with fast key erasure (host-tested)
 kernel/civil     calendar time to Unix time, for the firmware clock (host-tested)
 kernel/blake3    BLAKE3, portable, checked against the official vectors (host-tested)
+kernel/testprog  tiny x86-64 assembler + static-ELF writer for self-test and benchmark programs (host-tested; xtask uses it too)
 kernel/drivers/virtio-pci  modern virtio PCI transport shared by the virtio drivers
 kernel/drivers/virtio-blk  safe virtio-blk driver over frame's IoMem/DMA
 kernel/drivers/virtio-rng  safe virtio-rng (entropy) driver

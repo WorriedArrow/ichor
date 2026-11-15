@@ -1,17 +1,22 @@
-//! Building small static Linux test programs at runtime: a tiny x86-64
-//! assembler (the handful of instructions self-tests need, with labels and
-//! data references) and a wrapper that turns the result into a static ELF.
+//! Building small static Linux test programs: a tiny x86-64 assembler (the
+//! handful of instructions self-tests need, with labels and data
+//! references) and a wrapper that turns the result into a static ELF.
 //!
-//! This is test scaffolding for the boot self-tests until the block and
-//! image layers can supply real binaries (busybox) from disk.
+//! The kernel builds its boot self-tests and benchmarks with it at runtime;
+//! xtask builds the same benchmark programs on the host to run them under
+//! Linux, so both kernels execute identical bytes.
+
+#![no_std]
+#![forbid(unsafe_code)]
+
+extern crate alloc;
 
 use alloc::vec::Vec;
 
 /// x86-64 general-purpose registers, by encoding number.
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
-pub(crate) enum Reg {
+pub enum Reg {
     Rax = 0,
     Rcx = 1,
     Rdx = 2,
@@ -41,15 +46,15 @@ impl Reg {
 
 /// A forward-referenceable code position.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct Label(usize);
+pub struct Label(usize);
 
 /// A piece of data placed after the code.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct Data(usize);
+pub struct Data(usize);
 
 /// A minimal assembler.
 #[derive(Debug, Default)]
-pub(crate) struct Asm {
+pub struct Asm {
     code: Vec<u8>,
     labels: Vec<Option<usize>>,
     /// (position of rel32, label)
@@ -62,20 +67,20 @@ pub(crate) struct Asm {
 }
 
 impl Asm {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self::default()
     }
 
-    pub(crate) fn label(&mut self) -> Label {
+    pub fn label(&mut self) -> Label {
         self.labels.push(None);
         Label(self.labels.len() - 1)
     }
 
-    pub(crate) fn bind(&mut self, l: Label) {
+    pub fn bind(&mut self, l: Label) {
         self.labels[l.0] = Some(self.code.len());
     }
 
-    pub(crate) fn data(&mut self, bytes: &[u8]) -> Data {
+    pub fn data(&mut self, bytes: &[u8]) -> Data {
         self.data.push(bytes.to_vec());
         Data(self.data.len() - 1)
     }
@@ -85,35 +90,35 @@ impl Asm {
     }
 
     /// `mov dst, imm64`
-    pub(crate) fn mov_imm(&mut self, dst: Reg, imm: u64) {
+    pub fn mov_imm(&mut self, dst: Reg, imm: u64) {
         self.rex_w(0, dst.ext());
         self.code.push(0xB8 + dst.low());
         self.code.extend_from_slice(&imm.to_le_bytes());
     }
 
     /// `mov dst, <address of data>`
-    pub(crate) fn mov_data(&mut self, dst: Reg, d: Data) {
+    pub fn mov_data(&mut self, dst: Reg, d: Data) {
         self.mov_imm(dst, 0);
         let pos = self.code.len() - 8;
         self.data_refs.push((pos, d.0));
     }
 
     /// `mov dst, <address of label>`
-    pub(crate) fn mov_label(&mut self, dst: Reg, l: Label) {
+    pub fn mov_label(&mut self, dst: Reg, l: Label) {
         self.mov_imm(dst, 0);
         let pos = self.code.len() - 8;
         self.label_refs.push((pos, l.0));
     }
 
     /// `mov dst, src`
-    pub(crate) fn mov(&mut self, dst: Reg, src: Reg) {
+    pub fn mov(&mut self, dst: Reg, src: Reg) {
         self.rex_w(src.ext(), dst.ext());
         self.code.push(0x89);
         self.code.push(0xC0 | (src.low() << 3) | dst.low());
     }
 
     /// `mov dst, [base + disp32]`
-    pub(crate) fn load(&mut self, dst: Reg, base: Reg, disp: i32) {
+    pub fn load(&mut self, dst: Reg, base: Reg, disp: i32) {
         self.rex_w(dst.ext(), base.ext());
         self.code.push(0x8B);
         self.code.push(0x80 | (dst.low() << 3) | base.low());
@@ -124,7 +129,7 @@ impl Asm {
     }
 
     /// `mov [base + disp32], src`
-    pub(crate) fn store(&mut self, base: Reg, disp: i32, src: Reg) {
+    pub fn store(&mut self, base: Reg, disp: i32, src: Reg) {
         self.rex_w(src.ext(), base.ext());
         self.code.push(0x89);
         self.code.push(0x80 | (src.low() << 3) | base.low());
@@ -135,7 +140,7 @@ impl Asm {
     }
 
     /// `add dst, imm32`
-    pub(crate) fn add_imm(&mut self, dst: Reg, imm: i32) {
+    pub fn add_imm(&mut self, dst: Reg, imm: i32) {
         self.rex_w(0, dst.ext());
         self.code.push(0x81);
         self.code.push(0xC0 | dst.low());
@@ -143,7 +148,7 @@ impl Asm {
     }
 
     /// `sub dst, imm32`
-    pub(crate) fn sub_imm(&mut self, dst: Reg, imm: i32) {
+    pub fn sub_imm(&mut self, dst: Reg, imm: i32) {
         self.rex_w(0, dst.ext());
         self.code.push(0x81);
         self.code.push(0xE8 | dst.low());
@@ -151,7 +156,7 @@ impl Asm {
     }
 
     /// `cmp a, imm32` (sign-extended)
-    pub(crate) fn cmp_imm(&mut self, a: Reg, imm: i32) {
+    pub fn cmp_imm(&mut self, a: Reg, imm: i32) {
         self.rex_w(0, a.ext());
         self.code.push(0x81);
         self.code.push(0xF8 | a.low());
@@ -159,7 +164,7 @@ impl Asm {
     }
 
     /// `cmp a, b`
-    pub(crate) fn cmp(&mut self, a: Reg, b: Reg) {
+    pub fn cmp(&mut self, a: Reg, b: Reg) {
         self.rex_w(b.ext(), a.ext());
         self.code.push(0x39);
         self.code.push(0xC0 | (b.low() << 3) | a.low());
@@ -172,54 +177,54 @@ impl Asm {
     }
 
     /// `jne label`
-    pub(crate) fn jne(&mut self, l: Label) {
+    pub fn jne(&mut self, l: Label) {
         self.jump(&[0x0F, 0x85], l);
     }
 
     /// `jmp label`
-    pub(crate) fn jmp(&mut self, l: Label) {
+    pub fn jmp(&mut self, l: Label) {
         self.jump(&[0xE9], l);
     }
 
     /// Raw instruction bytes (for encodings the assembler has no method
     /// for, such as VEX).
-    pub(crate) fn raw(&mut self, bytes: &[u8]) {
+    pub fn raw(&mut self, bytes: &[u8]) {
         self.code.extend_from_slice(bytes);
     }
 
     /// `je label`
-    pub(crate) fn je(&mut self, l: Label) {
+    pub fn je(&mut self, l: Label) {
         self.jump(&[0x0F, 0x84], l);
     }
 
     /// `jbe label` (unsigned <=)
-    pub(crate) fn jbe(&mut self, l: Label) {
+    pub fn jbe(&mut self, l: Label) {
         self.jump(&[0x0F, 0x86], l);
     }
 
     /// `ja label` (unsigned >)
-    pub(crate) fn ja(&mut self, l: Label) {
+    pub fn ja(&mut self, l: Label) {
         self.jump(&[0x0F, 0x87], l);
     }
 
     /// `ret`
-    pub(crate) fn ret(&mut self) {
+    pub fn ret(&mut self) {
         self.code.push(0xC3);
     }
 
-    pub(crate) fn syscall(&mut self) {
+    pub fn syscall(&mut self) {
         self.code.extend_from_slice(&[0x0F, 0x05]);
     }
 
     /// `mov rax, nr; syscall` with arguments already in place.
-    pub(crate) fn sys(&mut self, nr: u64) {
+    pub fn sys(&mut self, nr: u64) {
         self.mov_imm(Reg::Rax, nr);
         self.syscall();
     }
 
     /// Resolves labels and data references for code loaded at `base`, and
     /// returns code followed by data. Returns `None` on an unbound label.
-    pub(crate) fn finish(mut self, base: u64) -> Option<Vec<u8>> {
+    pub fn finish(mut self, base: u64) -> Option<Vec<u8>> {
         for &(pos, l) in &self.jumps {
             let target = self.labels[l]? as i64;
             let rel = (target - (pos as i64 + 4)) as i32;
@@ -248,16 +253,16 @@ impl Asm {
 }
 
 /// Where test programs are loaded.
-pub(crate) const LOAD_VADDR: u64 = 0x40_0000;
+pub const LOAD_VADDR: u64 = 0x40_0000;
 const EHDR: usize = 64;
 const PHDR: usize = 56;
 /// Virtual address the assembled blob starts at (after the ELF headers,
 /// which share the one segment).
-pub(crate) const BLOB_VADDR: u64 = LOAD_VADDR + (EHDR + PHDR) as u64;
+pub const BLOB_VADDR: u64 = LOAD_VADDR + (EHDR + PHDR) as u64;
 
 /// Wraps a blob assembled for `BLOB_VADDR` into a static ET_EXEC ELF with one
 /// read+execute segment; the entry point is the start of the blob.
-pub(crate) fn static_elf(blob: &[u8]) -> Vec<u8> {
+pub fn static_elf(blob: &[u8]) -> Vec<u8> {
     let mut img = Vec::new();
     img.extend_from_slice(&[0x7f, b'E', b'L', b'F', 2, 1, 1, 0]);
     img.extend_from_slice(&[0; 8]);
@@ -283,4 +288,51 @@ pub(crate) fn static_elf(blob: &[u8]) -> Vec<u8> {
     img.extend_from_slice(&0x1000u64.to_le_bytes()); // p_align
     img.extend_from_slice(blob);
     img
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encodes_and_resolves_labels_and_data() {
+        let mut a = Asm::new();
+        let msg = a.data(b"hi");
+        let top = a.label();
+        a.bind(top);
+        a.mov_imm(Reg::R12, 7); // 49 BC imm64
+        a.mov_data(Reg::Rsi, msg);
+        a.sub_imm(Reg::R12, 1); // 49 81 EC imm32
+        a.jne(top);
+        a.sys(60);
+        let blob = a.finish(BLOB_VADDR).unwrap();
+        assert_eq!(&blob[..2], &[0x49, 0xBC]);
+        assert_eq!(&blob[2..10], &7u64.to_le_bytes());
+        // The data follows the code; mov_data loads its absolute address.
+        let data_at = blob.len() - 2;
+        assert_eq!(&blob[data_at..], b"hi");
+        let addr = u64::from_le_bytes(blob[12..20].try_into().unwrap());
+        assert_eq!(addr, BLOB_VADDR + data_at as u64);
+        // jne jumps back to the start: rel32 = -(end of the jne).
+        let jne_end = 10 + 10 + 7 + 6;
+        let rel = i32::from_le_bytes(blob[jne_end - 4..jne_end].try_into().unwrap());
+        assert_eq!(rel, -(jne_end as i32));
+        // An unbound label is an error.
+        let mut b = Asm::new();
+        let l = b.label();
+        b.jmp(l);
+        assert!(b.finish(BLOB_VADDR).is_none());
+    }
+
+    #[test]
+    fn static_elf_has_one_loadable_segment_at_the_blob() {
+        let elf = static_elf(&[0xC3]);
+        assert_eq!(&elf[..4], b"\x7fELF");
+        assert_eq!(
+            u64::from_le_bytes(elf[24..32].try_into().unwrap()),
+            BLOB_VADDR
+        );
+        assert_eq!(elf.len(), 64 + 56 + 1);
+        assert_eq!(*elf.last().unwrap(), 0xC3);
+    }
 }

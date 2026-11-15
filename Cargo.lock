@@ -19,6 +19,7 @@ dependencies = [
  "ichor-nvme",
  "ichor-overlay",
  "ichor-sched",
+ "ichor-testprog",
  "ichor-virtio-blk",
  "ichor-virtio-rng",
  "ichor-vma",
@@ -107,6 +108,10 @@ version = "0.0.0"
 
 [[package]]
 name = "ichor-sched"
+version = "0.0.0"
+
+[[package]]
+name = "ichor-testprog"
 version = "0.0.0"
 
 [[package]]

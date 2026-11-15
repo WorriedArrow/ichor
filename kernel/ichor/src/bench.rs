@@ -26,8 +26,8 @@ use crate::kcell::{Cell, System};
 use crate::pagecache::Mounted;
 use crate::process::LinuxProcess;
 use crate::runtest::{fail, run_linux};
-use crate::testprog::{Asm, BLOB_VADDR, Reg, static_elf};
 use crate::vfs::Vfs;
+use testprog::{Asm, BLOB_VADDR, Reg, static_elf};
 
 const GETPID: u64 = 39;
 const READ: u64 = 0;
