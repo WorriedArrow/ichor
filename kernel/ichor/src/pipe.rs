@@ -40,6 +40,8 @@ pub(crate) struct Pipe {
     writable: WaitQueue,
     /// State changes so far (edge-triggered epoll).
     changes: core::sync::atomic::AtomicU64,
+    /// Tasks polling either end.
+    watchers: crate::poll::Watchers,
 }
 
 impl Pipe {
@@ -54,7 +56,13 @@ impl Pipe {
             readable: WaitQueue::new(),
             writable: WaitQueue::new(),
             changes: core::sync::atomic::AtomicU64::new(0),
+            watchers: crate::poll::Watchers::new(),
         })
+    }
+
+    /// The tasks polling this pipe.
+    pub(crate) fn watchers(&self) -> &crate::poll::Watchers {
+        &self.watchers
     }
 
     /// Drops a reference to one end, waking the other side so it sees EOF
@@ -81,7 +89,7 @@ impl Pipe {
     fn changed(&self) {
         self.changes
             .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
-        crate::poll::notify();
+        self.watchers.notify();
     }
 
     /// Readiness of the read end (`write` false) or write end, as `poll`

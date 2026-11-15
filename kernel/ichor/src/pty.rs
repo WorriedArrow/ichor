@@ -365,6 +365,8 @@ pub(crate) struct Pty {
     state: SpinLock<State>,
     queue: WaitQueue,
     changes: AtomicU64,
+    /// Tasks polling either end.
+    watchers: crate::poll::Watchers,
 }
 
 /// A root's ptys by index.
@@ -374,7 +376,7 @@ impl Pty {
     fn changed(&self) {
         self.changes.fetch_add(1, Ordering::AcqRel);
         self.queue.wake_all();
-        crate::poll::notify();
+        self.watchers.notify();
     }
 
     fn name(&self) -> String {
@@ -521,6 +523,7 @@ pub(crate) fn open_master(p: &mut LinuxProcess, ino: Ino, nonblock: bool) -> Res
         }),
         queue: WaitQueue::new(),
         changes: AtomicU64::new(0),
+        watchers: crate::poll::Watchers::new(),
     });
     vfs.ptys.lock().insert(index, Arc::downgrade(&pty));
     drop(fs);
@@ -763,6 +766,10 @@ impl Object for End {
 
     fn tty(&self) -> Option<&End> {
         Some(self)
+    }
+
+    fn watchers(&self) -> Option<&crate::poll::Watchers> {
+        Some(&self.pty.watchers)
     }
 }
 

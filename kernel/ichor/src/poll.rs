@@ -4,11 +4,12 @@
 //!
 //! Readiness is computed from the objects descriptors name: a pipe is
 //! readable with data (or no writers), writable with room (or no readers);
-//! files, devices and the console are always ready. Waiters sleep on one
-//! poll queue that every state change wakes ([`notify`]), with a deadline
-//! for timeouts; a signal ends the wait with `EINTR`. The condition is
-//! checked while the task is marked blocked, so it only takes spinlocks: the
-//! descriptors are looked up once, before waiting.
+//! files, devices and the console are always ready. A waiter registers with
+//! the [`Watchers`] of each object it polls and sleeps on its own queue, so
+//! a state change wakes only the tasks polling that object; a deadline ends
+//! it for timeouts, a signal with `EINTR`. The condition is checked while
+//! the task is marked blocked, so it only takes spinlocks: the descriptors
+//! are looked up once, before waiting.
 //!
 //! `EPOLLET` entries report an object once per change: pipes and eventfds
 //! count their state changes ([`Object::changes`]), and an edge-triggered
@@ -18,7 +19,7 @@
 //! `epoll_wait`, and a nested epoll instance never polls ready.
 
 use alloc::collections::BTreeMap;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::fmt::Debug;
 use core::time::Duration;
@@ -83,18 +84,65 @@ pub(crate) trait Object: Send + Sync + Debug {
     fn tty(&self) -> Option<&crate::pty::End> {
         None
     }
+    /// The pollers to wake when its readiness changes (`None`: it never
+    /// changes, or is not worth waiting on).
+    fn watchers(&self) -> Option<&Watchers> {
+        None
+    }
     /// A directory's entries `(name, d_type)` and read cursor (`/proc`).
     fn dir(&self) -> Option<(&[DirEntry], &SpinLock<u64>)> {
         None
     }
 }
 
-/// The queue every readiness change wakes.
-static POLL_QUEUE: WaitQueue = WaitQueue::new();
+/// One task sleeping in `poll`/`select`/`epoll_wait`, registered with each
+/// object it watches.
+#[derive(Debug)]
+struct Poller {
+    queue: WaitQueue,
+}
 
-/// Wakes every task in `poll`/`select`/`epoll_wait` to re-check.
-pub(crate) fn notify() {
-    POLL_QUEUE.wake_all();
+/// The pollers watching one object. An object whose readiness can change
+/// (pipe, eventfd, pty) owns one and calls [`Watchers::notify`] on every
+/// change, which wakes only the tasks polling that object.
+#[derive(Debug)]
+pub(crate) struct Watchers(SpinLock<Vec<Weak<Poller>>>);
+
+impl Watchers {
+    pub(crate) const fn new() -> Watchers {
+        Watchers(SpinLock::new(Vec::new()))
+    }
+
+    /// Wakes every task polling this object, so it re-checks.
+    pub(crate) fn notify(&self) {
+        let live: Vec<Arc<Poller>> = {
+            let mut v = self.0.lock();
+            v.retain(|w| w.strong_count() > 0);
+            v.iter().filter_map(Weak::upgrade).collect()
+        };
+        for p in live {
+            p.queue.wake_all();
+        }
+    }
+
+    fn watch(&self, p: &Arc<Poller>) {
+        self.0.lock().push(Arc::downgrade(p));
+    }
+
+    fn unwatch(&self, p: &Arc<Poller>) {
+        self.0
+            .lock()
+            .retain(|w| w.strong_count() > 0 && !core::ptr::eq(w.as_ptr(), Arc::as_ptr(p)));
+    }
+}
+
+/// The watcher list of what `fd` names, if its readiness can change.
+fn watchers(fd: &Fd) -> Option<&Watchers> {
+    match fd {
+        Fd::Console | Fd::File(_) | Fd::Dev(_) => None,
+        Fd::Pipe(e) => Some(e.pipe.watchers()),
+        Fd::Object(o) => o.obj.watchers(),
+    }
 }
 
 /// The readiness of what `fd` names (spinlocks only).
@@ -116,9 +164,11 @@ fn changes(fd: &Fd) -> u64 {
 }
 
 /// Sleeps until `check` returns `Some`, the deadline passes (`Ok(None)`),
-/// or a signal arrives (`EINTR`).
-fn wait_ready<T>(
+/// or a signal arrives (`EINTR`; posting a signal wakes the task directly).
+/// The task is woken only by changes to the objects behind `fds`.
+fn wait_ready<'f, T>(
     p: &LinuxProcess,
+    fds: impl Iterator<Item = &'f Fd>,
     deadline: Option<Duration>,
     mut check: impl FnMut() -> Option<T>,
 ) -> Result<Option<T>, i64> {
@@ -129,10 +179,21 @@ fn wait_ready<T>(
         }
         proc::interrupted(&entry).then_some(Err(EINTR))
     };
+    // Registered before the first check, so a change after it wakes us.
+    let poller = Arc::new(Poller {
+        queue: WaitQueue::new(),
+    });
+    let watched: Vec<&Watchers> = fds.filter_map(watchers).collect();
+    for w in &watched {
+        w.watch(&poller);
+    }
     let r = match deadline {
-        Some(d) => POLL_QUEUE.wait_until_deadline(d, &mut cond),
-        None => Some(POLL_QUEUE.wait_until(&mut cond)),
+        Some(d) => poller.queue.wait_until_deadline(d, &mut cond),
+        None => Some(poller.queue.wait_until(&mut cond)),
     };
+    for w in &watched {
+        w.unwatch(&poller);
+    }
     match r {
         Some(Ok(v)) => Ok(Some(v)),
         Some(Err(e)) => Err(e),
@@ -205,7 +266,8 @@ fn do_poll(
         ready
     };
     let mut revents = Vec::with_capacity(n);
-    let ready = match wait_ready(p, deadline, || {
+    let fds = entries.iter().filter_map(|(_, _, o)| o.as_ref());
+    let ready = match wait_ready(p, fds, deadline, || {
         let r = scan(&mut revents);
         (r > 0).then_some(r)
     })? {
@@ -303,7 +365,8 @@ fn do_select(
         alloc::vec![0u8; bytes],
         alloc::vec![0u8; bytes],
     ];
-    let ready = match wait_ready(p, deadline, || {
+    let fds = watch.iter().map(|(_, _, o)| o);
+    let ready = match wait_ready(p, fds, deadline, || {
         let c = scan(&mut outs);
         (c > 0).then_some(c)
     })? {
@@ -375,9 +438,14 @@ pub(crate) struct EventFd {
     changes: core::sync::atomic::AtomicU64,
     semaphore: bool,
     queue: WaitQueue,
+    watchers: Watchers,
 }
 
 impl Object for EventFd {
+    fn watchers(&self) -> Option<&Watchers> {
+        Some(&self.watchers)
+    }
+
     fn read(
         &self,
         max: usize,
@@ -459,7 +527,7 @@ impl EventFd {
         self.changes
             .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
         self.queue.wake_all();
-        notify();
+        self.watchers.notify();
     }
 }
 
@@ -476,6 +544,7 @@ pub(crate) fn eventfd(p: &mut LinuxProcess, init: u64, flags: u64) -> Result<u64
         changes: core::sync::atomic::AtomicU64::new(0),
         semaphore: flags & EFD_SEMAPHORE != 0,
         queue: WaitQueue::new(),
+        watchers: Watchers::new(),
     });
     install(p, obj, flags & EFD_NONBLOCK != 0, flags & EFD_CLOEXEC != 0)
 }
@@ -660,7 +729,8 @@ pub(crate) fn epoll_wait(
         }
         hits
     };
-    let hits = wait_ready(p, deadline_ms(timeout), || {
+    let fds = watch.iter().map(|(_, i)| &i.fd);
+    let hits = wait_ready(p, fds, deadline_ms(timeout), || {
         let h = scan();
         (!h.is_empty()).then_some(h)
     })?
