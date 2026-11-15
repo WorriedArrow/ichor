@@ -48,8 +48,8 @@ pub fn spin_for(d: Duration) {
     apic::delay_us(u64::try_from(d.as_micros()).unwrap_or(u64::MAX));
 }
 
-/// `cpu`'s armed timer deadlines (scheduler slice, kernel timer) in
-/// nanoseconds from now; for diagnostics.
-pub fn deadlines(cpu: crate::cpu::CpuId) -> [Option<i64>; 2] {
+/// `cpu`'s armed timer deadlines (scheduler slice, kernel timer, timed
+/// waits) in nanoseconds from now; for diagnostics.
+pub fn deadlines(cpu: crate::cpu::CpuId) -> [Option<i64>; 3] {
     apic::deadlines_ns(cpu)
 }

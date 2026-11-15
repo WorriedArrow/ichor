@@ -238,8 +238,9 @@ pub(crate) fn pause(p: &mut LinuxProcess) -> Result<u64, i64> {
     Err(EINTR)
 }
 
-/// `nanosleep` / `clock_nanosleep` (relative). Partial: frame has no timed
-/// wait yet, so this yields until the deadline; a signal ends it early.
+/// `nanosleep` / `clock_nanosleep` (relative): sleeps on a frame timed
+/// wait; a signal the process would act on ends it early with `EINTR` and
+/// the time left in `rem`.
 pub(crate) fn nanosleep(p: &mut LinuxProcess, req: u64, rem: u64) -> Result<u64, i64> {
     let sec = read_u64(p, req)?;
     let nsec = read_u64(p, req + 8)?;
@@ -247,23 +248,17 @@ pub(crate) fn nanosleep(p: &mut LinuxProcess, req: u64, rem: u64) -> Result<u64,
         return Err(EINVAL);
     }
     let deadline = frame::time::now()
-        + core::time::Duration::from_secs(sec)
-        + core::time::Duration::from_nanos(nsec);
-    loop {
-        let now = frame::time::now();
-        if now >= deadline {
-            return Ok(0);
-        }
-        if proc::interrupted(&p.entry) {
-            if rem != 0 {
-                let left = deadline - now;
-                write_u64(p, rem, left.as_secs())?;
-                write_u64(p, rem + 8, u64::from(left.subsec_nanos()))?;
-            }
-            return Err(EINTR);
-        }
-        frame::task::yield_now();
+        .saturating_add(core::time::Duration::from_secs(sec))
+        .saturating_add(core::time::Duration::from_nanos(nsec));
+    if !proc::sleep_until(&p.entry, deadline) {
+        return Ok(0);
     }
+    if rem != 0 {
+        let left = deadline.saturating_sub(frame::time::now());
+        write_u64(p, rem, left.as_secs())?;
+        write_u64(p, rem + 8, u64::from(left.subsec_nanos()))?;
+    }
+    Err(EINTR)
 }
 
 /// `kill` (and `tkill`/`tgkill`, threads being processes for now).

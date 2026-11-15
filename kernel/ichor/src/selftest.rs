@@ -169,6 +169,56 @@ pub(crate) fn threads() {
     );
 }
 
+/// Timed waits: threads sleeping to staggered deadlines each wake after
+/// their deadline and not much later, and a wait whose condition comes
+/// true wakes early instead of timing out.
+pub(crate) fn timed_waits() {
+    const N: usize = 4;
+    static DONE: AtomicUsize = AtomicUsize::new(0);
+    static LATE: AtomicU64 = AtomicU64::new(0);
+    static EARLY: AtomicUsize = AtomicUsize::new(0);
+    static ALL_DONE: WaitQueue = WaitQueue::new();
+    let start = frame::time::now();
+    for i in 0..N {
+        let deadline = start + Duration::from_millis(20 * (i as u64 + 1));
+        let spawned = TaskOptions::new(move || {
+            frame::task::sleep_until(deadline);
+            let woke = frame::time::now();
+            if woke < deadline {
+                EARLY.fetch_add(1, Relaxed);
+            }
+            let late = (woke - deadline.min(woke)).as_millis() as u64;
+            LATE.fetch_max(late, Relaxed);
+            if DONE.fetch_add(1, Relaxed) + 1 == N {
+                ALL_DONE.wake_all();
+            }
+        })
+        .spawn();
+        if spawned.is_none() {
+            fail("could not spawn a sleeper");
+        }
+    }
+    // Wakes when the last sleeper finishes, long before this deadline.
+    let timeout = start + Duration::from_secs(10);
+    let finished =
+        ALL_DONE.wait_until_deadline(timeout, || (DONE.load(Relaxed) == N).then_some(()));
+    if finished.is_none() || EARLY.load(Relaxed) != 0 {
+        fail("timed waits: a sleeper woke early or never");
+    }
+    // A wait that times out returns None at about its deadline.
+    let q = WaitQueue::new();
+    let t0 = frame::time::now();
+    let r = q.wait_until_deadline(t0 + Duration::from_millis(15), || None::<()>);
+    let waited = frame::time::now() - t0;
+    if r.is_some() || waited < Duration::from_millis(15) {
+        fail("timed waits: timeout returned early");
+    }
+    println!(
+        "ichor: sleep: {N} timed waits woke after their deadlines (worst {} ms late), timeout ok",
+        LATE.load(Relaxed)
+    );
+}
+
 /// Preemption: more never-yielding spinners than CPUs must all make
 /// progress, and the main task (which competes with them) must still get
 /// to run and stop them.

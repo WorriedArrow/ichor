@@ -126,6 +126,14 @@ pub(crate) fn send(pid: u64, sig: u32) -> Result<(), i64> {
     Ok(())
 }
 
+/// Sleeps until `deadline` (time since boot) or until `e` has a signal it
+/// would act on; returns true if a signal ended the sleep.
+pub(crate) fn sleep_until(e: &ProcEntry, deadline: core::time::Duration) -> bool {
+    e.signals
+        .wait_until_deadline(deadline, || interrupted(e).then_some(()))
+        .is_some()
+}
+
 /// Sleeps until `e` has a signal it would act on.
 pub(crate) fn wait_for_signal(e: &ProcEntry) {
     e.signals.wait_until(|| interrupted(e).then_some(()));

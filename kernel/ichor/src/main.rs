@@ -91,6 +91,7 @@ fn kmain(info: BootInfo) -> ! {
     frame::task::inject_scheduler(&sched::SCHEDULER);
     selftest::threads();
     selftest::preemption();
+    selftest::timed_waits();
     selftest::user_mode();
     celltest::run();
     proctest::run();

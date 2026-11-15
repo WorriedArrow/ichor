@@ -45,7 +45,7 @@ mod nr {
     pub(super) const SCHED_YIELD: u64 = 24;
     pub(super) const MADVISE: u64 = 28; // stub: advice is ignored
     pub(super) const PAUSE: u64 = 34;
-    pub(super) const NANOSLEEP: u64 = 35; // partial: yields until the deadline (no timed wait yet)
+    pub(super) const NANOSLEEP: u64 = 35;
     pub(super) const DUP: u64 = 32; // partial: the copy has its own offset
     pub(super) const DUP2: u64 = 33; // partial: the copy has its own offset
     pub(super) const GETPID: u64 = 39;

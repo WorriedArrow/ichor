@@ -24,7 +24,7 @@
 //!   spinlock guard is live, panics.
 
 use alloc::boxed::Box;
-use alloc::collections::VecDeque;
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
@@ -617,6 +617,60 @@ pub fn snapshot(cpu: CpuId) -> CpuSnapshot {
     }
 }
 
+/// Tasks in a timed wait, by (deadline in ns since boot, task id). Adding
+/// one arms the adding CPU's sleep timer for the earliest deadline; the
+/// interrupt wakes everything due and re-arms for the next one. A sleeper
+/// woken early (its condition held) removes itself; a timer that then fires
+/// for nothing is harmless.
+static SLEEPERS: SpinLock<BTreeMap<(u64, u64), Arc<Task>>> = SpinLock::new(BTreeMap::new());
+
+fn arm_sleep_timer(deadline_ns: u64) {
+    let now = arch::apic::now_ns();
+    arch::apic::arm(
+        arch::apic::TimerKind::Sleep,
+        deadline_ns.saturating_sub(now).max(1),
+    );
+}
+
+fn add_sleeper(deadline_ns: u64, t: Arc<Task>) {
+    let first = {
+        let mut s = SLEEPERS.lock();
+        s.insert((deadline_ns, t.id()), t);
+        s.keys().next().map(|k| k.0)
+    };
+    if let Some(d) = first {
+        arm_sleep_timer(d);
+    }
+}
+
+fn remove_sleeper(deadline_ns: u64, id: u64) {
+    SLEEPERS.lock().remove(&(deadline_ns, id));
+}
+
+/// The sleep timer fired on this CPU: wakes every task whose deadline has
+/// passed and re-arms for the next.
+pub(crate) fn on_sleep_timer() {
+    let now = arch::apic::now_ns();
+    let (due, next) = {
+        let mut s = SLEEPERS.lock();
+        let later = s.split_off(&(now.saturating_add(1), 0));
+        let due = core::mem::replace(&mut *s, later);
+        (due, s.keys().next().map(|k| k.0))
+    };
+    for t in due.into_values() {
+        t.wake();
+    }
+    if let Some(d) = next {
+        arm_sleep_timer(d);
+    }
+}
+
+/// Sleeps until `deadline` (time since boot, as [`crate::time::now`]).
+pub fn sleep_until(deadline: Duration) {
+    let q = WaitQueue::new();
+    let _ = q.wait_until_deadline(deadline, || None::<()>);
+}
+
 /// A queue of tasks waiting for a condition.
 pub struct WaitQueue {
     waiters: SpinLock<VecDeque<Arc<Task>>>,
@@ -659,6 +713,37 @@ impl WaitQueue {
             });
             if let Some(v) = ready {
                 return v;
+            }
+        }
+    }
+
+    /// Like [`Self::wait_until`], but gives up at `deadline` (time since
+    /// boot, as [`crate::time::now`]) and returns `None`.
+    pub fn wait_until_deadline<T>(
+        &self,
+        deadline: Duration,
+        mut cond: impl FnMut() -> Option<T>,
+    ) -> Option<T> {
+        let dl = u64::try_from(deadline.as_nanos()).unwrap_or(u64::MAX);
+        loop {
+            if let Some(v) = cond() {
+                return Some(v);
+            }
+            if crate::time::now() >= deadline {
+                return None;
+            }
+            let me = current();
+            let id = me.id();
+            self.waiters.lock().push_back(me.clone());
+            add_sleeper(dl, me);
+            let mut ready = None;
+            block_current(|| {
+                ready = cond();
+                ready.is_none() && crate::time::now() < deadline
+            });
+            remove_sleeper(dl, id);
+            if let Some(v) = ready {
+                return Some(v);
             }
         }
     }

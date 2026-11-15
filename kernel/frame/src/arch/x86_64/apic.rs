@@ -220,18 +220,22 @@ pub(crate) fn init_timer() {
     write(MSR_LVT_TIMER, u64::from(TIMER_VECTOR));
 }
 
-/// Which of a CPU's two multiplexed timer deadlines.
+/// Which of a CPU's multiplexed timer deadlines.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TimerKind {
     /// The scheduler's timeslice.
     Slice = 0,
     /// The kernel's own timer (`time::arm_timer`).
     Kernel = 1,
+    /// The earliest timed wait (`task::sleep_until`, `wait_until_deadline`).
+    Sleep = 2,
 }
+
+const KINDS: usize = 3;
 
 crate::cpu_local! {
     /// Absolute TSC deadlines per kind; 0 means unarmed.
-    static DEADLINES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+    static DEADLINES: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
 }
 
 fn ns_to_tsc(ns: u64) -> u64 {
@@ -239,7 +243,7 @@ fn ns_to_tsc(ns: u64) -> u64 {
 }
 
 /// Programs the hardware for the earliest armed deadline.
-fn program(d: &[AtomicU64; 2]) {
+fn program(d: &[AtomicU64; KINDS]) {
     let next = d.iter().map(|x| x.load(Relaxed)).filter(|&x| x != 0).min();
     let Some(at) = next else { return };
     if DEADLINE_MODE.load(Relaxed) {
@@ -258,7 +262,7 @@ fn program(d: &[AtomicU64; 2]) {
 
 /// `cpu`'s armed deadlines as nanoseconds from now (negative: overdue),
 /// for diagnostics.
-pub(crate) fn deadlines_ns(cpu: crate::cpu::CpuId) -> [Option<i64>; 2] {
+pub(crate) fn deadlines_ns(cpu: crate::cpu::CpuId) -> [Option<i64>; KINDS] {
     let now = rdtsc();
     let hz = tsc_hz().max(1);
     DEADLINES.get_on(cpu).each_ref().map(|d| {
@@ -278,7 +282,7 @@ pub(crate) fn arm(kind: TimerKind, ns: u64) {
 
 /// Handles this CPU's timer interrupt: fires expired deadlines, re-arms.
 fn on_timer_interrupt() {
-    let (slice, kernel) = {
+    let (slice, kernel, sleep) = {
         let g = crate::cpu::IrqGuard::new();
         let d = DEADLINES.get(&g);
         let now = rdtsc();
@@ -290,7 +294,11 @@ fn on_timer_interrupt() {
             }
             f
         };
-        let r = (fired(TimerKind::Slice), fired(TimerKind::Kernel));
+        let r = (
+            fired(TimerKind::Slice),
+            fired(TimerKind::Kernel),
+            fired(TimerKind::Sleep),
+        );
         program(d);
         r
     };
@@ -299,6 +307,9 @@ fn on_timer_interrupt() {
         if let Some(h) = handler {
             h();
         }
+    }
+    if sleep {
+        crate::task::on_sleep_timer();
     }
     if slice {
         crate::task::on_tick();
