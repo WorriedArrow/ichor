@@ -264,7 +264,11 @@ report at the end of each phase. Do not rewrite `main`.
   [in progress: `bench.rs` measures all six on Ichor (`bench` flag,
   `benchmarks_run_and_report`; CI prints a KVM run to the job summary);
   futexes are in 64 hashed buckets; lower-file reads run outside the
-  root's tree lock (`Vfs::read`); Linux reference numbers not yet.]
+  root's tree lock (`Vfs::read`); console output fills the UART FIFO
+  between status polls. Baseline in `docs/benchmarks.md`; Linux reference
+  numbers not yet. Open: frame's `VmSpace` user copy ignores the page's
+  write permission and copies after dropping its lock (owner deciding how
+  to handle it; the Mm-lock item waits on it).]
 
 Carried over from milestone 3: per-cell pid namespaces (paging the root
 image in on demand, copy-on-write `fork`, `FD_CLOEXEC` and shared offsets

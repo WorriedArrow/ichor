@@ -6,6 +6,8 @@
 //! the "transmitter empty" bit reads as set and writes fall into the void
 //! without blocking.
 
+use core::sync::atomic::{AtomicUsize, Ordering};
+
 use super::io::{inb, outb};
 
 /// I/O base of COM1. Frame owns the eight ports `COM1..COM1 + 8` exclusively;
@@ -14,7 +16,8 @@ const COM1: u16 = 0x3F8;
 
 const DATA: u16 = 0; // DLAB=0: transmit/receive buffer. DLAB=1: divisor low.
 const IER: u16 = 1; // DLAB=0: interrupt enable. DLAB=1: divisor high.
-const FCR: u16 = 2; // FIFO control.
+const FCR: u16 = 2; // Write: FIFO control.
+const IIR: u16 = 2; // Read: interrupt identification (bits 7:6 set = FIFOs on).
 const LCR: u16 = 3; // Line control.
 const MCR: u16 = 4; // Modem control.
 const LSR: u16 = 5; // Line status.
@@ -25,6 +28,13 @@ const LSR_THR_EMPTY: u8 = 1 << 5;
 /// a byte takes ~87 µs; this is generous enough for any real UART while
 /// guaranteeing a broken one cannot wedge the kernel.
 const MAX_SPINS: u32 = 1 << 20;
+
+/// Depth of a 16550A's transmit FIFO.
+const TX_FIFO: usize = 16;
+
+/// Bytes the transmitter accepts once it reports empty: the FIFO depth if
+/// `init` found FIFOs enabled, else one (an 8250-style UART).
+static TX_ROOM: AtomicUsize = AtomicUsize::new(1);
 
 fn write_reg(reg: u16, value: u8) {
     // SAFETY: frame owns COM1..COM1+8 (see `COM1`). Writes reconfigure only
@@ -48,14 +58,33 @@ pub(crate) fn init() {
     write_reg(LCR, 0x03); // DLAB off, 8N1.
     write_reg(FCR, 0xC7); // Enable and clear FIFOs, 14-byte threshold.
     write_reg(MCR, 0x03); // DTR + RTS. OUT2 stays off: no IRQs.
+    if read_reg(IIR) & 0xC0 == 0xC0 {
+        TX_ROOM.store(TX_FIFO, Ordering::Relaxed);
+    }
 }
 
-/// Writes one byte, waiting (bounded) for room in the transmitter.
-pub(crate) fn write_byte(byte: u8) {
+/// Waits (bounded) until the transmitter is empty: with FIFOs on, the
+/// status bit means the whole FIFO has drained.
+fn wait_empty() {
     let mut spins = 0;
     while read_reg(LSR) & LSR_THR_EMPTY == 0 && spins < MAX_SPINS {
         core::hint::spin_loop();
         spins += 1;
     }
-    write_reg(DATA, byte);
+}
+
+/// Writes every byte, polling the line status once per FIFO-full rather
+/// than once per byte. Under a hypervisor each register access is a VM
+/// exit, so this nearly halves the cost of console output.
+pub(crate) fn write_all(bytes: impl IntoIterator<Item = u8>) {
+    let room = TX_ROOM.load(Ordering::Relaxed);
+    let mut left = 0;
+    for b in bytes {
+        if left == 0 {
+            wait_empty();
+            left = room;
+        }
+        write_reg(DATA, b);
+        left -= 1;
+    }
 }

@@ -16,14 +16,14 @@ static CONSOLE: SpinLock<()> = SpinLock::new(());
 
 struct Serial;
 
+/// `bytes` with each `\n` preceded by `\r`, as a serial terminal expects.
+fn crlf(bytes: impl Iterator<Item = u8>) -> impl Iterator<Item = u8> {
+    bytes.flat_map(|b| (b == b'\n').then_some(b'\r').into_iter().chain(Some(b)))
+}
+
 impl Write for Serial {
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        for byte in s.bytes() {
-            if byte == b'\n' {
-                early_console::write_byte(b'\r');
-            }
-            early_console::write_byte(byte);
-        }
+        early_console::write_all(crlf(s.bytes()));
         Ok(())
     }
 }
@@ -42,12 +42,7 @@ pub fn _print(args: fmt::Arguments<'_>) {
 /// write arbitrary bytes), under one lock for the whole buffer.
 pub fn write_bytes(bytes: &[u8]) {
     let _guard = CONSOLE.lock();
-    for &b in bytes {
-        if b == b'\n' {
-            early_console::write_byte(b'\r');
-        }
-        early_console::write_byte(b);
-    }
+    early_console::write_all(crlf(bytes.iter().copied()));
 }
 
 /// Writes to the console without taking the console lock. Used by the panic
