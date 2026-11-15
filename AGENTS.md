@@ -43,8 +43,11 @@ Milestones 0-3 are done.
   rt_sigsuspend, nanosleep) via an internal `ERESTARTSYS` that becomes a
   restart (`SA_RESTART`) or `EINTR`. Busybox `trap`, `kill` of a blocked
   `sleep`, `kill -9 $$` and `yes | head` pass. No job control or
-  `sigaltstack` yet. `nanosleep` yields until its deadline (frame needs a
-  timed wait), which also makes the QEMU suite slower.
+  `sigaltstack` yet.
+- M4 timed waits: frame's timer has a third deadline kind (`Sleep`) over a
+  global sleeper list; `WaitQueue::wait_until_deadline` and
+  `task::sleep_until` block until a condition or a deadline. `nanosleep`
+  uses them (interruptible by signals). Self-tested on every boot.
 
 - M0/M1: boots as a UEFI app into the higher half; buddy page allocator and
   heap; traps with IST stacks; x2APIC + tickless timer; SMP bring-up; per-CPU
@@ -115,9 +118,8 @@ demand (today the kernel reads the whole disk into memory, capped at
 
 Suggested order for milestone 4:
 
-1. Done: signals. Next: a frame timed wait (`WaitQueue::wait_until_deadline`)
-   for nanosleep/poll timeouts, and real futexes with threads (`clone` with `CLONE_VM|CLONE_THREAD`, TLB
-   shootdown, per-thread contexts).
+1. Done: signals and timed waits. Next: real futexes with threads (`clone`
+   with `CLONE_VM|CLONE_THREAD`, TLB shootdown, per-thread contexts).
 2. Copy-on-write fork (frame support for read-only remapping of shared
    untyped pages).
 3. `PT_INTERP` and PIE: done for musl (Alpine); glibc's `ld-linux` next with
@@ -130,9 +132,9 @@ IBPB on cross-cell switch, page-table isolation for Meltdown-affected CPUs)
 are owed as multi-cell scheduling lands in milestone 4. Boot logs which apply.
 
 Frame budget: ADR-0005 sets the milestone 3 ceiling at 8,500 lines / 380
-sites; `audit.toml` is at step 5 (5,100 / 235) and frame is at 5,019 / 226.
-Milestone 4's frame work (COW, threads, TLB shootdown, signal frames) needs
-its own budget step or ADR.
+sites; `audit.toml` is at step 5 (5,100 / 235) and frame is at 5,096 / 226:
+the next frame change (COW, threads, TLB shootdown) needs a milestone 4
+budget ADR first.
 
 The goal set for this effort is milestone 8, whose acceptance test needs
 cloud accounts and bare-metal hardware from the owner.
