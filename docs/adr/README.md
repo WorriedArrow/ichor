@@ -16,6 +16,7 @@ brief where they conflict with it.
 | [0008](0008-extended-cpu-state.md) | Extended CPU state: XSAVE, saved eagerly | Accepted |
 | [0009](0009-identity-model.md) | Identity inside a cell: uids, what uid 0 means, enforcement | Accepted |
 | [0010](0010-network-stack-and-cell-switch.md) | Network stack (own, sans-I/O, per cell) and the cell switch | Accepted |
+| [0011](0011-user-copies.md) | Kernel copies to and from user memory: a checked walk under the space lock | Accepted |
 
 ## Planned
 

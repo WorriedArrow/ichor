@@ -150,7 +150,10 @@ retyping also inspired:
 - **Fallible user-memory copies** use an exception-table `memcpy`. A fault
   returns a short count, never UB. `copy_from_user` can never touch kernel
   addresses: the user VA range check happens in frame, and SMAP is toggled
-  (`stac`/`clac`) only inside the copy routine.
+  (`stac`/`clac`) only inside the copy routine. *(Amended 2026-11-15 by
+  ADR-0011: copies go through the linear map instead, one page at a time
+  under the space lock, after checking the PTE's permissions; SMAP is
+  never opened.)*
 - `VmSpace` holds the user half of an address space. Its cursor API is
   `map(UFrame, Prop)`, `unmap`, `protect`, and TLB flush. Kernel top-level
   entries are shared, pre-allocated, and unreachable through `VmSpace`. Because
