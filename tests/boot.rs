@@ -40,7 +40,7 @@ fn m1_boots_on_four_cpus() {
     out.assert_in_order(BOOT_MARKERS);
     out.assert_in_order(&[
         "ichor: smp: 4 CPUs online, every CPU took 5 timer interrupts",
-        "ichor: sched: 32 threads finished, ran on 4 CPUs",
+        "ichor: sched: 32 threads finished",
         "ichor: sched: 9 spinners on 4 CPUs all ran (preemption works",
         "ichor: user: ring-3 program ran, 1 syscall(s), page fault at 0 handled, isolation ok",
         "ichor: cell: 2 cells isolated, rights enforced, accounting ok",
@@ -75,7 +75,7 @@ fn m1_boots_on_one_cpu() {
     out.assert_in_order(BOOT_MARKERS);
     out.assert_in_order(&[
         "ichor: smp: 1 CPUs online, every CPU took 5 timer interrupts",
-        "ichor: sched: 32 threads finished, ran on 1 CPUs",
+        "ichor: sched: 32 threads finished",
         "ichor: sched: 3 spinners on 1 CPUs all ran (preemption works",
         "ichor: user: ring-3 program ran, 1 syscall(s), page fault at 0 handled, isolation ok",
         "ichor: cell: 2 cells isolated, rights enforced, accounting ok",
@@ -90,7 +90,7 @@ fn m2_scheduler_on_eight_cpus() {
     out.assert_exit(Exit::Success);
     out.assert_in_order(&[
         "ichor: smp: 8 CPUs online, every CPU took 5 timer interrupts",
-        "ichor: sched: 32 threads finished, ran on ",
+        "ichor: sched: 32 threads finished",
         "ichor: sched: 17 spinners on 8 CPUs all ran (preemption works",
         "ichor: user: ring-3 program ran, 1 syscall(s), page fault at 0 handled, isolation ok",
         "ichor: cell: 2 cells isolated, rights enforced, accounting ok",

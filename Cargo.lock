@@ -39,6 +39,10 @@ name = "ichor-cmdline"
 version = "0.0.0"
 
 [[package]]
+name = "ichor-elf"
+version = "0.0.0"
+
+[[package]]
 name = "ichor-frame"
 version = "0.0.0"
 dependencies = [

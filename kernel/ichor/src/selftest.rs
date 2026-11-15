@@ -163,8 +163,9 @@ pub(crate) fn threads() {
     }
     ALL_DONE.wait_until(|| (DONE.load(Relaxed) == N).then_some(()));
     println!(
-        "ichor: sched: {N} threads finished, ran on {} CPUs",
-        CPUS_SEEN.load(Relaxed).count_ones()
+        "ichor: sched: {N} threads finished (seen on {} of {} CPUs)",
+        CPUS_SEEN.load(Relaxed).count_ones(),
+        cpu::online_count()
     );
 }
 

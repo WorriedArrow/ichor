@@ -10,6 +10,7 @@ members = [
     "kernel/cap",
     "kernel/cell",
     "kernel/abi",
+    "kernel/elf",
     "kernel/ichor",
     "tests",
     "xtask",
@@ -26,6 +27,7 @@ default-members = [
     "kernel/cap",
     "kernel/cell",
     "kernel/abi",
+    "kernel/elf",
     "tests",
     "xtask",
 ]
