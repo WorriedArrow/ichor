@@ -58,6 +58,7 @@ jobs:
       - run: cargo xtask test
         env:
           ICHOR_TEST_VERBOSE: "1"
+          ICHOR_REQUIRE_KVM: "1"
       - name: Upload QEMU run directories on failure
         if: failure()
         uses: actions/upload-artifact@v4

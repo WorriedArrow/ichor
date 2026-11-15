@@ -132,6 +132,16 @@ fn exclude_kernel_only(cmd: &mut std::process::Command) -> &mut std::process::Co
 }
 
 fn cmd_test(o: &Opts) -> Result<()> {
+    // CI sets ICHOR_REQUIRE_KVM=1: a silent fallback to TCG would hide
+    // timing problems and make the suite slow. QEMU itself fails rather than
+    // falling back when `-accel kvm` cannot start, so this check suffices.
+    let accel = o.accel.resolve();
+    println!("xtask: QEMU tests will use accel={accel:?}");
+    if std::env::var("ICHOR_REQUIRE_KVM").as_deref() == Ok("1") && accel != Accel::Kvm {
+        return Err(format!(
+            "ICHOR_REQUIRE_KVM=1 but the accelerator is {accel:?}: /dev/kvm is missing or not usable"
+        ));
+    }
     // Host unit tests for every host-buildable crate except the QEMU suite.
     run_cmd(exclude_kernel_only(cargo().args([
         "test",

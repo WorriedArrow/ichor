@@ -152,7 +152,7 @@ Milestones 0-3 are done.
 Commit at every green step; every commit must build and pass on its own;
 report at the end of each phase. Do not rewrite `main`.
 
-- **A. Harden what exists.** (1) apk green [done]. (2) CI asserts KVM.
+- **A. Harden what exists.** (1) apk green [done]. (2) CI asserts KVM [done].
   (3) fd model: open file descriptions shared by dup/fork (offset, status
   flags), FD_CLOEXEC/O_CLOEXEC, F_SETFL O_NONBLOCK/O_APPEND, a lock table
   for flock and fcntl F_SETLK/F_SETLKW/F_OFD_*; tests for `2>&1`, `>>` from
@@ -230,7 +230,9 @@ Useful options: `--release`, `--accel auto|kvm|whpx|hvf|tcg`, `--smp N`,
 qemu args>`.
 
 Environment overrides: `ICHOR_QEMU`, `ICHOR_OVMF_CODE` + `ICHOR_OVMF_VARS`,
-`ICHOR_ACCEL`, and `ICHOR_TEST_VERBOSE=1` (echo guest serial during tests).
+`ICHOR_ACCEL`, `ICHOR_TEST_VERBOSE=1` (echo guest serial during tests), and
+`ICHOR_REQUIRE_KVM=1` (CI sets it: `cargo xtask test` fails unless KVM is
+the accelerator).
 
 Plain `cargo build` / `cargo test` at the root only touch host crates
 (`default-members`). Crates that depend on frame (`ichor`, `ichor-frame`,
