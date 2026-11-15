@@ -25,6 +25,7 @@ use alloc::vec::Vec;
 use core::fmt;
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use cell::Account;
 use frame::sync::SpinLock;
 
 use super::EFAULT;
@@ -52,6 +53,8 @@ const EADDRINUSE: i64 = 98;
 const EISCONN: i64 = 106;
 const ENOTCONN: i64 = 107;
 const ECONNREFUSED: i64 = 111;
+const ENOBUFS: i64 = 105;
+const PAGE: usize = 4096;
 
 pub(super) const AF_UNIX: u64 = 1;
 const SOCK_STREAM: u64 = 1;
@@ -201,12 +204,32 @@ struct State {
     /// `O_ASYNC` and the `F_SETOWN` process.
     async_io: bool,
     owner: Option<u64>,
+    /// Pages charged to the cell for the receive queue.
+    charged: u64,
+}
+
+impl State {
+    /// Settles the queue's charge for `bytes` with `acct`; false if the
+    /// account cannot cover them.
+    fn charge_to(&mut self, acct: &Arc<Account>, bytes: usize) -> bool {
+        let want = bytes.div_ceil(PAGE) as u64;
+        if want > self.charged && acct.charge(want - self.charged).is_err() {
+            return false;
+        }
+        if want < self.charged {
+            acct.release(self.charged - want);
+        }
+        self.charged = want;
+        true
+    }
 }
 
 /// One end of `AF_UNIX` communication.
 pub(crate) struct Endpoint {
     ty: Type,
     cell: u64,
+    /// The cell's account, charged for what this end's queue holds.
+    account: Arc<Account>,
     id: u64,
     state: SpinLock<State>,
     wait: Waiters,
@@ -222,10 +245,11 @@ impl fmt::Debug for Endpoint {
 }
 
 impl Endpoint {
-    fn new(ty: Type, cell: u64) -> Arc<Endpoint> {
+    fn new(ty: Type, cell: &crate::kcell::Cell) -> Arc<Endpoint> {
         Arc::new(Endpoint {
             ty,
-            cell,
+            cell: cell.id(),
+            account: cell.account().clone(),
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             state: SpinLock::new(State {
                 name: None,
@@ -242,6 +266,7 @@ impl Endpoint {
                 passcred: false,
                 async_io: false,
                 owner: None,
+                charged: 0,
             }),
             wait: Waiters::default(),
         })
@@ -262,6 +287,7 @@ impl Endpoint {
             let mut st = self.state.lock();
             st.closed = true;
             st.rx_bytes = 0;
+            st.charge_to(&self.account, 0);
             let conn = core::mem::replace(&mut st.conn, Conn::Idle);
             (conn, core::mem::take(&mut st.rx), st.name.clone())
         };
@@ -452,6 +478,16 @@ impl Endpoint {
                 data.len()
             }
         };
+        // The queue is the receiving cell's memory: with nothing queued to
+        // wait for, a cell out of memory fails the write.
+        let after = ps.rx_bytes + n;
+        if !ps.charge_to(&peer.account, after) {
+            return if ps.rx.is_empty() {
+                Some(Err(ENOBUFS))
+            } else {
+                None
+            };
+        }
         ps.rx_bytes += n;
         ps.rx.push_back(Msg {
             data: data[..n].to_vec(),
@@ -483,6 +519,14 @@ impl Endpoint {
         }
         if ts.rx_bytes + data.len() > BUFFER && ts.rx_bytes > 0 {
             return None;
+        }
+        let after = ts.rx_bytes + data.len();
+        if !ts.charge_to(&to.account, after) {
+            return if ts.rx.is_empty() {
+                Some(Err(ENOBUFS))
+            } else {
+                None
+            };
         }
         ts.rx_bytes += data.len();
         ts.rx.push_back(Msg {
@@ -521,6 +565,8 @@ impl Endpoint {
         if self.ty != Type::Stream {
             let m = st.rx.pop_front()?;
             st.rx_bytes -= m.data.len();
+            let left = st.rx_bytes;
+            st.charge_to(&self.account, left);
             let full = m.data.len();
             let mut data = m.data;
             data.truncate(max);
@@ -557,6 +603,8 @@ impl Endpoint {
                 break;
             }
         }
+        let left = st.rx_bytes;
+        st.charge_to(&self.account, left);
         let full = out.len();
         Some(Ok(Received {
             data: out,
@@ -843,7 +891,7 @@ fn install(p: &mut LinuxProcess, u: UnixSocket, ty: u64) -> Result<u64, i64> {
 /// `socket(AF_UNIX, ty, proto)`.
 pub(super) fn socket(p: &mut LinuxProcess, ty: u64, proto: u64) -> Result<u64, i64> {
     let t = type_of(ty, proto)?;
-    let u = UnixSocket::new(Endpoint::new(t, p.cell.id()), p.vfs.clone(), Ucred::of(p));
+    let u = UnixSocket::new(Endpoint::new(t, &p.cell), p.vfs.clone(), Ucred::of(p));
     install(p, u, ty)
 }
 
@@ -851,7 +899,7 @@ pub(super) fn socket(p: &mut LinuxProcess, ty: u64, proto: u64) -> Result<u64, i
 pub(super) fn socketpair(p: &mut LinuxProcess, ty: u64, proto: u64, sv: u64) -> Result<u64, i64> {
     let t = type_of(ty, proto)?;
     let cred = Ucred::of(p);
-    let (a, b) = (Endpoint::new(t, p.cell.id()), Endpoint::new(t, p.cell.id()));
+    let (a, b) = (Endpoint::new(t, &p.cell), Endpoint::new(t, &p.cell));
     for (x, y) in [(&a, &b), (&b, &a)] {
         let mut st = x.state.lock();
         st.conn = Conn::Connected(Arc::downgrade(y));
@@ -979,7 +1027,7 @@ pub(super) fn connect(
         Conn::Listening { .. } => return Err(EINVAL),
     }
     // The server's end: it is connected to us and named like its listener.
-    let srv = Endpoint::new(ep.ty, ep.cell);
+    let srv = Endpoint::new(ep.ty, &p.cell);
     {
         let mut ss = srv.state.lock();
         ss.conn = Conn::Connected(Arc::downgrade(ep));
@@ -1454,6 +1502,62 @@ pub(super) fn recvmsg(
         r.data.len()
     };
     Ok(n as u64)
+}
+
+/// Self-test: an `AF_UNIX` queue is the receiving cell's memory. In a
+/// cell of 24 pages a stream queue stops at 24 pages (the writer would
+/// wait), well short of its 256 KiB buffer, and reading gives every page
+/// back.
+pub(crate) fn accounting_selftest() {
+    const PAGES: u64 = 24;
+    let fail = |m: &str| -> ! { crate::runtest::fail(m) };
+    let sys = crate::kcell::System::new(1 << 16).unwrap_or_else(|| fail("unix: no system cell"));
+    let cell = crate::kcell::Cell::new(&sys.root_account, PAGES)
+        .unwrap_or_else(|| fail("unix: no test cell"));
+    let (a, b) = (
+        Endpoint::new(Type::Stream, &cell),
+        Endpoint::new(Type::Stream, &cell),
+    );
+    for (x, y) in [(&a, &b), (&b, &a)] {
+        x.state.lock().conn = Conn::Connected(Arc::downgrade(y));
+    }
+    let cred = Ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let chunk = [7u8; PAGE];
+    let mut sent = 0;
+    loop {
+        match a.try_send_conn(&b, &chunk, &mut Vec::new(), cred) {
+            Some(Ok(n)) => sent += n,
+            None => break,
+            Some(Err(_)) => fail("unix: a write failed instead of waiting"),
+        }
+        if sent > BUFFER {
+            fail("unix: the queue grew past its cell's memory");
+        }
+    }
+    let used = cell.account().used();
+    if sent != PAGES as usize * PAGE || used != PAGES {
+        crate::println!("ichor: unix: queued {sent} bytes, {used} pages charged");
+        fail("unix: the queue did not stop at the cell's limit");
+    }
+    let mut got = 0;
+    while let Some(Ok(r)) = b.try_recv(BUFFER) {
+        if r.data.is_empty() {
+            break;
+        }
+        got += r.data.len();
+    }
+    if got != sent || cell.account().used() != 0 {
+        fail("unix: reading the queue did not give its pages back");
+    }
+    let _ = a.shut_down();
+    let _ = b.shut_down();
+    crate::println!(
+        "ichor: unix: a stream queue stopped at its cell's {PAGES} pages and gave them back when read"
+    );
 }
 
 /// The `AF_UNIX` socket behind `fd`, if it is one.

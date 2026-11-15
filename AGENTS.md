@@ -15,12 +15,32 @@ a framekernel. The founding brief is the source of truth until an ADR in
 
 ## Status
 
-**Active milestone: 5.** Network stack, virtio-net, inter-cell switching;
-nginx and redis serve traffic from cells. The design is ADR-0010: our own
-sans-I/O stack in `kernel/net` (host-tested), one stack per cell, an
-in-kernel cell switch with assigned addresses, proxy ARP, anti-spoofing,
-rate limits, a cross-cell fast path, and NAT plus published ports at the
-uplink; virtio-net first (polled).
+**Active milestone: 6.** The control plane pulls a real OCI image from a
+registry, verifies it, converts it, and runs it through the gRPC API.
+First step: the control-plane ADR (where it runs: a native-ABI service in
+the system cell; its API; how images reach the image format; registry
+auth and TLS).
+
+Roadmap from the founding brief (the brief is not checked in; this is
+its milestone list as an earlier session recorded it):
+
+6. Control plane pulls a real OCI image from a registry, verifies it,
+   converts it, and runs it through the gRPC API.
+7. io_uring; postgres, node, python, go, and JVM workloads pass their own
+   test suites at a tracked pass rate.
+8. Cloud drivers and metadata: Ichor boots and runs containers on AWS,
+   GCP, Azure, and one bare-metal machine (needs the owner's accounts and
+   hardware).
+9. CRI: a kubelet schedules onto Ichor.
+
+**Milestone 5 is done** (2026-11-15): network stack, virtio-net,
+inter-cell switching; nginx and redis serve traffic from cells, to each
+other and to the host through a published port. The design is ADR-0010:
+our own sans-I/O stack in `kernel/net` (host-tested), one stack per cell,
+an in-kernel cell switch with assigned addresses, anti-spoofing, rate
+limits, a cross-cell fast path, and NAT plus published ports at the
+uplink; virtio-net (polled). Open from it: IPv6, ICMP errors for UDP,
+`MSG_PEEK`, interrupt-driven virtio-net (milestone 8 with cloud NICs).
 
 - M5 so far: `kernel/net` (wire formats, an IPv4 interface with ARP, a
   TCP state machine tested over a lossy, reordering simulated link),
@@ -39,8 +59,7 @@ uplink; virtio-net first (polled).
   7.2 (pinned packages in the Alpine mirror) run in a server cell; a client
   cell checks them with wget, redis-cli and redis-benchmark through the
   switch, and with `net_publish` the host fetches from nginx through the
-  published port (`a_published_port_serves_the_host_from_a_cell`). nginx
-  runs with `master_process off` until `AF_UNIX`/socketpair lands. Needed
+  published port (`a_published_port_serves_the_host_from_a_cell`). Needed
   on the way: TCP_CORK and friends (recorded), `setitimer`/`getitimer`/
   `alarm` (`itimer.rs`, ITIMER_REAL), a 65,536-entry descriptor ceiling
   (soft 1024; raising a hard limit is EPERM, CAP_SYS_RESOURCE being outside
@@ -68,7 +87,15 @@ uplink; virtio-net first (polled).
   wait conditions. nginx now runs with its master process and workers.
   Tests: `scm_rights_program` (runtest) and Debian perl's `UNIX_SCRIPT`.
   Not yet: `MSG_PEEK`, a collector for `SCM_RIGHTS` cycles.
-  Next: socket buffers charged to the cell.
+- M5 socket memory: each stack charges what its sockets buffer to the
+  cell's account by the page (`Inner::settle` after every operation);
+  short of memory, it caps every connection's buffers where they stand
+  (`Tcp::set_cap`: the window closes, writers wait) and drops datagrams,
+  resuming with twice `RESERVE` pages of headroom. `AF_UNIX` queues charge
+  the receiving cell; a write it cannot cover waits (ENOBUFS with nothing
+  queued). Closing a TCP socket drops what it never read and answers later
+  data with RST, as Linux does. Self-tests: `netstack::accounting_selftest`
+  and `unix::accounting_selftest`.
 
 Milestones 0-4 are done (4's acceptance test: Debian's `apt-get install`
 from a local mirror). Phase E (scalability) is done except the vDSO and

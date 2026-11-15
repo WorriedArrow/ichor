@@ -207,6 +207,11 @@ pub struct Tcp {
     buf_seq: u32,
     /// The application closed its side: send FIN after the data.
     fin_queued: bool,
+    /// How many bytes each buffer may hold (at most [`BUFFER`]); the owner
+    /// lowers it when the memory it charges for buffers runs short.
+    cap: usize,
+    /// [`Tcp::discard_received`] was called.
+    discarding: bool,
     // Receive side.
     irs: u32,
     rcv_nxt: u32,
@@ -255,6 +260,8 @@ impl Tcp {
             send_buf: VecDeque::new(),
             buf_seq: iss.wrapping_add(1),
             fin_queued: false,
+            cap: BUFFER,
+            discarding: false,
             irs: 0,
             rcv_nxt: 0,
             rcv_shift: 0,
@@ -344,7 +351,26 @@ impl Tcp {
         if self.fin_queued || !self.can_send() {
             0
         } else {
-            BUFFER - self.send_buf.len()
+            self.cap.saturating_sub(self.send_buf.len())
+        }
+    }
+
+    /// Bytes the connection holds in memory: received, out of order, and
+    /// sent but not yet acknowledged or not yet sent.
+    pub fn buffered(&self) -> usize {
+        self.recv_buf.len() + self.ooo_bytes + self.send_buf.len()
+    }
+
+    /// Lets each buffer hold up to `cap` bytes (clamped to [`BUFFER`]).
+    /// Lowering it keeps what is buffered but stops growth: the window
+    /// closes and writes find no room. Raising it announces a window that
+    /// reopens.
+    pub fn set_cap(&mut self, cap: usize, now: Duration) {
+        let closed = self.rcv_window() == 0;
+        self.cap = cap.min(BUFFER);
+        if closed && self.rcv_window() > 0 && !self.peer_fin && self.state != State::Closed {
+            self.ack_now = true;
+            self.output(now);
         }
     }
 
@@ -386,6 +412,15 @@ impl Tcp {
         n
     }
 
+    /// The application is gone: drops what it never read, and answers any
+    /// new data with RST (Linux, closing a socket, does both).
+    pub fn discard_received(&mut self) {
+        self.recv_buf.clear();
+        self.ooo.clear();
+        self.ooo_bytes = 0;
+        self.discarding = true;
+    }
+
     /// Closes our side (FIN after the queued data).
     pub fn close(&mut self, now: Duration) {
         match self.state {
@@ -421,7 +456,7 @@ impl Tcp {
     }
 
     fn rcv_window(&self) -> u32 {
-        (BUFFER - self.recv_buf.len().min(BUFFER)) as u32
+        self.cap.saturating_sub(self.recv_buf.len()) as u32
     }
 
     fn window_field(&self) -> u16 {
@@ -681,7 +716,13 @@ impl Tcp {
         if self.state == State::Closed {
             return;
         }
-        // 5. Data and FIN.
+        // 5. Data and FIN. New data for an application that has gone away
+        // is answered with RST, as Linux does after close().
+        if self.discarding && lt(self.rcv_nxt, seg.seq.wrapping_add(seg.payload.len() as u32)) {
+            self.abort();
+            self.error = Some(Error::Reset);
+            return;
+        }
         if matches!(
             self.state,
             State::Established | State::FinWait1 | State::FinWait2
@@ -1278,6 +1319,74 @@ mod tests {
         assert_eq!(b.recv(&mut buf, now), 4096);
         assert!(b.transmit().is_none(), "a window update after the FIN");
         assert_eq!(&buf[..], &data[..4096]);
+    }
+
+    /// A receiver whose cap drops to nothing closes its window (the sender
+    /// waits, probing); raising the cap reopens it and the data arrives.
+    /// A capped sender finds no room to write.
+    #[test]
+    fn a_cap_closes_the_window_and_raising_it_resumes() {
+        let mut sim = Sim::new(0, 0, 21, 7);
+        for _ in 0..10 {
+            sim.step();
+        }
+        let now = sim.now;
+        sim.b.as_mut().unwrap().set_cap(0, now);
+        let data = pattern(100_000, 8);
+        let mut sent = sim.a.send(&data, now);
+        let until = sim.now + Duration::from_secs(20);
+        while sim.now < until && sim.step() {}
+        assert_eq!(
+            sim.b.as_ref().unwrap().readable(),
+            0,
+            "nothing past a zero cap"
+        );
+        assert_eq!(sim.a.state(), State::Established);
+        assert!(sim.a.buffered() >= sent);
+        sim.a.set_cap(0, sim.now);
+        assert_eq!(sim.a.writable(), 0);
+        sim.a.set_cap(BUFFER, sim.now);
+        let now = sim.now;
+        sim.b.as_mut().unwrap().set_cap(BUFFER, now);
+        let mut got = Vec::new();
+        let mut buf = vec![0u8; 65536];
+        for _ in 0..200_000 {
+            let now = sim.now;
+            sent += sim.a.send(&data[sent..], now);
+            let b = sim.b.as_mut().unwrap();
+            let n = b.recv(&mut buf, now);
+            got.extend_from_slice(&buf[..n]);
+            if got.len() == data.len() || !sim.step() {
+                break;
+            }
+        }
+        assert_eq!(got, data);
+    }
+
+    /// Closing with unread data drops it; data that arrives afterwards is
+    /// answered with RST.
+    #[test]
+    fn data_after_the_application_left_is_reset() {
+        let mut sim = Sim::new(0, 0, 23, 9);
+        for _ in 0..10 {
+            sim.step();
+        }
+        let now = sim.now;
+        sim.a.send(b"unread", now);
+        for _ in 0..10 {
+            sim.step();
+        }
+        let now = sim.now;
+        let b = sim.b.as_mut().unwrap();
+        assert_eq!(b.readable(), 6);
+        b.discard_received();
+        b.close(now);
+        assert_eq!(b.buffered(), 0);
+        let now = sim.now;
+        sim.a.send(b"more", now);
+        while sim.step() && !sim.a.is_closed() {}
+        assert_eq!(sim.a.error(), Some(Error::Reset), "the sender was reset");
+        assert!(sim.b.as_ref().unwrap().is_closed());
     }
 
     /// A RST that ends TIME_WAIT is no error: both sides had finished.

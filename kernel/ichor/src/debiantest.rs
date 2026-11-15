@@ -586,7 +586,7 @@ fn wait_for(slot: &SpinLock<Option<i32>>, what: &str) -> i32 {
 }
 
 fn cell_addr(cell: &Cell) -> String {
-    match crate::netstack::stack_for(cell.id()).addr() {
+    match crate::netstack::stack_for(cell).addr() {
         Some(a) => alloc::format!("{a}"),
         None => fail("debian: a cell got no address from the switch"),
     }

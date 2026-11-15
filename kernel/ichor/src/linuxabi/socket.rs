@@ -281,7 +281,7 @@ pub(super) fn socket(p: &mut LinuxProcess, domain: u64, ty: u64, proto: u64) -> 
     if proto != 0 && proto != want {
         return Err(EPROTONOSUPPORT);
     }
-    let stack = netstack::stack_for(p.cell.id());
+    let stack = netstack::stack_for(&p.cell);
     let (id, wait) = stack.socket(dgram);
     let s = Socket::new(stack, id, wait, dgram);
     install(p, s, ty & SOCK_NONBLOCK != 0, ty & SOCK_CLOEXEC != 0)

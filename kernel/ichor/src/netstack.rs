@@ -118,7 +118,21 @@ impl Kind {
     fn is_udp(&self) -> bool {
         matches!(self, Kind::Udp { .. })
     }
+
+    /// Bytes this socket holds in buffers.
+    fn buffered(&self) -> usize {
+        match self {
+            Kind::Conn { tcp, .. } => tcp.buffered(),
+            Kind::Udp { bytes, .. } => *bytes,
+            Kind::Fresh | Kind::Listening { .. } => 0,
+        }
+    }
 }
+
+/// Pages of headroom a stack leaves its cell before it stops growing
+/// buffers; growth resumes at twice this.
+const RESERVE: u64 = 16;
+const PAGE: usize = 4096;
 
 /// Most bytes a UDP socket queues before it drops datagrams.
 pub(crate) const UDP_BUFFER: usize = 256 * 1024;
@@ -137,10 +151,20 @@ struct Sock {
     shut_rd: bool,
     /// The socket's pending error, for `SO_ERROR` (taken on read).
     error: Option<i64>,
+    /// Buffered bytes as last counted toward the stack's charge.
+    held: usize,
 }
 
 #[derive(Debug, Default)]
 struct Inner {
+    /// The cell's account: socket buffers are charged to it, by the page.
+    account: Option<Arc<cell::Account>>,
+    /// Bytes every socket holds, and the pages charged for them.
+    held: usize,
+    charged: u64,
+    /// The account ran short: connections' buffers are capped where they
+    /// stand and datagrams are dropped until there is headroom again.
+    starved: bool,
     /// The address the switch assigned (none if the switch was full).
     addr: Option<Ipv4Addr>,
     socks: BTreeMap<u64, Sock>,
@@ -169,8 +193,10 @@ static NET_KICK: WaitQueue = WaitQueue::new();
 static KICKED: AtomicBool = AtomicBool::new(false);
 static NET_TASK: AtomicBool = AtomicBool::new(false);
 
-/// The stack of `cell`, made on first use.
-pub(crate) fn stack_for(cell: u64) -> Arc<Stack> {
+/// The stack of `cell`, made on first use; its socket buffers are charged
+/// to the cell's account.
+pub(crate) fn stack_for(c: &crate::kcell::Cell) -> Arc<Stack> {
+    let cell = c.id();
     let s = {
         let mut stacks = STACKS.lock();
         stacks
@@ -184,6 +210,7 @@ pub(crate) fn stack_for(cell: u64) -> Arc<Stack> {
                         inner: SpinLock::new(Inner {
                             addr,
                             next_port: *EPHEMERAL.start(),
+                            account: Some(c.account().clone()),
                             ..Inner::default()
                         }),
                     }
@@ -198,6 +225,78 @@ pub(crate) fn stack_for(cell: u64) -> Arc<Stack> {
 fn kick() {
     KICKED.store(true, Ordering::Release);
     NET_KICK.wake_all();
+}
+
+/// Self-test: socket buffers are the cell's memory. In a cell of 48 pages
+/// (far less than one connection's two 256 KiB buffers) a loopback sender
+/// is stopped once the account runs short, the transfer still completes
+/// as the reader drains, the charge never passes the limit, and closing
+/// both ends gives every page back.
+pub(crate) fn accounting_selftest() {
+    const PAGES: u64 = 48;
+    const LEN: usize = 1 << 20;
+    let fail = |m: &str| -> ! { crate::runtest::fail(m) };
+    let sys = crate::kcell::System::new(1 << 16).unwrap_or_else(|| fail("net: no system cell"));
+    let cell = crate::kcell::Cell::new(&sys.root_account, PAGES)
+        .unwrap_or_else(|| fail("net: no test cell"));
+    let st = stack_for(&cell);
+    let lo = Ipv4Addr::LOCALHOST;
+    let (l, _) = st.socket(false);
+    let (c, _) = st.socket(false);
+    let ok = st.bind(l, (lo, 0)).is_ok() && st.listen(l, 4).is_ok();
+    let port = st.local_addr(l).map_or(0, |a| a.1);
+    if !ok || st.connect(c, (lo, port)).is_err() {
+        fail("net: accounting: no loopback connection");
+    }
+    let Ok(Some((a, _, _))) = st.accept(l) else {
+        fail("net: accounting: nothing to accept");
+    };
+    let data = alloc::vec![0x5au8; LEN];
+    let mut buf = alloc::vec![0u8; 65536];
+    let (mut sent, mut got, mut peak, mut stopped) = (0, 0, 0, false);
+    let deadline = now() + Duration::from_secs(120);
+    while got < LEN {
+        if now() > deadline {
+            crate::println!("ichor: net: accounting: sent {sent}, got {got}");
+            fail("net: accounting: the capped transfer stalled");
+        }
+        // Write as far as it goes before reading anything.
+        while sent < LEN {
+            match st.send(c, &data[sent..(sent + 65536).min(LEN)]) {
+                Ok(0) => break,
+                Ok(n) => sent += n,
+                Err(_) => fail("net: accounting: send failed"),
+            }
+        }
+        peak = peak.max(cell.account().used());
+        stopped |= sent < LEN && got == 0;
+        match st.recv(a, &mut buf, false) {
+            Ok(Some(n)) => got += n,
+            Ok(None) => frame::task::yield_now(),
+            Err(_) => fail("net: accounting: recv failed"),
+        }
+    }
+    if !stopped || peak > PAGES {
+        crate::println!("ichor: net: accounting: peak {peak} pages, stopped {stopped}");
+        fail("net: accounting: the sender was not held to the cell's memory");
+    }
+    for id in [a, c, l] {
+        st.release(id);
+    }
+    let deadline = now() + Duration::from_secs(30);
+    while cell.account().used() != 0 {
+        if now() > deadline {
+            crate::println!(
+                "ichor: net: accounting: {} pages still charged",
+                cell.account().used()
+            );
+            fail("net: accounting: closed sockets kept their pages");
+        }
+        frame::task::yield_now();
+    }
+    crate::println!(
+        "ichor: net: socket buffers are charged to the cell: a 1 MiB loopback transfer peaked at {peak} of {PAGES} pages and gave them back"
+    );
 }
 
 fn start_net_task() {
@@ -415,6 +514,7 @@ impl Inner {
             return;
         };
         let from = (src, d.src_port);
+        let starved = self.starved;
         let target = self.socks.iter_mut().find_map(|(&id, s)| {
             let (ip, port) = s.local?;
             match &mut s.kind {
@@ -428,8 +528,10 @@ impl Inner {
                 _ => None,
             }
         });
+        // A full queue, or a cell short of memory, drops the datagram.
         if let Some((id, rx, queued)) = target
             && *queued + d.payload.len() <= UDP_BUFFER
+            && !starved
         {
             *queued += d.payload.len();
             rx.push_back((from, d.payload.to_vec()));
@@ -505,6 +607,7 @@ impl Inner {
                             orphan: false,
                             shut_rd: false,
                             error: None,
+                            held: 0,
                         },
                     );
                     self.touched.insert(id);
@@ -584,12 +687,77 @@ impl Inner {
                     backlog.retain(|&b| b != id);
                 }
             }
-            self.socks.remove(&id);
+            self.remove_sock(id);
+        }
+    }
+
+    /// Forgets socket `id`, and what it held.
+    fn remove_sock(&mut self, id: u64) {
+        if let Some(s) = self.socks.remove(&id) {
+            self.held = self.held.saturating_sub(s.held);
+        }
+    }
+
+    /// Recounts what the sockets in `ids` hold and settles the stack's
+    /// charge with the cell's account. When the account runs short (a
+    /// charge fails, or less than [`RESERVE`] pages are left) every
+    /// connection's buffers are capped where they stand: windows close and
+    /// writers wait, so peers back off instead of losing data. Growth
+    /// resumes once there is twice the reserve again. What a single
+    /// operation added before the cap took effect may stay uncharged until
+    /// the next settle succeeds.
+    fn settle(&mut self, ids: &BTreeSet<u64>) {
+        for id in ids {
+            if let Some(s) = self.socks.get_mut(id) {
+                let b = s.kind.buffered();
+                self.held = (self.held + b).saturating_sub(s.held);
+                s.held = b;
+            }
+        }
+        let Some(acct) = self.account.clone() else {
+            return;
+        };
+        let want = self.held.div_ceil(PAGE) as u64;
+        if want < self.charged {
+            acct.release(self.charged - want);
+            self.charged = want;
+        }
+        let mut short = false;
+        if want > self.charged {
+            match acct.charge(want - self.charged) {
+                Ok(()) => self.charged = want,
+                Err(_) => short = true,
+            }
+        }
+        let t = now();
+        if short || acct.available() < RESERVE {
+            let newly = !self.starved;
+            self.starved = true;
+            for (id, s) in &mut self.socks {
+                if let Kind::Conn { tcp, .. } = &mut s.kind
+                    && (newly || ids.contains(id))
+                {
+                    tcp.set_cap(0, t);
+                }
+            }
+        } else if self.starved && acct.available() >= 2 * RESERVE {
+            self.starved = false;
+            for s in self.socks.values_mut() {
+                if let Kind::Conn { tcp, .. } = &mut s.kind {
+                    tcp.set_cap(tcp::BUFFER, t);
+                }
+            }
+            // Reopened windows are announced now.
+            self.run_local();
         }
     }
 
     fn take_touched(&mut self) -> Vec<Arc<Waiters>> {
         let ids = core::mem::take(&mut self.touched);
+        self.settle(&ids);
+        // Thawing may have touched more (announcing windows).
+        let mut ids = ids;
+        ids.extend(core::mem::take(&mut self.touched));
         ids.iter()
             .filter_map(|id| self.socks.get(id).map(|s| s.wait.clone()))
             .collect()
@@ -664,6 +832,7 @@ impl Stack {
                 orphan: false,
                 shut_rd: false,
                 error: None,
+                held: 0,
             },
         );
         (id, wait)
@@ -876,19 +1045,23 @@ impl Stack {
             if let Some(s) = i.socks.get_mut(&id) {
                 match &mut s.kind {
                     Kind::Fresh | Kind::Udp { .. } => {
-                        i.socks.remove(&id);
+                        i.remove_sock(id);
                     }
                     Kind::Listening { backlog, .. } => {
                         doomed.extend(backlog.drain(..));
-                        i.socks.remove(&id);
+                        i.remove_sock(id);
                         doomed.extend(i.socks.iter().filter_map(|(&cid, c)| {
                             matches!(c.kind, Kind::Conn { parent: Some(p), .. } if p == id)
                                 .then_some(cid)
                         }));
                     }
                     Kind::Conn { tcp, .. } => {
+                        // What the application never read goes, and its
+                        // memory with it.
+                        tcp.discard_received();
                         tcp.close(now());
                         s.orphan = true;
+                        i.touched.insert(id);
                     }
                 }
             }
@@ -1023,6 +1196,9 @@ impl Stack {
         match rx.pop_front() {
             Some((from, d)) => {
                 *bytes -= d.len();
+                // What the queue held goes back to the cell.
+                i.touched.insert(id);
+                let _ = i.take_touched();
                 Ok(Some((from, d)))
             }
             // After shutdown(SHUT_RD) reads return 0 at once.

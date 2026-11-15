@@ -279,7 +279,7 @@ fn servers(vfs: &Arc<Vfs>, busybox: &[u8], interp: &[u8]) {
     }
     let (server, client) = (new_cell(), new_cell());
     let server_id = server.id();
-    let Some(addr) = crate::netstack::stack_for(server_id).addr() else {
+    let Some(addr) = crate::netstack::stack_for(&server).addr() else {
         fail("alpine: the server cell has no address");
     };
     let publish = crate::nettest::publish_port();

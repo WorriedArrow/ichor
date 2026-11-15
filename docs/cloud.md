@@ -18,8 +18,10 @@ Every line goes to the serial console, so read it there:
   (`GPT disk, Ichor root partition at sector ...`)
 - NVMe command timeouts or error statuses, if any (opcode, queue, status)
 
-There is no network driver yet (milestone 5): the VM cannot be reached over
-the network, only through its serial console.
+The only network driver is virtio-net (milestone 5); cloud NICs (AWS ENA,
+GCP gVNIC) come with milestone 8. On most cloud instance types the VM
+therefore cannot be reached over the network, only through its serial
+console.
 
 ## Build the images
 
