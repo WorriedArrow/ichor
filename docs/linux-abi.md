@@ -26,7 +26,7 @@ stale. Do not edit by hand.
 | 13 | `rt_sigaction` | implemented |  |
 | 14 | `rt_sigprocmask` | implemented |  |
 | 15 | `rt_sigreturn` | implemented |  |
-| 16 | `ioctl` | partial | no tty ioctls (the console is not a tty); FIONBIO, FIOCLEX/FIONCLEX |
+| 16 | `ioctl` | partial | termios, window size, job control and ptmx ioctls on ptys (the console is not a tty); FIONBIO, FIOCLEX/FIONCLEX |
 | 17 | `pread64` | implemented |  |
 | 18 | `pwrite64` | implemented |  |
 | 19 | `readv` | implemented |  |

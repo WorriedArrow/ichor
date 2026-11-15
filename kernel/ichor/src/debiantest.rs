@@ -16,6 +16,74 @@ use crate::vfs::{ROOT, Vfs};
 
 const CELL_PAGES: u64 = 65536;
 
+/// The pty session script (see `RUNS`).
+const PTY_SCRIPT: &str = r#"use strict; use warnings; use POSIX ();
+sub fail { print "debian: pty FAILED: @_\n"; exit 1 }
+# One terminal session: open a pty, type $pre, run $cmd on the slave as the
+# controlling terminal of a new session, then for each (pattern, input)
+# step wait for the output to match and type the input; read to the
+# hangup (EIO) and reap. Returns the master's output and the wait status.
+sub session {
+    my ($cmd, $pre, @steps) = @_;
+    sysopen(my $m, "/dev/ptmx", 2) or fail("open /dev/ptmx: $!");
+    my $n = pack("i", 0);
+    ioctl($m, 0x80045430, $n) or fail("TIOCGPTN: $!");
+    my $name = "/dev/pts/" . unpack("i", $n);
+    my @st = stat($name) or fail("stat $name: $!");
+    ($st[2] & 0170000) == 0020000 or fail("$name is not a character device");
+    sysopen(my $x, $name, 2) and fail("opened a locked slave");
+    $!{EIO} or fail("locked slave: $!");
+    my $unlock = pack("i", 0);
+    ioctl($m, 0x40045431, $unlock) or fail("unlockpt: $!");
+    my $ws = pack("S4", 24, 80, 0, 0);
+    ioctl($m, 0x5414, $ws) or fail("TIOCSWINSZ: $!");
+    syswrite($m, $pre) == length($pre) or fail("write: $!");
+    my $pid = fork() // fail("fork: $!");
+    if ($pid == 0) {
+        POSIX::setsid();
+        close $m;
+        sysopen(my $s, $name, 2) or POSIX::_exit(90);
+        POSIX::dup2(fileno($s), $_) for 0 .. 2;
+        exec("/bin/sh", "-c", $cmd) or POSIX::_exit(91);
+    }
+    my $out = "";
+    while (@steps) {
+        my ($wait, $send) = splice(@steps, 0, 2);
+        while ($out !~ $wait) {
+            my $r = sysread($m, my $buf, 4096);
+            $r or fail("output ended before $wait: " . ($r // $!) . " [$out]");
+            $out .= $buf;
+        }
+        syswrite($m, $send) == length($send) or fail("write: $!");
+    }
+    while (1) {
+        my $r = sysread($m, my $buf, 4096);
+        if (!defined $r) { $!{EIO} or fail("master read: $!"); last }
+        $r or fail("master read EOF instead of EIO [$out]");
+        $out .= $buf;
+    }
+    waitpid($pid, 0) == $pid or fail("waitpid: $!");
+    my $status = $?;
+    close $m;
+    -e $name and fail("$name outlived its master");
+    return ($out, $status);
+}
+my ($out, $st) = session(
+    'tty; stty size; read line; echo "got:$line"; stty -echo; echo noecho; read s; echo "secret:$s"',
+    "ab\x7fc\n",
+    qr/noecho\r\n/, "hidden\n");
+$st == 0 or fail("shell exited $st [$out]");
+$out =~ m{^ab\x08 \x08c\r\n/dev/pts/\d+\r\n24 80\r\ngot:ac\r\nnoecho\r\nsecret:hidden\r\n\z}
+    or fail("unexpected output [$out]");
+($out, $st) = session(
+    'trap "echo caught; exit 3" INT; echo ready; while :; do sleep 1; done',
+    "",
+    qr/ready\r\n/, "\x03");
+($st >> 8) == 3 or fail("^C: status $st [$out]");
+$out =~ /\^Ccaught\r\n/ or fail("^C: output [$out]");
+print "debian: pty: openpty, line editing, echo, stty, ^C and hangup work\n";
+"#;
+
 /// `(argv, expected exit code)`: argv[0] is a path under `/usr/bin`.
 const RUNS: &[(&[&str], i32)] = &[
     (
@@ -46,6 +114,10 @@ const RUNS: &[(&[&str], i32)] = &[
         ],
         0,
     ),
+    // Pseudo-terminals, driven the way a terminal emulator or sshd would:
+    // Debian's perl opens /dev/ptmx and runs dash, tty and stty on the
+    // slave (glibc's ttyname, tcgetattr/tcsetattr, ioctls).
+    (&["perl", "-e", PTY_SCRIPT], 0),
     (
         &[
             "dash",
@@ -87,7 +159,10 @@ pub(crate) fn run(vfs: &Arc<Vfs>) {
         let p = LinuxProcess::new(cell, vfs.clone()).unwrap_or_else(|| fail("no process"));
         let (code, syscalls) = run_linux(p, &exe, Some(&interp), argv);
         if code != *want {
-            println!("ichor: debian: {argv:?} exited {code}, expected {want}");
+            println!(
+                "ichor: debian: {:?} exited {code}, expected {want}",
+                &argv[..argv.len().min(2)]
+            );
             fail("debian program");
         }
         println!("ichor: debian: {} ok ({syscalls} syscalls)", argv[0]);

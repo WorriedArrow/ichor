@@ -203,6 +203,28 @@ pub(crate) fn send_group(
     if any { Ok(()) } else { Err(EPERM) }
 }
 
+/// Posts `sig` to every live process of group `pgid` in `cell`: what a
+/// terminal sends (INTR, hangup, window change), with no sender to check.
+pub(crate) fn signal_pgrp(cell: u64, pgid: u64, sig: u32) {
+    let pids: alloc::vec::Vec<u64> = TABLE
+        .lock()
+        .values()
+        .filter(|e| e.cell == cell && e.pid == e.tgid && e.status.lock().is_none())
+        .filter(|e| e.group().0 == pgid)
+        .map(|e| e.pid)
+        .collect();
+    for pid in pids {
+        let _ = send(cell, pid, sig);
+    }
+}
+
+/// Whether a live process of `cell` is in group `pgid` of session `sid`.
+pub(crate) fn pgrp_in_session(cell: u64, pgid: u64, sid: u64) -> bool {
+    TABLE.lock().values().any(|e| {
+        e.cell == cell && e.pid == e.tgid && e.status.lock().is_none() && e.group() == (pgid, sid)
+    })
+}
+
 /// The real and saved uids of process `pid` in `cell`, if it is live.
 pub(crate) fn uids_of(cell: u64, pid: u64) -> Result<(u32, u32), i64> {
     let t = TABLE.lock();

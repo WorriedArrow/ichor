@@ -6,13 +6,18 @@
 //! its device number to a [`Device`] descriptor, or to the console.
 //!
 //! `random` and `urandom` read the kernel's ChaCha20 generator
-//! ([`crate::random`]), as `getrandom` does.
+//! ([`crate::random`]), as `getrandom` does. `ptmx`, the `pts/` nodes and
+//! `tty` (with a controlling terminal) are pseudo-terminals ([`crate::pty`]).
 
 use overlay::{Overlay, ROOT};
 
-use crate::process::Fd;
+use crate::process::{Fd, LinuxProcess};
+use crate::vfs::Ino;
 
 const ENOSPC: i64 = 28;
+const ENXIO: i64 = 6;
+const O_NOCTTY: u64 = 0o400;
+const O_NONBLOCK: u64 = 0o4000;
 
 const fn rdev(major: u32, minor: u32) -> u32 {
     (major << 8) | minor
@@ -25,12 +30,14 @@ const RANDOM: u32 = rdev(1, 8);
 const URANDOM: u32 = rdev(1, 9);
 const TTY: u32 = rdev(5, 0);
 const CONSOLE: u32 = rdev(5, 1);
+const PTMX: u32 = rdev(5, 2);
 
 /// `(name, device number)` for every node in `/dev`.
 const NODES: &[(&str, u32)] = &[
     ("console", CONSOLE),
     ("full", FULL),
     ("null", NULL),
+    ("ptmx", PTMX),
     ("random", RANDOM),
     ("tty", TTY),
     ("urandom", URANDOM),
@@ -59,17 +66,27 @@ pub(crate) fn populate(fs: &mut Overlay<'static>) {
     for &(name, num) in NODES {
         let _ = fs.mknod(dev, name, 0o666, num);
     }
+    crate::pty::populate(fs, dev);
 }
 
-/// What opening the node with device number `num` gives.
-pub(crate) fn open(num: u32) -> Option<Fd> {
-    Some(match num {
+/// What opening node `ino`, device number `num`, with open `flags` gives.
+pub(crate) fn open(p: &mut LinuxProcess, num: u32, ino: Ino, flags: u64) -> Result<Fd, i64> {
+    let nonblock = flags & O_NONBLOCK != 0;
+    Ok(match num {
         NULL => Fd::Dev(Device::Null),
         ZERO => Fd::Dev(Device::Zero),
         FULL => Fd::Dev(Device::Full),
         RANDOM | URANDOM => Fd::Dev(Device::Random),
-        TTY | CONSOLE => Fd::Console,
-        _ => return None,
+        PTMX => return crate::pty::open_master(p, ino, nonblock),
+        TTY => match crate::pty::open_controlling(p, nonblock) {
+            Some(r) => return r,
+            None => Fd::Console,
+        },
+        CONSOLE => Fd::Console,
+        n if (crate::pty::PTS_MAJOR..crate::pty::PTS_MAJOR + 8).contains(&(n >> 8)) => {
+            return crate::pty::open_slave(p, n, ino, flags & O_NOCTTY != 0, nonblock);
+        }
+        _ => return Err(ENXIO),
     })
 }
 

@@ -31,6 +31,7 @@ mod proc;
 mod process;
 mod procfs;
 mod proctest;
+mod pty;
 mod random;
 mod runtest;
 mod sched;

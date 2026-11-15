@@ -36,6 +36,8 @@ pub(crate) struct Vfs {
     /// How the lower layer reads its disk through the page cache (shared or
     /// a private namespace), whose pages files map.
     view: Option<&'static crate::pagecache::View>,
+    /// This root's devpts: its pseudo-terminals by index.
+    pub(crate) ptys: crate::pty::Table,
 }
 
 impl Drop for Vfs {
@@ -62,6 +64,7 @@ impl Vfs {
         Ok(Vfs {
             fs: Mutex::new(fs),
             view: None,
+            ptys: frame::sync::SpinLock::new(alloc::collections::BTreeMap::new()),
         })
     }
 

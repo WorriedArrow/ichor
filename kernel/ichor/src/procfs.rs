@@ -226,7 +226,10 @@ fn describe(p: &LinuxProcess, f: &Fd) -> String {
             "pipe:[{:x}]",
             alloc::sync::Arc::as_ptr(&e.pipe) as usize & 0xffff_ffff
         ),
-        Fd::Object(_) => "anon_inode:[eventpoll]".to_string(),
+        Fd::Object(o) => match o.obj.tty() {
+            Some(t) => t.path(),
+            None => "anon_inode:[eventpoll]".to_string(),
+        },
     }
 }
 

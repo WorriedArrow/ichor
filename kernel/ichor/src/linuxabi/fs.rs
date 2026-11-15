@@ -31,7 +31,6 @@ pub(super) const O_CLOEXEC: u64 = 0o2_000_000;
 const ENAMETOOLONG: i64 = 36;
 const ESPIPE: i64 = 29;
 const EACCES: i64 = 13;
-const ENXIO: i64 = 6;
 const EPIPE: i64 = 32;
 const ERANGE: i64 = 34;
 
@@ -149,7 +148,7 @@ fn open_path(
             Kind::File | Kind::CharDevice if flags & O_DIRECTORY != 0 => return Err(ENOTDIR),
             Kind::CharDevice => {
                 drop(fs);
-                let fd = crate::dev::open(st.rdev).ok_or(ENXIO)?;
+                let fd = crate::dev::open(p, st.rdev, ino, flags)?;
                 return p.install_flags(fd, flags & O_CLOEXEC != 0).ok_or(EMFILE);
             }
             _ => {}
@@ -560,7 +559,12 @@ fn fstat_raw(p: &mut LinuxProcess, fd: u64) -> Result<[u8; 144], i64> {
     Ok(match p.fd(fd).ok_or(EBADF)? {
         Fd::Console => stat_bytes(0, S_IFCHR | 0o620, 1, 0),
         Fd::Pipe(_) => stat_bytes(0, S_IFIFO | 0o600, 1, 0),
-        Fd::Object(o) => stat_bytes(0, o.obj.mode() | 0o600, 1, 0),
+        Fd::Object(o) => match o.obj.tty() {
+            // A terminal stats as the node it was opened through, which
+            // `ttyname` checks.
+            Some(t) => to_stat(&p.fs().stat(t.ino())?),
+            None => stat_bytes(0, o.obj.mode() | 0o600, 1, 0),
+        },
         Fd::Dev(d) => {
             let mut st = stat_bytes(0, S_IFCHR | 0o666, 1, 0);
             st[40..48].copy_from_slice(&u64::from(d.rdev()).to_le_bytes()); // st_rdev

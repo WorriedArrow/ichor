@@ -39,7 +39,7 @@ mod nr {
     pub(super) const RT_SIGACTION: u64 = 13;
     pub(super) const RT_SIGPROCMASK: u64 = 14;
     pub(super) const RT_SIGRETURN: u64 = 15;
-    pub(super) const IOCTL: u64 = 16; // partial: no tty ioctls (the console is not a tty); FIONBIO, FIOCLEX/FIONCLEX
+    pub(super) const IOCTL: u64 = 16; // partial: termios, window size, job control and ptmx ioctls on ptys (the console is not a tty); FIONBIO, FIOCLEX/FIONCLEX
     pub(super) const PREAD64: u64 = 17;
     pub(super) const PWRITE64: u64 = 18;
     pub(super) const READV: u64 = 19;
@@ -500,6 +500,15 @@ fn ioctl(p: &mut LinuxProcess, fd: u64, request: u64, arg: u64) -> Result<u64, i
     const FIOCLEX: u64 = 0x5451;
     const FIONBIO: u64 = 0x5421;
     let desc = p.desc(fd).ok_or(EBADF)?;
+    if !matches!(request, FIOCLEX | FIONCLEX | FIONBIO) {
+        let obj = match &*desc.state() {
+            Fd::Object(o) => Some(o.obj.clone()),
+            _ => None,
+        };
+        if let Some(end) = obj.as_deref().and_then(|o| o.tty()) {
+            return crate::pty::ioctl(p, end, request, arg);
+        }
+    }
     match request {
         FIOCLEX | FIONCLEX => {
             p.set_cloexec(fd, request == FIOCLEX);

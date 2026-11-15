@@ -79,6 +79,10 @@ pub(crate) trait Object: Send + Sync + Debug {
     fn as_epoll(&self) -> Option<&Epoll> {
         None
     }
+    /// This object as a pseudo-terminal end.
+    fn tty(&self) -> Option<&crate::pty::End> {
+        None
+    }
     /// A directory's entries `(name, d_type)` and read cursor (`/proc`).
     fn dir(&self) -> Option<(&[DirEntry], &SpinLock<u64>)> {
         None

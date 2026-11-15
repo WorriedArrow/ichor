@@ -163,8 +163,15 @@ Milestones 0-3 are done.
   local `/mirror` (hello, jq, libjq1, libonig5; pinned on
   snapshot.debian.org) passes in CI: milestone 4's acceptance test.
   prctl, statx, sched_getaffinity, /sys cpu lists, mremap, sysinfo are in.
-  Open: no ptys (/dev/ptmx), the cross-cell isolation test (owner is
-  writing it).
+  Open: the cross-cell isolation test (owner is writing it).
+- Pseudo-terminals (`pty.rs`): `/dev/ptmx` and a devpts per root
+  (`Vfs::ptys`; a slave opens only through the node made for it in the
+  same root), an N_TTY-style line discipline (canonical editing, echo,
+  ISIG to the foreground group, MIN/TIME, ONLCR), termios/winsize/job
+  control/ptmx ioctls, controlling terminals and `/dev/tty`, hangup on
+  master close. Debian's perl drives a session through dash, `tty` and
+  `stty` on every boot. Partial: no SIGTTIN/SIGTTOU, flow control or
+  packet mode; the console is still not a tty.
 - Page-sharing opt-out (ADR-0004 §4): `Vfs::mount_disk_private` gives a
   cell's root a private page-cache namespace (`pagecache::View`), charged
   to the cell's account, evicting only its own pages, freed with the root.
