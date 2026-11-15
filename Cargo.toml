@@ -3,6 +3,9 @@ resolver = "3"
 members = [
     "kernel/frame",
     "kernel/cmdline",
+    "kernel/pe",
+    "kernel/buddy",
+    "kernel/acpi",
     "kernel/ichor",
     "tests",
     "xtask",
@@ -12,6 +15,9 @@ members = [
 # x86_64-unknown-uefi by `cargo xtask build`.
 default-members = [
     "kernel/cmdline",
+    "kernel/pe",
+    "kernel/buddy",
+    "kernel/acpi",
     "tests",
     "xtask",
 ]
@@ -25,6 +31,9 @@ publish = false
 [workspace.dependencies]
 frame = { package = "ichor-frame", path = "kernel/frame" }
 cmdline = { package = "ichor-cmdline", path = "kernel/cmdline" }
+pe = { package = "ichor-pe", path = "kernel/pe" }
+buddy = { package = "ichor-buddy", path = "kernel/buddy" }
+acpi = { package = "ichor-acpi", path = "kernel/acpi" }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

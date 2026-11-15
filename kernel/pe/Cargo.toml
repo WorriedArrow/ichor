@@ -1,0 +1,13 @@
+[package]
+name = "ichor-pe"
+description = "PE32+ header and base-relocation parser (no_std, host-testable)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "pe"
+
+[lints]
+workspace = true
