@@ -145,9 +145,11 @@ reason. Known candidates: CET/IBT codegen and retpolines (side-channel ADR).
 
 ## Needs the owner
 
+Settled by the owner:
+
+- License: MIT OR Apache-2.0 (confirmed 2026-11-14).
+
 The brief cannot decide these, so ask the owner:
 
-- License: MIT OR Apache-2.0 was chosen as the Rust-ecosystem default in
-  session 1 and is not yet confirmed by the owner.
 - Secure Boot signing keys and how they are custodied (before milestone 8).
 - Cloud accounts and bare-metal hardware for milestones 8 and benchmarks.
