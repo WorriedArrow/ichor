@@ -205,6 +205,24 @@ pub(crate) extern "sysv64" fn kernel_space_entry() -> ! {
             "one-shot"
         }
     );
+    let v = arch::cpu::vulnerabilities();
+    let yn = |b: bool| if b { "affected" } else { "no" };
+    println!(
+        "ichor: frame: cpu0 speculation (ADR-0004): meltdown {}, mds {}, taa {}, bhi {}, gds {}; eibrs {}, ibpb {}, md_clear {}{}",
+        yn(v.meltdown),
+        yn(v.mds),
+        yn(v.taa),
+        yn(v.bhi),
+        yn(v.gds),
+        v.eibrs,
+        v.ibpb,
+        v.md_clear,
+        if v.meltdown {
+            " -- not safe for untrusted cells until page-table isolation lands"
+        } else {
+            ""
+        },
+    );
     enter_kernel(BootInfo {
         cmdline: state.cmdline(),
         memory_map: state.regions(),

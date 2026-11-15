@@ -53,15 +53,15 @@ Milestones 0-2 are done.
 Next for milestone 3: virtio-blk (needs frame `IoMem`/DMA + a budget ADR),
 mounting the root image from a block device, `mmap`/`brk`/`getdents64`/
 signals stubs and whatever else a static busybox traces to, then the
-busybox QEMU test. The side-channel ADR is still owed.
+busybox QEMU test.
 
-The side-channel ADR (due before milestone 2 "completes" per ADR-0001) is
-still owed and now also needs to cover the GS-in-ring-3 info leak noted in
-ADR-0001's user-mode work. Write it early in milestone 3.
+ADR-0004 records the side-channel posture; its per-CPU mitigations (VERW,
+IBPB on cross-cell switch, page-table isolation for Meltdown-affected CPUs)
+are owed as multi-cell scheduling lands in milestone 4. Boot logs which apply.
 
 Suggested order for milestone 3 (see the brief and ADR-0001 §4.6):
 
-1. Side-channel ADR (overdue) and the image-format + volume-format ADRs.
+1. The volume-format ADR (ext4 read/write is the candidate).
 2. A safe block layer trait and a virtio-blk driver (safe, over frame's
    `IoMem`/DMA types, which milestone 3 adds to frame per a new budget ADR).
 3. The read-only, content-addressed image format (host-testable crate) and

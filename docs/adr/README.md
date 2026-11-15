@@ -9,13 +9,13 @@ brief where they conflict with it.
 | [0001](0001-kernel-architecture.md) | Kernel architecture and the frame crate's API surface | Accepted |
 | [0002](0002-cells-and-capabilities.md) | Cell model and capabilities | Accepted |
 | [0003](0003-frame-budget-milestone-2.md) | Frame growth for milestone 2 | Accepted |
+| [0004](0004-side-channels.md) | Side-channel posture | Accepted |
 
 ## Planned
 
 These are known decisions with deadlines, so a future session knows they are
 owed:
 
-- Side-channel posture and mitigations (before milestone 2 completes)
 - Read-only image format and page sharing (milestone 3)
 - Volume on-disk format; ext4 read/write is a strong candidate (milestone 3)
 - Network stack architecture and the cell switch (milestone 5)

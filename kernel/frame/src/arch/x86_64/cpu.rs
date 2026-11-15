@@ -97,3 +97,70 @@ pub(crate) fn enable_protections() -> Features {
     unsafe { regs::write_cr4(cr4) };
     f
 }
+
+const MSR_ARCH_CAPABILITIES: u32 = 0x10A;
+
+/// Which speculative-execution issues apply to this CPU (ADR-0004 §1).
+/// `true` means affected.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Vulnerabilities {
+    pub intel: bool,
+    /// Rogue data cache load: the kernel needs page-table isolation to
+    /// host untrusted cells.
+    pub meltdown: bool,
+    /// Microarchitectural data sampling: VERW on return to user.
+    pub mds: bool,
+    /// TSX asynchronous abort.
+    pub taa: bool,
+    /// Enhanced IBRS available (Spectre v2 mitigated in hardware).
+    pub eibrs: bool,
+    /// Branch history injection.
+    pub bhi: bool,
+    /// Gather data sampling (Downfall).
+    pub gds: bool,
+    /// The CPU supports IBRS/IBPB.
+    pub ibpb: bool,
+    /// VERW clears CPU buffers (MD_CLEAR microcode).
+    pub md_clear: bool,
+}
+
+/// Detects this CPU's vulnerabilities from CPUID and, where enumerated,
+/// `IA32_ARCH_CAPABILITIES`.
+pub fn vulnerabilities() -> Vulnerabilities {
+    let [_, b, c, d] = cpuid(0, 0);
+    let intel = [b, d, c] == [0x756e_6547, 0x4965_6e69, 0x6c65_746e]; // "GenuineIntel"
+    let max_leaf = cpuid(0, 0)[0];
+    let edx7 = if max_leaf >= 7 { cpuid(7, 0)[3] } else { 0 };
+    let bit = |r: u64, n: u32| r & (1 << n) != 0;
+    let caps = if edx7 & (1 << 29) != 0 {
+        // SAFETY: CPUID.(EAX=7):EDX[29] enumerates IA32_ARCH_CAPABILITIES,
+        // a read-only MSR with no side effects.
+        unsafe { regs::rdmsr(MSR_ARCH_CAPABILITIES) }
+    } else {
+        0
+    };
+    let ibpb = edx7 & (1 << 26) != 0;
+    let md_clear = edx7 & (1 << 10) != 0;
+    if !intel {
+        // AMD and others are not affected by Meltdown, MDS or TAA; their
+        // own issues (Retbleed, SRSO) are handled per ADR-0004 §2.
+        return Vulnerabilities {
+            intel,
+            eibrs: bit(caps, 1),
+            ibpb,
+            md_clear,
+            ..Vulnerabilities::default()
+        };
+    }
+    Vulnerabilities {
+        intel,
+        meltdown: !bit(caps, 0),
+        mds: !bit(caps, 5),
+        taa: !bit(caps, 8),
+        eibrs: bit(caps, 1),
+        bhi: !bit(caps, 20),
+        gds: !bit(caps, 26),
+        ibpb,
+        md_clear,
+    }
+}
