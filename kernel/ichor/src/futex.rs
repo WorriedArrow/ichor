@@ -1,9 +1,11 @@
 //! Futexes: user-space locks' kernel half.
 //!
-//! Waiters are kept per (process, address), so semantics are those of
-//! `FUTEX_PRIVATE_FLAG` for every futex: a shared futex in memory mapped
-//! into two processes is not supported (shared file mappings do not exist
-//! yet either). The table lock is held while the user word is read
+//! Waiters are kept per (process, address), except in shared anonymous
+//! memory, where they are kept per physical address so that processes
+//! sharing the page meet on the same futex (with or without
+//! `FUTEX_PRIVATE_FLAG`: a wake that Linux would confine to one process
+//! may reach another, which futex users must tolerate as a spurious
+//! wakeup). There are no shared file mappings yet. The table lock is held while the user word is read
 //! atomically and the waiter queued, and wakers take the same lock, so a
 //! wake between "check the value" and "go to sleep" cannot be lost.
 //!
@@ -38,8 +40,8 @@ const FUTEX_WAKE_BITSET: u64 = 10;
 const FUTEX_PRIVATE_FLAG: u64 = 128;
 const FUTEX_CLOCK_REALTIME: u64 = 256;
 
-/// (process identity, user address).
-type Key = (usize, u64);
+/// (shared, process identity or cell, user or physical address).
+type Key = (bool, usize, u64);
 
 #[derive(Debug)]
 struct Waiter {
@@ -53,7 +55,10 @@ struct Waiter {
 static FUTEXES: Mutex<BTreeMap<Key, VecDeque<Arc<Waiter>>>> = Mutex::new(BTreeMap::new());
 
 fn key(p: &LinuxProcess, addr: u64) -> Key {
-    (Arc::as_ptr(&p.group) as usize, addr)
+    match p.mm().shared_phys(addr) {
+        Some(pa) => (true, p.cell.id() as usize, pa),
+        None => (false, Arc::as_ptr(&p.group) as usize, addr),
+    }
 }
 
 /// Wakes up to `n` waiters on `addr` whose bitset meets `bitset`; returns

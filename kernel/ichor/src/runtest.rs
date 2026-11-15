@@ -1063,6 +1063,112 @@ fn madvise_program() -> Vec<u8> {
     static_elf(&a.finish(BLOB_VADDR).unwrap_or_else(|| fail("assembler")))
 }
 
+/// `MAP_SHARED | MAP_ANONYMOUS` across fork: the child writes a value and
+/// a flag into the shared page and wakes a (non-private) futex on the
+/// flag; the parent, waiting on that futex, sees both, and still sees the
+/// value after `MADV_DONTNEED`. A private page written by the child stays
+/// the parent's. Exits 0, or the number of the failed check.
+fn shared_program() -> Vec<u8> {
+    const PROT_RW: u64 = 3;
+    const SHARED_ANON: u64 = 0x21;
+    const PRIVATE_ANON: u64 = 0x22;
+    const FUTEX_WAIT: u64 = 0;
+    const FUTEX_WAKE: u64 = 1;
+    let mut a = Asm::new();
+    let bad = a.label();
+    let parent = a.label();
+    let again = a.label();
+    let done = a.label();
+    let ts = a.data(&[0, 0, 0, 0, 0, 0, 0, 0, 0x80, 0xf0, 0xfa, 0x02, 0, 0, 0, 0]); // 50 ms
+    let expect = |a: &mut Asm, n: u64, v: i32| {
+        a.mov_imm(Reg::R15, n);
+        a.cmp_imm(Reg::Rax, v);
+        a.jne(bad);
+    };
+    let map = |a: &mut Asm, flags: u64| {
+        a.mov_imm(Reg::Rdi, 0);
+        a.mov_imm(Reg::Rsi, 4096);
+        a.mov_imm(Reg::Rdx, PROT_RW);
+        a.mov_imm(Reg::R10, flags);
+        a.mov_imm(Reg::R8, u64::MAX);
+        a.mov_imm(Reg::R9, 0);
+        a.sys(sys::MMAP);
+    };
+    let futex = |a: &mut Asm, op: u64, val: u64| {
+        a.mov(Reg::Rdi, Reg::R12);
+        a.add_imm(Reg::Rdi, 8);
+        a.mov_imm(Reg::Rsi, op);
+        a.mov_imm(Reg::Rdx, val);
+        a.mov_imm(Reg::R10, 0);
+        a.sys(sys::FUTEX);
+    };
+    a.mov(Reg::Rbp, Reg::Rsp);
+    a.sub_imm(Reg::Rbp, 4096);
+    // r12 = shared page (value at 0, flag at 8), r13 = private page.
+    map(&mut a, SHARED_ANON);
+    a.mov(Reg::R12, Reg::Rax);
+    map(&mut a, PRIVATE_ANON);
+    a.mov(Reg::R13, Reg::Rax);
+    a.mov_imm(Reg::Rax, 1);
+    a.store(Reg::R13, 0, Reg::Rax);
+    a.sys(sys::FORK);
+    a.cmp_imm(Reg::Rax, 0);
+    a.jne(parent);
+    // Child: after 50 ms (the parent is asleep on the futex by then),
+    // private := 7, value := 42, flag := 1, wake the parent.
+    a.mov_data(Reg::Rdi, ts);
+    a.mov_imm(Reg::Rsi, 0);
+    a.sys(sys::NANOSLEEP);
+    a.mov_imm(Reg::Rax, 7);
+    a.store(Reg::R13, 0, Reg::Rax);
+    a.mov_imm(Reg::Rax, 42);
+    a.store(Reg::R12, 0, Reg::Rax);
+    a.mov_imm(Reg::Rax, 1);
+    a.store(Reg::R12, 8, Reg::Rax);
+    futex(&mut a, FUTEX_WAKE, 1);
+    a.mov_imm(Reg::Rdi, 0);
+    a.sys(sys::EXIT_GROUP);
+    // Parent: wait on the flag until it is set.
+    a.bind(parent);
+    a.bind(again);
+    a.load(Reg::Rax, Reg::R12, 8);
+    a.cmp_imm(Reg::Rax, 1);
+    a.je(done);
+    futex(&mut a, FUTEX_WAIT, 0);
+    a.jmp(again);
+    a.bind(done);
+    // 1: the child's value is in the shared page.
+    a.load(Reg::Rax, Reg::R12, 0);
+    expect(&mut a, 1, 42);
+    // 2: the private page is still ours.
+    a.load(Reg::Rax, Reg::R13, 0);
+    expect(&mut a, 2, 1);
+    // 3: MADV_DONTNEED keeps shared contents.
+    a.mov(Reg::Rdi, Reg::R12);
+    a.mov_imm(Reg::Rsi, 4096);
+    a.mov_imm(Reg::Rdx, 4);
+    a.sys(sys::MADVISE);
+    expect(&mut a, 3, 0);
+    a.load(Reg::Rax, Reg::R12, 0);
+    expect(&mut a, 3, 42);
+    // 4: reap the child; it exited 0.
+    a.mov_imm(Reg::Rdi, u64::MAX);
+    a.mov(Reg::Rsi, Reg::Rbp);
+    a.mov_imm(Reg::Rdx, 0);
+    a.mov_imm(Reg::R10, 0);
+    a.sys(sys::WAIT4);
+    a.load(Reg::Rax, Reg::Rbp, 0);
+    a.mov_imm(Reg::R14, 0xffff_ffff);
+    a.mov_imm(Reg::R15, 4);
+    a.cmp_imm(Reg::Rax, 0);
+    a.jne(bad);
+    a.mov_imm(Reg::R15, 0);
+    a.bind(bad);
+    a.mov(Reg::Rdi, Reg::R15);
+    a.sys(sys::EXIT_GROUP);
+    static_elf(&a.finish(BLOB_VADDR).unwrap_or_else(|| fail("assembler")))
+}
+
 /// POSIX record locks across fork: the parent write-locks bytes 0..10; the
 /// child's overlapping F_SETLK fails with EAGAIN, F_GETLK names the parent,
 /// a disjoint range locks fine, and F_SETLKW blocks until the parent
@@ -1274,5 +1380,14 @@ pub(crate) fn run() {
     }
     println!(
         "ichor: linux: madvise DONTNEED zero-fills anonymous pages, refills file pages ({syscalls} syscalls)"
+    );
+
+    let (status, syscalls) = run_linux(new_process(), &shared_program(), None, &["sharedtest"]);
+    if status != 0 {
+        println!("ichor: linux: sharedtest failed check {status}");
+        fail("sharedtest");
+    }
+    println!(
+        "ichor: linux: MAP_SHARED anonymous memory and its futex are shared across fork ({syscalls} syscalls)"
     );
 }

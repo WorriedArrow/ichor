@@ -15,6 +15,13 @@
 //! loader's own segments are not file mappings: dropping one of their pages
 //! zero-fills it (partial).
 //!
+//! Shared anonymous mappings (`MAP_SHARED | MAP_ANONYMOUS`) stay shared
+//! across `fork`: before the copy, every page of them is made resident,
+//! and parent and child then map the same frames writable, never
+//! copy-on-write. Their contents survive `MADV_DONTNEED`, as shmem's do.
+//! (Making a large shared mapping resident at fork is eager; a page cache
+//! will let it stay lazy.)
+//!
 //! `fork` is copy-on-write: parent and child map the same pages read-only
 //! and mark them shared; the first write on either side (a fault, or a
 //! kernel copy into user memory) gives that side its own copy. The child
@@ -123,6 +130,8 @@ pub(crate) struct Mm {
     cow: BTreeSet<u64>,
     /// File mappings, for filling their pages.
     files: Vec<FileRange>,
+    /// Shared anonymous mappings: `[start, end)`.
+    shared: Vec<(u64, u64)>,
     brk_start: u64,
     brk: u64,
 }
@@ -137,6 +146,7 @@ impl Mm {
             pages: BTreeMap::new(),
             cow: BTreeSet::new(),
             files: Vec::new(),
+            shared: Vec::new(),
             brk_start: 0,
             brk: 0,
         })
@@ -151,14 +161,32 @@ impl Mm {
     /// regions and break; every page is shared read-only and marked
     /// copy-on-write on both sides. `None` if memory or the account runs out.
     pub(crate) fn fork(&mut self) -> Option<Mm> {
+        // Shared memory must exist before the copy, so both sides hold it.
+        for (s, e) in self.shared.clone() {
+            let mut va = s;
+            while va < e {
+                self.frame(va)?;
+                va += PAGE_SIZE;
+            }
+        }
         let mut child = Mm::new(&self.account)?;
         child.regions = self.regions.clone();
         child.files = self.files.clone();
+        child.shared = self.shared.clone();
         child.brk_start = self.brk_start;
         child.brk = self.brk;
         self.account.charge(self.pages.len() as u64).ok()?;
         for (&va, f) in &self.pages {
             child.pages.insert(va, f.clone());
+            if self.is_shared(va) {
+                let prot = self.regions.find(va).map(|r| r.prot);
+                if let Some(prot) = prot.filter(|p| p.accessible())
+                    && child.space.map(va, f, user_prot(prot)).is_err()
+                {
+                    return None;
+                }
+                continue;
+            }
             child.cow.insert(va);
             self.cow.insert(va);
             if let Some((_, prot)) = self.space.translate(va) {
@@ -177,6 +205,25 @@ impl Mm {
             }
         }
         Some(child)
+    }
+
+    /// Whether `va` lies in a shared anonymous mapping.
+    fn is_shared(&self, va: u64) -> bool {
+        self.shared.iter().any(|&(s, e)| s <= va && va < e)
+    }
+
+    /// The physical address behind `addr` if it lies in shared memory (so a
+    /// futex there is the same futex in every process that maps it), making
+    /// the page resident first.
+    pub(crate) fn shared_phys(&mut self, addr: u64) -> Option<u64> {
+        let va = page_down(addr);
+        if !self.is_shared(va) {
+            return None;
+        }
+        self.populate(va, 4, false);
+        self.space
+            .translate(va)
+            .map(|(pa, _)| pa.as_u64() + (addr - va))
     }
 
     /// Gives this process its own copy of a copy-on-write page at `va` and
@@ -227,6 +274,7 @@ impl Mm {
         let mut s = alloc::string::String::new();
         let brk_end = page_up(self.brk).unwrap_or(self.brk);
         for r in self.regions.regions() {
+            let share = if self.is_shared(r.start) { 's' } else { 'p' };
             let label = if r.start >= self.brk_start && r.end <= brk_end && self.brk_start != 0 {
                 "[heap]"
             } else if r.end == 0x7fff_f000_0000 {
@@ -236,7 +284,7 @@ impl Mm {
             };
             let _ = writeln!(
                 s,
-                "{:08x}-{:08x} {}{}{}p 00000000 00:00 0 {label}",
+                "{:08x}-{:08x} {}{}{}{share} 00000000 00:00 0 {label}",
                 r.start,
                 r.end,
                 if r.prot.read { 'r' } else { '-' },
@@ -278,6 +326,41 @@ impl Mm {
         }
         self.pages.insert(va, f.clone());
         Some(f)
+    }
+
+    /// Forgets the shared anonymous ranges over `[start, end)`.
+    fn trim_shared(&mut self, start: u64, end: u64) {
+        let mut kept = Vec::with_capacity(self.shared.len());
+        for &(s, e) in &self.shared {
+            if e <= start || s >= end {
+                kept.push((s, e));
+                continue;
+            }
+            if s < start {
+                kept.push((s, start));
+            }
+            if e > end {
+                kept.push((end, e));
+            }
+        }
+        self.shared = kept;
+    }
+
+    /// Drops the private pages of `[start, end)` (`MADV_DONTNEED`);
+    /// shared memory keeps its contents.
+    fn drop_private(&mut self, start: u64, end: u64) {
+        let shared: Vec<(u64, u64)> = self
+            .shared
+            .iter()
+            .filter(|&&(s, e)| s < end && start < e)
+            .map(|&(s, e)| (s.max(start), e.min(end)))
+            .collect();
+        let mut at = start;
+        for (s, e) in shared {
+            self.free_range(at, s.max(at));
+            at = at.max(e);
+        }
+        self.free_range(at, end);
     }
 
     /// Forgets the file mappings over `[start, end)`.
@@ -420,6 +503,9 @@ impl Mm {
         if !self.regions.insert(start, start + len, prot) {
             return Err(ENOMEM); // `backing` drops and returns its charge
         }
+        if backing.is_none() && map_flags & MAP_SHARED != 0 {
+            self.shared.push((start, start + len));
+        }
         if let Some(backing) = backing {
             self.files.push(FileRange {
                 start,
@@ -442,6 +528,7 @@ impl Mm {
             self.free_range(s, e);
         }
         self.trim_files(addr, end);
+        self.trim_shared(addr, end);
         Ok(0)
     }
 
@@ -457,10 +544,11 @@ impl Mm {
         }
         let len = vma::page_len(len).ok_or(EINVAL)?;
         let end = addr.checked_add(len).ok_or(EINVAL)?;
-        let file = self.files.iter().any(|r| r.start < end && addr < r.end);
+        let file = self.files.iter().any(|r| r.start < end && addr < r.end)
+            || self.shared.iter().any(|&(s, e)| s < end && addr < e);
         match advice {
             NORMAL..=WILLNEED | MERGEABLE..=DODUMP | KEEPONFORK..=PAGEOUT => {}
-            DONTNEED => self.free_range(addr, end),
+            DONTNEED => self.drop_private(addr, end),
             FREE if !file => self.free_range(addr, end),
             POPULATE_READ | POPULATE_WRITE => {
                 self.populate(addr, len as usize, advice == POPULATE_WRITE)
