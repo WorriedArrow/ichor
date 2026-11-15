@@ -20,8 +20,14 @@
 //! leave through the switch after the stack lock is dropped, and the
 //! switch hands segments for this stack's address to [`Stack::receive`].
 //!
-//! Partial (milestone 5 so far): TCP only (no UDP), no IPv6; socket
-//! buffers are not yet charged to the cell's account.
+//! UDP sockets share the stack: datagrams go through the same local
+//! delivery and switch paths, with their own port space; a socket queues
+//! up to [`UDP_BUFFER`] bytes and drops what does not fit, as a full Linux
+//! socket does.
+//!
+//! Partial (milestone 5 so far): no IPv6, no ICMP errors for UDP (a
+//! datagram to a closed port is dropped silently, never ECONNREFUSED);
+//! socket buffers are not yet charged to the cell's account.
 
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -35,7 +41,7 @@ use frame::task::{TaskOptions, WaitQueue};
 use net::Ipv4Addr;
 use net::iface::Packet;
 use net::tcp::{self, Segment, State, Tcp};
-use net::wire::PROTO_TCP;
+use net::wire::{PROTO_TCP, PROTO_UDP, Udp};
 
 use crate::poll::Watchers;
 
@@ -51,6 +57,8 @@ pub(crate) const EALREADY: i64 = 114;
 pub(crate) const EINPROGRESS: i64 = 115;
 pub(crate) const EINVAL: i64 = 22;
 pub(crate) const EPIPE: i64 = 32;
+pub(crate) const EDESTADDRREQ: i64 = 89;
+pub(crate) const EMSGSIZE: i64 = 90;
 pub(crate) const EOPNOTSUPP: i64 = 95;
 
 /// An IPv4 socket address.
@@ -97,7 +105,25 @@ enum Kind {
         /// Already put in the parent's backlog.
         queued: bool,
     },
+    /// A UDP socket: received datagrams with their sources, and the
+    /// peer `connect` fixed, if any.
+    Udp {
+        rx: VecDeque<(Addr, Vec<u8>)>,
+        bytes: usize,
+        peer: Option<Addr>,
+    },
 }
+
+impl Kind {
+    fn is_udp(&self) -> bool {
+        matches!(self, Kind::Udp { .. })
+    }
+}
+
+/// Most bytes a UDP socket queues before it drops datagrams.
+pub(crate) const UDP_BUFFER: usize = 256 * 1024;
+/// Largest UDP payload over IPv4.
+pub(crate) const UDP_MAX: usize = 65507;
 
 #[derive(Debug)]
 struct Sock {
@@ -120,8 +146,8 @@ struct Inner {
     socks: BTreeMap<u64, Sock>,
     next_id: u64,
     next_port: u16,
-    /// Segments between local addresses, to deliver: (src, dst, segment).
-    local: VecDeque<(Ipv4Addr, Ipv4Addr, Vec<u8>)>,
+    /// Packets between local addresses, to deliver.
+    local: VecDeque<Packet>,
     /// Segments for the switch, sent once the lock is released.
     out: Vec<Packet>,
     /// Sockets to wake when the lock is released.
@@ -241,18 +267,23 @@ impl Inner {
         ip.is_loopback() || Some(ip) == self.addr
     }
 
-    /// Queues a segment for `dst`: delivered here if local, else sent
+    /// Queues a TCP segment for `dst`: delivered here if local, else sent
     /// through the switch.
     fn route(&mut self, src: Ipv4Addr, dst: Ipv4Addr, seg: Vec<u8>) {
+        self.route_proto(PROTO_TCP, src, dst, seg);
+    }
+
+    fn route_proto(&mut self, protocol: u8, src: Ipv4Addr, dst: Ipv4Addr, payload: Vec<u8>) {
+        let p = Packet {
+            src,
+            dst,
+            protocol,
+            payload,
+        };
         if self.is_local(dst) {
-            self.local.push_back((src, dst, seg));
+            self.local.push_back(p);
         } else {
-            self.out.push(Packet {
-                src,
-                dst,
-                protocol: PROTO_TCP,
-                payload: seg,
-            });
+            self.out.push(p);
         }
     }
 
@@ -260,13 +291,15 @@ impl Inner {
         self.socks.get_mut(&id).ok_or(EINVAL)
     }
 
-    /// Whether `port` on `ip` is taken for a new bind by `by`.
+    /// Whether `port` on `ip` is taken for a new bind by `by` (TCP and
+    /// UDP have separate port spaces).
     fn port_taken(&self, ip: Ipv4Addr, port: u16, by: u64, reuse: bool) -> bool {
+        let udp = self.socks.get(&by).is_some_and(|s| s.kind.is_udp());
         self.socks.iter().any(|(&id, s)| {
             let Some((sip, sport)) = s.local else {
                 return false;
             };
-            if id == by || sport != port {
+            if id == by || sport != port || s.kind.is_udp() != udp {
                 return false;
             }
             let overlap = sip == ip || sip.is_unspecified() || ip.is_unspecified();
@@ -302,6 +335,31 @@ impl Inner {
         Err(EADDRINUSE)
     }
 
+    /// The local endpoint socket `id` sends to `dst` from: its bound
+    /// address if specific, else loopback or the switch's assignment, and
+    /// its bound port or a new ephemeral one.
+    fn source_for(&mut self, id: u64, dst: Ipv4Addr) -> Result<Addr, i64> {
+        let loopback = dst.is_loopback();
+        if dst.is_unspecified() || dst.is_broadcast() || dst.is_multicast() {
+            return Err(ENETUNREACH);
+        }
+        let bound = self.sock(id)?.local;
+        let ip = match (bound, self.addr) {
+            (Some((ip, _)), _) if !ip.is_unspecified() => ip,
+            _ if loopback => Ipv4Addr::LOCALHOST,
+            (_, Some(a)) => a,
+            (_, None) => return Err(ENETUNREACH),
+        };
+        if ip.is_loopback() != loopback {
+            return Err(EINVAL); // bound to loopback, sending out (or the reverse)
+        }
+        let port = match bound {
+            Some((_, p)) => p,
+            None => self.ephemeral(ip, id)?,
+        };
+        Ok((ip, port))
+    }
+
     fn new_id(&mut self) -> u64 {
         self.next_id += 1;
         self.next_id
@@ -332,13 +390,51 @@ impl Inner {
     fn run_local(&mut self) {
         let _ = self.flush();
         for _ in 0..MAX_LOCAL_ROUNDS {
-            let Some((src, dst, bytes)) = self.local.pop_front() else {
+            let Some(p) = self.local.pop_front() else {
                 break;
             };
-            self.input(src, dst, &bytes);
+            self.input_packet(&p);
             let _ = self.flush();
         }
         self.promote_and_reap();
+    }
+
+    /// One packet for this stack, by protocol.
+    fn input_packet(&mut self, p: &Packet) {
+        match p.protocol {
+            PROTO_TCP => self.input(p.src, p.dst, &p.payload),
+            PROTO_UDP => self.input_udp(p.src, p.dst, &p.payload),
+            _ => {}
+        }
+    }
+
+    /// A UDP datagram: queued on the socket bound to its port (and
+    /// connected to its source, if connected); dropped if none or full.
+    fn input_udp(&mut self, src: Ipv4Addr, dst: Ipv4Addr, bytes: &[u8]) {
+        let Some(d) = Udp::parse(bytes, src, dst) else {
+            return;
+        };
+        let from = (src, d.src_port);
+        let target = self.socks.iter_mut().find_map(|(&id, s)| {
+            let (ip, port) = s.local?;
+            match &mut s.kind {
+                Kind::Udp { rx, bytes, peer }
+                    if port == d.dst_port
+                        && (ip.is_unspecified() || ip == dst)
+                        && peer.is_none_or(|p| p == from) =>
+                {
+                    Some((id, rx, bytes))
+                }
+                _ => None,
+            }
+        });
+        if let Some((id, rx, queued)) = target
+            && *queued + d.payload.len() <= UDP_BUFFER
+        {
+            *queued += d.payload.len();
+            rx.push_back((from, d.payload.to_vec()));
+            self.touched.insert(id);
+        }
     }
 
     /// One segment arriving at this stack.
@@ -534,8 +630,8 @@ impl Stack {
     pub(crate) fn receive(&self, p: Packet) -> Vec<Packet> {
         let (woken, out) = {
             let mut i = self.inner.lock();
-            if p.protocol == PROTO_TCP && Some(p.dst) == i.addr {
-                i.input(p.src, p.dst, &p.payload);
+            if Some(p.dst) == i.addr {
+                i.input_packet(&p);
             }
             i.run_local();
             (i.take_touched(), core::mem::take(&mut i.out))
@@ -545,15 +641,23 @@ impl Stack {
         out
     }
 
-    /// A new, unbound socket.
-    pub(crate) fn socket(&self) -> (u64, Arc<Waiters>) {
+    /// A new, unbound socket: TCP, or UDP if `udp`.
+    pub(crate) fn socket(&self, udp: bool) -> (u64, Arc<Waiters>) {
         let mut i = self.inner.lock();
         let id = i.new_id();
         let wait = Arc::new(Waiters::default());
         i.socks.insert(
             id,
             Sock {
-                kind: Kind::Fresh,
+                kind: if udp {
+                    Kind::Udp {
+                        rx: VecDeque::new(),
+                        bytes: 0,
+                        peer: None,
+                    }
+                } else {
+                    Kind::Fresh
+                },
                 local: None,
                 wait: wait.clone(),
                 reuse_addr: false,
@@ -616,35 +720,28 @@ impl Stack {
                 Ok(())
             }
             Kind::Conn { .. } => Err(EINVAL),
+            Kind::Udp { .. } => Err(EOPNOTSUPP),
         }
     }
 
-    /// Starts connecting to `remote`.
+    /// Starts connecting to `remote` (for UDP: fixes the peer).
     pub(crate) fn connect(&self, id: u64, remote: Addr) -> Result<(), i64> {
         self.with(|i| {
-            match i.sock(id)?.kind {
-                Kind::Fresh => {}
+            let udp = match i.sock(id)?.kind {
+                Kind::Fresh => false,
+                Kind::Udp { .. } => true,
                 Kind::Conn { .. } => return Err(EISCONN),
                 Kind::Listening { .. } => return Err(EINVAL),
-            }
-            let loopback = remote.0.is_loopback();
-            if remote.0.is_unspecified() || remote.0.is_broadcast() || remote.0.is_multicast() {
-                return Err(ENETUNREACH);
-            }
-            let local_ip = match (i.sock(id)?.local, i.addr) {
-                (Some((ip, _)), _) if !ip.is_unspecified() => ip,
-                _ if loopback => Ipv4Addr::LOCALHOST,
-                (_, Some(a)) => a,
-                (_, None) => return Err(ENETUNREACH),
             };
-            if local_ip.is_loopback() != loopback {
-                return Err(EINVAL); // bound to loopback, connecting out (or the reverse)
+            let local = i.source_for(id, remote.0)?;
+            if udp {
+                let s = i.sock(id)?;
+                s.local.get_or_insert(local);
+                if let Kind::Udp { peer, .. } = &mut s.kind {
+                    *peer = Some(remote);
+                }
+                return Ok(());
             }
-            let port = match i.sock(id)?.local {
-                Some((_, p)) => p,
-                None => i.ephemeral(local_ip, id)?,
-            };
-            let local = (local_ip, port);
             let tcp = Box::new(Tcp::connect(local, remote, random_iss(), now()));
             let s = i.sock(id)?;
             s.local = Some(local);
@@ -753,11 +850,15 @@ impl Stack {
     pub(crate) fn shutdown(&self, id: u64, rd: bool, wr: bool) -> Result<(), i64> {
         self.with(|i| {
             let s = i.sock(id)?;
-            let Kind::Conn { tcp, .. } = &mut s.kind else {
-                return Err(ENOTCONN);
-            };
-            if wr {
-                tcp.close(now());
+            match &mut s.kind {
+                Kind::Conn { tcp, .. } => {
+                    if wr {
+                        tcp.close(now());
+                    }
+                }
+                // A connected datagram socket: only reads change.
+                Kind::Udp { peer: Some(_), .. } => {}
+                _ => return Err(ENOTCONN),
             }
             if rd {
                 s.shut_rd = true;
@@ -774,7 +875,7 @@ impl Stack {
             let mut doomed = Vec::new();
             if let Some(s) = i.socks.get_mut(&id) {
                 match &mut s.kind {
-                    Kind::Fresh => {
+                    Kind::Fresh | Kind::Udp { .. } => {
                         i.socks.remove(&id);
                     }
                     Kind::Listening { backlog, .. } => {
@@ -834,6 +935,13 @@ impl Stack {
                     r |= POLLHUP | POLLIN;
                 }
             }
+            // A datagram socket can always send (a full receiver drops).
+            Kind::Udp { rx, .. } => {
+                r |= POLLOUT;
+                if !rx.is_empty() || s.shut_rd {
+                    r |= POLLIN;
+                }
+            }
         }
         r
     }
@@ -850,7 +958,76 @@ impl Stack {
         let i = self.inner.lock();
         match &i.socks.get(&id).ok_or(EINVAL)?.kind {
             Kind::Conn { tcp, .. } if !tcp.is_closed() => Ok(tcp.remote),
+            Kind::Udp { peer: Some(p), .. } => Ok(*p),
             _ => Err(ENOTCONN),
+        }
+    }
+
+    /// `connect(AF_UNSPEC)` on a UDP socket: forgets the peer.
+    pub(crate) fn disconnect(&self, id: u64) -> Result<(), i64> {
+        let mut i = self.inner.lock();
+        match &mut i.sock(id)?.kind {
+            Kind::Udp { peer, .. } => {
+                *peer = None;
+                Ok(())
+            }
+            _ => Err(EOPNOTSUPP),
+        }
+    }
+
+    /// Sends one UDP datagram to `to`, or to the connected peer. An
+    /// unbound socket is bound to an ephemeral port first, as on Linux.
+    pub(crate) fn send_to(&self, id: u64, to: Option<Addr>, data: &[u8]) -> Result<usize, i64> {
+        if data.len() > UDP_MAX {
+            return Err(EMSGSIZE);
+        }
+        self.with(|i| {
+            let s = i.sock(id)?;
+            if let Some(e) = s.error.take() {
+                return Err(e);
+            }
+            let Kind::Udp { peer, .. } = &s.kind else {
+                return Err(EOPNOTSUPP);
+            };
+            let dst = match (to, *peer) {
+                (Some(t), _) => t,
+                (None, Some(p)) => p,
+                (None, None) => return Err(EDESTADDRREQ),
+            };
+            if dst.1 == 0 {
+                return Err(EINVAL);
+            }
+            if i.sock(id)?.local.is_none() {
+                let port = i.ephemeral(Ipv4Addr::UNSPECIFIED, id)?;
+                i.sock(id)?.local = Some((Ipv4Addr::UNSPECIFIED, port));
+            }
+            let (sip, sport) = i.source_for(id, dst.0)?;
+            let d = net::wire::udp(sip, sport, dst.0, dst.1, data);
+            i.route_proto(PROTO_UDP, sip, dst.0, d);
+            Ok(data.len())
+        })
+    }
+
+    /// Takes the next received datagram and its source: `Ok(None)` when
+    /// none is queued.
+    pub(crate) fn recv_from(&self, id: u64) -> Result<Option<(Addr, Vec<u8>)>, i64> {
+        let mut i = self.inner.lock();
+        let s = i.sock(id)?;
+        if let Some(e) = s.error.take() {
+            return Err(e);
+        }
+        let shut = s.shut_rd;
+        let Kind::Udp { rx, bytes, .. } = &mut s.kind else {
+            return Err(EOPNOTSUPP);
+        };
+        match rx.pop_front() {
+            Some((from, d)) => {
+                *bytes -= d.len();
+                Ok(Some((from, d)))
+            }
+            // After shutdown(SHUT_RD) reads return 0 at once.
+            None if shut => Ok(Some(((Ipv4Addr::UNSPECIFIED, 0), Vec::new()))),
+            None => Ok(None),
         }
     }
 

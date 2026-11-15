@@ -127,10 +127,12 @@ fn m1_boots_on_four_cpus() {
         "debian: nproc, getconf and stat agree",
         "debian: pty: openpty, line editing, echo, stty, ^C and hangup work",
         "debian: sockets: refused, EADDRINUSE, 1 MiB each way, half-close, non-blocking connect and accept work",
+        "debian: udp: datagrams keep boundaries and sources, truncate, connect filters, ports are per protocol",
         "debian: alarm and setitimer deliver SIGALRM, getitimer reads back",
         "Hello, world!",
         "debian: apt-get installed hello and jq from the local repository",
         "through the switch; loopback is per cell",
+        "debian: cells: a datagram crossed the switch and came back",
         "ichor: debian: all runs passed",
         "ichor: blk: nvme block size 4096 bytes",
         "ichor: blk: nvme: verified 300 KiB read across multiple requests",
@@ -249,10 +251,12 @@ fn m1_boots_on_one_cpu() {
         "debian: nproc, getconf and stat agree",
         "debian: pty: openpty, line editing, echo, stty, ^C and hangup work",
         "debian: sockets: refused, EADDRINUSE, 1 MiB each way, half-close, non-blocking connect and accept work",
+        "debian: udp: datagrams keep boundaries and sources, truncate, connect filters, ports are per protocol",
         "debian: alarm and setitimer deliver SIGALRM, getitimer reads back",
         "Hello, world!",
         "debian: apt-get installed hello and jq from the local repository",
         "through the switch; loopback is per cell",
+        "debian: cells: a datagram crossed the switch and came back",
         "ichor: debian: all runs passed",
         "ichor: blk: nvme block size 4096 bytes",
         "ichor: blk: nvme: verified 300 KiB read across multiple requests",
@@ -351,10 +355,12 @@ fn m2_scheduler_on_eight_cpus() {
         "debian: nproc, getconf and stat agree",
         "debian: pty: openpty, line editing, echo, stty, ^C and hangup work",
         "debian: sockets: refused, EADDRINUSE, 1 MiB each way, half-close, non-blocking connect and accept work",
+        "debian: udp: datagrams keep boundaries and sources, truncate, connect filters, ports are per protocol",
         "debian: alarm and setitimer deliver SIGALRM, getitimer reads back",
         "Hello, world!",
         "debian: apt-get installed hello and jq from the local repository",
         "through the switch; loopback is per cell",
+        "debian: cells: a datagram crossed the switch and came back",
         "ichor: debian: all runs passed",
         "ichor: blk: nvme block size 4096 bytes",
         "ichor: blk: nvme: verified 300 KiB read across multiple requests",
@@ -462,8 +468,25 @@ fn tcp_through_virtio_net_to_a_host_echo_server() {
     use std::io::{Read, Write};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    // A TCP echo and a UDP echo on the same port number.
+    let (listener, udp) = (0..50)
+        .find_map(|_| {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
+            let u = std::net::UdpSocket::bind(l.local_addr().ok()?).ok()?;
+            Some((l, u))
+        })
+        .expect("a port free for both TCP and UDP");
     let port = listener.local_addr().unwrap().port();
+    let datagrams = Arc::new(AtomicUsize::new(0));
+    let counted = datagrams.clone();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 2048];
+        while let Ok((n, from)) = udp.recv_from(&mut buf) {
+            if udp.send_to(&buf[..n], from).is_ok() {
+                counted.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    });
     // Two clients: the kernel's own TCP, then a Debian cell through the
     // cell switch's NAT.
     let totals: Arc<[AtomicUsize; 2]> = Arc::new([AtomicUsize::new(0), AtomicUsize::new(0)]);
@@ -496,7 +519,12 @@ fn tcp_through_virtio_net_to_a_host_echo_server() {
         "ichor: net: uplink 10.0.2.15 is the cell switch's",
         "through the switch; loopback is per cell",
         &format!("debian: nat: a cell echoed 256 KiB with 10.0.2.2:{port} through the uplink"),
+        "debian: nat: a datagram went through the uplink and came back",
     ]);
+    assert!(
+        datagrams.load(Ordering::SeqCst) >= 1,
+        "the host echoed no datagram"
+    );
     for (i, t) in totals.iter().enumerate() {
         assert_eq!(
             t.load(Ordering::SeqCst),

@@ -51,7 +51,13 @@ uplink; virtio-net first (polled).
   number was EEXIST and closed sockets stayed alive); TCP takes a bare FIN
   against a zero window, sends no window update after the peer's FIN, and
   ends TIME_WAIT quietly on a RST; the NAT lets a SYN reopen a finished
-  mapping. Next: UDP, `AF_UNIX`, socket buffers charged to the cell.
+  mapping.
+- M5 UDP: `SOCK_DGRAM` sockets on the same per-cell stack (own port
+  space, 256 KiB receive queue that drops when full, autobind on first
+  send, connect/AF_UNSPEC, MSG_TRUNC, msg_name in sendmsg/recvmsg).
+  Tested on loopback (Debian perl), across the switch between cells, and
+  through the uplink's NAT to a host UDP echo. No ICMP errors yet.
+  Next: `AF_UNIX`, socket buffers charged to the cell.
 
 Milestones 0-4 are done (4's acceptance test: Debian's `apt-get install`
 from a local mirror). Phase E (scalability) is done except the vDSO and

@@ -167,6 +167,46 @@ my $p4 = "";
 sysread($b, $p4, 4) == 4 && $p4 eq "ping" or fail("read back");
 close $nb; close $b; close $l;
 print "debian: sockets: refused, EADDRINUSE, 1 MiB each way, half-close, non-blocking connect and accept work\n";
+# UDP: datagram boundaries, sources, truncation, connect, port spaces.
+sub udp { socket(my $s, AF_INET, SOCK_DGRAM, 0) or fail("udp socket: $!"); $s }
+my $u1 = udp();
+bind($u1, pack_sockaddr_in(0, $lo)) or fail("udp bind: $!");
+my ($up) = unpack_sockaddr_in(getsockname($u1));
+my $u2 = udp();
+unpack("i", getsockopt($u2, SOL_SOCKET, SO_TYPE)) == SOCK_DGRAM or fail("udp SO_TYPE");
+send($u2, "one", 0, pack_sockaddr_in($up, $lo)) == 3 or fail("udp send: $!");
+send($u2, "two!", 0, pack_sockaddr_in($up, $lo)) == 4 or fail("udp send 2: $!");
+my ($u2p) = unpack_sockaddr_in(getsockname($u2));
+$u2p >= 32768 or fail("udp autobind port $u2p");
+my $rin2 = ""; vec($rin2, fileno($u1), 1) = 1;
+select(my $rout2 = $rin2, undef, undef, 5) == 1 or fail("udp not readable");
+my $from = recv($u1, my $m, 100, 0) // fail("udp recv: $!");
+$m eq "one" or fail("udp got [$m]");
+my ($fp, $fa) = unpack_sockaddr_in($from);
+$fp == $u2p && inet_ntoa($fa) eq "127.0.0.1" or fail("udp source $fp");
+recv($u1, $m, 2, 0) // fail("udp recv 2: $!");
+$m eq "tw" or fail("udp truncation gave [$m]");
+connect($u1, $from) or fail("udp connect: $!");
+syswrite($u1, "back") == 4 or fail("udp write: $!");
+sysread($u2, $m, 100) == 4 && $m eq "back" or fail("udp read back [$m]");
+my ($pp) = unpack_sockaddr_in(getpeername($u1));
+$pp == $u2p or fail("udp getpeername");
+# A connected socket hears only its peer.
+my $u3 = udp();
+send($u3, "stranger", 0, pack_sockaddr_in($up, $lo)) == 8 or fail("udp send 3: $!");
+send($u2, "friend", 0, pack_sockaddr_in($up, $lo)) == 6 or fail("udp send 4: $!");
+sysread($u1, $m, 100) == 6 && $m eq "friend" or fail("connected socket got [$m]");
+# UDP and TCP have separate port spaces; a second UDP bind is refused.
+my $t = tcp();
+bind($t, pack_sockaddr_in($up, $lo)) or fail("tcp could not share the udp port number: $!");
+my $u4 = udp();
+bind($u4, pack_sockaddr_in($up, $lo)) and fail("second udp bind worked");
+$!{EADDRINUSE} or fail("second udp bind: $!");
+listen($u4, 1) and fail("listen on udp worked");
+fcntl($u2, F_SETFL, O_NONBLOCK) or fail("F_SETFL: $!");
+defined(sysread($u2, $m, 100)) and fail("empty udp read returned");
+$!{EAGAIN} or fail("empty non-blocking udp read: $!");
+print "debian: udp: datagrams keep boundaries and sources, truncate, connect filters, ports are per protocol\n";
 "#;
 
 /// Interval timers: `alarm` interrupts a sleep with SIGALRM and reports
@@ -210,6 +250,8 @@ print "debian: alarm and setitimer deliver SIGALRM, getitimer reads back\n";
 const CELL_SERVER: &str = r#"use strict; use warnings; use Socket;
 sub fail { print "debian: cells FAILED (server): @_\n"; exit 1 }
 my ($me, $peer, $port) = @ARGV;
+socket(my $u, AF_INET, SOCK_DGRAM, 0) or fail("udp socket: $!");
+bind($u, pack_sockaddr_in($port, INADDR_ANY)) or fail("udp bind: $!");
 socket(my $l, AF_INET, SOCK_STREAM, 0) or fail("socket: $!");
 setsockopt($l, SOL_SOCKET, SO_REUSEADDR, 1) or fail("SO_REUSEADDR: $!");
 bind($l, pack_sockaddr_in($port, INADDR_ANY)) or fail("bind: $!");
@@ -228,6 +270,11 @@ while (1) {
 }
 syswrite($c, inet_ntoa($paddr) . " $n\n") or fail("write: $!");
 close $c;
+# One datagram from the client cell, answered to its source.
+my $src = recv($u, my $dg, 2048, 0) // fail("udp recv: $!");
+my (undef, $saddr) = unpack_sockaddr_in($src);
+inet_ntoa($saddr) eq $peer or fail("datagram from " . inet_ntoa($saddr));
+send($u, "pong $dg", 0, $src) or fail("udp send: $!");
 "#;
 
 /// The client cell of the cross-cell run: `ME SERVER PORT`. Its own
@@ -259,6 +306,15 @@ my $reply = "";
 while (1) { my $r = sysread($s, my $buf, 4096); defined $r or fail("read: $!"); last if !$r; $reply .= $buf }
 $reply eq "$me $n\n" or fail("reply [$reply]");
 print "debian: cells: $me sent 1 MiB to $server through the switch; loopback is per cell\n";
+socket(my $u, AF_INET, SOCK_DGRAM, 0) or fail("udp socket: $!");
+my $to = pack_sockaddr_in($port, inet_aton($server));
+send($u, "ping", 0, $to) == 4 or fail("udp send: $!");
+my $rin = ""; vec($rin, fileno($u), 1) = 1;
+select(my $rout = $rin, undef, undef, 30) == 1 or fail("no datagram came back");
+my $f = recv($u, my $back, 2048, 0) // fail("udp recv: $!");
+$f eq $to or fail("the answer came from elsewhere");
+$back eq "pong ping" or fail("udp answer [$back]");
+print "debian: cells: a datagram crossed the switch and came back\n";
 "#;
 
 /// A cell reaching the host through the uplink's NAT: `HOST PORT`, an echo
@@ -282,6 +338,21 @@ while (1) { my $r = sysread($s, my $buf, 65536); defined $r or fail("read: $!");
 waitpid($pid, 0) == $pid && $? == 0 or fail("writer exited $?");
 $back eq $data or fail("echo returned " . length($back) . " bytes");
 print "debian: nat: a cell echoed 256 KiB with $host:$port through the uplink\n";
+# A datagram to the host's UDP echo on the same port number (retried: the
+# outside may drop one).
+socket(my $u, AF_INET, SOCK_DGRAM, 0) or fail("udp socket: $!");
+my $to = pack_sockaddr_in($port, inet_aton($host));
+my $got = "";
+for my $try (1 .. 20) {
+    send($u, "datagram $try", 0, $to) or fail("udp send: $!");
+    my $rin = ""; vec($rin, fileno($u), 1) = 1;
+    next unless select(my $r = $rin, undef, undef, 1) == 1;
+    my $f = recv($u, $got, 2048, 0) // fail("udp recv: $!");
+    $f eq $to or fail("the udp answer came from elsewhere");
+    last;
+}
+$got =~ /^datagram \d+$/ or fail("no udp echo [$got]");
+print "debian: nat: a datagram went through the uplink and came back\n";
 "#;
 
 /// A published port's server: `PORT`. Serves one HTTP/1.0 request.
