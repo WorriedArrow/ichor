@@ -92,6 +92,8 @@ pub(super) fn execve(
     // Switch to the new space, then drop the old one (no longer active).
     mm.space().bind_to_current_task();
     drop(core::mem::replace(&mut p.mm, mm));
+    p.sig.exec_reset();
+    crate::signal::sync(p);
     *ctx = UserContext::new(loaded.entry, loaded.stack_pointer);
     Ok(())
 }

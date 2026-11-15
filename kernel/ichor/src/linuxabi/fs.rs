@@ -10,6 +10,7 @@ use super::{EBADF, EFAULT, EINVAL, EMFILE, console_bytes, console_write, le_u64}
 use crate::pipe::Pipe;
 use crate::process::{Fd, LinuxProcess, OpenFile, PipeEnd};
 use crate::vfs::{self, Ino, Kind, Stat, errno::*};
+use crate::{proc, signal};
 
 pub(super) const AT_FDCWD: i64 = -100;
 const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
@@ -27,6 +28,7 @@ const O_NOFOLLOW: u64 = 0o400_000;
 
 const ENAMETOOLONG: i64 = 36;
 const ESPIPE: i64 = 29;
+const EPIPE: i64 = 32;
 const ERANGE: i64 = 34;
 
 /// Copy chunk for file I/O.
@@ -201,7 +203,10 @@ pub(super) fn read(p: &mut LinuxProcess, fd: u64, buf: u64, count: usize) -> Res
         Fd::Pipe(e) if e.write => Err(EBADF),
         Fd::Pipe(e) => {
             let mut chunk = alloc::vec![0u8; CHUNK.min(count)];
-            let n = e.pipe.read(&mut chunk, e.nonblock)?;
+            let entry = p.entry.clone();
+            let n = e
+                .pipe
+                .read(&mut chunk, e.nonblock, &|| proc::interrupted(&entry))?;
             if p.copy_to_user(buf, &chunk[..n]) != n {
                 return Err(EFAULT);
             }
@@ -691,7 +696,9 @@ pub(super) fn sendfile(
             Fd::Console => console_bytes(&buf[..n]),
             Fd::Pipe(e) if !e.write => return Err(EBADF),
             Fd::Pipe(e) => {
-                e.pipe.write(&buf[..n], e.nonblock)?;
+                let entry = p.entry.clone();
+                e.pipe
+                    .write(&buf[..n], e.nonblock, &|| proc::interrupted(&entry))?;
             }
             Fd::File(o) => {
                 let at = if o.flags & O_APPEND != 0 {
@@ -732,10 +739,21 @@ fn pipe_write(p: &mut LinuxProcess, e: &PipeEnd, buf: u64, count: usize) -> Resu
                 Ok(done as u64)
             };
         }
-        match e.pipe.write(&chunk[..got], e.nonblock) {
+        let entry = p.entry.clone();
+        match e
+            .pipe
+            .write(&chunk[..got], e.nonblock, &|| proc::interrupted(&entry))
+        {
             Ok(n) => done += n,
-            Err(err) if done == 0 => return Err(err),
-            Err(_) => break,
+            Err(err) => {
+                if err == EPIPE {
+                    proc::post(&p.entry, signal::SIGPIPE);
+                }
+                if done == 0 {
+                    return Err(err);
+                }
+                break;
+            }
         }
     }
     Ok(done as u64)

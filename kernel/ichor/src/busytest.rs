@@ -38,6 +38,31 @@ const RUNS: &[(&[&str], i32)] = &[
         0,
     ),
     (&["cat", "/etc/motd"], 0),
+    (
+        &[
+            "sh",
+            "-c",
+            "trap 'echo sh: trap ran' USR1; kill -USR1 $$; echo sh: after the trap",
+        ],
+        0,
+    ),
+    (
+        &[
+            "sh",
+            "-c",
+            "sleep 30 & kill $!; wait $!; echo sh: sleep was killed, status $?",
+        ],
+        0,
+    ),
+    (
+        &[
+            "sh",
+            "-c",
+            "[ \"$(yes | head -n 3 | wc -l)\" -eq 3 ] && echo sh: yes died of SIGPIPE",
+        ],
+        0,
+    ),
+    (&["sh", "-c", "kill -9 $$; echo not reached"], -9),
     (&["sh", "-c", "echo sh: 6x7=$((6*7)); exit 3"], 3),
     (
         &["sh", "-c", "/bin/true && echo sh: fork, exec and wait ok"],

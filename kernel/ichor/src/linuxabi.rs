@@ -11,9 +11,9 @@
 mod exec;
 mod fs;
 
-use crate::proc;
 use crate::process::{Fd, LinuxProcess, MAX_FDS};
 use crate::umem;
+use crate::{proc, signal};
 use fs::AT_FDCWD;
 
 /// Linux x86-64 syscall numbers implemented so far. `cargo xtask
@@ -32,8 +32,9 @@ mod nr {
     pub(super) const MPROTECT: u64 = 10;
     pub(super) const MUNMAP: u64 = 11;
     pub(super) const BRK: u64 = 12;
-    pub(super) const RT_SIGACTION: u64 = 13; // stub: accepted, signals are never delivered
-    pub(super) const RT_SIGPROCMASK: u64 = 14; // stub: accepted, the mask is always empty
+    pub(super) const RT_SIGACTION: u64 = 13;
+    pub(super) const RT_SIGPROCMASK: u64 = 14;
+    pub(super) const RT_SIGRETURN: u64 = 15;
     pub(super) const IOCTL: u64 = 16; // partial: TIOCGWINSZ on the console
     pub(super) const PREAD64: u64 = 17;
     pub(super) const PWRITE64: u64 = 18;
@@ -43,6 +44,8 @@ mod nr {
     pub(super) const PIPE: u64 = 22;
     pub(super) const SCHED_YIELD: u64 = 24;
     pub(super) const MADVISE: u64 = 28; // stub: advice is ignored
+    pub(super) const PAUSE: u64 = 34;
+    pub(super) const NANOSLEEP: u64 = 35; // partial: yields until the deadline (no timed wait yet)
     pub(super) const DUP: u64 = 32; // partial: the copy has its own offset
     pub(super) const DUP2: u64 = 33; // partial: the copy has its own offset
     pub(super) const GETPID: u64 = 39;
@@ -53,6 +56,7 @@ mod nr {
     pub(super) const EXECVE: u64 = 59; // partial: static ELF binaries
     pub(super) const EXIT: u64 = 60; // partial: ends the whole process (single-threaded)
     pub(super) const WAIT4: u64 = 61; // partial: no rusage, no process groups
+    pub(super) const KILL: u64 = 62; // partial: pid > 0 only (no process groups)
     pub(super) const UNAME: u64 = 63;
     pub(super) const FCNTL: u64 = 72; // partial: F_DUPFD, F_GETFD/SETFD, F_GETFL/SETFL
     pub(super) const FSYNC: u64 = 74; // partial: the upper layer is memory
@@ -78,15 +82,24 @@ mod nr {
     pub(super) const GETGID: u64 = 104; // partial: always 0
     pub(super) const GETEUID: u64 = 107; // partial: always 0
     pub(super) const GETEGID: u64 = 108; // partial: always 0
+    pub(super) const SETPGID: u64 = 109; // stub: no process groups yet
     pub(super) const GETPPID: u64 = 110;
-    pub(super) const SIGALTSTACK: u64 = 131; // stub: accepted, signals are never delivered
+    pub(super) const GETPGRP: u64 = 111; // stub: the pid
+    pub(super) const SETSID: u64 = 112; // stub: the pid
+    pub(super) const GETPGID: u64 = 121; // stub: the pid
+    pub(super) const GETSID: u64 = 124; // stub: the pid
+    pub(super) const RT_SIGSUSPEND: u64 = 130;
+    pub(super) const SIGALTSTACK: u64 = 131; // stub: no alternate stacks yet
     pub(super) const ARCH_PRCTL: u64 = 158; // partial: ARCH_SET_FS only
     pub(super) const GETTID: u64 = 186; // partial: the pid (single-threaded)
+    pub(super) const TKILL: u64 = 200; // partial: threads are processes
     pub(super) const FUTEX: u64 = 202; // partial: WAIT/WAKE for one thread
     pub(super) const GETDENTS64: u64 = 217;
     pub(super) const SET_TID_ADDRESS: u64 = 218; // stub: returns TID 1
     pub(super) const CLOCK_GETTIME: u64 = 228; // partial: every clock counts from boot
+    pub(super) const CLOCK_NANOSLEEP: u64 = 230; // partial: relative sleeps only
     pub(super) const EXIT_GROUP: u64 = 231;
+    pub(super) const TGKILL: u64 = 234; // partial: threads are processes
     pub(super) const OPENAT: u64 = 257;
     pub(super) const MKDIRAT: u64 = 258;
     pub(super) const NEWFSTATAT: u64 = 262;
@@ -202,8 +215,23 @@ pub(crate) fn dispatch(p: &mut LinuxProcess, ctx: &mut frame::user::UserContext)
         nr::GETTIMEOFDAY => gettimeofday(p, a[0]),
         nr::GETRLIMIT => prlimit(p, a[0], a[1]),
         nr::PRLIMIT64 => prlimit(p, a[1], a[3]),
-        nr::RT_SIGACTION => zero_out(p, a[2], 32),
-        nr::RT_SIGPROCMASK => zero_out(p, a[2], (a[3] as usize).min(128)),
+        nr::RT_SIGACTION => signal::sigaction(p, a[0], a[1], a[2], a[3]),
+        nr::RT_SIGPROCMASK => signal::sigprocmask(p, a[0], a[1], a[2], a[3]),
+        nr::RT_SIGRETURN => match signal::sigreturn(p, ctx) {
+            // The interrupted context is back, return value included.
+            Ok(()) => return Outcome::Continue,
+            Err(_) => return Outcome::Exit(-(signal::SIGSEGV as i32)),
+        },
+        nr::RT_SIGSUSPEND => signal::sigsuspend(p, a[0], a[1]),
+        nr::PAUSE => signal::pause(p),
+        nr::NANOSLEEP => signal::nanosleep(p, a[0], a[1]),
+        nr::CLOCK_NANOSLEEP if a[1] == 0 => signal::nanosleep(p, a[2], a[3]),
+        nr::CLOCK_NANOSLEEP => Err(EINVAL), // TIMER_ABSTIME
+        nr::KILL => signal::kill(p, i(a[0]), a[1]),
+        nr::TKILL => signal::kill(p, i(a[0]), a[1]),
+        nr::TGKILL => signal::kill(p, i(a[1]), a[2]),
+        nr::SETPGID => Ok(0),
+        nr::GETPGRP | nr::SETSID | nr::GETPGID | nr::GETSID => Ok(p.entry.pid),
         nr::SIGALTSTACK => zero_out(p, a[1], 24),
         nr::FUTEX => futex(p, a[0], a[1]),
         nr::SCHED_YIELD | nr::SET_ROBUST_LIST => Ok(0),

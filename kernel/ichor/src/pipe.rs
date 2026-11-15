@@ -15,6 +15,7 @@ use frame::task::WaitQueue;
 
 const EAGAIN: i64 = 11;
 const EPIPE: i64 = 32;
+use crate::signal::ERESTARTSYS;
 
 /// Bytes a pipe buffers (Linux's default).
 const CAPACITY: usize = 64 * 1024;
@@ -79,7 +80,12 @@ impl Pipe {
 
     /// Reads up to `out.len()` bytes, blocking until some data is available
     /// or every writer is gone (then 0, end of file).
-    pub(crate) fn read(&self, out: &mut [u8], nonblock: bool) -> Result<usize, i64> {
+    pub(crate) fn read(
+        &self,
+        out: &mut [u8],
+        nonblock: bool,
+        interrupted: &dyn Fn() -> bool,
+    ) -> Result<usize, i64> {
         if out.is_empty() {
             return Ok(0);
         }
@@ -95,6 +101,8 @@ impl Pipe {
                 Some(Ok(0))
             } else if nonblock {
                 Some(Err(EAGAIN))
+            } else if interrupted() {
+                Some(Err(ERESTARTSYS))
             } else {
                 None
             }
@@ -105,7 +113,12 @@ impl Pipe {
 
     /// Writes all of `data` (blocking while the pipe is full), or fails
     /// with `EPIPE` once no reader is left. Returns the bytes written.
-    pub(crate) fn write(&self, data: &[u8], nonblock: bool) -> Result<usize, i64> {
+    pub(crate) fn write(
+        &self,
+        data: &[u8],
+        nonblock: bool,
+        interrupted: &dyn Fn() -> bool,
+    ) -> Result<usize, i64> {
         let mut done = 0;
         while done < data.len() {
             let rest = &data[done..];
@@ -127,6 +140,8 @@ impl Pipe {
                     Some(Ok(n))
                 } else if nonblock {
                     Some(Err(EAGAIN))
+                } else if interrupted() {
+                    Some(Err(ERESTARTSYS))
                 } else {
                     None
                 }

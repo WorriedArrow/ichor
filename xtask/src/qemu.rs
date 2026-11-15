@@ -309,7 +309,9 @@ pub fn pattern_byte(i: usize) -> u8 {
 }
 
 /// Busybox applets linked into `/bin` on the root disk.
-pub const BUSYBOX_APPLETS: &[&str] = &["cat", "echo", "grep", "ls", "sh", "true", "wc"];
+pub const BUSYBOX_APPLETS: &[&str] = &[
+    "cat", "echo", "grep", "head", "ls", "sh", "sleep", "true", "wc", "yes",
+];
 
 /// The root disk: an Ichor image with `/usr/share/motd`,
 /// `/etc/motd -> /usr/share/motd`, `/usr/share/pattern`, and a static

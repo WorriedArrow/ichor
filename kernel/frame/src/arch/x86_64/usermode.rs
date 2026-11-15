@@ -110,6 +110,42 @@ impl UserContext {
     pub fn set_return(&mut self, value: u64) {
         self.rax = value;
     }
+
+    /// The user-visible flags (as a signal frame saves them).
+    pub fn rflags(&self) -> u64 {
+        self.rflags & USER_RFLAGS_ALLOWED
+    }
+
+    /// Sets the user-modifiable flags (`rt_sigreturn`); privileged bits
+    /// (IOPL, IF, ...) are not taken from `value`.
+    pub fn set_rflags(&mut self, value: u64) {
+        self.rflags = (value & USER_RFLAGS_ALLOWED) | RFLAGS_IF | RFLAGS_RESERVED1;
+    }
+
+    /// The x87/SSE state in FXSAVE format (as a signal frame saves it).
+    pub fn fpu_state(&self) -> [u8; 512] {
+        self.fpu.0
+    }
+
+    /// Replaces the x87/SSE state (`rt_sigreturn`). MXCSR bits the CPU does
+    /// not support are cleared, so the next `fxrstor` cannot fault.
+    pub fn set_fpu_state(&mut self, state: &[u8; 512]) {
+        let mask = match u32::from_le_bytes([
+            self.fpu.0[28],
+            self.fpu.0[29],
+            self.fpu.0[30],
+            self.fpu.0[31],
+        ]) {
+            0 => 0xffbf, // MXCSR_MASK 0 means the architectural default
+            m => m,
+        };
+        let mut s = *state;
+        let mxcsr = u32::from_le_bytes([s[24], s[25], s[26], s[27]]) & mask;
+        s[24..28].copy_from_slice(&mxcsr.to_le_bytes());
+        // Keep this CPU's MXCSR_MASK (read-only to software).
+        s[28..32].copy_from_slice(&self.fpu.0[28..32]);
+        self.fpu.0 = s;
+    }
 }
 
 /// Why [`UserMode::execute`] returned.

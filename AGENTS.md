@@ -35,6 +35,16 @@ Milestones 0-3 are done.
   blocking on wait queues, EOF and `EPIPE` from per-end reference counts,
   atomic writes up to `PIPE_BUF`). Shell pipelines and command substitution
   work in both the static busybox and Alpine's dynamic shell.
+- M4 signals (`signal.rs`, pending state in `proc::ProcEntry`):
+  rt_sigaction/rt_sigprocmask/rt_sigreturn with a Linux-layout
+  `rt_sigframe` (registers, FXSAVE state, mask, siginfo), default actions,
+  kill/tkill/tgkill, SIGCHLD on child exit, SIGPIPE on EPIPE, faults
+  delivered to handlers, and interruptible waits (pipes, wait4, pause,
+  rt_sigsuspend, nanosleep) via an internal `ERESTARTSYS` that becomes a
+  restart (`SA_RESTART`) or `EINTR`. Busybox `trap`, `kill` of a blocked
+  `sleep`, `kill -9 $$` and `yes | head` pass. No job control or
+  `sigaltstack` yet. `nanosleep` yields until its deadline (frame needs a
+  timed wait), which also makes the QEMU suite slower.
 
 - M0/M1: boots as a UEFI app into the higher half; buddy page allocator and
   heap; traps with IST stacks; x2APIC + tickless timer; SMP bring-up; per-CPU
@@ -105,8 +115,8 @@ demand (today the kernel reads the whole disk into memory, capped at
 
 Suggested order for milestone 4:
 
-1. Signals (delivery, `sigaction`, `kill`, default actions, `SIGCHLD`) and
-   real futexes with threads (`clone` with `CLONE_VM|CLONE_THREAD`, TLB
+1. Done: signals. Next: a frame timed wait (`WaitQueue::wait_until_deadline`)
+   for nanosleep/poll timeouts, and real futexes with threads (`clone` with `CLONE_VM|CLONE_THREAD`, TLB
    shootdown, per-thread contexts).
 2. Copy-on-write fork (frame support for read-only remapping of shared
    untyped pages).
@@ -120,7 +130,7 @@ IBPB on cross-cell switch, page-table isolation for Meltdown-affected CPUs)
 are owed as multi-cell scheduling lands in milestone 4. Boot logs which apply.
 
 Frame budget: ADR-0005 sets the milestone 3 ceiling at 8,500 lines / 380
-sites; `audit.toml` is at step 5 (5,100 / 235) and frame is at 4,994 / 226.
+sites; `audit.toml` is at step 5 (5,100 / 235) and frame is at 5,019 / 226.
 Milestone 4's frame work (COW, threads, TLB shootdown, signal frames) needs
 its own budget step or ADR.
 

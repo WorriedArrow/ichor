@@ -25,6 +25,7 @@ mod proctest;
 mod runtest;
 mod sched;
 mod selftest;
+mod signal;
 mod testprog;
 mod umem;
 mod usertest;

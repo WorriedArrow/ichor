@@ -13,6 +13,7 @@ use alloc::vec::Vec;
 use crate::kcell::Cell;
 use crate::pipe::Pipe;
 use crate::proc::{self, ProcEntry};
+use crate::signal::Signals;
 use crate::umem::Mm;
 use crate::vfs::{Ino, ROOT, Vfs};
 
@@ -59,6 +60,8 @@ pub(crate) struct LinuxProcess {
     /// The working directory (holds an open reference).
     pub(crate) cwd: Ino,
     pub(crate) umask: u32,
+    /// Signal dispositions and mask (pending signals live in `entry`).
+    pub(crate) sig: Signals,
     fds: Vec<Option<Fd>>,
 }
 
@@ -76,6 +79,7 @@ impl LinuxProcess {
             mm,
             cwd: ROOT,
             umask: 0o022,
+            sig: Signals::new(),
             fds: alloc::vec![Some(Fd::Console); 3],
         })
     }
@@ -105,6 +109,7 @@ impl LinuxProcess {
             mm,
             cwd: self.cwd,
             umask: self.umask,
+            sig: self.sig.clone(),
             fds: self.fds.clone(),
         })
     }
