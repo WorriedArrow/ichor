@@ -31,6 +31,10 @@ Milestones 0-3 are done.
   in the mmap area, `AT_BASE`), in `execve` too, so Alpine's dynamic
   busybox shell forks and execs dynamic children. The buddy allocator's
   largest block is 64 MiB (`MAX_ORDER` 14) so a whole image fits one buffer.
+- M4 pipes: `pipe`/`pipe2` (`kernel/ichor/src/pipe.rs`: 64 KiB buffer,
+  blocking on wait queues, EOF and `EPIPE` from per-end reference counts,
+  atomic writes up to `PIPE_BUF`). Shell pipelines and command substitution
+  work in both the static busybox and Alpine's dynamic shell.
 
 - M0/M1: boots as a UEFI app into the higher half; buddy page allocator and
   heap; traps with IST stacks; x2APIC + tickless timer; SMP bring-up; per-CPU
@@ -108,7 +112,7 @@ Suggested order for milestone 4:
    untyped pages).
 3. `PT_INTERP` and PIE: done for musl (Alpine); glibc's `ld-linux` next with
    debian-slim (it needs more of `mmap` with file offsets and `/proc/self`).
-4. pipes, `poll`/`epoll`, `/proc` and `/dev`, then Alpine `apk` and
+4. `poll`/`epoll`, `/proc` and `/dev` (pipes are done), then Alpine `apk` and
    debian-slim `apt` against a local mirror.
 
 ADR-0004 records the side-channel posture; its per-CPU mitigations (VERW,

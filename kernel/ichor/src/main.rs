@@ -18,6 +18,7 @@ mod kcell;
 mod linuxabi;
 mod loader;
 mod nativeabi;
+mod pipe;
 mod proc;
 mod process;
 mod proctest;

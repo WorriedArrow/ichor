@@ -20,6 +20,23 @@ const CELL_PAGES: u64 = 8192;
 const RUNS: &[(&[&str], i32)] = &[
     (&["echo", "hello from busybox"], 0),
     (&["ls", "/etc", "/bin"], 0),
+    (&["sh", "-c", "echo sh: pipes work | cat"], 0),
+    (
+        &[
+            "sh",
+            "-c",
+            "ls /bin | grep -q wc && echo sh: ls piped into grep",
+        ],
+        0,
+    ),
+    (
+        &[
+            "sh",
+            "-c",
+            "[ \"$(echo a b c | wc -w)\" -eq 3 ] && echo sh: command substitution",
+        ],
+        0,
+    ),
     (&["cat", "/etc/motd"], 0),
     (&["sh", "-c", "echo sh: 6x7=$((6*7)); exit 3"], 3),
     (

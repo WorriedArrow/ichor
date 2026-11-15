@@ -26,6 +26,14 @@ const RUNS: &[(&[&str], i32)] = &[
         &[
             "sh",
             "-c",
+            "grep -h ^NAME /etc/os-release | cut -d= -f2 | tr -d '\"'",
+        ],
+        0,
+    ),
+    (
+        &[
+            "sh",
+            "-c",
             "/bin/true && echo alpine: fork, exec via ld-musl, wait ok",
         ],
         0,

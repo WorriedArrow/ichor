@@ -40,6 +40,7 @@ mod nr {
     pub(super) const READV: u64 = 19;
     pub(super) const WRITEV: u64 = 20;
     pub(super) const ACCESS: u64 = 21; // partial: existence only (every process is root)
+    pub(super) const PIPE: u64 = 22;
     pub(super) const SCHED_YIELD: u64 = 24;
     pub(super) const MADVISE: u64 = 28; // stub: advice is ignored
     pub(super) const DUP: u64 = 32; // partial: the copy has its own offset
@@ -97,6 +98,7 @@ mod nr {
     pub(super) const FACCESSAT: u64 = 269; // partial: existence only (every process is root)
     pub(super) const SET_ROBUST_LIST: u64 = 273; // stub: accepted (single-threaded)
     pub(super) const DUP3: u64 = 292; // partial: the copy has its own offset
+    pub(super) const PIPE2: u64 = 293; // partial: O_CLOEXEC is accepted and ignored
     pub(super) const PRLIMIT64: u64 = 302; // partial: reads limits, ignores new ones
     pub(super) const RENAMEAT2: u64 = 316; // partial: RENAME_NOREPLACE only
 }
@@ -174,6 +176,8 @@ pub(crate) fn dispatch(p: &mut LinuxProcess, ctx: &mut frame::user::UserContext)
         nr::FCHDIR => fs::fchdir(p, a[0]),
         nr::GETCWD => fs::getcwd(p, a[0], a[1]),
         nr::UMASK => fs::umask(p, a[0]),
+        nr::PIPE => fs::pipe2(p, a[0], 0),
+        nr::PIPE2 => fs::pipe2(p, a[0], a[1]),
         // Descriptors.
         nr::DUP => p.dup_from(a[0], 0).ok_or(EBADF),
         nr::DUP2 => p.dup_to(a[0], a[1]).ok_or(EBADF),
@@ -303,6 +307,7 @@ fn fcntl(p: &mut LinuxProcess, fd: u64, cmd: u64, arg: u64) -> Result<u64, i64> 
         F_GETFL => Ok(match f {
             Fd::Console => O_RDWR,
             Fd::File(of) => of.flags,
+            Fd::Pipe(e) => u64::from(e.write) | if e.nonblock { 0o4000 } else { 0 },
         }),
         _ => Err(EINVAL),
     }
@@ -317,7 +322,7 @@ fn mmap(p: &mut LinuxProcess, a: &[u64; 6]) -> Result<u64, i64> {
     if map_flags & umem::flags::MAP_ANONYMOUS != 0 {
         return p.mm.mmap(addr, len, prot, map_flags, None);
     }
-    if matches!(p.fd(fd).ok_or(EBADF)?, Fd::Console) {
+    if !matches!(p.fd(fd).ok_or(EBADF)?, Fd::File(_)) {
         return Err(ENODEV);
     }
     if map_flags & umem::flags::MAP_SHARED != 0 && prot & 2 != 0 {

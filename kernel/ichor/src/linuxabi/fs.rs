@@ -7,7 +7,8 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use super::{EBADF, EFAULT, EINVAL, EMFILE, console_bytes, console_write, le_u64};
-use crate::process::{Fd, LinuxProcess, OpenFile};
+use crate::pipe::Pipe;
+use crate::process::{Fd, LinuxProcess, OpenFile, PipeEnd};
 use crate::vfs::{self, Ino, Kind, Stat, errno::*};
 
 pub(super) const AT_FDCWD: i64 = -100;
@@ -25,6 +26,7 @@ const O_DIRECTORY: u64 = 0o200_000;
 const O_NOFOLLOW: u64 = 0o400_000;
 
 const ENAMETOOLONG: i64 = 36;
+const ESPIPE: i64 = 29;
 const ERANGE: i64 = 34;
 
 /// Copy chunk for file I/O.
@@ -55,7 +57,7 @@ fn base(p: &LinuxProcess, dirfd: i64, path: &str) -> Result<Ino, i64> {
     }
     match p.fd(dirfd as u64).ok_or(EBADF)? {
         Fd::File(f) => Ok(f.ino),
-        Fd::Console => Err(ENOTDIR),
+        Fd::Console | Fd::Pipe(_) => Err(ENOTDIR),
     }
 }
 
@@ -69,6 +71,7 @@ fn file(p: &LinuxProcess, fd: u64) -> Result<OpenFile, i64> {
     match p.fd(fd).ok_or(EBADF)? {
         Fd::File(f) => Ok(f),
         Fd::Console => Err(EINVAL),
+        Fd::Pipe(_) => Err(ESPIPE),
     }
 }
 
@@ -195,6 +198,15 @@ fn write_file(
 pub(super) fn read(p: &mut LinuxProcess, fd: u64, buf: u64, count: usize) -> Result<u64, i64> {
     match p.fd(fd).ok_or(EBADF)? {
         Fd::Console => Ok(0), // No console input yet: EOF.
+        Fd::Pipe(e) if e.write => Err(EBADF),
+        Fd::Pipe(e) => {
+            let mut chunk = alloc::vec![0u8; CHUNK.min(count)];
+            let n = e.pipe.read(&mut chunk, e.nonblock)?;
+            if p.copy_to_user(buf, &chunk[..n]) != n {
+                return Err(EFAULT);
+            }
+            Ok(n as u64)
+        }
         Fd::File(f) => {
             let n = read_file(p, f, f.offset, buf, count)?;
             if let Some(of) = p.file_mut(fd) {
@@ -208,6 +220,8 @@ pub(super) fn read(p: &mut LinuxProcess, fd: u64, buf: u64, count: usize) -> Res
 pub(super) fn write(p: &mut LinuxProcess, fd: u64, buf: u64, count: usize) -> Result<u64, i64> {
     match p.fd(fd).ok_or(EBADF)? {
         Fd::Console => Ok(console_write(p, buf, count) as u64),
+        Fd::Pipe(e) if !e.write => Err(EBADF),
+        Fd::Pipe(e) => pipe_write(p, &e, buf, count),
         Fd::File(f) => {
             let offset = if f.flags & O_APPEND != 0 {
                 p.vfs.lock().stat(f.ino)?.size
@@ -282,7 +296,7 @@ pub(super) fn lseek(p: &mut LinuxProcess, fd: u64, offset: i64, whence: u64) -> 
     const SEEK_SET: u64 = 0;
     const SEEK_CUR: u64 = 1;
     const SEEK_END: u64 = 2;
-    let f = file(p, fd).map_err(|_| 29)?; // ESPIPE on the console
+    let f = file(p, fd).map_err(|_| ESPIPE)?;
     let base = match whence {
         SEEK_SET => 0i64,
         SEEK_CUR => f.offset as i64,
@@ -350,6 +364,7 @@ const S_IFREG: u32 = 0o100_000;
 const S_IFDIR: u32 = 0o040_000;
 const S_IFLNK: u32 = 0o120_000;
 const S_IFCHR: u32 = 0o020_000;
+const S_IFIFO: u32 = 0o010_000;
 
 /// Builds an x86-64 `struct stat` (144 bytes).
 fn stat_bytes(ino: u64, mode: u32, nlink: u32, size: u64) -> [u8; 144] {
@@ -384,6 +399,7 @@ fn put_stat(p: &mut LinuxProcess, addr: u64, st: &[u8; 144]) -> Result<u64, i64>
 pub(super) fn fstat(p: &mut LinuxProcess, fd: u64, addr: u64) -> Result<u64, i64> {
     let st = match p.fd(fd).ok_or(EBADF)? {
         Fd::Console => stat_bytes(0, S_IFCHR | 0o620, 1, 0),
+        Fd::Pipe(_) => stat_bytes(0, S_IFIFO | 0o600, 1, 0),
         Fd::File(f) => to_stat(&p.vfs.lock().stat(f.ino)?),
     };
     put_stat(p, addr, &st)
@@ -673,6 +689,10 @@ pub(super) fn sendfile(
         }
         match p.fd(out_fd).ok_or(EBADF)? {
             Fd::Console => console_bytes(&buf[..n]),
+            Fd::Pipe(e) if !e.write => return Err(EBADF),
+            Fd::Pipe(e) => {
+                e.pipe.write(&buf[..n], e.nonblock)?;
+            }
             Fd::File(o) => {
                 let at = if o.flags & O_APPEND != 0 {
                     p.vfs.lock().stat(o.ino)?.size
@@ -696,4 +716,62 @@ pub(super) fn sendfile(
         f.offset = offset;
     }
     Ok(done as u64)
+}
+
+/// Writes user memory to a pipe's write end, in chunks.
+fn pipe_write(p: &mut LinuxProcess, e: &PipeEnd, buf: u64, count: usize) -> Result<u64, i64> {
+    let mut chunk = alloc::vec![0u8; CHUNK.min(count.max(1))];
+    let mut done = 0usize;
+    while done < count {
+        let want = chunk.len().min(count - done);
+        let got = p.copy_from_user(buf + done as u64, &mut chunk[..want]);
+        if got == 0 {
+            return if done == 0 {
+                Err(EFAULT)
+            } else {
+                Ok(done as u64)
+            };
+        }
+        match e.pipe.write(&chunk[..got], e.nonblock) {
+            Ok(n) => done += n,
+            Err(err) if done == 0 => return Err(err),
+            Err(_) => break,
+        }
+    }
+    Ok(done as u64)
+}
+
+/// `pipe2`: a new pipe; `[read fd, write fd]` go to `fds` as two `int`s.
+pub(super) fn pipe2(p: &mut LinuxProcess, fds: u64, flags: u64) -> Result<u64, i64> {
+    const O_NONBLOCK: u64 = 0o4000;
+    const O_CLOEXEC: u64 = 0o2_000_000;
+    if flags & !(O_NONBLOCK | O_CLOEXEC) != 0 {
+        return Err(EINVAL);
+    }
+    let pipe = Pipe::new();
+    let nonblock = flags & O_NONBLOCK != 0;
+    let end = |write| {
+        Fd::Pipe(PipeEnd {
+            pipe: pipe.clone(),
+            write,
+            nonblock,
+        })
+    };
+    let r = p.install(end(false)).ok_or(EMFILE)?;
+    let w = match p.install(end(true)) {
+        Some(w) => w,
+        None => {
+            p.close(r);
+            return Err(EMFILE);
+        }
+    };
+    let mut out = [0u8; 8];
+    out[..4].copy_from_slice(&(r as u32).to_le_bytes());
+    out[4..].copy_from_slice(&(w as u32).to_le_bytes());
+    if p.copy_to_user(fds, &out) != out.len() {
+        p.close(r);
+        p.close(w);
+        return Err(EFAULT);
+    }
+    Ok(0)
 }

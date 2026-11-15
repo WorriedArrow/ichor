@@ -11,6 +11,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::kcell::Cell;
+use crate::pipe::Pipe;
 use crate::proc::{self, ProcEntry};
 use crate::umem::Mm;
 use crate::vfs::{Ino, ROOT, Vfs};
@@ -30,12 +31,22 @@ pub(crate) struct OpenFile {
     pub(crate) flags: u64,
 }
 
+/// One end of a pipe, as a descriptor holds it.
+#[derive(Clone, Debug)]
+pub(crate) struct PipeEnd {
+    pub(crate) pipe: Arc<Pipe>,
+    /// The write end (otherwise the read end).
+    pub(crate) write: bool,
+    pub(crate) nonblock: bool,
+}
+
 /// What a descriptor refers to.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) enum Fd {
     /// The kernel console (stdin reads EOF, stdout/stderr print).
     Console,
     File(OpenFile),
+    Pipe(PipeEnd),
 }
 
 /// A Linux process.
@@ -78,8 +89,12 @@ impl LinuxProcess {
             let mut fs = self.vfs.lock();
             fs.open(self.cwd).ok()?;
             for f in self.fds.iter().flatten() {
-                if let Fd::File(of) = f {
-                    let _ = fs.open(of.ino);
+                match f {
+                    Fd::Console => {}
+                    Fd::File(of) => {
+                        let _ = fs.open(of.ino);
+                    }
+                    Fd::Pipe(e) => e.pipe.add(e.write),
                 }
             }
         }
@@ -119,7 +134,7 @@ impl LinuxProcess {
 
     /// The descriptor `fd`, if open.
     pub(crate) fn fd(&self, fd: u64) -> Option<Fd> {
-        self.fds.get(usize::try_from(fd).ok()?).copied().flatten()
+        self.fds.get(usize::try_from(fd).ok()?).cloned().flatten()
     }
 
     /// Mutable access to an open file's state.
@@ -130,25 +145,33 @@ impl LinuxProcess {
         }
     }
 
-    /// Takes an open reference for a descriptor about to be stored.
-    fn hold(&self, f: Fd) {
-        if let Fd::File(of) = f {
-            let _ = self.vfs.lock().open(of.ino);
+    /// Takes a reference for a descriptor about to be stored: an open
+    /// reference on a file's inode, or a reader/writer count on a pipe.
+    fn hold(&self, f: &Fd) {
+        match f {
+            Fd::Console => {}
+            Fd::File(of) => {
+                let _ = self.vfs.lock().open(of.ino);
+            }
+            Fd::Pipe(e) => e.pipe.add(e.write),
         }
     }
 
-    /// Drops the open reference a descriptor held.
+    /// Drops the reference a descriptor held.
     fn release(&self, f: Fd) {
-        if let Fd::File(of) = f {
-            self.vfs.lock().close(of.ino);
+        match f {
+            Fd::Console => {}
+            Fd::File(of) => self.vfs.lock().close(of.ino),
+            Fd::Pipe(e) => e.pipe.drop_end(e.write),
         }
     }
 
     /// Stores `f` at the lowest free descriptor at or above `min` (POSIX
-    /// semantics). The caller's open reference moves into the table.
-    fn place(&mut self, f: Fd, min: usize) -> Option<u64> {
+    /// semantics); the caller's reference moves into the table. Hands `f`
+    /// back if the table is full.
+    fn place(&mut self, f: Fd, min: usize) -> Result<u64, Fd> {
         if min >= MAX_FDS {
-            return None;
+            return Err(f);
         }
         if self.fds.len() <= min {
             self.fds.resize(min + 1, None);
@@ -157,34 +180,44 @@ impl LinuxProcess {
             .find(|&i| self.fds.get(i).is_some_and(Option::is_none))
             .unwrap_or(self.fds.len());
         if i >= MAX_FDS {
-            return None;
+            return Err(f);
         }
         if i == self.fds.len() {
             self.fds.push(None);
         }
-        *self.fds.get_mut(i)? = Some(f);
-        Some(i as u64)
+        match self.fds.get_mut(i) {
+            Some(slot) => {
+                *slot = Some(f);
+                Ok(i as u64)
+            }
+            None => Err(f),
+        }
     }
 
-    /// Installs a freshly opened `f` (whose open reference the caller took)
-    /// at the lowest free descriptor. On failure the reference is dropped.
+    /// Installs a freshly opened `f` (whose reference the caller took) at
+    /// the lowest free descriptor. On failure the reference is dropped.
     pub(crate) fn install(&mut self, f: Fd) -> Option<u64> {
-        let r = self.place(f, 0);
-        if r.is_none() {
-            self.release(f);
+        match self.place(f, 0) {
+            Ok(n) => Some(n),
+            Err(f) => {
+                self.release(f);
+                None
+            }
         }
-        r
     }
 
     /// Duplicates `fd` to the lowest free descriptor at or above `min`.
     pub(crate) fn dup_from(&mut self, fd: u64, min: u64) -> Option<u64> {
         let f = self.fd(fd)?;
-        self.hold(f);
-        let r = self.place(f, usize::try_from(min).ok()?);
-        if r.is_none() {
-            self.release(f);
+        let min = usize::try_from(min).ok()?;
+        self.hold(&f);
+        match self.place(f, min) {
+            Ok(n) => Some(n),
+            Err(f) => {
+                self.release(f);
+                None
+            }
         }
-        r
     }
 
     /// Makes `new` refer to what `old` refers to (closing `new` first).
@@ -197,7 +230,7 @@ impl LinuxProcess {
         if self.fds.len() <= n {
             self.fds.resize(n + 1, None);
         }
-        self.hold(f);
+        self.hold(&f);
         let prev = self.fds.get_mut(n)?.replace(f);
         if let Some(p) = prev {
             self.release(p);
@@ -226,8 +259,10 @@ impl Drop for LinuxProcess {
         let fds = core::mem::take(&mut self.fds);
         let mut fs = self.vfs.lock();
         for f in fds.into_iter().flatten() {
-            if let Fd::File(of) = f {
-                fs.close(of.ino);
+            match f {
+                Fd::Console => {}
+                Fd::File(of) => fs.close(of.ino),
+                Fd::Pipe(e) => e.pipe.drop_end(e.write),
             }
         }
         fs.close(self.cwd);
