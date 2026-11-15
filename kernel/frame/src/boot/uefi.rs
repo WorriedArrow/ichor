@@ -54,6 +54,34 @@ struct TableHeader {
 
 const SYSTEM_TABLE_SIGNATURE: u64 = 0x5453_5953_2049_4249; // "IBI SYST"
 const BOOT_SERVICES_SIGNATURE: u64 = 0x5652_4553_544f_4f42; // "BOOTSERV"
+const RUNTIME_SERVICES_SIGNATURE: u64 = 0x5652_4553_544e_5552; // "RUNTSERV"
+
+/// `EFI_TIME`.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct EfiTime {
+    year: u16,
+    month: u8,
+    day: u8,
+    hour: u8,
+    minute: u8,
+    second: u8,
+    pad1: u8,
+    nanosecond: u32,
+    time_zone: i16,
+    daylight: u8,
+    pad2: u8,
+}
+
+/// `EFI_UNSPECIFIED_TIMEZONE`: the time is local time, taken as UTC.
+const UNSPECIFIED_TIMEZONE: i16 = 0x07ff;
+
+/// The prefix of `EFI_RUNTIME_SERVICES` up to `GetTime`.
+#[repr(C)]
+struct RuntimeServices {
+    hdr: TableHeader,
+    get_time: Option<unsafe extern "efiapi" fn(time: *mut EfiTime, caps: *mut c_void) -> Status>,
+}
 
 #[repr(C)]
 struct SystemTable {
@@ -326,6 +354,46 @@ impl<'a> Firmware<'a> {
         unsafe { core::slice::from_raw_parts(ptr, self.st.number_of_table_entries) }
     }
 
+    /// The firmware's real-time clock as Unix seconds and nanoseconds.
+    fn wall_clock(&self) -> Option<(u64, u32)> {
+        let rt = self
+            .st
+            .runtime_services
+            .cast::<RuntimeServices>()
+            .cast_const();
+        if rt.is_null() {
+            return None;
+        }
+        // SAFETY: firmware's system table points at its runtime services
+        // table, which stays valid (and is only read here) while boot
+        // services are live.
+        let rt = unsafe { &*rt };
+        if rt.hdr.signature != RUNTIME_SERVICES_SIGNATURE {
+            return None;
+        }
+        let get_time = rt.get_time?;
+        let mut t = EfiTime::default();
+        // SAFETY: GetTime writes one EFI_TIME through a valid pointer; the
+        // capabilities pointer may be null.
+        check(unsafe { get_time(&mut t, core::ptr::null_mut()) }).ok()?;
+        let civil = civil::Civil {
+            year: t.year,
+            month: t.month,
+            day: t.day,
+            hour: t.hour,
+            minute: t.minute,
+            second: t.second,
+        };
+        let local = civil.unix_seconds()?;
+        // UEFI 2.x: TimeZone = local time - UTC, in minutes.
+        let utc = if t.time_zone == UNSPECIFIED_TIMEZONE {
+            local
+        } else {
+            local.checked_add_signed(-i64::from(t.time_zone) * 60)?
+        };
+        Some((utc, t.nanosecond.min(999_999_999)))
+    }
+
     fn acpi_rsdp(&self) -> Option<PhysAddr> {
         let find = |guid: Guid| {
             self.config_tables()
@@ -578,6 +646,15 @@ extern "efiapi" fn efi_main(image: Handle, system_table: *const SystemTable) -> 
     };
     if cmdline::Cmdline::new(state.cmdline()).flag("qemu_debug_exit") {
         power::enable_qemu_debug_exit();
+    }
+
+    // The wall clock: read it while the runtime services are callable
+    // without a virtual address map.
+    match fw.wall_clock() {
+        Some((secs, nanos)) => {
+            crate::time::set_boot_wall_clock(secs, nanos, arch::regs::rdtsc());
+        }
+        None => println!("ichor: frame: warning: no firmware clock (GetTime failed)"),
     }
 
     let (map_len, desc_size) = match fw.exit_boot_services(map) {

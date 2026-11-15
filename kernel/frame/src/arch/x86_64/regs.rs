@@ -109,6 +109,40 @@ pub(crate) fn cpuid(leaf: u32, subleaf: u32) -> [u32; 4] {
     [r.eax, r.ebx, r.ecx, r.edx]
 }
 
+/// One RDRAND: a 64-bit value from the CPU's DRBG, or `None` if it had none
+/// ready (carry clear).
+///
+/// # Safety
+///
+/// The CPU must support RDRAND (CPUID.1:ECX bit 30), else it faults (#UD).
+pub(crate) unsafe fn rdrand() -> Option<u64> {
+    let v: u64;
+    let ok: u8;
+    // SAFETY: caller contract; RDRAND only writes the output register and
+    // the flags.
+    unsafe {
+        asm!("rdrand {v}", "setc {ok}", v = out(reg) v, ok = out(reg_byte) ok, options(nomem, nostack))
+    };
+    (ok != 0).then_some(v)
+}
+
+/// One RDSEED: a 64-bit value from the CPU's conditioned entropy source,
+/// or `None` if it had none ready (carry clear).
+///
+/// # Safety
+///
+/// The CPU must support RDSEED (CPUID.7.0:EBX bit 18), else it faults (#UD).
+pub(crate) unsafe fn rdseed() -> Option<u64> {
+    let v: u64;
+    let ok: u8;
+    // SAFETY: caller contract; RDSEED only writes the output register and
+    // the flags.
+    unsafe {
+        asm!("rdseed {v}", "setc {ok}", v = out(reg) v, ok = out(reg_byte) ok, options(nomem, nostack))
+    };
+    (ok != 0).then_some(v)
+}
+
 /// Reads the time-stamp counter.
 pub(crate) fn rdtsc() -> u64 {
     let (lo, hi): (u32, u32);

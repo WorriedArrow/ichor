@@ -146,6 +146,17 @@ Milestones 0-3 are done.
   overlay records uid/gid and atime/mtime/ctime; `chown` family and
   `utimensat`/`futimesat`/`utimes` set them (uid 0 semantics until the
   identity ADR). Linux console writes go out as raw bytes.
+- M4 honest stubs and entropy (Phase A, done): sigaltstack/SA_ONSTACK,
+  per-process rlimits (NOFILE, STACK enforced), madvise (file mappings
+  fill on touch and refill after DONTNEED), MAP_SHARED anonymous memory
+  across fork with physically keyed futexes, EPOLLET, ppoll/pselect6/
+  epoll_pwait masks, vfork waits, process groups and sessions, real /proc
+  numbers. `cargo xtask lint` fails if a `=> Ok(0)` dispatch arm is listed
+  as implemented or a table entry has no arm. `random.rs`: ChaCha20
+  seeded from RDSEED/RDRAND and virtio-rng (every QEMU run attaches one)
+  behind getrandom, /dev/[u]random and AT_RANDOM; `frame::time::wall_clock`
+  is UEFI GetTime at boot plus TSC time, behind CLOCK_REALTIME,
+  gettimeofday and file times.
 - M4 fd model: descriptors point at shared open file descriptions
   (`process::Description`: offset, status flags, the reference on what it
   names), so `dup`/`dup2`/`dup3`/`F_DUPFD` and `fork` share offset and
@@ -168,10 +179,10 @@ report at the end of each phase. Do not rewrite `main`.
   (3) [done] fd model: open file descriptions shared by dup/fork (offset, status
   flags), FD_CLOEXEC/O_CLOEXEC, F_SETFL O_NONBLOCK/O_APPEND, a lock table
   for flock and fcntl F_SETLK/F_SETLKW/F_OFD_*; tests for `2>&1`, `>>` from
-  two processes, no fd leak across exec. (4) Every fake-success stub made
-  honest (audit table), ABI statuses checkable by lint. (5) RDSEED/RDRAND +
+  two processes, no fd leak across exec. (4) [done] Every fake-success stub made
+  honest (audit table), ABI statuses checkable by lint. (5) [done] RDSEED/RDRAND +
   virtio-rng into a ChaCha20 CSPRNG for getrandom, /dev/urandom, AT_RANDOM;
-  wall clock from UEFI GetTime or the CMOS RTC.
+  wall clock from UEFI GetTime (no CMOS fallback).
 - **B. XSAVE before glibc.** Document today's FPU handling; enable
   XSAVE/XSAVEOPT, XCR0 per CPU support, per-thread extended state (lazy vs
   eager in an ADR with the security reasoning), XSAVE layout in signal
@@ -220,7 +231,7 @@ are owed as multi-cell scheduling lands in milestone 4. Boot logs which apply.
 Frame budget: ADR-0005 sets the milestone 3 ceiling at 8,500 lines / 380
 sites; ADR-0007 raises it to 9,500 / 420 for milestone 4 (TLB shootdown,
 atomic user ops for futexes, PCID). `audit.toml` is at step 6 (5,800 / 250);
-frame is at 5,230 / 229.
+frame is at 5,378 / 238 (A5 added RDSEED/RDRAND and UEFI GetTime).
 
 The goal set for this effort is milestone 8, whose acceptance test needs
 cloud accounts and bare-metal hardware from the owner.
@@ -248,7 +259,7 @@ the accelerator).
 
 Plain `cargo build` / `cargo test` at the root only touch host crates
 (`default-members`). Crates that depend on frame (`ichor`, `ichor-frame`,
-`ichor-virtio-blk`, `ichor-nvme`) are kernel-only: xtask's `KERNEL_ONLY` list keeps them
+`ichor-virtio-pci`, `ichor-virtio-blk`, `ichor-virtio-rng`, `ichor-nvme`) are kernel-only: xtask's `KERNEL_ONLY` list keeps them
 out of host clippy and tests and lints them for the UEFI target. The kernel and frame build for `x86_64-unknown-uefi`
 through xtask, into `target/kernel` so they never contend for cargo's build
 lock with the host build.
@@ -289,7 +300,11 @@ kernel/image     read-only content-addressed image format (host-tested)
 kernel/block     block-device trait and helpers (host-tested)
 kernel/vma       user address-space region map for mmap/brk (host-tested)
 kernel/overlay   cell root: image + copy-on-write upper layer (host-tested)
+kernel/csprng    ChaCha20 generator with fast key erasure (host-tested)
+kernel/civil     calendar time to Unix time, for the firmware clock (host-tested)
+kernel/drivers/virtio-pci  modern virtio PCI transport shared by the virtio drivers
 kernel/drivers/virtio-blk  safe virtio-blk driver over frame's IoMem/DMA
+kernel/drivers/virtio-rng  safe virtio-rng (entropy) driver
 kernel/drivers/nvme        safe NVMe driver (polled, DMA-trusted)
 xtask/src/artifact.rs      pinned downloads (busybox, Alpine): SHA-256, cache, never committed
 xtask/src/inflate.rs       gzip/DEFLATE decoder; rootfs.rs: tar -> Ichor image

@@ -1,0 +1,16 @@
+[package]
+name = "ichor-virtio-pci"
+description = "The modern (virtio 1.x) PCI transport shared by virtio drivers; safe code only"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "virtio_pci"
+
+[dependencies]
+frame.workspace = true
+
+[lints]
+workspace = true

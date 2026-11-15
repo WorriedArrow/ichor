@@ -46,6 +46,8 @@ fn m1_boots_on_four_cpus() {
     out.assert_in_order(BOOT_MARKERS);
     out.assert_in_order(&[
         "ichor: smp: 4 CPUs online, every CPU took 5 timer interrupts",
+        "ichor: random: ChaCha20 seeded",
+        "ichor: time: wall clock from UEFI",
         "ichor: sched: 32 threads finished",
         "ichor: sched: 9 spinners on 4 CPUs all ran (preemption works",
         "ichor: sleep: 4 timed waits woke after their deadlines",
@@ -104,6 +106,7 @@ fn m1_boots_on_four_cpus() {
         "alpine: kill -pgid ended the whole group",
         "alpine: ulimit survives fork and exec",
         "alpine: /proc shows cell memory and threads",
+        "alpine: wall clock, file times and urandom are real",
         "ichor: alpine: all runs passed",
         "ichor: blk: nvme block size 4096 bytes",
         "ichor: blk: nvme: verified 300 KiB read across multiple requests",
@@ -139,6 +142,8 @@ fn m1_boots_on_one_cpu() {
     out.assert_in_order(BOOT_MARKERS);
     out.assert_in_order(&[
         "ichor: smp: 1 CPUs online, every CPU took 5 timer interrupts",
+        "ichor: random: ChaCha20 seeded",
+        "ichor: time: wall clock from UEFI",
         "ichor: sched: 32 threads finished",
         "ichor: sched: 3 spinners on 1 CPUs all ran (preemption works",
         "ichor: sleep: 4 timed waits woke after their deadlines",
@@ -197,6 +202,7 @@ fn m1_boots_on_one_cpu() {
         "alpine: kill -pgid ended the whole group",
         "alpine: ulimit survives fork and exec",
         "alpine: /proc shows cell memory and threads",
+        "alpine: wall clock, file times and urandom are real",
         "ichor: alpine: all runs passed",
         "ichor: blk: nvme block size 4096 bytes",
         "ichor: blk: nvme: verified 300 KiB read across multiple requests",
@@ -212,6 +218,8 @@ fn m2_scheduler_on_eight_cpus() {
     out.assert_exit(Exit::Success);
     out.assert_in_order(&[
         "ichor: smp: 8 CPUs online, every CPU took 5 timer interrupts",
+        "ichor: random: ChaCha20 seeded",
+        "ichor: time: wall clock from UEFI",
         "ichor: sched: 32 threads finished",
         "ichor: sched: 17 spinners on 8 CPUs all ran (preemption works",
         "ichor: sleep: 4 timed waits woke after their deadlines",
@@ -270,6 +278,7 @@ fn m2_scheduler_on_eight_cpus() {
         "alpine: kill -pgid ended the whole group",
         "alpine: ulimit survives fork and exec",
         "alpine: /proc shows cell memory and threads",
+        "alpine: wall clock, file times and urandom are real",
         "ichor: alpine: all runs passed",
         "ichor: blk: nvme block size 4096 bytes",
         "ichor: blk: nvme: verified 300 KiB read across multiple requests",

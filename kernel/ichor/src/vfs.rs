@@ -10,10 +10,15 @@ use overlay::Overlay;
 pub(crate) use overlay::errno;
 pub(crate) use overlay::{Ino, Kind, PATH_MAX, ROOT, Stat};
 
-/// The time file changes are stamped with: the kernel's realtime clock
-/// (`CLOCK_REALTIME`).
+/// The time of day (`CLOCK_REALTIME`): the firmware clock read at boot plus
+/// the monotonic time since, or time since boot if there was no clock.
+pub(crate) fn wall_clock() -> core::time::Duration {
+    frame::time::wall_clock().unwrap_or_else(frame::time::now)
+}
+
+/// The time file changes are stamped with: the realtime clock.
 pub(crate) fn realtime() -> overlay::Time {
-    let t = frame::time::now();
+    let t = wall_clock();
     overlay::Time {
         sec: t.as_secs(),
         nsec: t.subsec_nanos(),

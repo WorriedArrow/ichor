@@ -27,6 +27,7 @@ mod proc;
 mod process;
 mod procfs;
 mod proctest;
+mod random;
 mod runtest;
 mod sched;
 mod selftest;
@@ -91,6 +92,15 @@ fn kmain(info: BootInfo) -> ! {
     selftest::install_timer_handler();
     let cpus = frame::smp::start_aps(ap_main);
     selftest::timers_on_every_cpu(cpus);
+
+    random::init();
+    match frame::time::wall_clock() {
+        Some(t) => println!(
+            "ichor: time: wall clock from UEFI, {} s since the epoch",
+            t.as_secs()
+        ),
+        None => println!("ichor: time: no wall clock; CLOCK_REALTIME counts from boot"),
+    }
 
     // Milestone 2: tasks and scheduling.
     frame::task::inject_scheduler(&sched::SCHEDULER);

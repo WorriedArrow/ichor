@@ -18,6 +18,8 @@ pub struct Features {
     pub invariant_tsc: bool,
     pub rdpid: bool,
     pub hypervisor: bool,
+    pub rdrand: bool,
+    pub rdseed: bool,
 }
 
 /// Detects features with CPUID. Cheap enough to call repeatedly.
@@ -51,6 +53,8 @@ pub fn features() -> Features {
         invariant_tsc: bit(edx_e7, 8),
         rdpid: bit(ecx7, 22),
         hypervisor: bit(ecx1, 31),
+        rdrand: bit(ecx1, 30),
+        rdseed: bit(ebx7, 18),
     }
 }
 

@@ -5,9 +5,46 @@
 //! handler (installed once, for every CPU) decides whether to re-arm. The
 //! scheduler (milestone 2) becomes that handler.
 
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use core::time::Duration;
 
 use crate::arch::apic;
+
+/// The firmware's clock as read at boot: Unix seconds, nanoseconds, and
+/// the TSC at the moment of reading.
+static WALL_SECS: AtomicU64 = AtomicU64::new(0);
+static WALL_NANOS: AtomicU32 = AtomicU32::new(0);
+static WALL_TSC: AtomicU64 = AtomicU64::new(0);
+static WALL_VALID: AtomicBool = AtomicBool::new(false);
+
+/// Records the firmware clock reading (boot, before ExitBootServices).
+pub(crate) fn set_boot_wall_clock(secs: u64, nanos: u32, tsc: u64) {
+    WALL_SECS.store(secs, Ordering::Relaxed);
+    WALL_NANOS.store(nanos, Ordering::Relaxed);
+    WALL_TSC.store(tsc, Ordering::Relaxed);
+    WALL_VALID.store(true, Ordering::Release);
+}
+
+/// The time of day as time since the Unix epoch (UTC): the firmware's
+/// clock as read at boot plus the TSC time since. `None` if the firmware
+/// had no clock to read. Advances with the monotonic clock; nothing
+/// disciplines it yet (no NTP).
+pub fn wall_clock() -> Option<Duration> {
+    if !WALL_VALID.load(Ordering::Acquire) {
+        return None;
+    }
+    let hz = u128::from(tsc_hz().max(1));
+    let ticks =
+        u128::from(crate::arch::regs::rdtsc().wrapping_sub(WALL_TSC.load(Ordering::Relaxed)));
+    let since = Duration::from_nanos(u64::try_from(ticks * 1_000_000_000 / hz).unwrap_or(u64::MAX));
+    Some(
+        Duration::new(
+            WALL_SECS.load(Ordering::Relaxed),
+            WALL_NANOS.load(Ordering::Relaxed),
+        )
+        .saturating_add(since),
+    )
+}
 
 /// Time since boot.
 pub fn now() -> Duration {

@@ -25,6 +25,8 @@ virtio-blk.workspace = true
 nvme.workspace = true
 vma.workspace = true
 overlay.workspace = true
+csprng.workspace = true
+virtio-rng.workspace = true
 
 [lints]
 workspace = true

@@ -412,6 +412,7 @@ pub fn command(cfg: &RunConfig) -> Result<Command> {
             drive_path(&dir.join("root.img"))
         ))
         .args(["-device", "virtio-blk-pci,drive=root,disable-legacy=on"])
+        .args(["-device", "virtio-rng-pci,disable-legacy=on"])
         // Alpine's root file system, for a cell that runs its userland.
         .arg("-drive")
         .arg(format!(

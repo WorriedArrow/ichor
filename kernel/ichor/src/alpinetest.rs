@@ -126,6 +126,14 @@ const RUNS: &[(&[&str], i32)] = &[
         ],
         0,
     ),
+    (
+        &[
+            "sh",
+            "-c",
+            "[ \"$(date +%s)\" -gt 1700000000 ] && touch /tmp/t &&              [ \"$(stat -c %Y /tmp/t)\" -gt 1700000000 ] &&              [ \"$(head -c 16 /dev/urandom | od -An -tx1)\" != \"$(head -c 16 /dev/urandom | od -An -tx1)\" ] &&              echo alpine: wall clock, file times and urandom are real",
+        ],
+        0,
+    ),
 ];
 
 fn read(vfs: &Vfs, path: &str) -> Vec<u8> {

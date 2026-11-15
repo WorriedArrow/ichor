@@ -12,6 +12,7 @@ name = "virtio_blk"
 [dependencies]
 frame.workspace = true
 block.workspace = true
+virtio-pci.workspace = true
 
 [lints]
 workspace = true

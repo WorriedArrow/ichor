@@ -248,20 +248,10 @@ fn copy_segment_page(image: &[u8], seg: &elf::Segment, va: u64, frame: &UFrame) 
 }
 
 /// 16 bytes for `AT_RANDOM` (the libc's stack-protector canary and pointer
-/// guard). Mixed from the TSC-based clock: unpredictable enough to catch
-/// bugs, not a security boundary until frame has an entropy source.
+/// guard), from the kernel generator.
 fn random_bytes() -> [u8; 16] {
-    let mut x = frame::time::now().as_nanos() as u64 ^ 0x9e37_79b9_7f4a_7c15;
     let mut out = [0u8; 16];
-    for chunk in out.chunks_mut(8) {
-        // splitmix64
-        x = x.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        let mut z = x;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        z ^= z >> 31;
-        chunk.copy_from_slice(&z.to_le_bytes());
-    }
+    crate::random::fill(&mut out);
     out
 }
 

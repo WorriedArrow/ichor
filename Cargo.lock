@@ -11,6 +11,7 @@ dependencies = [
  "ichor-cap",
  "ichor-cell",
  "ichor-cmdline",
+ "ichor-csprng",
  "ichor-elf",
  "ichor-frame",
  "ichor-image",
@@ -18,6 +19,7 @@ dependencies = [
  "ichor-overlay",
  "ichor-sched",
  "ichor-virtio-blk",
+ "ichor-virtio-rng",
  "ichor-vma",
 ]
 
@@ -46,7 +48,15 @@ name = "ichor-cell"
 version = "0.0.0"
 
 [[package]]
+name = "ichor-civil"
+version = "0.0.0"
+
+[[package]]
 name = "ichor-cmdline"
+version = "0.0.0"
+
+[[package]]
+name = "ichor-csprng"
 version = "0.0.0"
 
 [[package]]
@@ -59,6 +69,7 @@ version = "0.0.0"
 dependencies = [
  "ichor-acpi",
  "ichor-buddy",
+ "ichor-civil",
  "ichor-cmdline",
  "ichor-pe",
 ]
@@ -103,6 +114,22 @@ version = "0.0.0"
 dependencies = [
  "ichor-block",
  "ichor-frame",
+ "ichor-virtio-pci",
+]
+
+[[package]]
+name = "ichor-virtio-pci"
+version = "0.0.0"
+dependencies = [
+ "ichor-frame",
+]
+
+[[package]]
+name = "ichor-virtio-rng"
+version = "0.0.0"
+dependencies = [
+ "ichor-frame",
+ "ichor-virtio-pci",
 ]
 
 [[package]]

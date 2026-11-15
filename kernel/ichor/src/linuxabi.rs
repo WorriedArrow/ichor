@@ -85,7 +85,7 @@ mod nr {
     pub(super) const FCHOWN: u64 = 93; // partial: recorded; every process is uid 0 (no checks yet)
     pub(super) const LCHOWN: u64 = 94; // partial: recorded; every process is uid 0 (no checks yet)
     pub(super) const UMASK: u64 = 95;
-    pub(super) const GETTIMEOFDAY: u64 = 96; // partial: time since boot (no RTC yet)
+    pub(super) const GETTIMEOFDAY: u64 = 96; // firmware clock at boot plus monotonic time (no NTP)
     pub(super) const GETRLIMIT: u64 = 97;
     pub(super) const SETRLIMIT: u64 = 160; // partial: NOFILE and STACK enforced, others stored
     pub(super) const GETUID: u64 = 102; // partial: always 0
@@ -111,7 +111,7 @@ mod nr {
     pub(super) const EPOLL_CREATE: u64 = 213;
     pub(super) const GETDENTS64: u64 = 217;
     pub(super) const SET_TID_ADDRESS: u64 = 218;
-    pub(super) const CLOCK_GETTIME: u64 = 228; // partial: every clock counts from boot
+    pub(super) const CLOCK_GETTIME: u64 = 228; // partial: CPU-time clocks report time since the process started
     pub(super) const CLOCK_NANOSLEEP: u64 = 230; // partial: relative sleeps only
     pub(super) const UTIMES: u64 = 235;
     pub(super) const EXIT_GROUP: u64 = 231;
@@ -139,7 +139,7 @@ mod nr {
     pub(super) const DUP3: u64 = 292;
     pub(super) const PIPE2: u64 = 293;
     pub(super) const PRLIMIT64: u64 = 302; // partial: own process only; NOFILE and STACK enforced, others stored
-    pub(super) const GETRANDOM: u64 = 318; // partial: not cryptographic until frame has an entropy source
+    pub(super) const GETRANDOM: u64 = 318; // ChaCha20 seeded from RDSEED/RDRAND and virtio-rng
     pub(super) const RENAMEAT2: u64 = 316; // partial: RENAME_NOREPLACE only
 }
 
@@ -226,7 +226,7 @@ pub(crate) fn dispatch(p: &mut LinuxProcess, ctx: &mut frame::user::UserContext)
         nr::FLOCK => fs::flock(p, a[0], a[1]),
         nr::STATFS => fs::statfs(p, a[0], a[1]),
         nr::FSTATFS => fs::fstatfs(p, a[0], a[1]),
-        nr::GETRANDOM => getrandom(p, a[0], a[1] as usize),
+        nr::GETRANDOM => getrandom(p, a[0], a[1] as usize, a[2]),
         // Readiness.
         nr::POLL => crate::poll::poll(p, a[0], a[1], i(a[2])),
         nr::PPOLL => crate::poll::ppoll(p, &a),
@@ -261,7 +261,7 @@ pub(crate) fn dispatch(p: &mut LinuxProcess, ctx: &mut frame::user::UserContext)
         nr::MADVISE => p.mm().madvise(a[0], a[1], a[2]),
         // Identity, time, limits, signals, threads.
         nr::UNAME => uname(p, a[0]),
-        nr::CLOCK_GETTIME => clock_gettime(p, a[1]),
+        nr::CLOCK_GETTIME => clock_gettime(p, a[0], a[1]),
         nr::GETTIMEOFDAY => gettimeofday(p, a[0]),
         nr::GETRLIMIT => prlimit(p, 0, a[0], 0, a[1]),
         nr::SETRLIMIT => prlimit(p, 0, a[0], a[1], 0),
@@ -352,11 +352,26 @@ fn console_write(p: &mut LinuxProcess, buf: u64, count: usize) -> usize {
     written
 }
 
-/// `getrandom`: fills `buf` from the kernel generator (`/dev/urandom`).
-fn getrandom(p: &mut LinuxProcess, buf: u64, len: usize) -> Result<u64, i64> {
+/// `getrandom(buf, len, flags)`: fills `buf` from the kernel generator
+/// (`/dev/urandom`). If boot found too little entropy the generator never
+/// becomes seeded, so a caller that did not pass `GRND_INSECURE` gets
+/// EAGAIN rather than a wait that could not end.
+fn getrandom(p: &mut LinuxProcess, buf: u64, len: usize, flags: u64) -> Result<u64, i64> {
+    const GRND_NONBLOCK: u64 = 1;
+    const GRND_RANDOM: u64 = 2;
+    const GRND_INSECURE: u64 = 4;
+    const EAGAIN: i64 = 11;
+    if flags & !(GRND_NONBLOCK | GRND_RANDOM | GRND_INSECURE) != 0
+        || flags & (GRND_RANDOM | GRND_INSECURE) == GRND_RANDOM | GRND_INSECURE
+    {
+        return Err(EINVAL);
+    }
+    if !crate::random::seeded() && flags & GRND_INSECURE == 0 {
+        return Err(EAGAIN);
+    }
     let n = len.min(256 * 1024);
     let mut b = alloc::vec![0u8; n];
-    crate::dev::random_bytes(&mut b);
+    crate::random::fill(&mut b);
     if p.copy_to_user(buf, &b) != n {
         return Err(EFAULT);
     }
@@ -647,16 +662,36 @@ fn put_pair(p: &mut LinuxProcess, addr: u64, a: u64, b: u64) -> Result<u64, i64>
     }
 }
 
-fn clock_gettime(p: &mut LinuxProcess, tp: u64) -> Result<u64, i64> {
-    let now = frame::time::now();
-    put_pair(p, tp, now.as_secs(), u64::from(now.subsec_nanos()))
+/// `clock_gettime`. The realtime clocks read the firmware clock taken at
+/// boot plus monotonic time; the monotonic and boot-time clocks count from
+/// boot. CPU time is not accounted yet, so the CPU-time clocks report the
+/// time since the process started, an upper bound (partial).
+fn clock_gettime(p: &mut LinuxProcess, clock: u64, tp: u64) -> Result<u64, i64> {
+    const REALTIME: u64 = 0;
+    const MONOTONIC: u64 = 1;
+    const PROCESS_CPUTIME: u64 = 2;
+    const THREAD_CPUTIME: u64 = 3;
+    const MONOTONIC_RAW: u64 = 4;
+    const REALTIME_COARSE: u64 = 5;
+    const MONOTONIC_COARSE: u64 = 6;
+    const BOOTTIME: u64 = 7;
+    let t = match clock {
+        REALTIME | REALTIME_COARSE => crate::vfs::wall_clock(),
+        MONOTONIC | MONOTONIC_RAW | MONOTONIC_COARSE | BOOTTIME => frame::time::now(),
+        PROCESS_CPUTIME | THREAD_CPUTIME => {
+            let started = core::time::Duration::from_millis(p.group.leader.started * 10);
+            frame::time::now().saturating_sub(started)
+        }
+        _ => return Err(EINVAL),
+    };
+    put_pair(p, tp, t.as_secs(), u64::from(t.subsec_nanos()))
 }
 
 fn gettimeofday(p: &mut LinuxProcess, tv: u64) -> Result<u64, i64> {
     if tv == 0 {
         return Ok(0);
     }
-    let now = frame::time::now();
+    let now = crate::vfs::wall_clock();
     put_pair(p, tv, now.as_secs(), u64::from(now.subsec_micros()))
 }
 

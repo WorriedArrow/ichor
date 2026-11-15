@@ -122,7 +122,14 @@ fn cmd_run(o: &Opts) -> Result<()> {
 }
 
 /// Crates that only build for the kernel target (they depend on frame).
-const KERNEL_ONLY: &[&str] = &["ichor", "ichor-frame", "ichor-virtio-blk", "ichor-nvme"];
+const KERNEL_ONLY: &[&str] = &[
+    "ichor",
+    "ichor-frame",
+    "ichor-virtio-pci",
+    "ichor-virtio-blk",
+    "ichor-virtio-rng",
+    "ichor-nvme",
+];
 
 fn exclude_kernel_only(cmd: &mut std::process::Command) -> &mut std::process::Command {
     for c in KERNEL_ONLY {

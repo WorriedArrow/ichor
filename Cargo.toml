@@ -15,7 +15,11 @@ members = [
     "kernel/block",
     "kernel/vma",
     "kernel/overlay",
+    "kernel/csprng",
+    "kernel/civil",
+    "kernel/drivers/virtio-pci",
     "kernel/drivers/virtio-blk",
+    "kernel/drivers/virtio-rng",
     "kernel/drivers/nvme",
     "kernel/ichor",
     "tests",
@@ -38,6 +42,8 @@ default-members = [
     "kernel/block",
     "kernel/vma",
     "kernel/overlay",
+    "kernel/csprng",
+    "kernel/civil",
     "tests",
     "xtask",
 ]
@@ -63,6 +69,10 @@ image = { package = "ichor-image", path = "kernel/image" }
 block = { package = "ichor-block", path = "kernel/block" }
 vma = { package = "ichor-vma", path = "kernel/vma" }
 overlay = { package = "ichor-overlay", path = "kernel/overlay" }
+csprng = { package = "ichor-csprng", path = "kernel/csprng" }
+civil = { package = "ichor-civil", path = "kernel/civil" }
+virtio-pci = { package = "ichor-virtio-pci", path = "kernel/drivers/virtio-pci" }
+virtio-rng = { package = "ichor-virtio-rng", path = "kernel/drivers/virtio-rng" }
 virtio-blk = { package = "ichor-virtio-blk", path = "kernel/drivers/virtio-blk" }
 nvme = { package = "ichor-nvme", path = "kernel/drivers/nvme" }
 
