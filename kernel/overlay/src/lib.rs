@@ -294,6 +294,22 @@ impl Inode<'_> {
     }
 }
 
+/// An unmodified lower file, readable without the overlay
+/// ([`Overlay::lower_reader`]).
+#[derive(Clone, Copy, Debug)]
+pub struct LowerReader<'a> {
+    node: Node<'a>,
+    src: &'a (dyn ChunkSource + Sync),
+}
+
+impl LowerReader<'_> {
+    /// Reads bytes at `offset`; returns how many were read (EIO if a chunk
+    /// fails verification or the device fails).
+    pub fn read(&self, offset: u64, out: &mut [u8]) -> Result<usize, i64> {
+        self.node.read_at(offset, out, self.src).map_err(|_| EIO)
+    }
+}
+
 /// An image with a copy-on-write upper layer.
 #[derive(Debug)]
 pub struct Overlay<'a> {
@@ -681,6 +697,22 @@ impl<'a> Overlay<'a> {
     pub fn lower_extent(&self, ino: Ino, index: u64) -> Option<image::Extent> {
         match &self.get(ino).ok()?.data {
             Data::LowerFile(n) => n.extent(index),
+            _ => None,
+        }
+    }
+
+    /// If `ino` is still an unmodified lower file, a reader for it that
+    /// does not borrow the overlay: its image node and chunk source, which
+    /// outlive the overlay. A caller holding the overlay behind a lock can
+    /// drop the lock before reading, so readers (and the device reads a
+    /// cache miss makes) do not serialize. The read sees the file as it was
+    /// when this was called, as a read racing a write may.
+    pub fn lower_reader(&self, ino: Ino) -> Option<LowerReader<'a>> {
+        match &self.get(ino).ok()?.data {
+            Data::LowerFile(n) => Some(LowerReader {
+                node: *n,
+                src: self.src?,
+            }),
             _ => None,
         }
     }
@@ -1274,6 +1306,27 @@ mod tests {
         fs.truncate(motd, 5).unwrap();
         assert_eq!(read_all(&fs, motd), b"UPPER");
         assert_eq!(fs.used_bytes(), PAGE);
+    }
+
+    #[test]
+    fn lower_reader_reads_without_the_overlay_until_copy_up() {
+        let img = lower_image();
+        let image = Image::mount(&img).unwrap();
+        let src = image::SliceSource(&img);
+        let mut fs = Overlay::new(&image, &src, 1 << 20).unwrap();
+        let motd = fs.resolve(ROOT, "/etc/motd", true).unwrap();
+        let r = fs.lower_reader(motd).unwrap();
+        // Usable while the overlay is mutably borrowed: it does not borrow it.
+        assert_eq!(fs.write(motd, 0, b"UPPER").unwrap(), 5);
+        let mut buf = [0u8; 32];
+        let n = r.read(0, &mut buf).unwrap();
+        assert_eq!(&buf[..n], b"lower motd\n");
+        assert_eq!(r.read(6, &mut buf).unwrap(), 5);
+        // Copied up: no lower reader any more, and reads see the upper data.
+        assert!(fs.lower_reader(motd).is_none());
+        assert_eq!(read_all(&fs, motd), b"UPPER motd\n");
+        let etc = fs.resolve(ROOT, "/etc", true).unwrap();
+        assert!(fs.lower_reader(etc).is_none());
     }
 
     #[test]

@@ -249,7 +249,6 @@ fn read_file(
         let want = chunk.len().min(count - done);
         let n = p
             .vfs
-            .lock()
             .read(f.ino, offset + done as u64, &mut chunk[..want])?;
         if n == 0 {
             break;
@@ -1022,7 +1021,7 @@ pub(super) fn sendfile(
     let mut done = 0usize;
     while done < count {
         let want = CHUNK.min(count - done);
-        let n = p.fs().read(src.ino, offset, &mut buf[..want])?;
+        let n = p.vfs.read(src.ino, offset, &mut buf[..want])?;
         if n == 0 {
             break;
         }

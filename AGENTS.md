@@ -263,7 +263,8 @@ report at the end of each phase. Do not rewrite `main`.
   page fault, fork+exec, container start) against Linux before and after.
   [in progress: `bench.rs` measures all six on Ichor (`bench` flag,
   `benchmarks_run_and_report`; CI prints a KVM run to the job summary);
-  futexes are in 64 hashed buckets; Linux reference numbers not yet.]
+  futexes are in 64 hashed buckets; lower-file reads run outside the
+  root's tree lock (`Vfs::read`); Linux reference numbers not yet.]
 
 Carried over from milestone 3: per-cell pid namespaces (paging the root
 image in on demand, copy-on-write `fork`, `FD_CLOEXEC` and shared offsets

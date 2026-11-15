@@ -1,7 +1,8 @@
 //! The virtual file system: a cell's root is a read-only Ichor image with a
 //! copy-on-write upper layer in memory (ADR-0002 §6, ADR-0006). The
 //! `overlay` crate holds the logic (and path resolution); this wraps it in
-//! a lock so the processes sharing a root see one consistent tree.
+//! a lock so the processes sharing a root see one consistent tree. File
+//! data from the lower image is read outside that lock ([`Vfs::read`]).
 
 use frame::sync::{Mutex, MutexGuard};
 use image::Image;
@@ -122,6 +123,21 @@ impl Vfs {
     pub(crate) fn mount_slice(bytes: &'static [u8]) -> Result<Vfs, image::Error> {
         let src = alloc::boxed::Box::leak(alloc::boxed::Box::new(image::SliceSource(bytes)));
         Vfs::mount(bytes, src)
+    }
+
+    /// Reads file bytes at `offset`. An unmodified lower file is read after
+    /// the tree lock is dropped, so readers of a root do not serialize on
+    /// each other, or on the device read a page-cache miss makes. Upper
+    /// files are copied under the lock.
+    pub(crate) fn read(&self, ino: Ino, offset: u64, out: &mut [u8]) -> Result<usize, i64> {
+        let fs = self.fs.lock();
+        match fs.lower_reader(ino) {
+            Some(r) => {
+                drop(fs);
+                r.read(offset, out)
+            }
+            None => fs.read(ino, offset, out),
+        }
     }
 
     /// The upper layer's budget and use, in bytes (for `statfs`).

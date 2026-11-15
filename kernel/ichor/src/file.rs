@@ -71,7 +71,7 @@ impl File for VfsFile {
     }
 
     fn read_at(&self, offset: u64, out: &mut [u8]) -> usize {
-        self.vfs.lock().read(self.ino, offset, out).unwrap_or(0)
+        self.vfs.read(self.ino, offset, out).unwrap_or(0)
     }
 
     fn cached_page(&self, index: u64) -> Option<UFrame> {
