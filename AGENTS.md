@@ -355,7 +355,7 @@ the accelerator).
 
 Plain `cargo build` / `cargo test` at the root only touch host crates
 (`default-members`). Crates that depend on frame (`ichor`, `ichor-frame`,
-`ichor-virtio-pci`, `ichor-virtio-blk`, `ichor-virtio-rng`, `ichor-nvme`) are kernel-only: xtask's `KERNEL_ONLY` list keeps them
+`ichor-virtio-pci`, `ichor-virtio-blk`, `ichor-virtio-rng`, `ichor-virtio-net`, `ichor-nvme`) are kernel-only: xtask's `KERNEL_ONLY` list keeps them
 out of host clippy and tests and lints them for the UEFI target. The kernel and frame build for `x86_64-unknown-uefi`
 through xtask, into `target/kernel` so they never contend for cargo's build
 lock with the host build.
@@ -407,6 +407,8 @@ kernel/gpt       GUID partition tables: CRC-checked reader (kernel), writer behi
 kernel/drivers/virtio-pci  modern virtio PCI transport shared by the virtio drivers
 kernel/drivers/virtio-blk  safe virtio-blk driver over frame's IoMem/DMA
 kernel/drivers/virtio-rng  safe virtio-rng (entropy) driver
+kernel/drivers/virtio-net  safe virtio-net driver (polled, MAC feature only)
+kernel/net       network protocols, sans-I/O: Ethernet, ARP, IPv4, ICMP, UDP, TCP (host-tested; ADR-0010)
 kernel/drivers/nvme        safe NVMe driver (polled, DMA-trusted)
 xtask/src/artifact.rs      pinned downloads (busybox, Alpine): SHA-256, cache, never committed
 xtask/src/inflate.rs       gzip/DEFLATE decoder; rootfs.rs: tar -> Ichor image

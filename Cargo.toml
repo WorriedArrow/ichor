@@ -24,6 +24,7 @@ members = [
     "kernel/drivers/virtio-pci",
     "kernel/drivers/virtio-blk",
     "kernel/drivers/virtio-rng",
+    "kernel/drivers/virtio-net",
     "kernel/drivers/nvme",
     "kernel/ichor",
     "tests",
@@ -84,6 +85,8 @@ testprog = { package = "ichor-testprog", path = "kernel/testprog" }
 gpt = { package = "ichor-gpt", path = "kernel/gpt" }
 virtio-pci = { package = "ichor-virtio-pci", path = "kernel/drivers/virtio-pci" }
 virtio-rng = { package = "ichor-virtio-rng", path = "kernel/drivers/virtio-rng" }
+virtio-net = { package = "ichor-virtio-net", path = "kernel/drivers/virtio-net" }
+net = { package = "ichor-net", path = "kernel/net" }
 virtio-blk = { package = "ichor-virtio-blk", path = "kernel/drivers/virtio-blk" }
 nvme = { package = "ichor-nvme", path = "kernel/drivers/nvme" }
 

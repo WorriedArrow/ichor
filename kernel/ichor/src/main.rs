@@ -25,6 +25,7 @@ mod linuxabi;
 mod loader;
 mod locks;
 mod nativeabi;
+mod nettest;
 mod pagecache;
 mod partition;
 mod pipe;
@@ -70,6 +71,9 @@ fn kmain(info: BootInfo) -> ! {
     }
     if cmdline.flag("bench") {
         bench::enable();
+    }
+    if let Some(port) = cmdline.get("net_echo_port").and_then(|v| v.parse().ok()) {
+        nettest::set_echo_port(port);
     }
 
     let image = info.kernel_image();
@@ -134,6 +138,7 @@ fn kmain(info: BootInfo) -> ! {
     proctest::run();
     runtest::run();
     blktest::run();
+    nettest::run();
 
     if cmdline.flag("test_stack_overflow") {
         selftest::stack_overflow();

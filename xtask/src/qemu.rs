@@ -222,9 +222,30 @@ pub struct RunConfig {
     /// `sockets=2,cores=3`, which gives sparse APIC ids as multi-socket
     /// cloud hosts do).
     pub smp_topology: String,
+    /// Extra options for the user-mode network backend (for example
+    /// `hostfwd=tcp:127.0.0.1:8080-:80`).
+    pub net_user_opts: String,
 }
 
 impl RunConfig {
+    /// A virtio-net device on QEMU's user-mode network (slirp: the guest
+    /// is 10.0.2.15, the gateway 10.0.2.2, which reaches the host's
+    /// loopback). No option ROM, so the firmware never tries to network
+    /// boot.
+    fn net_args(&self) -> [String; 4] {
+        let extra = if self.net_user_opts.is_empty() {
+            String::new()
+        } else {
+            format!(",{}", self.net_user_opts)
+        };
+        [
+            "-netdev".into(),
+            format!("user,id=net0{extra}"),
+            "-device".into(),
+            "virtio-net-pci,netdev=net0,disable-legacy=on,romfile=".into(),
+        ]
+    }
+
     fn machine(&self) -> String {
         if self.machine_props.is_empty() {
             "q35".into()
@@ -260,6 +281,7 @@ impl RunConfig {
             disk_devices_before: Vec::new(),
             machine_props: String::new(),
             smp_topology: String::new(),
+            net_user_opts: String::new(),
         }
     }
 }
@@ -519,6 +541,7 @@ pub fn command(cfg: &RunConfig) -> Result<Command> {
         ))
         .args(["-device", "virtio-blk-pci,drive=root,disable-legacy=on"])
         .args(["-device", "virtio-rng-pci,disable-legacy=on"])
+        .args(cfg.net_args())
         // Alpine's root file system, for a cell that runs its userland.
         .arg("-drive")
         .arg(format!(
@@ -591,6 +614,7 @@ fn disk_command(cfg: &RunConfig, qemu: &Path, fw: &Firmware, img: &Path) -> Resu
             cfg.disk_nvme_props
         ))
         .args(["-device", "virtio-rng-pci,disable-legacy=on"])
+        .args(cfg.net_args())
         .args(&cfg.extra_args);
     Ok(cmd)
 }

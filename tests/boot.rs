@@ -428,6 +428,45 @@ fn cloud_disk_boots_without_legacy_timers_on_two_sockets() {
     ]);
 }
 
+/// Milestone 5, first network test: virtio-net and Ichor's own TCP/IP
+/// against a real peer. The kernel resolves QEMU's user-mode gateway, then
+/// opens a TCP connection through it to an echo server this test runs on
+/// the host's loopback, sends 256 KiB, checks it all comes back, and
+/// closes.
+#[test]
+fn tcp_through_virtio_net_to_a_host_echo_server() {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        let (mut s, _) = listener.accept().unwrap();
+        let mut buf = vec![0u8; 65536];
+        let mut total = 0usize;
+        loop {
+            match s.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    s.write_all(&buf[..n]).unwrap();
+                    total += n;
+                }
+            }
+        }
+        total
+    });
+    let out = boot("net-echo", &format!("net_echo_port={port}"), 2);
+    out.assert_exit(Exit::Success);
+    out.assert_in_order(&[
+        "ichor: net: virtio-net ",
+        "ichor: net: gateway 10.0.2.2 is at ",
+        "ichor: net: tcp echo of 256 KiB through slirp ok",
+    ]);
+    assert_eq!(
+        server.join().unwrap(),
+        256 * 1024,
+        "the host saw every byte"
+    );
+}
+
 /// The Phase E benchmarks still build and run (their numbers are printed,
 /// not checked: CI machines vary).
 #[test]

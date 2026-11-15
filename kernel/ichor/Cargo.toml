@@ -30,6 +30,8 @@ testprog.workspace = true
 gpt.workspace = true
 blake3.workspace = true
 virtio-rng.workspace = true
+virtio-net.workspace = true
+net.workspace = true
 
 [lints]
 workspace = true

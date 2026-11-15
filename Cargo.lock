@@ -17,11 +17,13 @@ dependencies = [
  "ichor-frame",
  "ichor-gpt",
  "ichor-image",
+ "ichor-net",
  "ichor-nvme",
  "ichor-overlay",
  "ichor-sched",
  "ichor-testprog",
  "ichor-virtio-blk",
+ "ichor-virtio-net",
  "ichor-virtio-rng",
  "ichor-vma",
 ]
@@ -135,6 +137,14 @@ name = "ichor-virtio-blk"
 version = "0.0.0"
 dependencies = [
  "ichor-block",
+ "ichor-frame",
+ "ichor-virtio-pci",
+]
+
+[[package]]
+name = "ichor-virtio-net"
+version = "0.0.0"
+dependencies = [
  "ichor-frame",
  "ichor-virtio-pci",
 ]
