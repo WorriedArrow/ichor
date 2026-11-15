@@ -269,7 +269,11 @@ report at the end of each phase. Do not rewrite `main`.
   `Group::gone` instead of yield loops (the polled block drivers and TLB
   shootdown acks still spin, by design until interrupt-driven I/O);
   poll/select/epoll waiters register with each watched object's
-  `poll::Watchers`, so a change wakes only its own pollers. Baseline in `docs/benchmarks.md`; Linux reference
+  `poll::Watchers`, so a change wakes only its own pollers; idle CPUs
+  are already kicked when a task is enqueued on them (`sched.rs`).
+  Per-CPU single-page lists are on the local branch `pcp-page-lists`,
+  held back: one unexplained user page fault (dpkg's decompressor) in 20
+  one-CPU boots, against 0 in 20 without it. Baseline in `docs/benchmarks.md`; Linux reference
   numbers not yet. Open: frame's `VmSpace` user copy ignores the page's
   write permission and copies after dropping its lock (owner deciding how
   to handle it; the Mm-lock item waits on it).]
