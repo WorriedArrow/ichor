@@ -10,6 +10,16 @@ use overlay::Overlay;
 pub(crate) use overlay::errno;
 pub(crate) use overlay::{Ino, Kind, PATH_MAX, ROOT, Stat};
 
+/// The time file changes are stamped with: the kernel's realtime clock
+/// (`CLOCK_REALTIME`).
+pub(crate) fn realtime() -> overlay::Time {
+    let t = frame::time::now();
+    overlay::Time {
+        sec: t.as_secs(),
+        nsec: t.subsec_nanos(),
+    }
+}
+
 /// Bytes a root's upper layer may hold. Milestone 4 charges them to the
 /// owning cell's account instead (ADR-0006).
 const UPPER_BYTES: usize = 64 << 20;
@@ -26,8 +36,14 @@ impl Vfs {
     pub(crate) fn mount(bytes: &'static [u8]) -> Result<Vfs, image::Error> {
         let image = Image::mount(bytes)?;
         let mut fs = Overlay::new(&image, UPPER_BYTES)?;
+        fs.set_clock(realtime);
         crate::dev::populate(&mut fs);
         Ok(Vfs { fs: Mutex::new(fs) })
+    }
+
+    /// The upper layer's budget and use, in bytes (for `statfs`).
+    pub(crate) fn space(&self) -> (usize, usize) {
+        (UPPER_BYTES, self.fs.lock().used_bytes())
     }
 
     /// Locks the tree.

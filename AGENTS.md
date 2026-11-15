@@ -138,6 +138,52 @@ Milestones 0-3 are done.
 
 `tests/boot.rs` proves all of this on 1, 4 and 8 vCPUs.
 
+- M4 apk: the Alpine disk carries a local `/mirror` of three official,
+  signed Alpine 3.20 packages (`tree`, `jq`, `oniguruma`; pinned in
+  `xtask/src/artifact.rs`). `apk add` installs them (signatures checked by
+  apk against the minirootfs keys, dependency order resolved), runs the
+  busybox trigger, and the binaries work. `execve` runs `#!` scripts. The
+  overlay records uid/gid and atime/mtime/ctime; `chown` family and
+  `utimensat`/`futimesat`/`utimes` set them (uid 0 semantics until the
+  identity ADR). Linux console writes go out as raw bytes.
+
+## Agreed plan (owner, 2026-11-15)
+
+Commit at every green step; every commit must build and pass on its own;
+report at the end of each phase. Do not rewrite `main`.
+
+- **A. Harden what exists.** (1) apk green [done]. (2) CI asserts KVM.
+  (3) fd model: open file descriptions shared by dup/fork (offset, status
+  flags), FD_CLOEXEC/O_CLOEXEC, F_SETFL O_NONBLOCK/O_APPEND, a lock table
+  for flock and fcntl F_SETLK/F_SETLKW/F_OFD_*; tests for `2>&1`, `>>` from
+  two processes, no fd leak across exec. (4) Every fake-success stub made
+  honest (audit table), ABI statuses checkable by lint. (5) RDSEED/RDRAND +
+  virtio-rng into a ChaCha20 CSPRNG for getrandom, /dev/urandom, AT_RANDOM;
+  wall clock from UEFI GetTime or the CMOS RTC.
+- **B. XSAVE before glibc.** Document today's FPU handling; enable
+  XSAVE/XSAVEOPT, XCR0 per CPU support, per-thread extended state (lazy vs
+  eager in an ADR with the security reasoning), XSAVE layout in signal
+  frames.
+- **C. Page cache and storage.** The audit's plan, plus: BLAKE3 chunk
+  hashes verified on fill and a root hash in the header (hash-keyed sharing
+  only on verified BLAKE3); the upper layer as a real in-memory filesystem
+  (paged data, mode, uid/gid, times, nlink, hard links); `VmSpace::frames`
+  as a tree with range ops; `MAX_ORDER` back to 10 with a test that fails
+  on any > 4 MiB contiguous allocation. Write the frame budget ADR before
+  exceeding the budget.
+- **D. Debian.** Identity-model ADR first (per-cell uid/gid mapping, what
+  uid 0 means in a cell, enforcement); then setresuid & co., chown family,
+  utimensat, link/linkat, statx, sched_getaffinity,
+  /sys/devices/system/cpu/online, mremap, prctl, sysinfo/getrusage/times.
+  Then pinned bookworm-slim by digest, dash, coreutils, `apt-get install`
+  from a local `file:` repo in CI: milestone 4 is done only then.
+- **E. Scalability before milestone 5.** Per-CPU page lists, hashed futex
+  buckets (shared futexes keyed by physical page), per-object wait queues,
+  no busy-wait loops, idle CPUs kicked for woken tasks, Mm lock not held
+  across whole user copies, a VFS that does not serialize reads, batched
+  console writes, a vDSO; first benchmarks (null syscall, context switch,
+  page fault, fork+exec, container start) against Linux before and after.
+
 Carried over from milestone 3: paging the root image in from the device on
 demand (today the kernel reads the whole disk into memory, capped at
 64 MiB), copy-on-write `fork`, `FD_CLOEXEC`, shared file offsets after

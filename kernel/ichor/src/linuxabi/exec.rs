@@ -4,9 +4,9 @@
 //! address space; only once it has loaded does the process switch to it,
 //! so a failed `execve` returns to the old program intact.
 //!
-//! Partial: `FD_CLOEXEC` is not tracked (every descriptor survives), and
-//! `#!` scripts return `ENOEXEC`, which shells handle by running the script
-//! themselves.
+//! `#!` scripts run their interpreter with the script path as an argument.
+//!
+//! Partial: `FD_CLOEXEC` is not tracked (every descriptor survives).
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -24,6 +24,7 @@ const E2BIG: i64 = 7;
 const ENOEXEC: i64 = 8;
 const ENOMEM: i64 = 12;
 const EACCES: i64 = 13;
+const ELOOP: i64 = 40;
 
 /// Most argv or envp entries.
 const MAX_STRINGS: usize = 4096;
@@ -68,10 +69,29 @@ pub(super) fn execve(
 ) -> Result<(), i64> {
     let path = user_path(p, path)?;
     let mut total = 0;
-    let argv = user_strings(p, argv, &mut total)?;
+    let mut argv = user_strings(p, argv, &mut total)?;
     let envp = user_strings(p, envp, &mut total)?;
 
-    let image = read_executable(p, &path)?;
+    // `#!` scripts: run the interpreter with the script as an argument, as
+    // Linux does (`interp [arg] script argv[1..]`). An interpreter may itself
+    // be a script, a few levels deep.
+    let mut exe_path = path.clone();
+    let mut image = read_executable(p, &exe_path)?;
+    for _ in 0..4 {
+        let Some((interp, arg)) = shebang(&image) else {
+            break;
+        };
+        let mut new_argv = alloc::vec![interp.clone()];
+        new_argv.extend(arg);
+        new_argv.push(exe_path.clone());
+        new_argv.extend(argv.iter().skip(1).cloned());
+        argv = new_argv;
+        exe_path = interp;
+        image = read_executable(p, &exe_path)?;
+    }
+    if shebang(&image).is_some() {
+        return Err(ELOOP);
+    }
     let interp = match loader::interp_path(&image).map_err(|_| ENOEXEC)? {
         Some(ld) => Some(read_executable(p, &ld)?),
         None => None,
@@ -107,7 +127,7 @@ pub(super) fn execve(
     mm.space().bind_to_current_task();
     drop(p.replace_mm(mm));
     p.group.actions.lock().exec_reset();
-    p.group.set_exec(&path, &argv_refs);
+    p.group.set_exec(&exe_path, &argv_refs);
     crate::signal::sync(p);
     *ctx = UserContext::new(loaded.entry, loaded.stack_pointer);
     Ok(())
@@ -129,4 +149,25 @@ fn read_executable(p: &LinuxProcess, path: &str) -> Result<Vec<u8>, i64> {
     let n = fs.read(ino, 0, &mut bytes)?;
     bytes.truncate(n);
     Ok(bytes)
+}
+
+/// Parses a `#!` line: the interpreter path and its optional single
+/// argument (Linux passes everything after the path as one argument).
+fn shebang(image: &[u8]) -> Option<(String, Option<String>)> {
+    let rest = image.strip_prefix(b"#!")?;
+    let line = &rest[..rest
+        .iter()
+        .position(|&b| b == b'\n')
+        .unwrap_or(rest.len())
+        .min(255)];
+    let line = core::str::from_utf8(line).ok()?.trim();
+    let (interp, arg) = match line.find([' ', '\t']) {
+        Some(i) => (&line[..i], Some(line[i..].trim())),
+        None => (line, None),
+    };
+    if interp.is_empty() {
+        return None;
+    }
+    let arg = arg.filter(|a| !a.is_empty()).map(String::from);
+    Some((String::from(interp), arg))
 }

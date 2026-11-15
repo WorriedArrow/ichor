@@ -67,6 +67,14 @@ pub enum Kind {
     CharDevice,
 }
 
+/// A timestamp (seconds and nanoseconds since the epoch the kernel's
+/// clock uses).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Time {
+    pub sec: u64,
+    pub nsec: u32,
+}
+
 /// What `stat` reports.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Stat {
@@ -79,6 +87,11 @@ pub struct Stat {
     /// Device number (`major << 8 | minor`, Linux's old encoding) of a
     /// character device; 0 otherwise.
     pub rdev: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub atime: Time,
+    pub mtime: Time,
+    pub ctime: Time,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -111,6 +124,28 @@ struct Inode<'a> {
     mode: u32,
     nlink: u32,
     opens: u32,
+    uid: u32,
+    gid: u32,
+    atime: Time,
+    mtime: Time,
+    ctime: Time,
+}
+
+impl<'a> Inode<'a> {
+    /// A new upper-layer inode, owned by root, all times `now`.
+    fn fresh(data: Data<'a>, mode: u32, nlink: u32, now: Time) -> Inode<'a> {
+        Inode {
+            data,
+            mode,
+            nlink,
+            opens: 0,
+            uid: 0,
+            gid: 0,
+            atime: now,
+            mtime: now,
+            ctime: now,
+        }
+    }
 }
 
 impl Inode<'_> {
@@ -128,6 +163,8 @@ impl Inode<'_> {
 #[derive(Debug)]
 pub struct Overlay<'a> {
     inodes: Vec<Option<Inode<'a>>>,
+    /// The clock that stamps changes (the kernel installs its own).
+    clock: fn() -> Time,
     free: Vec<Ino>,
     used_bytes: usize,
     max_bytes: usize,
@@ -148,12 +185,8 @@ fn from_lower<'a>(node: Node<'a>, parent: Ino) -> Inode<'a> {
         image::Kind::Directory => upper_dir(parent, Some(node)),
         image::Kind::Symlink => Data::Symlink(node.symlink_target().unwrap_or("").to_string()),
     };
-    Inode {
-        data,
-        mode: node.mode & 0o7777,
-        nlink: 1,
-        opens: 0,
-    }
+    // The image format records no owner or times yet: root, epoch.
+    Inode::fresh(data, node.mode & 0o7777, 1, Time::default())
 }
 
 fn check_name(name: &str) -> Result<(), i64> {
@@ -187,16 +220,70 @@ impl<'a> Overlay<'a> {
     /// An overlay with no lower layer (a `tmpfs`).
     pub fn empty(max_bytes: usize) -> Overlay<'a> {
         Overlay {
-            inodes: alloc::vec![Some(Inode {
-                data: upper_dir(ROOT, None),
-                mode: 0o755,
-                nlink: 2,
-                opens: 0,
-            })],
+            inodes: alloc::vec![Some(Inode::fresh(
+                upper_dir(ROOT, None),
+                0o755,
+                2,
+                Time::default()
+            ))],
             free: Vec::new(),
+            clock: || Time::default(),
             used_bytes: 0,
             max_bytes,
         }
+    }
+
+    /// Installs the clock that stamps modification and change times.
+    pub fn set_clock(&mut self, clock: fn() -> Time) {
+        self.clock = clock;
+    }
+
+    /// Marks `ino` modified (`mtime` and `ctime` now).
+    fn touch(&mut self, ino: Ino) {
+        let now = (self.clock)();
+        if let Ok(i) = self.get_mut(ino) {
+            i.mtime = now;
+            i.ctime = now;
+        }
+    }
+
+    /// Changes the owner (`None` leaves a field as it is), as `chown`.
+    pub fn chown(&mut self, ino: Ino, uid: Option<u32>, gid: Option<u32>) -> Result<(), i64> {
+        let now = (self.clock)();
+        let i = self.get_mut(ino)?;
+        if let Some(u) = uid {
+            i.uid = u;
+        }
+        if let Some(g) = gid {
+            i.gid = g;
+        }
+        i.ctime = now;
+        Ok(())
+    }
+
+    /// Sets access and modification times (`None` leaves one as it is), as
+    /// `utimensat`; the change time becomes now.
+    pub fn set_times(
+        &mut self,
+        ino: Ino,
+        atime: Option<Time>,
+        mtime: Option<Time>,
+    ) -> Result<(), i64> {
+        let now = (self.clock)();
+        let i = self.get_mut(ino)?;
+        if let Some(a) = atime {
+            i.atime = a;
+        }
+        if let Some(m) = mtime {
+            i.mtime = m;
+        }
+        i.ctime = now;
+        Ok(())
+    }
+
+    /// The current time by the installed clock.
+    pub fn now(&self) -> Time {
+        (self.clock)()
     }
 
     /// Bytes the upper layer holds.
@@ -327,6 +414,11 @@ impl<'a> Overlay<'a> {
                 i.nlink
             },
             rdev,
+            uid: i.uid,
+            gid: i.gid,
+            atime: i.atime,
+            mtime: i.mtime,
+            ctime: i.ctime,
         })
     }
 
@@ -402,6 +494,7 @@ impl<'a> Overlay<'a> {
         let old = v.len();
         v.resize(len, 0);
         self.used_bytes = used - old + len;
+        self.touch(ino);
         Ok(())
     }
 
@@ -427,12 +520,16 @@ impl<'a> Overlay<'a> {
         }
         v[off..end].copy_from_slice(data);
         self.used_bytes = used + grow;
+        self.touch(ino);
         Ok(data.len())
     }
 
     /// Changes permission bits.
     pub fn chmod(&mut self, ino: Ino, mode: u32) -> Result<(), i64> {
-        self.get_mut(ino)?.mode = mode & 0o7777;
+        let now = (self.clock)();
+        let i = self.get_mut(ino)?;
+        i.mode = mode & 0o7777;
+        i.ctime = now;
         Ok(())
     }
 
@@ -446,39 +543,25 @@ impl<'a> Overlay<'a> {
         self.dir_mut(dir)?
             .entries
             .insert(name.to_string(), Entry::Ino(ino));
+        self.touch(dir);
         Ok(ino)
     }
 
     /// Creates an empty file.
     pub fn create(&mut self, dir: Ino, name: &str, mode: u32) -> Result<Ino, i64> {
-        let inode = Inode {
-            data: Data::File(Vec::new()),
-            mode: mode & 0o7777,
-            nlink: 1,
-            opens: 0,
-        };
+        let inode = Inode::fresh(Data::File(Vec::new()), mode & 0o7777, 1, (self.clock)());
         self.add(dir, name, inode)
     }
 
     /// Creates an empty directory.
     pub fn mkdir(&mut self, dir: Ino, name: &str, mode: u32) -> Result<Ino, i64> {
-        let inode = Inode {
-            data: upper_dir(dir, None),
-            mode: mode & 0o7777,
-            nlink: 1,
-            opens: 0,
-        };
+        let inode = Inode::fresh(upper_dir(dir, None), mode & 0o7777, 1, (self.clock)());
         self.add(dir, name, inode)
     }
 
     /// Creates a character device node.
     pub fn mknod(&mut self, dir: Ino, name: &str, mode: u32, rdev: u32) -> Result<Ino, i64> {
-        let inode = Inode {
-            data: Data::Device(rdev),
-            mode: mode & 0o7777,
-            nlink: 1,
-            opens: 0,
-        };
+        let inode = Inode::fresh(Data::Device(rdev), mode & 0o7777, 1, (self.clock)());
         self.add(dir, name, inode)
     }
 
@@ -490,12 +573,7 @@ impl<'a> Overlay<'a> {
         if target.len() > PATH_MAX {
             return Err(ENAMETOOLONG);
         }
-        let inode = Inode {
-            data: Data::Symlink(target.to_string()),
-            mode: 0o777,
-            nlink: 1,
-            opens: 0,
-        };
+        let inode = Inode::fresh(Data::Symlink(target.to_string()), 0o777, 1, (self.clock)());
         self.add(dir, name, inode)
     }
 
@@ -509,6 +587,7 @@ impl<'a> Overlay<'a> {
         } else {
             d.entries.remove(name);
         }
+        self.touch(dir);
         Ok(())
     }
 
@@ -605,6 +684,9 @@ impl<'a> Overlay<'a> {
         if let Data::Dir(d) = &mut self.get_mut(src)?.data {
             d.parent = ndir;
         }
+        self.touch(ndir);
+        let now = (self.clock)();
+        self.get_mut(src)?.ctime = now;
         Ok(())
     }
 
@@ -920,6 +1002,37 @@ mod tests {
         assert!(fs.truncate(null, 0).is_ok());
         assert_eq!(fs.write(null, 0, b"x"), Err(EINVAL));
         assert_eq!(fs.readdir(dev).unwrap()[0].2, Kind::CharDevice);
+    }
+
+    #[test]
+    fn owners_and_times() {
+        let mut fs = Overlay::empty(1 << 20);
+        fs.set_clock(|| Time { sec: 100, nsec: 5 });
+        let d = fs.mkdir(ROOT, "d", 0o755).unwrap();
+        let f = fs.create(d, "f", 0o644).unwrap();
+        let st = fs.stat(f).unwrap();
+        assert_eq!(
+            (st.uid, st.gid, st.mtime.sec, st.ctime.nsec),
+            (0, 0, 100, 5)
+        );
+        assert_eq!(fs.stat(d).unwrap().mtime.sec, 100);
+        fs.chown(f, Some(1000), None).unwrap();
+        fs.set_times(
+            f,
+            Some(Time { sec: 7, nsec: 0 }),
+            Some(Time { sec: 8, nsec: 9 }),
+        )
+        .unwrap();
+        let st = fs.stat(f).unwrap();
+        assert_eq!(
+            (st.uid, st.gid, st.atime.sec, st.mtime.sec, st.mtime.nsec),
+            (1000, 0, 7, 8, 9)
+        );
+        fs.set_clock(|| Time { sec: 200, nsec: 0 });
+        fs.write(f, 0, b"x").unwrap();
+        assert_eq!(fs.stat(f).unwrap().mtime.sec, 200);
+        fs.unlink(d, "f").unwrap();
+        assert_eq!(fs.stat(d).unwrap().ctime.sec, 200);
     }
 
     #[test]

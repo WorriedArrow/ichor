@@ -38,6 +38,18 @@ pub fn _print(args: fmt::Arguments<'_>) {
     let _ = Serial.write_fmt(args);
 }
 
+/// Writes raw bytes to the console (no UTF-8 interpretation: user programs
+/// write arbitrary bytes), under one lock for the whole buffer.
+pub fn write_bytes(bytes: &[u8]) {
+    let _guard = CONSOLE.lock();
+    for &b in bytes {
+        if b == b'\n' {
+            early_console::write_byte(b'\r');
+        }
+        early_console::write_byte(b);
+    }
+}
+
 /// Writes to the console without taking the console lock. Used by the panic
 /// handler, which may run while the lock is held. Output may interleave with
 /// other CPUs.

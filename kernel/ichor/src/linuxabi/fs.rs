@@ -496,6 +496,16 @@ fn stat_bytes(ino: u64, mode: u32, nlink: u32, size: u64) -> [u8; 144] {
     st
 }
 
+/// Fills `st_uid`/`st_gid` and the three timestamps of a `struct stat`.
+fn put_owner_times(st: &mut [u8; 144], s: &Stat) {
+    st[28..32].copy_from_slice(&s.uid.to_le_bytes());
+    st[32..36].copy_from_slice(&s.gid.to_le_bytes());
+    for (off, t) in [(72, s.atime), (88, s.mtime), (104, s.ctime)] {
+        st[off..off + 8].copy_from_slice(&t.sec.to_le_bytes());
+        st[off + 8..off + 16].copy_from_slice(&u64::from(t.nsec).to_le_bytes());
+    }
+}
+
 fn to_stat(s: &Stat) -> [u8; 144] {
     let kind = match s.kind {
         Kind::File => S_IFREG,
@@ -505,6 +515,7 @@ fn to_stat(s: &Stat) -> [u8; 144] {
     };
     let mut st = stat_bytes(s.ino, kind | s.mode, s.nlink, s.size);
     st[40..48].copy_from_slice(&u64::from(s.rdev).to_le_bytes()); // st_rdev
+    put_owner_times(&mut st, s);
     st
 }
 
@@ -967,5 +978,186 @@ pub(super) fn pipe2(p: &mut LinuxProcess, fds: u64, flags: u64) -> Result<u64, i
         p.close(w);
         return Err(EFAULT);
     }
+    Ok(0)
+}
+
+/// The `struct statfs` (120 bytes) for the root, or `/proc` if `proc`.
+fn statfs_bytes(p: &LinuxProcess, proc: bool) -> [u8; 120] {
+    const PROC_SUPER_MAGIC: u64 = 0x9fa0;
+    const OVERLAYFS_SUPER_MAGIC: u64 = 0x794c_7630;
+    let (total, used) = p.vfs.space();
+    let blocks = (total / 4096) as u64;
+    let free = (total.saturating_sub(used) / 4096) as u64;
+    let mut b = [0u8; 120];
+    let mut put = |i: usize, v: u64| b[i * 8..i * 8 + 8].copy_from_slice(&v.to_le_bytes());
+    if proc {
+        put(0, PROC_SUPER_MAGIC);
+        put(1, 4096);
+    } else {
+        put(0, OVERLAYFS_SUPER_MAGIC);
+        put(1, 4096); // f_bsize
+        put(2, blocks); // f_blocks
+        put(3, free); // f_bfree
+        put(4, free); // f_bavail
+        put(5, 1 << 20); // f_files
+        put(6, 1 << 20); // f_ffree
+    }
+    put(8, 255); // f_namelen
+    put(9, 4096); // f_frsize
+    b
+}
+
+/// `statfs(path, buf)`.
+pub(super) fn statfs(p: &mut LinuxProcess, addr: u64, buf: u64) -> Result<u64, i64> {
+    let (start, path) = path_at(p, AT_FDCWD, addr)?;
+    let proc = match procfs::lookup(p, &path, true) {
+        Some(n) => {
+            n?;
+            true
+        }
+        None => {
+            p.vfs.lock().resolve(start, &path, true)?;
+            false
+        }
+    };
+    let b = statfs_bytes(p, proc);
+    if p.copy_to_user(buf, &b) != b.len() {
+        return Err(EFAULT);
+    }
+    Ok(0)
+}
+
+/// `fstatfs(fd, buf)`.
+pub(super) fn fstatfs(p: &mut LinuxProcess, fd: u64, buf: u64) -> Result<u64, i64> {
+    let f = p.fd(fd).ok_or(EBADF)?;
+    let proc = matches!(&f, Fd::Object(o) if o.obj.dir().is_some() || o.obj.mode() == 0o100_000);
+    let b = statfs_bytes(p, proc);
+    if p.copy_to_user(buf, &b) != b.len() {
+        return Err(EFAULT);
+    }
+    Ok(0)
+}
+
+/// `flock`: advisory locks are always granted (partial: there is no lock
+/// table yet, so this does not exclude other processes).
+pub(super) fn flock(p: &mut LinuxProcess, fd: u64, _op: u64) -> Result<u64, i64> {
+    p.fd(fd).ok_or(EBADF).map(|_| 0)
+}
+
+/// The inode a `*at` call names: `path` from `dirfd`, or `dirfd` itself
+/// for an empty path with `AT_EMPTY_PATH` (or a null path, as
+/// `utimensat` allows).
+fn inode_at(p: &mut LinuxProcess, dirfd: i64, addr: u64, flags: u64) -> Result<Ino, i64> {
+    let path = if addr == 0 {
+        alloc::string::String::new()
+    } else {
+        user_path(p, addr)?
+    };
+    if path.is_empty() {
+        if addr != 0 && flags & AT_EMPTY_PATH == 0 {
+            return Err(ENOENT);
+        }
+        return match p.fd(dirfd as u64).ok_or(EBADF)? {
+            Fd::File(f) => Ok(f.ino),
+            _ => Err(EINVAL),
+        };
+    }
+    let start = base(p, dirfd, &path)?;
+    p.vfs
+        .lock()
+        .resolve(start, &path, flags & AT_SYMLINK_NOFOLLOW == 0)
+}
+
+/// `chown`, `fchown`, `lchown`, `fchownat`. Every process in a cell is uid
+/// 0 for now (the identity-model ADR adds per-cell mapping and checks), and
+/// Linux lets root change any owner, so this records the owner.
+pub(super) fn chown(
+    p: &mut LinuxProcess,
+    dirfd: i64,
+    addr: u64,
+    uid: u64,
+    gid: u64,
+    flags: u64,
+) -> Result<u64, i64> {
+    let ino = inode_at(p, dirfd, addr, flags)?;
+    // -1 (as a 32-bit id) means "leave unchanged".
+    let id = |v: u64| (v as u32 != u32::MAX).then_some(v as u32);
+    p.vfs.lock().chown(ino, id(uid), id(gid))?;
+    Ok(0)
+}
+
+/// `fchown(fd, uid, gid)`.
+pub(super) fn fchown(p: &mut LinuxProcess, fd: u64, uid: u64, gid: u64) -> Result<u64, i64> {
+    chown(p, fd as i64, 0, uid, gid, AT_EMPTY_PATH)
+}
+
+/// Reads `struct timespec[2]` for `utimensat` (null: both now), honouring
+/// `UTIME_NOW` and `UTIME_OMIT`.
+fn read_times(
+    p: &mut LinuxProcess,
+    addr: u64,
+    micros: bool,
+) -> Result<[Option<overlay::Time>; 2], i64> {
+    const UTIME_NOW: u64 = (1 << 30) - 1;
+    const UTIME_OMIT: u64 = (1 << 30) - 2;
+    let now = crate::vfs::realtime();
+    if addr == 0 {
+        return Ok([Some(now), Some(now)]);
+    }
+    let mut b = [0u8; 32];
+    if p.copy_from_user(addr, &mut b) != 32 {
+        return Err(EFAULT);
+    }
+    let mut out = [None, None];
+    for (i, slot) in out.iter_mut().enumerate() {
+        let sec = u64::from_le_bytes(b[i * 16..i * 16 + 8].try_into().unwrap_or([0; 8]));
+        let frac = u64::from_le_bytes(b[i * 16 + 8..i * 16 + 16].try_into().unwrap_or([0; 8]));
+        if micros {
+            if frac >= 1_000_000 {
+                return Err(EINVAL);
+            }
+            *slot = Some(overlay::Time {
+                sec,
+                nsec: (frac * 1000) as u32,
+            });
+            continue;
+        }
+        *slot = match frac {
+            UTIME_NOW => Some(now),
+            UTIME_OMIT => None,
+            n if n < 1_000_000_000 => Some(overlay::Time {
+                sec,
+                nsec: n as u32,
+            }),
+            _ => return Err(EINVAL),
+        };
+    }
+    Ok(out)
+}
+
+/// `utimensat(dirfd, path, times, flags)`.
+pub(super) fn utimensat(
+    p: &mut LinuxProcess,
+    dirfd: i64,
+    addr: u64,
+    times: u64,
+    flags: u64,
+) -> Result<u64, i64> {
+    let [a, m] = read_times(p, times, false)?;
+    let ino = inode_at(p, dirfd, addr, flags | AT_EMPTY_PATH)?;
+    p.vfs.lock().set_times(ino, a, m)?;
+    Ok(0)
+}
+
+/// `futimesat(dirfd, path, timeval[2])` and `utimes(path, timeval[2])`.
+pub(super) fn futimesat(
+    p: &mut LinuxProcess,
+    dirfd: i64,
+    addr: u64,
+    times: u64,
+) -> Result<u64, i64> {
+    let [a, m] = read_times(p, times, true)?;
+    let ino = inode_at(p, dirfd, addr, 0)?;
+    p.vfs.lock().set_times(ino, a, m)?;
     Ok(0)
 }

@@ -144,6 +144,9 @@ fn cmd_test(o: &Opts) -> Result<()> {
     let kernel = build::kernel(o.profile)?;
     xtask::artifact::BUSYBOX.bytes()?;
     xtask::artifact::ALPINE_MINIROOTFS.bytes()?;
+    for a in xtask::artifact::ALPINE_PACKAGES {
+        a.bytes()?;
+    }
     let mut cmd = cargo();
     cmd.args(["test", "--package", "ichor-tests"]);
     if std::env::var_os("ICHOR_TEST_VERBOSE").is_some() {

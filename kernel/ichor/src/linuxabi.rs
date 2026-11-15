@@ -61,6 +61,7 @@ mod nr {
     pub(super) const KILL: u64 = 62; // partial: pid > 0 only (no process groups)
     pub(super) const UNAME: u64 = 63;
     pub(super) const FCNTL: u64 = 72; // partial: F_DUPFD, F_GETFD/SETFD, F_GETFL/SETFL
+    pub(super) const FLOCK: u64 = 73; // partial: always granted (no lock table yet)
     pub(super) const FSYNC: u64 = 74; // partial: the upper layer is memory
     pub(super) const FDATASYNC: u64 = 75; // partial: the upper layer is memory
     pub(super) const TRUNCATE: u64 = 76;
@@ -77,6 +78,9 @@ mod nr {
     pub(super) const READLINK: u64 = 89;
     pub(super) const CHMOD: u64 = 90;
     pub(super) const FCHMOD: u64 = 91;
+    pub(super) const CHOWN: u64 = 92; // partial: recorded; every process is uid 0 (no checks yet)
+    pub(super) const FCHOWN: u64 = 93; // partial: recorded; every process is uid 0 (no checks yet)
+    pub(super) const LCHOWN: u64 = 94; // partial: recorded; every process is uid 0 (no checks yet)
     pub(super) const UMASK: u64 = 95;
     pub(super) const GETTIMEOFDAY: u64 = 96; // partial: time since boot (no RTC yet)
     pub(super) const GETRLIMIT: u64 = 97;
@@ -92,6 +96,10 @@ mod nr {
     pub(super) const GETSID: u64 = 124; // stub: the pid
     pub(super) const RT_SIGSUSPEND: u64 = 130;
     pub(super) const SIGALTSTACK: u64 = 131; // stub: no alternate stacks yet
+    pub(super) const MOUNT: u64 = 165; // partial: always EPERM (cells cannot mount)
+    pub(super) const UMOUNT2: u64 = 166; // partial: always EPERM (cells cannot mount)
+    pub(super) const STATFS: u64 = 137;
+    pub(super) const FSTATFS: u64 = 138;
     pub(super) const ARCH_PRCTL: u64 = 158; // partial: ARCH_SET_FS only
     pub(super) const GETTID: u64 = 186;
     pub(super) const TKILL: u64 = 200;
@@ -101,14 +109,17 @@ mod nr {
     pub(super) const SET_TID_ADDRESS: u64 = 218;
     pub(super) const CLOCK_GETTIME: u64 = 228; // partial: every clock counts from boot
     pub(super) const CLOCK_NANOSLEEP: u64 = 230; // partial: relative sleeps only
+    pub(super) const UTIMES: u64 = 235;
     pub(super) const EXIT_GROUP: u64 = 231;
     pub(super) const EPOLL_WAIT: u64 = 232;
     pub(super) const EPOLL_CTL: u64 = 233; // partial: EPOLLET is level-triggered
     pub(super) const TGKILL: u64 = 234;
     pub(super) const OPENAT: u64 = 257;
     pub(super) const MKDIRAT: u64 = 258;
+    pub(super) const FCHOWNAT: u64 = 260; // partial: recorded; every process is uid 0 (no checks yet)
     pub(super) const NEWFSTATAT: u64 = 262;
     pub(super) const UNLINKAT: u64 = 263;
+    pub(super) const FUTIMESAT: u64 = 261;
     pub(super) const RENAMEAT: u64 = 264;
     pub(super) const SYMLINKAT: u64 = 266;
     pub(super) const READLINKAT: u64 = 267;
@@ -117,6 +128,7 @@ mod nr {
     pub(super) const PPOLL: u64 = 271; // partial: the signal mask is ignored
     pub(super) const FACCESSAT: u64 = 269; // partial: existence only (every process is root)
     pub(super) const SET_ROBUST_LIST: u64 = 273; // stub: robust lists are not walked at exit
+    pub(super) const UTIMENSAT: u64 = 280;
     pub(super) const EPOLL_PWAIT: u64 = 281; // partial: the signal mask is ignored
     pub(super) const EVENTFD: u64 = 284;
     pub(super) const EVENTFD2: u64 = 290;
@@ -200,6 +212,17 @@ pub(crate) fn dispatch(p: &mut LinuxProcess, ctx: &mut frame::user::UserContext)
         nr::FCHDIR => fs::fchdir(p, a[0]),
         nr::GETCWD => fs::getcwd(p, a[0], a[1]),
         nr::UMASK => fs::umask(p, a[0]),
+        nr::CHOWN => fs::chown(p, AT_FDCWD, a[0], a[1], a[2], 0),
+        nr::LCHOWN => fs::chown(p, AT_FDCWD, a[0], a[1], a[2], 0x100),
+        nr::FCHOWN => fs::fchown(p, a[0], a[1], a[2]),
+        nr::FCHOWNAT => fs::chown(p, i(a[0]), a[1], a[2], a[3], a[4]),
+        nr::UTIMENSAT => fs::utimensat(p, i(a[0]), a[1], a[2], a[3]),
+        nr::FUTIMESAT => fs::futimesat(p, i(a[0]), a[1], a[2]),
+        nr::UTIMES => fs::futimesat(p, AT_FDCWD, a[0], a[1]),
+        nr::MOUNT | nr::UMOUNT2 => Err(EPERM),
+        nr::FLOCK => fs::flock(p, a[0], a[1]),
+        nr::STATFS => fs::statfs(p, a[0], a[1]),
+        nr::FSTATFS => fs::fstatfs(p, a[0], a[1]),
         nr::GETRANDOM => getrandom(p, a[0], a[1] as usize),
         // Readiness.
         nr::POLL => crate::poll::poll(p, a[0], a[1], i(a[2])),
@@ -317,11 +340,8 @@ fn console_write(p: &mut LinuxProcess, buf: u64, count: usize) -> usize {
         if got == 0 {
             break;
         }
-        for &b in &chunk[..got] {
-            // The console is byte-oriented; print each byte as a char so
-            // invalid UTF-8 cannot stop the stream.
-            frame::print!("{}", char::from(b));
-        }
+        // The console is byte-oriented: bytes go out as they are.
+        frame::console::write_bytes(&chunk[..got]);
         written += got;
     }
     written
@@ -340,9 +360,7 @@ fn getrandom(p: &mut LinuxProcess, buf: u64, len: usize) -> Result<u64, i64> {
 
 /// Prints kernel-held bytes to the console.
 fn console_bytes(b: &[u8]) {
-    for &c in b {
-        frame::print!("{}", char::from(c));
-    }
+    frame::console::write_bytes(b);
 }
 
 fn le_u64(b: &[u8]) -> u64 {

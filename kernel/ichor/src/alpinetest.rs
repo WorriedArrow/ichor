@@ -21,6 +21,17 @@ const CELL_PAGES: u64 = 8192;
 /// `(argv, expected exit code)`. argv[0] selects the busybox applet.
 const RUNS: &[(&[&str], i32)] = &[
     (&["cat", "/etc/alpine-release"], 0),
+    (
+        &[
+            "sh",
+            "-c",
+            "apk add --no-network /mirror/tree-2.1.1-r0.apk /mirror/oniguruma-6.9.9-r0.apk \
+             /mirror/jq-1.7.1-r0.apk && apk info -e tree jq oniguruma >/dev/null && \
+             tree /etc/apk >/dev/null && [ \"$(echo '{\"a\":[1,2,3]}' | jq '.a|add')\" = 6 ] && \
+             echo alpine: apk installed tree and jq from the local mirror",
+        ],
+        0,
+    ),
     (&["sh", "-c", "echo alpine sh: $((2+3))"], 0),
     (
         &[

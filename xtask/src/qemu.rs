@@ -355,6 +355,10 @@ pub fn alpine_image() -> Result<Vec<u8>> {
     let tar = crate::inflate::gunzip(&tgz)?;
     let mut t = crate::rootfs::Tree::new();
     t.add_tar(&tar)?;
+    // A local package mirror for `apk`.
+    for a in crate::artifact::ALPINE_PACKAGES {
+        t.add_file(&format!("/mirror/{}", a.file), &a.bytes()?, 0o644)?;
+    }
     Ok(t.image())
 }
 

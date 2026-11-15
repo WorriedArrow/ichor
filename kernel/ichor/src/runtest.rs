@@ -62,7 +62,11 @@ const MOTD: &[u8] = b"hello from /etc/motd inside an Ichor image\n";
 const HELLO: &[u8] = b"hello from a real Linux ELF running on Ichor\n";
 
 /// The environment every test program gets.
-const ENVP: &[&str] = &["PATH=/bin:/usr/bin", "HOME=/", "TERM=dumb"];
+const ENVP: &[&str] = &[
+    "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    "HOME=/root",
+    "TERM=dumb",
+];
 
 /// Loads `elf` into `p` with `argv`, runs it to exit (on this task; any
 /// children it forks run on their own), and checks that all of the cell's

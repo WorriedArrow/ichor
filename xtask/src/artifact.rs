@@ -97,6 +97,38 @@ pub const BUSYBOX: Artifact = Artifact {
     env: "ICHOR_BUSYBOX",
 };
 
+/// An official Alpine 3.20 `main` package (signed by Alpine's keys, which
+/// the minirootfs trusts). Branch packages are replaced on updates, so the
+/// cached copy (and CI's cache) is what keeps these reproducible.
+const fn alpine_pkg(file: &'static str, url: &'static str, sha256: &'static str) -> Artifact {
+    Artifact {
+        dir: "alpine-pkgs/3.20",
+        file,
+        url,
+        sha256,
+        env: "ICHOR_ALPINE_PKGS_UNUSED",
+    }
+}
+
+/// Packages put in the Alpine disk's `/mirror` for `apk` to install.
+pub const ALPINE_PACKAGES: &[Artifact] = &[
+    alpine_pkg(
+        "tree-2.1.1-r0.apk",
+        "https://dl-cdn.alpinelinux.org/alpine/v3.20/main/x86_64/tree-2.1.1-r0.apk",
+        "538045ec484b1f4edd758c7f33fa53aea488372fbdf2d35998d6f2e87f59f7af",
+    ),
+    alpine_pkg(
+        "oniguruma-6.9.9-r0.apk",
+        "https://dl-cdn.alpinelinux.org/alpine/v3.20/main/x86_64/oniguruma-6.9.9-r0.apk",
+        "209d7404cf17adecc8ce966afaa5806b896ae12d165c8f1747e7da15df876f71",
+    ),
+    alpine_pkg(
+        "jq-1.7.1-r0.apk",
+        "https://dl-cdn.alpinelinux.org/alpine/v3.20/main/x86_64/jq-1.7.1-r0.apk",
+        "219edabad0ef4250055d23df237b8d8103015a855e75367951c14314f833c507",
+    ),
+];
+
 /// Alpine Linux 3.20.3 minirootfs (x86-64). The hash matches Alpine's
 /// published `.sha256` for this release.
 pub const ALPINE_MINIROOTFS: Artifact = Artifact {
