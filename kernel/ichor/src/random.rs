@@ -10,7 +10,9 @@
 //! long and each piece's key is erased before the next.
 //!
 //! Credit: 64 bits per RDSEED word and per virtio-rng 8 bytes; 32 bits per
-//! RDRAND word (a DRBG output, so counted at half). The generator is
+//! RDRAND word (a DRBG output, so counted at half). CPU words that look
+//! stuck (a zero or all-ones word, or a repeat) are mixed in but earn no
+//! credit. The generator is
 //! seeded once 256 bits are credited; if no source gave that much at boot,
 //! [`seeded`] stays false and `getrandom` refuses callers that did not ask
 //! for `GRND_INSECURE`.
@@ -39,10 +41,15 @@ pub(crate) fn init() {
     let mut cpu = alloc::string::String::from("no RDSEED/RDRAND");
     let mut w = [0u64; 8];
     if let Some((src, n)) = frame::entropy::hardware_random(&mut w) {
-        let per = if src == Source::Rdseed { 64 } else { 32 };
-        cpu_bits = per * n as u32;
-        g.absorb(&words_to_bytes(&w[..n]), cpu_bits);
-        cpu = alloc::format!("{src:?} {cpu_bits} bits");
+        let words = &w[..n];
+        if plausible(words) {
+            let per = if src == Source::Rdseed { 64 } else { 32 };
+            cpu_bits = per * n as u32;
+            cpu = alloc::format!("{src:?} {cpu_bits} bits");
+        } else {
+            cpu = alloc::format!("{src:?} looks stuck, not credited");
+        }
+        g.absorb(&words_to_bytes(words), cpu_bits);
     }
     let mut rng_bits = 0u32;
     let rng = match virtio_rng::probe() {
@@ -67,6 +74,19 @@ pub(crate) fn init() {
             cpu_bits + rng_bits
         );
     }
+}
+
+/// Whether hardware words look like they could be random: none all-zero or
+/// all-ones, and no two equal. Broken RDRAND implementations have returned
+/// a constant (some returned all-ones after a resume); a working one
+/// repeats a 64-bit word with negligible probability.
+fn plausible(words: &[u64]) -> bool {
+    !words.is_empty()
+        && words.iter().all(|&w| w != 0 && w != u64::MAX)
+        && words
+            .iter()
+            .enumerate()
+            .all(|(i, a)| words[i + 1..].iter().all(|b| a != b))
 }
 
 /// Whether the generator was seeded with enough entropy.
