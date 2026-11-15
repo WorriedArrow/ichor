@@ -51,6 +51,7 @@ impl DmaBuf {
     pub fn alloc(len: usize) -> Option<DmaBuf> {
         let pages = (len as u64).div_ceil(PAGE_SIZE).max(1);
         let order = pages.next_power_of_two().trailing_zeros();
+        page_alloc::note_request(order);
         if order > u32::from(buddy::MAX_ORDER) {
             return None;
         }

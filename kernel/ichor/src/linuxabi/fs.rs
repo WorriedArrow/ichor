@@ -480,26 +480,6 @@ pub(super) fn fsync(p: &mut LinuxProcess, fd: u64) -> Result<u64, i64> {
     p.fd(fd).ok_or(EBADF).map(|_| 0)
 }
 
-/// Reads `len` bytes of `fd` from `offset` (for private file mappings).
-pub(super) fn file_bytes(
-    p: &mut LinuxProcess,
-    fd: u64,
-    offset: u64,
-    len: u64,
-) -> Result<Vec<u8>, i64> {
-    let f = file(p, fd).map_err(|_| EBADF)?;
-    let fs = p.vfs.lock();
-    let st = fs.stat(f.ino)?;
-    if st.kind != Kind::File {
-        return Err(19); // ENODEV
-    }
-    let n = st.size.saturating_sub(offset).min(len);
-    let mut v = alloc::vec![0u8; usize::try_from(n).map_err(|_| EINVAL)?];
-    let got = fs.read(f.ino, offset, &mut v)?;
-    v.truncate(got);
-    Ok(v)
-}
-
 // ---------------------------------------------------------------------------
 // stat.
 // ---------------------------------------------------------------------------

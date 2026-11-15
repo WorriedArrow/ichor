@@ -19,7 +19,7 @@ stale. Do not edit by hand.
 | 6 | `lstat` | implemented |  |
 | 7 | `poll` | implemented |  |
 | 8 | `lseek` | implemented |  |
-| 9 | `mmap` | partial | shared file mappings are read-only snapshots |
+| 9 | `mmap` | partial | shared file mappings are read-only and see a page as of its first touch |
 | 10 | `mprotect` | implemented |  |
 | 11 | `munmap` | implemented |  |
 | 12 | `brk` | implemented |  |

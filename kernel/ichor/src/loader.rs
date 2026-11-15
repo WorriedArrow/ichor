@@ -18,6 +18,7 @@ use elf::{LoadPlan, Machine};
 use frame::mm::{PAGE_SIZE, UFrame, UserProt};
 use vma::Prot;
 
+use crate::file::File;
 use crate::umem::Mm;
 
 /// A loaded program ready to run.
@@ -81,23 +82,47 @@ const PIE_BASE: u64 = 0x5555_5555_4000;
 
 /// The interpreter (`PT_INTERP`) `image` asks for, if any: the path the
 /// caller must read and pass to [`load`].
-pub(crate) fn interp_path(image: &[u8]) -> Result<Option<String>, LoadError> {
-    let plan = elf::parse(image).map_err(LoadError::Elf)?;
+pub(crate) fn interp_path(image: &dyn File) -> Result<Option<String>, LoadError> {
+    let plan = parse(image)?;
     let Some((off, len)) = plan.interp else {
         return Ok(None);
     };
-    let bytes = image
-        .get(off as usize..(off + len) as usize)
-        .ok_or(LoadError::Elf(elf::Error::BadSegment))?;
-    let path = core::str::from_utf8(bytes).map_err(|_| LoadError::Dynamic)?;
+    let len = usize::try_from(len)
+        .map_err(|_| LoadError::Dynamic)?
+        .min(4096);
+    let mut bytes = alloc::vec![0u8; len];
+    if image.read_at(off, &mut bytes) != len {
+        return Err(LoadError::Elf(elf::Error::BadSegment));
+    }
+    while bytes.last() == Some(&0) {
+        bytes.pop();
+    }
+    let path = core::str::from_utf8(&bytes).map_err(|_| LoadError::Dynamic)?;
     Ok(Some(String::from(path)))
 }
 
+/// Bytes of an image read to parse its headers.
+const HEAD: usize = 64 << 10;
+
+/// The image's first bytes (its ELF and program headers).
+fn head(image: &dyn File) -> alloc::vec::Vec<u8> {
+    let n = usize::try_from(image.size()).unwrap_or(HEAD).min(HEAD);
+    let mut v = alloc::vec![0u8; n];
+    let got = image.read_at(0, &mut v);
+    v.truncate(got);
+    v
+}
+
 /// Maps `plan`'s segments at `bias` into `mm`; returns the end of the
-/// highest page.
-fn map_image(mm: &mut Mm, plan: &LoadPlan, image: &[u8], bias: u64) -> Result<u64, LoadError> {
+/// highest page. A page that lies wholly within one segment's file bytes
+/// at a page-aligned file offset maps the page cache's copy of the file
+/// page copy-on-write when there is one; every other page is a fresh page
+/// the segment bytes are copied into.
+fn map_image(mm: &mut Mm, plan: &LoadPlan, image: &dyn File, bias: u64) -> Result<u64, LoadError> {
     // Every page the image touches, with the union of its segments' access.
     let mut pages: BTreeMap<u64, Prot> = BTreeMap::new();
+    // How many segments touch each page (a shared page is always copied).
+    let mut users: BTreeMap<u64, u32> = BTreeMap::new();
     let mut image_end = 0;
     let segs: Vec<elf::Segment> = plan
         .segments()
@@ -116,6 +141,7 @@ fn map_image(mm: &mut Mm, plan: &LoadPlan, image: &[u8], bias: u64) -> Result<u6
         image_end = image_end.max(end);
         let mut va = start;
         while va < end {
+            *users.entry(va).or_insert(0) += 1;
             let p = pages.entry(va).or_insert(Prot::NONE);
             p.read |= seg.flags.read;
             p.write |= seg.flags.write;
@@ -127,6 +153,20 @@ fn map_image(mm: &mut Mm, plan: &LoadPlan, image: &[u8], bias: u64) -> Result<u6
     for (&va, &prot) in &pages {
         if !mm.reserve(va, va + PAGE_SIZE, prot) {
             return Err(LoadError::Map);
+        }
+        // A whole file page: share the cache's copy.
+        let whole = segs.iter().find_map(|seg| {
+            let off = seg.file_offset + va.checked_sub(seg.vaddr)?;
+            let inside = va >= seg.vaddr && va + PAGE_SIZE <= seg.vaddr + seg.file_size;
+            (inside && off.is_multiple_of(PAGE_SIZE)).then_some(off / PAGE_SIZE)
+        });
+        if users.get(&va) == Some(&1)
+            && let Some(f) = whole.and_then(|i| image.cached_page(i))
+        {
+            if !mm.map_cow(va, f, prot) {
+                return Err(LoadError::OutOfMemory);
+            }
+            continue;
         }
         let frame = mm.frame(va).ok_or(LoadError::OutOfMemory)?;
         frames.insert(va, frame);
@@ -155,8 +195,8 @@ fn map_image(mm: &mut Mm, plan: &LoadPlan, image: &[u8], bias: u64) -> Result<u6
     Ok(image_end)
 }
 
-fn parse(image: &[u8]) -> Result<LoadPlan, LoadError> {
-    let plan: LoadPlan = elf::parse(image).map_err(LoadError::Elf)?;
+fn parse(image: &dyn File) -> Result<LoadPlan, LoadError> {
+    let plan: LoadPlan = elf::parse_head(&head(image), image.size()).map_err(LoadError::Elf)?;
     if plan.machine != Machine::X86_64 {
         return Err(LoadError::WrongArch);
     }
@@ -181,8 +221,8 @@ struct Aux {
 /// `AT_BASE`), as on Linux.
 pub(crate) fn load(
     mm: &mut Mm,
-    image: &[u8],
-    interp: Option<&[u8]>,
+    image: &dyn File,
+    interp: Option<&dyn File>,
     argv: &[&str],
     envp: &[&str],
     stack_limit: u64,
@@ -229,7 +269,7 @@ pub(crate) fn load(
 
 /// Copies the file bytes of `seg` that fall within the page at `va` into
 /// `frame` at the right offset.
-fn copy_segment_page(image: &[u8], seg: &elf::Segment, va: u64, frame: &UFrame) {
+fn copy_segment_page(image: &dyn File, seg: &elf::Segment, va: u64, frame: &UFrame) {
     let page_end = va + PAGE_SIZE;
     // The segment's file-backed virtual range is [vaddr, vaddr+file_size).
     let file_vend = seg.vaddr + seg.file_size;
@@ -239,13 +279,13 @@ fn copy_segment_page(image: &[u8], seg: &elf::Segment, va: u64, frame: &UFrame) 
         return; // All .bss on this page.
     }
     let in_page = (copy_start - va) as usize;
-    let in_file = (seg.file_offset + (copy_start - seg.vaddr)) as usize;
+    let in_file = seg.file_offset + (copy_start - seg.vaddr);
     let len = (copy_end - copy_start) as usize;
-    if let Some(bytes) = image.get(in_file..in_file + len) {
-        let mut w = frame.writer();
-        w.skip(in_page);
-        w.write(bytes);
-    }
+    let mut bytes = alloc::vec![0u8; len];
+    let n = image.read_at(in_file, &mut bytes);
+    let mut w = frame.writer();
+    w.skip(in_page);
+    w.write(&bytes[..n]);
 }
 
 /// 16 bytes for `AT_RANDOM` (the libc's stack-protector canary and pointer

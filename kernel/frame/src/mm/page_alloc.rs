@@ -13,6 +13,14 @@ use crate::sync::SpinLock;
 const ONE_MIB: u64 = 1 << 20;
 
 static BUDDY: SpinLock<Buddy> = SpinLock::new(Buddy::new(0));
+/// The largest order any contiguous request has asked for, served or not
+/// (page allocator, large heap allocations, DMA buffers).
+static LARGEST_REQUEST: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Records a contiguous request of `2^order` pages (see [`MemStats`]).
+pub(crate) fn note_request(order: u32) {
+    LARGEST_REQUEST.fetch_max(order, Relaxed);
+}
 
 struct Links(&'static [PageMeta]);
 
@@ -117,6 +125,7 @@ pub(crate) fn init(regions: &[MemoryRegion], reserved: (u64, u64)) {
 /// Allocates `2^order` contiguous pages, marking them with `tag`
 /// (`kind::ALLOCATED` or `kind::SLAB`).
 pub(crate) fn alloc(order: u8, tag: u8) -> Option<PhysAddr> {
+    note_request(u32::from(order));
     let metas = meta::all();
     let pfn = BUDDY.lock().alloc(&mut Links(metas), order)?;
     let block = metas.get(pfn..pfn + (1 << order))?;
@@ -176,6 +185,9 @@ pub struct MemStats {
     pub total_pages: usize,
     /// Pages currently free.
     pub free_pages: usize,
+    /// The largest order (`2^order` pages) any contiguous request has asked
+    /// for since boot, including ones refused for exceeding `MAX_ORDER`.
+    pub largest_request_order: u32,
 }
 
 /// Current physical memory statistics.
@@ -184,5 +196,6 @@ pub fn stats() -> MemStats {
     MemStats {
         total_pages: b.total_pages(),
         free_pages: b.free_pages(),
+        largest_request_order: LARGEST_REQUEST.load(Relaxed),
     }
 }

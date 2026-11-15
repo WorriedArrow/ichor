@@ -28,9 +28,8 @@ pub(crate) fn run() {
             fail("virtio-blk init")
         });
         let m = mount("virtio-blk", d);
-        let vfs = Arc::new(
-            Vfs::mount(m.metadata, m.disk).unwrap_or_else(|_| fail("disk is not an Ichor image")),
-        );
+        let vfs =
+            Arc::new(Vfs::mount_disk(&m).unwrap_or_else(|_| fail("disk is not an Ichor image")));
         // A disk carrying a distribution's userland is a container root.
         let is_alpine = vfs
             .lock()
@@ -52,17 +51,19 @@ pub(crate) fn run() {
             println!("ichor: blk: nvme block size {} bytes", d.block_size());
             let m = mount("nvme", d);
             let vfs = Arc::new(
-                Vfs::mount(m.metadata, m.disk)
-                    .unwrap_or_else(|_| fail("disk is not an Ichor image")),
+                Vfs::mount_disk(&m).unwrap_or_else(|_| fail("disk is not an Ichor image")),
             );
             exercise("nvme", &m, vfs);
         }
     }
     tampering();
-    let (pages, hits, misses, shared) = pagecache::stats();
+    let (pages, hits, misses, shared, mapped) = pagecache::stats();
     println!(
-        "ichor: pagecache: {pages} pages, {misses} chunks read and verified, {hits} hits ({shared} on pages another disk filled)"
+        "ichor: pagecache: {pages} pages, {misses} chunks read and verified, {hits} hits ({shared} on pages another disk filled), {mapped} mapped copy-on-write into processes"
     );
+    if mapped == 0 {
+        fail("no executable or library page was mapped from the page cache");
+    }
 }
 
 /// Mounts a disk's image: metadata read and checked against the root hash
@@ -154,7 +155,7 @@ fn tampering() {
     let mut data_bad = padded(good.to_vec());
     data_bad[motd.offset as usize] ^= 0x20;
     let m = pagecache::mount_disk(MemDisk(data_bad)).unwrap_or_else(|_| fail("mount"));
-    let vfs = Vfs::mount(m.metadata, m.disk).unwrap_or_else(|_| fail("tampered-data image"));
+    let vfs = Vfs::mount_disk(&m).unwrap_or_else(|_| fail("tampered-data image"));
     let mut fs = vfs.lock();
     let ino = fs
         .resolve(crate::vfs::ROOT, "/usr/share/motd", true)

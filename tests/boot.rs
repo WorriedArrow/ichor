@@ -117,6 +117,7 @@ fn m1_boots_on_four_cpus() {
         "ichor: blk: cat read /etc/motd from the nvme disk",
         "ichor: blk: tampered metadata is refused at mount; a tampered chunk reads as EIO",
         "ichor: pagecache: ",
+        "ichor: memory: largest contiguous request 2^",
         "ichor: boot complete; halting",
     ]);
     // Every page the heap self-test used came back.
@@ -218,6 +219,7 @@ fn m1_boots_on_one_cpu() {
         "ichor: blk: cat read /etc/motd from the nvme disk",
         "ichor: blk: tampered metadata is refused at mount; a tampered chunk reads as EIO",
         "ichor: pagecache: ",
+        "ichor: memory: largest contiguous request 2^",
         "ichor: boot complete; halting",
     ]);
 }
@@ -299,6 +301,7 @@ fn m2_scheduler_on_eight_cpus() {
         "ichor: blk: cat read /etc/motd from the nvme disk",
         "ichor: blk: tampered metadata is refused at mount; a tampered chunk reads as EIO",
         "ichor: pagecache: ",
+        "ichor: memory: largest contiguous request 2^",
         "ichor: boot complete; halting",
     ]);
 }

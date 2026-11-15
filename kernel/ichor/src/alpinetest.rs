@@ -163,7 +163,7 @@ pub(crate) fn run(vfs: &Arc<Vfs>) {
         String::from_utf8_lossy(&release).trim()
     );
     let busybox = read(vfs, "/bin/busybox");
-    let interp_path = match loader::interp_path(&busybox) {
+    let interp_path = match loader::interp_path(&crate::file::Bytes(&busybox)) {
         Ok(Some(p)) => p,
         _ => fail("alpine: /bin/busybox is not dynamically linked"),
     };

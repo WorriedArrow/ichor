@@ -40,6 +40,9 @@ pub fn activate_kernel_space() {
 }
 pub use crate::arch::paging::{MapError, UserProt};
 
+/// The largest contiguous block is `2^MAX_ORDER` pages.
+pub const MAX_ORDER: u8 = buddy::MAX_ORDER;
+
 /// Size of a base page on every architecture Ichor supports.
 pub const PAGE_SIZE: u64 = 4096;
 

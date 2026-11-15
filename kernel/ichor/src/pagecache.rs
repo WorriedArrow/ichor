@@ -10,9 +10,10 @@
 //! returns wrong bytes yields EIO instead of corrupt data.
 //!
 //! The cache is global and bounded ([`CAPACITY`] pages) with clock
-//! eviction. Partial: its pages are not charged to the cells that read
-//! them, and readers copy out of it; mapping cached pages into processes
-//! (exec, mmap) is the next step.
+//! eviction. The loader and file mappings map cached pages into processes
+//! copy-on-write (see `file.rs`), so a library or executable that many
+//! processes run shares one physical copy. Partial: cache pages are not
+//! charged to the cells that read them.
 
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, VecDeque};
@@ -26,8 +27,9 @@ use image::{CHUNK_SIZE, ChunkSource, Error, Extent, Hash};
 
 /// Most pages the cache holds (32 MiB).
 pub(crate) const CAPACITY: usize = 8192;
-/// Largest image metadata read at mount.
-const MAX_METADATA: usize = 16 << 20;
+/// Largest image metadata read at mount: one contiguous buffer, so at most
+/// the allocator's largest block (4 MiB, enough for ~80,000 files).
+const MAX_METADATA: usize = 4 << 20;
 
 struct Entry {
     frame: UFrame,
@@ -48,15 +50,18 @@ static CACHE: Mutex<Cache> = Mutex::new(Cache {
 static HITS: AtomicU64 = AtomicU64::new(0);
 static MISSES: AtomicU64 = AtomicU64::new(0);
 static SHARED: AtomicU64 = AtomicU64::new(0);
+static MAPPED: AtomicU64 = AtomicU64::new(0);
 static NEXT_DISK: AtomicU64 = AtomicU64::new(1);
 
-/// `(pages cached, hits, misses, hits on a page another disk filled)`.
-pub(crate) fn stats() -> (usize, u64, u64, u64) {
+/// `(pages cached, hits, misses, hits on a page another disk filled,
+/// pages handed out to be mapped into processes)`.
+pub(crate) fn stats() -> (usize, u64, u64, u64, u64) {
     (
         CACHE.lock().map.len(),
         HITS.load(Ordering::Relaxed),
         MISSES.load(Ordering::Relaxed),
         SHARED.load(Ordering::Relaxed),
+        MAPPED.load(Ordering::Relaxed),
     )
 }
 
@@ -131,6 +136,15 @@ impl Disk {
         MISSES.fetch_add(1, Ordering::Relaxed);
         insert(ext.hash, frame.clone(), self.id);
         Ok(frame)
+    }
+}
+
+/// The verified cache page for chunk `ext` of `disk`, filling it if needed.
+pub(crate) fn frame(disk: &Disk, ext: &Extent) -> Result<UFrame, Error> {
+    MAPPED.fetch_add(1, Ordering::Relaxed);
+    match lookup(&ext.hash, disk.id) {
+        Some(f) => Ok(f),
+        None => disk.fill(ext),
     }
 }
 

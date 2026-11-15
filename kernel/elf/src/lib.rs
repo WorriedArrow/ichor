@@ -132,9 +132,16 @@ impl LoadPlan {
     }
 }
 
-/// Parses an ELF64 image into a load plan. `len` is the full image length so
-/// that segment extents can be validated against it.
+/// Parses an ELF64 image into a load plan.
 pub fn parse(image: &[u8]) -> Result<LoadPlan, Error> {
+    parse_head(image, image.len() as u64)
+}
+
+/// Parses a load plan from the first bytes of an image (`head`, which must
+/// hold the ELF and program headers) whose full length is `file_len`;
+/// segment extents are checked against `file_len`. A `PT_INTERP` path's
+/// trailing NUL is dropped only if it lies within `head`.
+pub fn parse_head(image: &[u8], file_len: u64) -> Result<LoadPlan, Error> {
     if image.get(0..4) != Some(&[0x7f, b'E', b'L', b'F']) {
         return Err(Error::BadMagic);
     }
@@ -190,7 +197,7 @@ pub fn parse(image: &[u8]) -> Result<LoadPlan, Error> {
             PT_PHDR => phdr_vaddr = Some(p_vaddr),
             PT_INTERP => {
                 let end = p_offset.checked_add(p_filesz).ok_or(Error::BadSegment)?;
-                if end as usize > image.len() || p_filesz == 0 {
+                if end > file_len || p_filesz == 0 {
                     return Err(Error::BadSegment);
                 }
                 // Drop a trailing NUL from the length.
@@ -206,7 +213,7 @@ pub fn parse(image: &[u8]) -> Result<LoadPlan, Error> {
                     return Err(Error::BadSegment);
                 }
                 let fend = p_offset.checked_add(p_filesz).ok_or(Error::BadSegment)?;
-                if fend as usize > image.len() {
+                if fend > file_len {
                     return Err(Error::BadSegment);
                 }
                 let vend = p_vaddr.checked_add(p_memsz).ok_or(Error::BadSegment)?;

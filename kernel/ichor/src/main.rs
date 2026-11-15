@@ -15,6 +15,7 @@ mod blktest;
 mod busytest;
 mod celltest;
 mod dev;
+mod file;
 mod futex;
 mod kcell;
 mod linuxabi;
@@ -130,6 +131,17 @@ fn kmain(info: BootInfo) -> ! {
         {
             panic!("test_panic requested on the command line");
         }
+    }
+
+    // Nothing may need more contiguous memory than MAX_ORDER (4 MiB).
+    let largest = frame::mm::stats().largest_request_order;
+    println!(
+        "ichor: memory: largest contiguous request 2^{largest} pages (MAX_ORDER {})",
+        frame::mm::MAX_ORDER
+    );
+    if largest > u32::from(frame::mm::MAX_ORDER) {
+        println!("ichor: FAILED: a request exceeded MAX_ORDER");
+        shutdown(ExitStatus::Failure);
     }
 
     println!("ichor: boot complete; halting");

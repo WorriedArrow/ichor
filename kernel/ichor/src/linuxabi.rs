@@ -32,7 +32,7 @@ mod nr {
     pub(super) const LSTAT: u64 = 6;
     pub(super) const POLL: u64 = 7;
     pub(super) const LSEEK: u64 = 8;
-    pub(super) const MMAP: u64 = 9; // partial: shared file mappings are read-only snapshots
+    pub(super) const MMAP: u64 = 9; // partial: shared file mappings are read-only and see a page as of its first touch
     pub(super) const MPROTECT: u64 = 10;
     pub(super) const MUNMAP: u64 = 11;
     pub(super) const BRK: u64 = 12;
@@ -503,8 +503,19 @@ fn mmap(p: &mut LinuxProcess, a: &[u64; 6]) -> Result<u64, i64> {
         // A shared writable mapping would need writes to reach the file.
         return Err(EACCES);
     }
-    let bytes = fs::file_bytes(p, fd, offset, len)?;
-    let src = umem::FileSource { bytes, offset };
+    let _ = len;
+    let ino = match p.fd(fd).ok_or(EBADF)? {
+        Fd::File(f) => f.ino,
+        _ => return Err(ENODEV),
+    };
+    if p.vfs.lock().stat(ino)?.kind != crate::vfs::Kind::File {
+        return Err(ENODEV);
+    }
+    let file = crate::file::VfsFile::open(&p.vfs, ino)?;
+    let src = umem::FileSource {
+        file: alloc::sync::Arc::new(file),
+        offset,
+    };
     p.mm().mmap(addr, len, prot, map_flags, Some(src))
 }
 

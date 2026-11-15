@@ -1,5 +1,6 @@
-//! `execve`: replaces the calling process's program with an ELF read from
-//! its root. Dynamically linked programs load their `PT_INTERP`
+//! `execve`: replaces the calling process's program with an ELF on its
+//! root, which stays open while it loads (its pages come from the page
+//! cache, mapped copy-on-write, not copied whole into memory). Dynamically linked programs load their `PT_INTERP`
 //! interpreter from the same root. The new image is built in a fresh
 //! address space; only once it has loaded does the process switch to it,
 //! so a failed `execve` returns to the old program intact.
@@ -15,6 +16,7 @@ use frame::user::UserContext;
 
 use super::EFAULT;
 use super::fs::user_path;
+use crate::file::{File, VfsFile};
 use crate::loader::{self, LoadError};
 use crate::process::LinuxProcess;
 use crate::umem::Mm;
@@ -24,14 +26,13 @@ const E2BIG: i64 = 7;
 const ENOEXEC: i64 = 8;
 const ENOMEM: i64 = 12;
 const EACCES: i64 = 13;
+const ENOENT: i64 = 2;
 const ELOOP: i64 = 40;
 
 /// Most argv or envp entries.
 const MAX_STRINGS: usize = 4096;
 /// Most bytes of argv plus envp strings.
 const MAX_STRING_BYTES: usize = 128 * 1024;
-/// Largest executable read.
-const MAX_EXECUTABLE: u64 = 64 << 20;
 
 /// Reads a NULL-terminated array of string pointers (argv, envp).
 fn user_strings(p: &mut LinuxProcess, addr: u64, total: &mut usize) -> Result<Vec<String>, i64> {
@@ -117,7 +118,7 @@ pub(super) fn execve(
     let loaded = loader::load(
         &mut mm,
         &image,
-        interp.as_deref(),
+        interp.as_ref().map(|f| f as &dyn File),
         &argv_refs,
         &envp_refs,
         p.group.limits()[crate::process::RLIMIT_STACK].0,
@@ -144,27 +145,26 @@ pub(super) fn execve(
 }
 
 /// Reads an executable (or interpreter) from the process's root.
-fn read_executable(p: &LinuxProcess, path: &str) -> Result<Vec<u8>, i64> {
+fn read_executable(p: &LinuxProcess, path: &str) -> Result<VfsFile, i64> {
     let cwd = p.cwd();
-    let mut fs = p.vfs.lock();
-    let ino = fs.resolve(cwd, path, true)?;
-    let st = fs.stat(ino)?;
-    if st.kind != Kind::File || st.mode & 0o111 == 0 {
-        return Err(EACCES);
-    }
-    if st.size > MAX_EXECUTABLE {
-        return Err(ENOMEM);
-    }
-    let mut bytes = alloc::vec![0u8; st.size as usize];
-    let n = fs.read(ino, 0, &mut bytes)?;
-    bytes.truncate(n);
-    Ok(bytes)
+    let ino = {
+        let mut fs = p.vfs.lock();
+        let ino = fs.resolve(cwd, path, true)?;
+        let st = fs.stat(ino)?;
+        if st.kind != Kind::File || st.mode & 0o111 == 0 {
+            return Err(EACCES);
+        }
+        ino
+    };
+    VfsFile::open(&p.vfs, ino).map_err(|_| ENOENT)
 }
 
 /// Parses a `#!` line: the interpreter path and its optional single
 /// argument (Linux passes everything after the path as one argument).
-fn shebang(image: &[u8]) -> Option<(String, Option<String>)> {
-    let rest = image.strip_prefix(b"#!")?;
+fn shebang(image: &dyn File) -> Option<(String, Option<String>)> {
+    let mut head = [0u8; 258];
+    let n = image.read_at(0, &mut head);
+    let rest = head[..n].strip_prefix(b"#!")?;
     let line = &rest[..rest
         .iter()
         .position(|&b| b == b'\n')

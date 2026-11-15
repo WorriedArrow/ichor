@@ -529,6 +529,15 @@ impl<'a> Overlay<'a> {
         }
     }
 
+    /// Where page `index` of `ino` lives in the lower image, if `ino` is
+    /// still an unmodified lower file (for mapping the cached page).
+    pub fn lower_extent(&self, ino: Ino, index: u64) -> Option<image::Extent> {
+        match &self.get(ino).ok()?.data {
+            Data::LowerFile(n) => n.extent(index),
+            _ => None,
+        }
+    }
+
     fn read_lower(&self, n: &Node<'a>, offset: u64, out: &mut [u8]) -> Result<usize, i64> {
         let src = self.src.ok_or(EIO)?;
         n.read_at(offset, out, src).map_err(|_| EIO)

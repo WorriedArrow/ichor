@@ -29,8 +29,7 @@ Milestones 0-3 are done.
   disk and runs the Alpine checks on the one with `/etc/alpine-release`.
   The loader handles PIEs (fixed bias) and `PT_INTERP` (`ld-musl` loaded
   in the mmap area, `AT_BASE`), in `execve` too, so Alpine's dynamic
-  busybox shell forks and execs dynamic children. The buddy allocator's
-  largest block is 64 MiB (`MAX_ORDER` 14) so a whole image fits one buffer.
+  busybox shell forks and execs dynamic children.
 - M4 pipes: `pipe`/`pipe2` (`kernel/ichor/src/pipe.rs`: 64 KiB buffer,
   blocking on wait queues, EOF and `EPIPE` from per-end reference counts,
   atomic writes up to `PIPE_BUF`). Shell pipelines and command substitution
@@ -163,8 +162,12 @@ Milestones 0-3 are done.
   metadata alone; lower-file reads fetch one chunk (one aligned device
   read) at a time through a global, bounded (32 MiB, clock) cache keyed by
   the *verified* chunk hash, so identical chunks share a page across disks
-  and a bad device byte is EIO. The whole-disk buffer is gone. Not yet:
-  cache pages charged to cells; exec/mmap mapping cached pages.
+  and a bad device byte is EIO. The whole-disk buffer is gone. `file.rs`:
+  exec and file mmap work on open files; whole file pages of an unmodified
+  lower file map the cache's page copy-on-write (one physical copy of
+  busybox/ld-musl for every process). `MAX_ORDER` is back to 10 (4 MiB):
+  frame records the largest contiguous request and the boot fails if it
+  exceeds that. Not yet: cache pages charged to cells.
 - M4 upper layer (Phase C, step 2): upper files are paged and sparse (a
   page map, the byte budget counts pages; MAX_FILE 1 TiB of offsets), copy-up
   goes page by page, directories report 2 + subdirectories, and
@@ -207,7 +210,7 @@ report at the end of each phase. Do not rewrite `main`.
   XSAVE/XSAVEOPT, XCR0 per CPU support, per-thread extended state (lazy vs
   eager in an ADR with the security reasoning), XSAVE layout in signal
   frames.
-- **C. Page cache and storage.** The audit's plan, plus: BLAKE3 chunk
+- **C. Page cache and storage.** [done] The audit's plan, plus: BLAKE3 chunk
   hashes verified on fill and a root hash in the header (hash-keyed sharing
   only on verified BLAKE3); the upper layer as a real in-memory filesystem
   (paged data, mode, uid/gid, times, nlink, hard links); `VmSpace::frames`
@@ -250,8 +253,8 @@ are owed as multi-cell scheduling lands in milestone 4. Boot logs which apply.
 Frame budget: ADR-0005 sets the milestone 3 ceiling at 8,500 lines / 380
 sites; ADR-0007 raises it to 9,500 / 420 for milestone 4 (TLB shootdown,
 atomic user ops for futexes, PCID). `audit.toml` is at step 6 (5,800 / 250);
-frame is at 5,504 / 242 (A5 added RDSEED/RDRAND and UEFI GetTime; B
-added XSAVE).
+frame is at 5,527 / 242 (A5 added RDSEED/RDRAND and UEFI GetTime; B
+added XSAVE; C the frames tree and request tracking).
 
 The goal set for this effort is milestone 8, whose acceptance test needs
 cloud accounts and bare-metal hardware from the owner.

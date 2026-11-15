@@ -12,10 +12,11 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
-/// Largest block is `2^MAX_ORDER` pages (64 MiB with 4 KiB pages): enough
-/// for a whole root image read into one buffer, until the page cache reads
-/// images on demand.
-pub const MAX_ORDER: u8 = 14;
+/// Largest block is `2^MAX_ORDER` pages (4 MiB with 4 KiB pages). Nothing
+/// in the kernel needs more contiguous memory: images are read on demand
+/// through the page cache, executables and file mappings map cached pages,
+/// and upper-layer files are paged. Kept at least 9, for 2 MiB pages.
+pub const MAX_ORDER: u8 = 10;
 
 /// Per-page storage the allocator threads its free lists through.
 pub trait PageLinks {

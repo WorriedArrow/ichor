@@ -91,7 +91,15 @@ pub(crate) fn run_linux(
     interp: Option<&[u8]>,
     argv: &[&str],
 ) -> (i32, u32) {
-    let loaded = match loader::load(&mut p.mm(), elf, interp, argv, ENVP, 8 << 20) {
+    let interp = interp.map(crate::file::Bytes);
+    let loaded = match loader::load(
+        &mut p.mm(),
+        &crate::file::Bytes(elf),
+        interp.as_ref().map(|f| f as &dyn crate::file::File),
+        argv,
+        ENVP,
+        8 << 20,
+    ) {
         Ok(l) => l,
         Err(e) => {
             println!("ichor: runtest: load error {e:?}");

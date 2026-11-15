@@ -33,6 +33,8 @@ const UPPER_BYTES: usize = 64 << 20;
 #[derive(Debug)]
 pub(crate) struct Vfs {
     fs: Mutex<Overlay<'static>>,
+    /// The disk the lower layer comes from, whose cache pages files map.
+    disk: Option<&'static crate::pagecache::Disk>,
 }
 
 impl Vfs {
@@ -47,7 +49,24 @@ impl Vfs {
         let mut fs = Overlay::new(&image, src, UPPER_BYTES)?;
         fs.set_clock(realtime);
         crate::dev::populate(&mut fs);
-        Ok(Vfs { fs: Mutex::new(fs) })
+        Ok(Vfs {
+            fs: Mutex::new(fs),
+            disk: None,
+        })
+    }
+
+    /// Mounts a disk's image (see [`crate::pagecache::mount_disk`]).
+    pub(crate) fn mount_disk(m: &crate::pagecache::Mounted) -> Result<Vfs, image::Error> {
+        let mut vfs = Vfs::mount(m.metadata, m.disk)?;
+        vfs.disk = Some(m.disk);
+        Ok(vfs)
+    }
+
+    /// The verified cache page holding page `index` of `ino`, if `ino` is
+    /// an unmodified lower file on a disk.
+    pub(crate) fn cached_page(&self, ino: Ino, index: u64) -> Option<frame::mm::UFrame> {
+        let ext = self.fs.lock().lower_extent(ino, index)?;
+        crate::pagecache::frame(self.disk?, &ext).ok()
     }
 
     /// Mounts a whole image held in memory (self-tests).

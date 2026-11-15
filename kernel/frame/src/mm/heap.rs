@@ -35,6 +35,7 @@ fn class_for(layout: Layout) -> Option<usize> {
 fn large_order(layout: Layout) -> Option<u8> {
     let size = (layout.size().max(layout.align()) as u64).div_ceil(PAGE_SIZE);
     let order = size.next_power_of_two().trailing_zeros();
+    page_alloc::note_request(order);
     (order <= u32::from(buddy::MAX_ORDER)).then_some(order as u8)
 }
 

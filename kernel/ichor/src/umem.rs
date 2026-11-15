@@ -9,11 +9,13 @@
 //! memory a user access would. A page made `PROT_NONE` is unmapped but kept,
 //! so its contents survive a later `mprotect` back.
 //!
-//! Private file mappings are filled on first touch from the file's bytes,
-//! which the mapping keeps (charged to the account) so that a page dropped
-//! by `MADV_DONTNEED` comes back with the file's contents, as on Linux. The
-//! loader's own segments are not file mappings: dropping one of their pages
-//! zero-fills it (partial).
+//! File mappings are filled on first touch from the file they hold: a page
+//! the page cache has (an unmodified lower-layer file) is mapped
+//! copy-on-write, so processes mapping the same library share it;
+//! anything else is read into a fresh page. A page dropped by
+//! `MADV_DONTNEED` comes back with the file's contents, as on Linux. The
+//! loader maps whole executable pages the same way; dropping one of its
+//! pages zero-fills it (partial).
 //!
 //! Shared anonymous mappings (`MAP_SHARED | MAP_ANONYMOUS`) stay shared
 //! across `fork`: before the copy, every page of them is made resident,
@@ -33,6 +35,8 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use cell::Account;
+
+use crate::file::File;
 use frame::mm::{PAGE_SIZE, UFrame, UserProt, VmSpace};
 use vma::{Prot, RegionMap};
 
@@ -56,34 +60,22 @@ pub(crate) mod flags {
     pub(crate) const MAP_FIXED_NOREPLACE: u64 = 0x10_0000;
 }
 
-/// A file mapping's source: the file's bytes from `offset` on (already
-/// read, at most the mapping's length; the rest of the mapping is zero).
+/// A file mapping's source: the file, and the offset the mapping starts
+/// at (page-aligned).
 pub(crate) struct FileSource {
-    pub(crate) bytes: Vec<u8>,
+    pub(crate) file: Arc<dyn File>,
     pub(crate) offset: u64,
 }
 
-/// The bytes behind a file mapping, charged to `account` (by the page)
-/// while any mapping still uses them.
-struct Backing {
-    bytes: Vec<u8>,
-    account: Arc<Account>,
-    pages: u64,
-}
-
-impl Drop for Backing {
-    fn drop(&mut self) {
-        self.account.release(self.pages);
-    }
-}
-
-/// `[start, end)` of the address space shows `backing` from `base` on.
+/// `[start, end)` of the address space shows `file` from `offset` (at
+/// `base`) on.
 #[derive(Clone)]
 struct FileRange {
     start: u64,
     end: u64,
     base: u64,
-    backing: Arc<Backing>,
+    offset: u64,
+    file: Arc<dyn File>,
 }
 
 /// Linux `madvise` advice values.
@@ -226,6 +218,18 @@ impl Mm {
             .map(|(pa, _)| pa.as_u64() + (addr - va))
     }
 
+    /// Maps `frame` (a page cache page) at `va`, copy-on-write: read-only
+    /// until written. Charged as one page.
+    pub(crate) fn map_cow(&mut self, va: u64, frame: UFrame, prot: Prot) -> bool {
+        if self.pages.contains_key(&va) || self.account.charge(1).is_err() {
+            return false;
+        }
+        self.pages.insert(va, frame.clone());
+        self.cow.insert(va);
+        let p = self.mapped_prot(va, prot);
+        !prot.accessible() || self.space.map(va, &frame, p).is_ok()
+    }
+
     /// Gives this process its own copy of a copy-on-write page at `va` and
     /// maps it with the region's protection.
     fn break_cow(&mut self, va: u64, prot: Prot) -> bool {
@@ -323,11 +327,17 @@ impl Mm {
             return None;
         };
         if let Some(r) = self.files.iter().find(|r| r.start <= va && va < r.end) {
-            let at = (va - r.base) as usize;
-            let bytes = &r.backing.bytes;
-            if let Some(chunk) = bytes.get(at..bytes.len().min(at + PAGE_SIZE as usize)) {
-                f.writer().write(chunk);
+            let at = r.offset + (va - r.base);
+            if let Some(cached) = r.file.cached_page(at / PAGE_SIZE) {
+                // Shared with the cache: read-only until written.
+                drop(f);
+                self.pages.insert(va, cached.clone());
+                self.cow.insert(va);
+                return Some(cached);
             }
+            let mut page = alloc::vec![0u8; PAGE_SIZE as usize];
+            let n = r.file.read_at(at, &mut page);
+            f.writer().write(&page[..n]);
         }
         self.pages.insert(va, f.clone());
         Some(f)
@@ -410,6 +420,9 @@ impl Mm {
         let Some(f) = self.frame(va) else {
             return false;
         };
+        if write && self.cow.contains(&va) {
+            return self.break_cow(va, region.prot); // a cached file page
+        }
         let prot = self.mapped_prot(va, region.prot);
         self.space.map(va, &f, prot).is_ok()
     }
@@ -492,35 +505,23 @@ impl Mm {
                 self.regions.find_free(len).ok_or(ENOMEM)?
             }
         };
-        // A file mapping keeps the file's bytes and fills pages as they are
-        // touched. A shared mapping is only allowed read-only, so it cannot
-        // miss a write to the file it would have made; it can miss later
-        // writes by others (partial).
-        let backing = match file {
-            Some(f) => {
-                let pages = page_up(f.bytes.len() as u64).ok_or(ENOMEM)? / PAGE_SIZE;
-                self.account.charge(pages).map_err(|_| ENOMEM)?;
-                Some(Arc::new(Backing {
-                    bytes: f.bytes,
-                    account: self.account.clone(),
-                    pages,
-                }))
-            }
-            None => None,
-        };
         if !self.regions.insert(start, start + len, prot) {
-            return Err(ENOMEM); // `backing` drops and returns its charge
+            return Err(ENOMEM);
         }
-        if backing.is_none() && map_flags & MAP_SHARED != 0 {
-            self.shared.push((start, start + len));
-        }
-        if let Some(backing) = backing {
-            self.files.push(FileRange {
+        // A file mapping fills pages from the file as they are touched. A
+        // shared mapping is only allowed read-only, so it cannot miss a
+        // write to the file it would have made; it can miss later writes by
+        // others (partial).
+        match file {
+            Some(f) => self.files.push(FileRange {
                 start,
                 end: start + len,
                 base: start,
-                backing,
-            });
+                offset: f.offset,
+                file: f.file,
+            }),
+            None if map_flags & MAP_SHARED != 0 => self.shared.push((start, start + len)),
+            None => {}
         }
         Ok(start)
     }
