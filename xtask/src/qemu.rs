@@ -67,10 +67,12 @@ impl Accel {
         if kvm_usable { Accel::Kvm } else { Accel::Tcg }
     }
 
-    /// The `-accel` value.
+    /// The `-accel` value. TCG's translation buffer is 256 MiB rather than
+    /// QEMU's 1 GiB default: every boot test runs at once, and eleven
+    /// default buffers exhausted a shared machine's commit limit.
     pub fn qemu_name(self) -> &'static str {
         match self {
-            Accel::Auto | Accel::Tcg => "tcg",
+            Accel::Auto | Accel::Tcg => "tcg,tb-size=256",
             Accel::Kvm => "kvm",
             Accel::Whpx => "whpx",
             Accel::Hvf => "hvf",

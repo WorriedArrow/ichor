@@ -65,6 +65,13 @@ name = "ichor-cmdline"
 version = "0.0.0"
 
 [[package]]
+name = "ichor-crypto"
+version = "0.0.0"
+dependencies = [
+ "ichor-csprng",
+]
+
+[[package]]
 name = "ichor-csprng"
 version = "0.0.0"
 

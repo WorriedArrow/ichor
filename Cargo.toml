@@ -27,6 +27,7 @@ members = [
     "kernel/drivers/virtio-net",
     "kernel/drivers/nvme",
     "kernel/ichor",
+    "services/crypto",
     "tests",
     "xtask",
 ]
@@ -53,6 +54,7 @@ default-members = [
     "kernel/testprog",
     "kernel/gpt",
     "kernel/net",
+    "services/crypto",
     "tests",
     "xtask",
 ]
