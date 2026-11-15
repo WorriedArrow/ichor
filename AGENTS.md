@@ -17,9 +17,15 @@ a framekernel. The founding brief is the source of truth until an ADR in
 
 **Active milestone: 6.** The control plane pulls a real OCI image from a
 registry, verifies it, converts it, and runs it through the gRPC API.
-First step: the control-plane ADR (where it runs: a native-ABI service in
-the system cell; its API; how images reach the image format; registry
-auth and TLS).
+The design is ADR-0012: `services/control`, a native-ABI service embedded
+in the kernel image and run in the system cell; `services/rt` its only
+`unsafe` crate; native ABI v2 (sockets, waiting, images, cells); our own
+host-tested crates for crypto, X.509, TLS 1.2 + 1.3 (Docker Hub's blob CDN
+is TLS 1.2 only), HTTP/1.1 and HTTP/2, gRPC/protobuf, OCI, layer
+conversion and DNS; Mozilla's CA bundle as boot-volume configuration.
+Order: crypto, X.509, TLS, HTTP + OCI + layer (host-tested against
+recorded traffic), native ABI v2 + `services/rt` + the loader, HTTP/2 +
+gRPC, then the end-to-end pull-and-run test.
 
 Roadmap from the founding brief (the brief is not checked in; this is
 its milestone list as an earlier session recorded it):
