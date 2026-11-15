@@ -11,6 +11,8 @@
 
 extern crate alloc;
 
+pub mod bench;
+
 use alloc::vec::Vec;
 
 /// x86-64 general-purpose registers, by encoding number.

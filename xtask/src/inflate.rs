@@ -242,6 +242,25 @@ pub fn crc32(data: &[u8]) -> u32 {
 
 /// Decompresses a gzip file (one member), checking its CRC and length.
 pub fn gunzip(data: &[u8]) -> Result<Vec<u8>> {
+    Ok(gunzip_member(data)?.0)
+}
+
+/// Decompresses every member of a multi-member gzip stream and joins them
+/// (an Alpine `.apk` is a signature, a control and a data member, each a
+/// tar fragment, which together make one tar stream).
+pub fn gunzip_all(mut data: &[u8]) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    while !data.is_empty() {
+        let (part, used) = gunzip_member(data)?;
+        out.extend_from_slice(&part);
+        data = &data[used..];
+    }
+    Ok(out)
+}
+
+/// One gzip member at the start of `data`: its bytes, and how much of
+/// `data` it took (header, body and trailer).
+fn gunzip_member(data: &[u8]) -> Result<(Vec<u8>, usize)> {
     if data.len() < 18 || data[0] != 0x1f || data[1] != 0x8b || data[2] != 8 {
         return Err("gzip: not a deflate gzip file".into());
     }
@@ -272,7 +291,7 @@ pub fn gunzip(data: &[u8]) -> Result<Vec<u8>> {
     if crc != crc32(&out) || isize != out.len() as u32 {
         return Err("gzip: CRC or length mismatch".into());
     }
-    Ok(out)
+    Ok((out, pos + used + 8))
 }
 
 #[cfg(test)]
@@ -344,10 +363,14 @@ mod tests {
             0x45, 0x7c, 0x00, 0x64, 0x58, 0x7b, 0x18, 0x3e, 0x08, 0x00, 0x00,
         ];
         assert_eq!(gunzip(&g).unwrap(), sample());
+        // Two members back to back decompress to both payloads joined.
+        let two = [g.as_slice(), g.as_slice()].concat();
+        assert_eq!(gunzip_all(&two).unwrap(), [sample(), sample()].concat());
         let mut bad = g;
         let n = bad.len();
         bad[n - 5] ^= 1; // corrupt the CRC
         assert!(gunzip(&bad).is_err());
+        assert!(gunzip_all(&[g.as_slice(), bad.as_slice()].concat()).is_err());
     }
 
     #[test]

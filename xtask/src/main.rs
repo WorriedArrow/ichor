@@ -20,6 +20,8 @@ Commands:
   lint         rustfmt check, clippy (host + kernel target), unsafe policy, frame budget
   frame-audit  Print frame's size and unsafe-site count; fail if over budget
   linux-abi-table  Regenerate docs/linux-abi.md from the Linux syscall table
+  bench        Run the benchmarks on Ichor and on a pinned Linux kernel, same
+               machine and programs; prints a Markdown table (CI: --smp 4)
   help         Show this message
 
 Options:
@@ -134,6 +136,68 @@ fn cmd_run(o: &Opts) -> Result<()> {
     }
 }
 
+/// Boots Ichor with `bench`, then Linux with the same programs, and prints
+/// both kernels' per-operation costs side by side.
+fn cmd_bench(o: &Opts) -> Result<()> {
+    let timeout = o.timeout.unwrap_or(Duration::from_secs(900));
+    let accel = o.accel.resolve();
+    let mut cfg = RunConfig::new("bench", build::kernel(o.profile)?);
+    cfg.cmdline = "qemu_debug_exit bench".into();
+    cfg.smp = o.smp;
+    cfg.memory_mib = o.memory_mib;
+    cfg.accel = accel;
+    cfg.timeout = Some(timeout);
+    cfg.capture = true;
+    eprintln!("xtask: bench: Ichor, accel={accel:?}, {} vCPUs", o.smp);
+    let ichor = qemu::run(&cfg)?;
+    if ichor.exit != Exit::Success {
+        return Err(format!(
+            "Ichor benchmark boot ended with {:?}:\n{}",
+            ichor.exit, ichor.serial
+        ));
+    }
+    eprintln!("xtask: bench: Linux (Alpine linux-virt 6.6.142)");
+    let linux = xtask::linuxref::run(o.smp, o.memory_mib, accel, timeout)?;
+    if !linux.serial.contains("ichor-linux-bench: done") {
+        return Err(format!(
+            "Linux benchmark boot ended with {:?} before finishing:\n{}",
+            linux.exit, linux.serial
+        ));
+    }
+    let (a, b) = (
+        xtask::linuxref::results(&ichor.serial),
+        xtask::linuxref::results(&linux.serial),
+    );
+    println!("| Benchmark | Ichor | Linux | Ichor / Linux |");
+    println!("|---|---|---|---|");
+    for (name, _, _) in testprog::bench::ALL {
+        let cell = |r: &std::collections::BTreeMap<String, (u64, u64)>| {
+            r.get(*name)
+                .map(|&(n, ns)| (ns as f64 / n.max(1) as f64, n, ns))
+        };
+        match (cell(&a), cell(&b)) {
+            (Some((pa, na, sa)), Some((pb, nb, sb))) => println!(
+                "| {name} | {} | {} | {:.2}x |",
+                xtask::linuxref::per_op(na, sa),
+                xtask::linuxref::per_op(nb, sb),
+                pa / pb
+            ),
+            _ => return Err(format!("{name}: missing from one of the runs")),
+        }
+    }
+    for line in ichor.serial.lines() {
+        if let Some(v) = line.strip_prefix("ichor: bench: container start: ") {
+            println!("| container start | {v} | (no equivalent) | |");
+        }
+    }
+    println!();
+    println!(
+        "{} vCPUs, {} MiB, accel {accel:?}. Each program times its own loop; Linux runs with its default mitigations.",
+        o.smp, o.memory_mib
+    );
+    Ok(())
+}
+
 /// Crates that only build for the kernel target (they depend on frame).
 const KERNEL_ONLY: &[&str] = &[
     "ichor",
@@ -229,6 +293,7 @@ fn main() -> ExitCode {
         "lint" => cmd_lint(),
         "frame-audit" => audit::check_frame_budget().map(|_| ()),
         "linux-abi-table" => linux_abi::write_table(),
+        "bench" => cmd_bench(&o),
         "help" | "--help" | "-h" => {
             print!("{HELP}");
             Ok(())

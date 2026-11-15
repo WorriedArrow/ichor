@@ -25,6 +25,16 @@ Commit `e719b45` (after the futex buckets and unlocked lower-file reads):
 
 ## Linux reference
 
-Not measured yet. The plan is to run the same static programs under a
-pinned Linux kernel on the same runner, so the comparison shares hardware
-and hypervisor.
+`cargo xtask bench --accel kvm --smp 4` boots Ichor with `bench`, then
+Alpine 3.20's official `linux-virt` kernel (Linux 6.6.142, pinned by
+SHA-256 in `xtask/src/artifact.rs`) in the same QEMU machine (q35, same
+CPU model, vCPUs and memory) with an initramfs of the static busybox and
+the benchmark programs from `kernel/testprog/src/bench.rs`, the same bytes
+Ichor runs. Each program times its own loop with `clock_gettime` and prints
+an `ichor-bench:` line; the table compares those. CI runs it after the
+tests and puts the table in the job summary.
+
+Caveats: Linux runs with its default CPU-vulnerability mitigations, which
+Ichor does not all apply yet (ADR-0004). Container start has no Linux
+equivalent here. Numbers from TCG (no KVM, as on a Windows laptop) say
+little about either kernel.

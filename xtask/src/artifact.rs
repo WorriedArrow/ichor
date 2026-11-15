@@ -159,6 +159,20 @@ pub const ALPINE_PACKAGES: &[Artifact] = &[
     ),
 ];
 
+/// Alpine 3.20's `linux-virt` kernel package (Linux 6.6.142, the kernel
+/// Alpine ships for VMs), for the Linux reference benchmarks: only
+/// `boot/vmlinuz-virt` is used. Size and version match the signed
+/// APKINDEX; like the other branch packages, the cache keeps it once the
+/// branch moves on.
+pub const ALPINE_LINUX_VIRT: Artifact = Artifact {
+    dir: "alpine-kernel/3.20",
+    file: "linux-virt-6.6.142-r0.apk",
+    url: "https://dl-cdn.alpinelinux.org/alpine/v3.20/main/x86_64/linux-virt-6.6.142-r0.apk",
+    sha256: "0d84e30c04c52426b0bf10b01616c45f7d0c5384a59552e4c4a6caeb13a3f6e7",
+    env: "ICHOR_LINUX_VIRT_APK",
+    token_url: None,
+};
+
 /// Alpine Linux 3.20.3 minirootfs (x86-64). The hash matches Alpine's
 /// published `.sha256` for this release.
 pub const ALPINE_MINIROOTFS: Artifact = Artifact {

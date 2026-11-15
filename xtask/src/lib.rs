@@ -1,8 +1,10 @@
 //! Host-side tooling for Ichor, used both by `cargo xtask` and by the QEMU
 //! integration tests in `tests/`.
 //!
-//! Deliberately dependency-free: it must build fast and run anywhere a Rust
-//! toolchain and QEMU are installed (Linux CI, Windows and macOS laptops).
+//! Deliberately free of external dependencies (only this workspace's own
+//! `image` and `testprog` crates): it must build fast and run anywhere a
+//! Rust toolchain and QEMU are installed (Linux CI, Windows and macOS
+//! laptops).
 
 #![forbid(unsafe_code)]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // host tool
@@ -12,6 +14,7 @@ pub mod audit;
 pub mod build;
 pub mod inflate;
 pub mod linux_abi;
+pub mod linuxref;
 pub mod qemu;
 pub mod rootfs;
 pub mod sha256;

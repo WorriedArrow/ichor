@@ -154,4 +154,5 @@ name = "xtask"
 version = "0.0.0"
 dependencies = [
  "ichor-image",
+ "ichor-testprog",
 ]

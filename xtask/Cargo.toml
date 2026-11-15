@@ -19,6 +19,9 @@ test = false
 # Builds the root disk image each QEMU run boots with (a path crate, no
 # external code).
 image = { workspace = true, features = ["builder"] }
+# Builds the benchmark programs for the Linux reference boot, the same
+# bytes the kernel runs (a path crate, no external code).
+testprog.workspace = true
 
 [lints]
 workspace = true

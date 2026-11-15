@@ -56,19 +56,26 @@ jobs:
             target/alpine-pkgs
             target/debian
           key: artifacts-busybox-1.35.0-alpine-3.20.3-pkgs-1-debian-dd051e1b8c92
+      # Its own entry, so adding it did not invalidate the cache above (whose
+      # branch packages may no longer be downloadable).
+      - name: Cache the Linux reference kernel (hash-checked by xtask)
+        uses: actions/cache@v4
+        with:
+          path: target/alpine-kernel
+          key: linux-virt-6.6.142-r0
       - run: cargo xtask test
         env:
           ICHOR_TEST_VERBOSE: "1"
           ICHOR_REQUIRE_KVM: "1"
-      # Phase E baseline: one boot on its own, so the numbers are not
-      # disturbed by parallel test boots. Printed and summarized, not checked.
-      - name: Benchmarks (KVM, 4 vCPUs)
+      # Phase E: Ichor and a pinned Linux (Alpine linux-virt) on the same
+      # machine and programs, one boot at a time so parallel test boots do
+      # not disturb the numbers. Printed and summarized, not checked.
+      - name: Benchmarks against Linux (KVM, 4 vCPUs)
         shell: bash
         run: |
-          cargo xtask run --accel kvm --smp 4 --timeout 600 --name bench \
-            --cmdline "qemu_debug_exit bench" | tee bench.log
-          { echo '### Benchmarks (KVM, 4 vCPUs)'; echo '```'
-            grep -a 'ichor: bench:' bench.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          cargo xtask bench --accel kvm --smp 4 --timeout 900 | tee bench.md
+          { echo '### Benchmarks: Ichor vs Linux (KVM, 4 vCPUs)'; echo
+            cat bench.md; } >> "$GITHUB_STEP_SUMMARY"
       - name: Upload QEMU run directories on failure
         if: failure()
         uses: actions/upload-artifact@v4

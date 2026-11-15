@@ -274,7 +274,9 @@ report at the end of each phase. Do not rewrite `main`.
   Per-CPU single-page lists are on the local branch `pcp-page-lists`,
   held back: one unexplained user page fault (dpkg's decompressor) in 20
   one-CPU boots, against 0 in 20 without it. Baseline in `docs/benchmarks.md`; Linux reference
-  numbers not yet. Open: frame's `VmSpace` user copy ignores the page's
+  numbers come from `cargo xtask bench` (Alpine `linux-virt` booted with
+  the same `testprog::bench` programs; CI job summary). Open: frame's
+  `VmSpace` user copy ignores the page's
   write permission and copies after dropping its lock (owner deciding how
   to handle it; the Mm-lock item waits on it).]
 

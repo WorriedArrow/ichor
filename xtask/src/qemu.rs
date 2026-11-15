@@ -67,7 +67,8 @@ impl Accel {
         if kvm_usable { Accel::Kvm } else { Accel::Tcg }
     }
 
-    fn qemu_name(self) -> &'static str {
+    /// The `-accel` value.
+    pub fn qemu_name(self) -> &'static str {
         match self {
             Accel::Auto | Accel::Tcg => "tcg",
             Accel::Kvm => "kvm",
@@ -76,7 +77,8 @@ impl Accel {
         }
     }
 
-    fn cpu_model(self) -> &'static str {
+    /// The `-cpu` model.
+    pub fn cpu_model(self) -> &'static str {
         match self {
             Accel::Kvm | Accel::Hvf => "host",
             _ => "max",
@@ -502,8 +504,13 @@ pub fn command(cfg: &RunConfig) -> Result<Command> {
 
 /// Boots the kernel and waits for QEMU to exit (or the timeout).
 pub fn run(cfg: &RunConfig) -> Result<Outcome> {
-    let mut cmd = command(cfg)?;
-    if cfg.capture {
+    run_command(command(cfg)?, cfg.capture, cfg.timeout)
+}
+
+/// Runs a prepared QEMU command to exit (or `timeout`), capturing its
+/// serial output on stdout if `capture`.
+pub fn run_command(mut cmd: Command, capture: bool, timeout: Option<Duration>) -> Result<Outcome> {
+    if capture {
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
@@ -542,7 +549,7 @@ pub fn run(cfg: &RunConfig) -> Result<Outcome> {
                 code => Exit::Other(code),
             };
         }
-        if cfg.timeout.is_some_and(|t| start.elapsed() > t) {
+        if timeout.is_some_and(|t| start.elapsed() > t) {
             let _ = child.kill();
             let _ = child.wait();
             break Exit::Timeout;
