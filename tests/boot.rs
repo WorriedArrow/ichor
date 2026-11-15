@@ -18,9 +18,9 @@
 //! memory is accounted hierarchically, revocation works, and a native-ABI
 //! ring-3 process can act only on handles its cell holds.
 //!
-//! Milestone 3 (Linux ABI, in progress): a real static Linux x86-64 ELF runs
-//! unmodified in a cell, writing to stdout and exiting through the Linux
-//! syscall personality.
+//! Milestone 3 (in progress): real static Linux x86-64 ELFs run unmodified
+//! in cells through the Linux syscall personality, and read files from a
+//! root image that a safe virtio-blk driver reads off a disk.
 
 use ichor_tests::{Exit, boot};
 
@@ -53,6 +53,11 @@ fn m1_boots_on_four_cpus() {
         "ichor: linux: static ELF ran via the Linux ABI, exited 7 after 2 syscalls",
         "hello from /etc/motd inside an Ichor image",
         "ichor: linux: cat read /etc/motd through a symlink in the image",
+        "ichor: blk: virtio-blk disk, ",
+        "ichor: blk: verified 300 KiB read across multiple requests",
+        "ichor: blk: mounted the root image from the disk",
+        "hello from /etc/motd on a virtio-blk disk",
+        "ichor: blk: cat read /etc/motd from the virtio-blk disk",
         "ichor: boot complete; halting",
     ]);
     // Every page the heap self-test used came back.
@@ -92,6 +97,11 @@ fn m1_boots_on_one_cpu() {
         "ichor: linux: static ELF ran via the Linux ABI, exited 7 after 2 syscalls",
         "hello from /etc/motd inside an Ichor image",
         "ichor: linux: cat read /etc/motd through a symlink in the image",
+        "ichor: blk: virtio-blk disk, ",
+        "ichor: blk: verified 300 KiB read across multiple requests",
+        "ichor: blk: mounted the root image from the disk",
+        "hello from /etc/motd on a virtio-blk disk",
+        "ichor: blk: cat read /etc/motd from the virtio-blk disk",
         "ichor: boot complete; halting",
     ]);
 }
@@ -111,6 +121,11 @@ fn m2_scheduler_on_eight_cpus() {
         "ichor: linux: static ELF ran via the Linux ABI, exited 7 after 2 syscalls",
         "hello from /etc/motd inside an Ichor image",
         "ichor: linux: cat read /etc/motd through a symlink in the image",
+        "ichor: blk: virtio-blk disk, ",
+        "ichor: blk: verified 300 KiB read across multiple requests",
+        "ichor: blk: mounted the root image from the disk",
+        "hello from /etc/motd on a virtio-blk disk",
+        "ichor: blk: cat read /etc/motd from the virtio-blk disk",
         "ichor: boot complete; halting",
     ]);
 }

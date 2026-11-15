@@ -15,5 +15,10 @@ name = "xtask"
 path = "src/main.rs"
 test = false
 
+[dependencies]
+# Builds the root disk image each QEMU run boots with (a path crate, no
+# external code).
+image = { workspace = true, features = ["builder"] }
+
 [lints]
 workspace = true

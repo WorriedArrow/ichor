@@ -47,13 +47,20 @@ Milestones 0-2 are done.
   `docs/linux-abi.md` (`cargo xtask linux-abi-table`; lint checks it).
   `testprog` is a tiny assembler for self-test binaries. Real static Linux
   ELFs run in cells and read files from a mounted image.
+- M3 device I/O (ADR-0005): frame enumerates PCI and offers `IoMem`
+  (bounds-checked MMIO from `PciDevice::map_bar` only), `DmaBuf`/`DmaAddr`
+  and a frame-owned split `VirtQueue`. `kernel/block` is the block-device
+  trait; `kernel/drivers/virtio-blk` is a safe, polled virtio-blk driver.
+  Every QEMU run attaches `target/qemu/<run>/root.img` (built by xtask with
+  the image builder) as a virtio-blk disk; the kernel reads it, verifies a
+  300 KiB pattern file, mounts it, and runs `cat` against it.
 
 `tests/boot.rs` proves all of this on 1, 4 and 8 vCPUs.
 
-Next for milestone 3: virtio-blk (needs frame `IoMem`/DMA + a budget ADR),
-mounting the root image from a block device, `mmap`/`brk`/`getdents64`/
-signals stubs and whatever else a static busybox traces to, then the
-busybox QEMU test.
+Next for milestone 3: page the root image in from the device on demand
+(today the kernel reads the whole disk into memory, capped at 64 MiB),
+`mmap`/`brk`/`getdents64`/signals stubs and whatever else a static busybox
+traces to, then the busybox QEMU test.
 
 ADR-0004 records the side-channel posture; its per-CPU mitigations (VERW,
 IBPB on cross-cell switch, page-table isolation for Meltdown-affected CPUs)
@@ -71,9 +78,8 @@ Suggested order for milestone 3 (see the brief and ADR-0001 §4.6):
    `write`, `exit`, `uname`, ...) to run static busybox.
 5. A QEMU test that runs a real static busybox applet in a cell.
 
-Frame budget: ADR-0003 set the milestone 2 ceiling at 7,000 lines / 300
-sites; frame is at 4,310 and 206. Device I/O, IOMMU and DMA in milestone 3
-need their own budget ADR (ADR-0001 §8).
+Frame budget: ADR-0005 sets the milestone 3 ceiling at 8,500 lines / 380
+sites; `audit.toml` is at step 5 (5,100 / 235) and frame is at 4,963 / 223.
 
 The goal set for this effort is milestone 8, whose acceptance test needs
 cloud accounts and bare-metal hardware from the owner.
@@ -98,7 +104,9 @@ Environment overrides: `ICHOR_QEMU`, `ICHOR_OVMF_CODE` + `ICHOR_OVMF_VARS`,
 `ICHOR_ACCEL`, and `ICHOR_TEST_VERBOSE=1` (echo guest serial during tests).
 
 Plain `cargo build` / `cargo test` at the root only touch host crates
-(`default-members`). The kernel and frame build for `x86_64-unknown-uefi`
+(`default-members`). Crates that depend on frame (`ichor`, `ichor-frame`,
+`ichor-virtio-blk`) are kernel-only: xtask's `KERNEL_ONLY` list keeps them
+out of host clippy and tests and lints them for the UEFI target. The kernel and frame build for `x86_64-unknown-uefi`
 through xtask, into `target/kernel` so they never contend for cargo's build
 lock with the host build.
 
@@ -123,6 +131,7 @@ kernel/frame     the unsafe TCB (only crate allowed `unsafe`); owns efi_main
   src/mm           linear map/kspace switch, page metadata, page allocator, heap
   src/arch/x86_64  paging, GDT/TSS/IDT + trap stubs, x2APIC/timer, AP trampoline
   src/cpu.rs       CpuId, IrqGuard, CpuLocal<T>, cpu_local!
+  src/bus, io.rs, dma.rs, virtio.rs   PCI, IoMem, DmaBuf, VirtQueue
 kernel/cmdline   command line parser (no_std, host-tested)
 kernel/pe        PE32+ headers + base relocations (no_std, host-tested)
 kernel/buddy     buddy allocator policy over abstract links (no_std, host-tested)
@@ -132,6 +141,10 @@ kernel/sched     scheduling policy: group fair-share + work stealing (host-teste
 kernel/cap       capabilities, rights, revocation, CSpace (host-tested)
 kernel/cell      hierarchical resource accounts (host-tested)
 kernel/abi       native ABI definitions (docs/abi/native.md)
+kernel/elf       ELF64 parsing into load plans (host-tested)
+kernel/image     read-only content-addressed image format (host-tested)
+kernel/block     block-device trait and helpers (host-tested)
+kernel/drivers/virtio-blk  safe virtio-blk driver over frame's IoMem/DMA
 kernel/ichor     the kernel binary; frame::main!(kmain); kcell/nativeabi tie it together
 xtask/           build/run/test/lint tooling (lib + bin, no dependencies)
 tests/           QEMU integration tests (host crate using xtask's runner)

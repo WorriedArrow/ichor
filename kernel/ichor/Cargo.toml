@@ -20,6 +20,8 @@ cell.workspace = true
 ichor-abi.workspace = true
 elf.workspace = true
 image = { workspace = true, features = ["builder"] }
+block.workspace = true
+virtio-blk.workspace = true
 
 [lints]
 workspace = true

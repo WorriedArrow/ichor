@@ -6,6 +6,7 @@
 //! ```text
 //! esp/EFI/BOOT/BOOTX64.EFI   the kernel
 //! esp/ichor/cmdline          the kernel command line
+//! root.img                   the root image, attached as a virtio-blk disk
 //! ```
 //!
 //! OVMF finds `BOOTX64.EFI` through the removable-media boot path, so no boot
@@ -286,9 +287,42 @@ fn prepare_run_dir(cfg: &RunConfig, fw: &Firmware) -> Result<PathBuf> {
         .map_err(|e| format!("copying kernel {}: {e}", cfg.kernel.display()))?;
     fs::write(cfg_dir.join("cmdline"), &cfg.cmdline)
         .map_err(|e| format!("writing cmdline: {e}"))?;
+    fs::write(dir.join("root.img"), root_image())
+        .map_err(|e| format!("writing root image: {e}"))?;
     fs::copy(&fw.vars, dir.join("vars.fd"))
         .map_err(|e| format!("copying OVMF vars {}: {e}", fw.vars.display()))?;
     Ok(dir)
+}
+
+/// Text of `/usr/share/motd` on the root disk; tests look for it.
+pub const DISK_MOTD: &str = "hello from /etc/motd on a virtio-blk disk
+";
+
+/// Size of `/usr/share/pattern`, large enough that reading the disk takes
+/// several requests and multi-page DMA buffers.
+pub const DISK_PATTERN_LEN: usize = 300 * 1024;
+
+/// Byte `i` of `/usr/share/pattern` (the kernel checks the same formula).
+pub fn pattern_byte(i: usize) -> u8 {
+    (i.wrapping_mul(31) ^ (i >> 9)) as u8
+}
+
+/// The root disk: an Ichor image with `/usr/share/motd`,
+/// `/etc/motd -> /usr/share/motd` and `/usr/share/pattern`, padded to
+/// whole sectors.
+pub fn root_image() -> Vec<u8> {
+    let mut b = image::builder::Builder::new();
+    let motd = b.file("motd", DISK_MOTD.as_bytes(), 0o644);
+    let data: Vec<u8> = (0..DISK_PATTERN_LEN).map(pattern_byte).collect();
+    let pattern = b.file("pattern", &data, 0o644);
+    let share = b.dir("share", &[motd, pattern], 0o755);
+    let usr = b.dir("usr", &[share], 0o755);
+    let link = b.symlink("motd", "/usr/share/motd");
+    let etc = b.dir("etc", &[link], 0o755);
+    let root = b.dir("/", &[etc, usr], 0o755);
+    let mut img = b.finish(root);
+    img.resize(img.len().next_multiple_of(512), 0);
+    img
 }
 
 /// Builds the QEMU command line for a run.
@@ -332,7 +366,15 @@ pub fn command(cfg: &RunConfig) -> Result<Command> {
             drive_path(&dir.join("vars.fd"))
         ))
         .arg("-drive")
-        .arg(format!("format=raw,file=fat:rw:{esp_rel}"))
+        .arg(format!("if=none,id=esp,format=raw,file=fat:rw:{esp_rel}"))
+        // Boot from the ESP first; OVMF would otherwise try the root disk.
+        .args(["-device", "ide-hd,drive=esp,bus=ide.0,bootindex=0"])
+        .arg("-drive")
+        .arg(format!(
+            "if=none,id=root,format=raw,readonly=on,file={}",
+            drive_path(&dir.join("root.img"))
+        ))
+        .args(["-device", "virtio-blk-pci,drive=root,disable-legacy=on"])
         .args(&cfg.extra_args);
     Ok(cmd)
 }

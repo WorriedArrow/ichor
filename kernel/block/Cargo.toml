@@ -1,0 +1,13 @@
+[package]
+name = "ichor-block"
+description = "Block device trait and helpers (no_std, host-testable)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "block"
+
+[lints]
+workspace = true

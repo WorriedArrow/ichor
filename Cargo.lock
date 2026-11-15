@@ -7,6 +7,7 @@ name = "ichor"
 version = "0.0.0"
 dependencies = [
  "ichor-abi",
+ "ichor-block",
  "ichor-cap",
  "ichor-cell",
  "ichor-cmdline",
@@ -14,6 +15,7 @@ dependencies = [
  "ichor-frame",
  "ichor-image",
  "ichor-sched",
+ "ichor-virtio-blk",
 ]
 
 [[package]]
@@ -22,6 +24,10 @@ version = "0.0.0"
 
 [[package]]
 name = "ichor-acpi"
+version = "0.0.0"
+
+[[package]]
+name = "ichor-block"
 version = "0.0.0"
 
 [[package]]
@@ -74,5 +80,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ichor-virtio-blk"
+version = "0.0.0"
+dependencies = [
+ "ichor-block",
+ "ichor-frame",
+]
+
+[[package]]
 name = "xtask"
 version = "0.0.0"
+dependencies = [
+ "ichor-image",
+]

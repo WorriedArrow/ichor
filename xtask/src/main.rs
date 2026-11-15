@@ -121,18 +121,24 @@ fn cmd_run(o: &Opts) -> Result<()> {
     }
 }
 
+/// Crates that only build for the kernel target (they depend on frame).
+const KERNEL_ONLY: &[&str] = &["ichor", "ichor-frame", "ichor-virtio-blk"];
+
+fn exclude_kernel_only(cmd: &mut std::process::Command) -> &mut std::process::Command {
+    for c in KERNEL_ONLY {
+        cmd.args(["--exclude", c]);
+    }
+    cmd
+}
+
 fn cmd_test(o: &Opts) -> Result<()> {
     // Host unit tests for every host-buildable crate except the QEMU suite.
-    run_cmd(cargo().args([
+    run_cmd(exclude_kernel_only(cargo().args([
         "test",
         "--workspace",
         "--exclude",
         "ichor-tests",
-        "--exclude",
-        "ichor",
-        "--exclude",
-        "ichor-frame",
-    ]))?;
+    ])))?;
     // Build the kernel once, then hand it to the integration tests.
     let kernel = build::kernel(o.profile)?;
     let mut cmd = cargo();
@@ -149,29 +155,22 @@ fn cmd_test(o: &Opts) -> Result<()> {
 
 fn cmd_lint() -> Result<()> {
     run_cmd(cargo().args(["fmt", "--all", "--check"]))?;
-    run_cmd(cargo().args([
-        "clippy",
-        "--workspace",
-        "--exclude",
-        "ichor",
-        "--exclude",
-        "ichor-frame",
-        "--all-targets",
-        "--",
-        "-D",
-        "warnings",
-    ]))?;
     run_cmd(
-        cargo()
-            .args([
-                "clippy",
-                "--package",
-                "ichor",
-                "--package",
-                "ichor-frame",
-                "--target",
-                KERNEL_TARGET,
-            ])
+        exclude_kernel_only(cargo().args(["clippy", "--workspace"])).args([
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings",
+        ]),
+    )?;
+    let mut kernel_clippy = cargo();
+    kernel_clippy.arg("clippy");
+    for c in KERNEL_ONLY {
+        kernel_clippy.args(["--package", c]);
+    }
+    run_cmd(
+        kernel_clippy
+            .args(["--target", KERNEL_TARGET])
             .arg("--target-dir")
             .arg(build::kernel_target_dir())
             .args(["--", "-D", "warnings"]),

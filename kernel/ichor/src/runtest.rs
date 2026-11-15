@@ -16,7 +16,7 @@ use crate::process::LinuxProcess;
 use crate::testprog::{Asm, BLOB_VADDR, Reg, static_elf};
 use crate::vfs::Vfs;
 
-fn fail(what: &str) -> ! {
+pub(crate) fn fail(what: &str) -> ! {
     println!("ichor: runtest FAILED: {what}");
     shutdown(ExitStatus::Failure)
 }
@@ -36,7 +36,7 @@ const HELLO: &[u8] = b"hello from a real Linux ELF running on Ichor\n";
 
 /// Loads `elf` into `p`'s cell and runs it to exit; returns the exit status
 /// and the number of syscalls it made.
-fn run_linux(p: &mut LinuxProcess, elf: &[u8]) -> (i32, u32) {
+pub(crate) fn run_linux(p: &mut LinuxProcess, elf: &[u8]) -> (i32, u32) {
     let loaded = match loader::load(&p.cell, elf) {
         Ok(l) => l,
         Err(e) => {
@@ -86,7 +86,7 @@ fn hello_program() -> Vec<u8> {
 }
 
 /// A tiny `cat /etc/motd` with checks; exits 0 only if every check held.
-fn cat_program() -> Vec<u8> {
+pub(crate) fn cat_program() -> Vec<u8> {
     let mut a = Asm::new();
     let nope = a.data(b"/nope\0");
     let motd = a.data(b"/etc/motd\0");

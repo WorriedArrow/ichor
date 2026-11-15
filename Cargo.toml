@@ -12,6 +12,8 @@ members = [
     "kernel/abi",
     "kernel/elf",
     "kernel/image",
+    "kernel/block",
+    "kernel/drivers/virtio-blk",
     "kernel/ichor",
     "tests",
     "xtask",
@@ -30,6 +32,7 @@ default-members = [
     "kernel/abi",
     "kernel/elf",
     "kernel/image",
+    "kernel/block",
     "tests",
     "xtask",
 ]
@@ -52,6 +55,8 @@ cell = { package = "ichor-cell", path = "kernel/cell" }
 ichor-abi = { path = "kernel/abi" }
 elf = { package = "ichor-elf", path = "kernel/elf" }
 image = { package = "ichor-image", path = "kernel/image" }
+block = { package = "ichor-block", path = "kernel/block" }
+virtio-blk = { package = "ichor-virtio-blk", path = "kernel/drivers/virtio-blk" }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

@@ -1,0 +1,17 @@
+[package]
+name = "ichor-virtio-blk"
+description = "virtio-blk driver (modern virtio-pci transport, polled); safe code only"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "virtio_blk"
+
+[dependencies]
+frame.workspace = true
+block.workspace = true
+
+[lints]
+workspace = true
