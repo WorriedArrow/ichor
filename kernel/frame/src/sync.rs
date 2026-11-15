@@ -1,14 +1,17 @@
 //! Synchronization primitives.
 //!
-//! Milestone 0 runs on one CPU with interrupts masked, so this is a plain
-//! test-and-test-and-set spinlock. Milestone 1 makes `SpinLock` disable local
-//! interrupts and preemption for the guard's lifetime (ADR-0001, "sync").
+//! `SpinLock` masks local interrupts for the lifetime of its guard, so a
+//! lock taken in an interrupt handler can never deadlock against the code it
+//! interrupted on the same CPU. Preemption control joins it with the
+//! scheduler (milestone 2).
 
 use core::cell::UnsafeCell;
 use core::fmt;
 use core::marker::PhantomData;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, Ordering};
+
+use crate::arch;
 
 /// A mutual-exclusion spinlock.
 pub struct SpinLock<T: ?Sized> {
@@ -34,25 +37,40 @@ impl<T> SpinLock<T> {
 impl<T: ?Sized> SpinLock<T> {
     /// Spins until the lock is acquired.
     pub fn lock(&self) -> SpinLockGuard<'_, T> {
-        loop {
-            if let Some(guard) = self.try_lock() {
-                return guard;
-            }
+        let irq = arch::save_and_disable_interrupts();
+        while self
+            .locked
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
             while self.locked.load(Ordering::Relaxed) {
                 core::hint::spin_loop();
             }
+        }
+        SpinLockGuard {
+            lock: self,
+            irq,
+            _not_send: PhantomData,
         }
     }
 
     /// Acquires the lock if it is free.
     pub fn try_lock(&self) -> Option<SpinLockGuard<'_, T>> {
-        self.locked
+        let irq = arch::save_and_disable_interrupts();
+        match self
+            .locked
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .ok()
-            .map(|_| SpinLockGuard {
+        {
+            Ok(_) => Some(SpinLockGuard {
                 lock: self,
+                irq,
                 _not_send: PhantomData,
-            })
+            }),
+            Err(_) => {
+                arch::restore_interrupts(irq);
+                None
+            }
+        }
     }
 }
 
@@ -70,6 +88,8 @@ impl<T: ?Sized> fmt::Debug for SpinLock<T> {
 /// relies on when the guard also holds the CPU's interrupt state.
 pub struct SpinLockGuard<'a, T: ?Sized> {
     lock: &'a SpinLock<T>,
+    /// Whether interrupts were enabled before locking.
+    irq: bool,
     _not_send: PhantomData<*mut ()>,
 }
 
@@ -98,6 +118,7 @@ impl<T: ?Sized> DerefMut for SpinLockGuard<'_, T> {
 impl<T: ?Sized> Drop for SpinLockGuard<'_, T> {
     fn drop(&mut self) {
         self.lock.locked.store(false, Ordering::Release);
+        arch::restore_interrupts(self.irq);
     }
 }
 

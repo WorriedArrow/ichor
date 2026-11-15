@@ -12,7 +12,7 @@ use core::ffi::c_void;
 use core::ptr;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use super::{BootInfo, MemoryKind, MemoryRegion, enter_kernel};
+use super::{MemoryKind, MemoryRegion, Phase, take_boot_state};
 use crate::mm::{PAGE_SIZE, PhysAddr};
 use crate::power::{self, ExitStatus};
 use crate::{arch, println};
@@ -204,54 +204,31 @@ const FILE_MODE_READ: u64 = 1;
 const MIN_DESCRIPTOR_SIZE: usize = 40;
 
 // ---------------------------------------------------------------------------
-// Boot-time static storage.
+// Boot-time static storage for the raw firmware memory map.
 // ---------------------------------------------------------------------------
 
 const MAP_BUF_SIZE: usize = 64 * 1024;
-const MAX_REGIONS: usize = MAP_BUF_SIZE / MIN_DESCRIPTOR_SIZE;
-const CMDLINE_MAX: usize = 4096;
-const VENDOR_MAX: usize = 64;
 
+/// Room for the firmware memory map. Lives in `.bss` so that nothing needs
+/// allocating between GetMemoryMap and ExitBootServices (allocating would
+/// change the memory map key).
 #[repr(C, align(8))]
-struct MapBuf([u8; MAP_BUF_SIZE]);
+struct MapBuf(UnsafeCell<[u8; MAP_BUF_SIZE]>);
 
-/// Storage that boot fills in and then hands to the kernel as `&'static`
-/// data. Lives in `.bss` so that nothing needs allocating before boot
-/// services exit (allocating would change the memory map key).
-struct BootState {
-    map: MapBuf,
-    regions: [MemoryRegion; MAX_REGIONS],
-    cmdline: [u8; CMDLINE_MAX],
-    vendor: [u8; VENDOR_MAX],
-}
+// SAFETY: the contents are only reached through `take_map_buf`, which hands
+// out a single `&mut` exactly once.
+unsafe impl Sync for MapBuf {}
 
-struct BootStateCell(UnsafeCell<BootState>);
+static MAP_BUF: MapBuf = MapBuf(UnsafeCell::new([0; MAP_BUF_SIZE]));
+static MAP_BUF_TAKEN: AtomicBool = AtomicBool::new(false);
 
-// SAFETY: the only access to the contents is through `take_boot_state`, which
-// hands out a single `&mut` exactly once for the life of the system.
-unsafe impl Sync for BootStateCell {}
-
-const EMPTY_REGION: MemoryRegion = MemoryRegion {
-    base: PhysAddr::new(0),
-    len: 0,
-    kind: MemoryKind::Usable,
-};
-
-static BOOT_STATE: BootStateCell = BootStateCell(UnsafeCell::new(BootState {
-    map: MapBuf([0; MAP_BUF_SIZE]),
-    regions: [EMPTY_REGION; MAX_REGIONS],
-    cmdline: [0; CMDLINE_MAX],
-    vendor: [0; VENDOR_MAX],
-}));
-static BOOT_STATE_TAKEN: AtomicBool = AtomicBool::new(false);
-
-fn take_boot_state() -> Option<&'static mut BootState> {
-    if BOOT_STATE_TAKEN.swap(true, Ordering::AcqRel) {
+fn take_map_buf() -> Option<&'static mut [u8; MAP_BUF_SIZE]> {
+    if MAP_BUF_TAKEN.swap(true, Ordering::AcqRel) {
         return None;
     }
     // SAFETY: the swap above succeeds at most once, so this is the only
-    // reference ever created to the contents of `BOOT_STATE`.
-    Some(unsafe { &mut *BOOT_STATE.0.get() })
+    // reference ever created to the buffer.
+    Some(unsafe { &mut *MAP_BUF.0.get() })
 }
 
 /// Builds a NUL-terminated UCS-2 string from ASCII at compile time.
@@ -556,7 +533,7 @@ fn fatal(what: &str, status: Status) -> ! {
 
 #[unsafe(export_name = "efi_main")]
 extern "efiapi" fn efi_main(image: Handle, system_table: *const SystemTable) -> Status {
-    let Some(state) = take_boot_state() else {
+    let (Some(state), Some(map)) = (take_boot_state(Phase::Firmware), take_map_buf()) else {
         return ALREADY_STARTED;
     };
     arch::early_console::init();
@@ -571,18 +548,11 @@ extern "efiapi" fn efi_main(image: Handle, system_table: *const SystemTable) -> 
         Err(status) => return status,
     };
 
-    let BootState {
-        map,
-        regions,
-        cmdline,
-        vendor,
-    } = state;
-
-    let firmware_vendor: &'static str = fw.vendor(vendor);
-    let firmware_revision = fw.firmware_revision();
-    let uefi_revision = fw.uefi_revision();
-    let acpi_rsdp = fw.acpi_rsdp();
-    let kernel_image = match fw.loaded_image() {
+    state.vendor_len = fw.vendor(&mut state.vendor).len();
+    state.firmware_revision = fw.firmware_revision();
+    state.uefi_revision = fw.uefi_revision();
+    state.acpi_rsdp = fw.acpi_rsdp();
+    state.kernel_image = match fw.loaded_image() {
         Ok(li) => MemoryRegion {
             base: PhysAddr::new(li.image_base as u64),
             len: li.image_size.next_multiple_of(PAGE_SIZE),
@@ -591,52 +561,37 @@ extern "efiapi" fn efi_main(image: Handle, system_table: *const SystemTable) -> 
         Err(status) => fatal("cannot locate own loaded image", status),
     };
 
-    let cmdline_len = match fw.read_boot_file(&CMDLINE_PATH, cmdline) {
+    let cmdline_len = match fw.read_boot_file(&CMDLINE_PATH, &mut state.cmdline) {
         Ok(n) => n,
         Err(NOT_FOUND) => 0,
         Err(status) => {
-            println!(
-                "ichor: frame: warning: cannot read \\ichor\\cmdline (EFI status {status:#x})"
-            );
+            println!(r"ichor: frame: warning: cannot read \ichor\cmdline (EFI status {status:#x})");
             0
         }
     };
-    let cmdline: &'static [u8; CMDLINE_MAX] = cmdline;
-    let cmdline: &'static [u8] = &cmdline[..cmdline_len];
-    let cmdline: &'static str = match core::str::from_utf8(cmdline) {
-        Ok(s) => s,
+    state.cmdline_len = match core::str::from_utf8(&state.cmdline[..cmdline_len]) {
+        Ok(s) => s.len(),
         Err(e) => {
             println!("ichor: frame: warning: command line is not UTF-8; truncating");
-            core::str::from_utf8(&cmdline[..e.valid_up_to()]).unwrap_or("")
+            e.valid_up_to()
         }
     };
-    if cmdline::Cmdline::new(cmdline).flag("qemu_debug_exit") {
+    if cmdline::Cmdline::new(state.cmdline()).flag("qemu_debug_exit") {
         power::enable_qemu_debug_exit();
     }
 
-    let (map_len, desc_size) = match fw.exit_boot_services(&mut map.0) {
+    let (map_len, desc_size) = match fw.exit_boot_services(map) {
         Ok(v) => v,
         Err(status) => fatal("ExitBootServices failed", status),
     };
-    // Boot services are gone. Mask interrupts until frame installs its own IDT
-    // (milestone 1); firmware's handlers live in memory we now own.
+    // Boot services are gone. Mask interrupts until frame installs its own
+    // IDT; firmware's handlers live in memory we will reclaim.
     arch::disable_local_interrupts();
     println!("ichor: frame: boot services exited");
 
     if desc_size < MIN_DESCRIPTOR_SIZE {
         fatal("firmware memory descriptor size too small", desc_size);
     }
-    let region_count = convert_memory_map(&map.0[..map_len], desc_size, regions);
-    let regions: &'static [MemoryRegion; MAX_REGIONS] = regions;
-    let memory_map: &'static [MemoryRegion] = &regions[..region_count];
-
-    enter_kernel(BootInfo {
-        cmdline,
-        memory_map,
-        acpi_rsdp,
-        firmware_vendor,
-        firmware_revision,
-        uefi_revision,
-        kernel_image,
-    })
+    state.region_count = convert_memory_map(&map[..map_len], desc_size, &mut state.regions);
+    super::start(state)
 }

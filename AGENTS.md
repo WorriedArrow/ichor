@@ -15,32 +15,51 @@ a framekernel. The founding brief is the source of truth until an ADR in
 
 ## Status
 
-**Active milestone: 1**: the frame crate gets paging, the frame allocator,
-heap, IDT and traps, x2APIC, timer, SMP bring-up on every core, and per-CPU
-data.
+**Active milestone: 2.** Its scope is the scheduler, kernel threads,
+native-ABI user processes, capabilities, and cells.
 
-Milestone 0 is done. The kernel boots as a UEFI application under QEMU + OVMF,
-prints to serial, reads `\ichor\cmdline`, exits boot services, and reports the
-memory map and ACPI RSDP. It then halts, or under the test harness exits QEMU
-with a status. `tests/boot.rs` proves this, including the panic path.
+Milestones 0 and 1 are done. The kernel boots as a UEFI application, builds
+its own page tables, and runs in the higher half. It reclaims boot-services
+memory and has a validated buddy page allocator and a heap. It handles traps
+with IST stacks (stack overflows hit a guard page and are reported), and
+brings up every CPU listed in the ACPI MADT in parallel. Each CPU gets
+x2APIC, a tickless TSC-deadline or one-shot timer, and per-CPU data.
+`tests/boot.rs` proves all of this on 1 and 4 vCPUs, including the panic and
+stack-overflow paths. ADR-0001's amendment records what landed and what
+deviated from the plan.
 
-Suggested order for milestone 1 (see ADR-0001 §3 and §4.3–4.4):
+Suggested order for milestone 2 (see ADR-0001 §4.3–4.5 and ADR-0002):
 
-1. Host-testable safe crates first: physical page allocator (buddy + per-CPU
-   caches) and page-table index math. Give them Miri and proptests.
-2. Frame: own page tables, a linear map at `0xffff_8000_0000_0000`, the image
-   at `0xffff_ffff_8000_0000` via PE base relocations, a frame-allocated stack,
-   dropping the identity map, then reclaiming `BootServices` memory.
-3. Frame metadata array, `Frame<M>`/`UFrame`, kernel heap (`GlobalAlloc` shim
-   in frame, slab policy in safe code).
-4. GDT/TSS/IDT with IST stacks, exception handlers, x2APIC, TSC-deadline
-   timer.
-5. ACPI MADT parsing (safe crate, over byte slices from frame), AP
-   trampoline, `cpu_local!`, and an integration test that every vCPU checks in
-   (`-smp 4`).
+1. Frame: `Task` and the context switch (callee-saved registers plus the
+   stack pointer). Add the "running on CPU n" atomic so a task can never run
+   on two CPUs, preemption counting, and atomic-mode checks: sleeping while
+   holding an `IrqGuard` or a spinlock must panic. Also scheduler injection
+   through a `Scheduler` trait.
+2. Safe `kernel/sched`: per-CPU run queues, work stealing, and hierarchical
+   fair share. Host-testable policy core plus QEMU tests. The timer handler
+   drives preemption, and IPIs wake idle CPUs (`apic::send_ipi` is ready).
+3. Frame: the typed/untyped frame API (`Frame<M>`, `UFrame`, `Segment`),
+   `VmReader`/`VmWriter` with fallible user copies (exception table, SMAP
+   `stac`/`clac`), `VmSpace` with a cursor API and PCID. Move the slab policy
+   out of frame into a safe crate and add per-CPU caches.
+4. Frame: `UserMode::execute` and `UserContext`, using `syscall`/`sysret`
+   and `swapgs`, with the NMI-in-`swapgs` window handled.
+5. Safe `kernel/cap` (`Cap<T>`, rights, revocation tokens, CSpace with
+   generation-tagged handles) and `kernel/cell` (cells, accounts, the system
+   cell).
+6. Safe `kernel/native-abi` plus `abi/` (the ABI definitions, documented in
+   `docs/abi/`). Add a tiny native-ABI user program, embedded in the image
+   for now, that runs in a cell and makes capability calls. A QEMU test proves
+   that isolation holds: a stale or foreign handle is rejected.
+7. Write the side-channel ADR (it is due before milestone 2 completes).
 
-Raise `kernel/frame/audit.toml` in steps as frame grows, citing ADR-0001 §8.
-The milestone-1 ceiling is 6,000 lines and 320 unsafe sites.
+Raise `kernel/frame/audit.toml` in steps as frame grows. Milestone 1's
+ceiling was 6,000 lines and 320 sites, and frame is at 2,894 and 150. Going
+past that ceiling needs a new ADR, as ADR-0001 §8 requires.
+
+The goal set for this effort is milestone 8. Milestone 8's acceptance test
+(booting on AWS, GCP, Azure and one bare-metal machine) needs cloud
+accounts and hardware from the owner. Ask for them when you get there.
 
 ## Commands
 
@@ -77,12 +96,20 @@ comment.
 | `qemu_debug_exit` | `shutdown()` exits QEMU through `isa-debug-exit`: status 33 = success, 35 = failure |
 | `memmap` | print the full memory map |
 | `test_panic` | panic after boot (exercises the panic path) |
+| `test_stack_overflow` | recurse until the kernel stack hits its guard page |
 
 ## Layout
 
 ```
 kernel/frame     the unsafe TCB (only crate allowed `unsafe`); owns efi_main
+  src/boot         UEFI entry, boot state, higher-half entry, per-CPU init
+  src/mm           linear map/kspace switch, page metadata, page allocator, heap
+  src/arch/x86_64  paging, GDT/TSS/IDT + trap stubs, x2APIC/timer, AP trampoline
+  src/cpu.rs       CpuId, IrqGuard, CpuLocal<T>, cpu_local!
 kernel/cmdline   command line parser (no_std, host-tested)
+kernel/pe        PE32+ headers + base relocations (no_std, host-tested)
+kernel/buddy     buddy allocator policy over abstract links (no_std, host-tested)
+kernel/acpi      RSDP/XSDT/MADT parsing from byte slices (no_std, host-tested)
 kernel/ichor     the kernel binary; `frame::main!(kmain)`
 xtask/           build/run/test/lint tooling (lib + bin, no dependencies)
 tests/           QEMU integration tests (host crate using xtask's runner)

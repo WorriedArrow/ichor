@@ -9,7 +9,11 @@
 //! 3. reads the kernel command line from `\ichor\cmdline` on the volume the
 //!    kernel was loaded from,
 //! 4. fetches the final memory map and exits boot services,
-//! 5. masks interrupts and calls the kernel's main function (declared with
+//! 5. builds the kernel page tables and jumps to the higher half on a guarded
+//!    boot stack (`mm::kspace`),
+//! 6. drops the identity map, enables SMEP/SMAP/UMIP/WP, initializes the
+//!    page allocator and the heap, and
+//! 7. calls the kernel's main function (declared with
 //!    [`frame::main!`](crate::main)) with a [`BootInfo`].
 //!
 //! After step 4 no firmware code runs again: Ichor never calls UEFI runtime
@@ -17,9 +21,196 @@
 
 mod uefi;
 
+use core::cell::UnsafeCell;
 use core::fmt;
+use core::sync::atomic::{AtomicU8, Ordering};
 
-use crate::mm::PhysAddr;
+use crate::cpu::CpuId;
+use crate::mm::early::EarlyAlloc;
+use crate::mm::{self, PhysAddr};
+use crate::power::{self, ExitStatus};
+use crate::sync::SpinLock;
+use crate::{arch, println};
+
+pub(crate) const MAX_REGIONS: usize = 1638;
+pub(crate) const CMDLINE_MAX: usize = 4096;
+pub(crate) const VENDOR_MAX: usize = 64;
+
+/// What boot learns from firmware, kept in `.bss` and handed from the
+/// firmware phase to the higher-half phase.
+pub(crate) struct BootState {
+    pub(crate) regions: [MemoryRegion; MAX_REGIONS],
+    pub(crate) region_count: usize,
+    pub(crate) cmdline: [u8; CMDLINE_MAX],
+    /// Length of the valid UTF-8 prefix of `cmdline`.
+    pub(crate) cmdline_len: usize,
+    pub(crate) vendor: [u8; VENDOR_MAX],
+    pub(crate) vendor_len: usize,
+    pub(crate) acpi_rsdp: Option<PhysAddr>,
+    pub(crate) firmware_revision: u32,
+    pub(crate) uefi_revision: u32,
+    pub(crate) kernel_image: MemoryRegion,
+    pub(crate) early: EarlyAlloc,
+}
+
+impl BootState {
+    pub(crate) fn cmdline(&self) -> &str {
+        core::str::from_utf8(&self.cmdline[..self.cmdline_len]).unwrap_or("")
+    }
+
+    pub(crate) fn regions(&self) -> &[MemoryRegion] {
+        &self.regions[..self.region_count]
+    }
+}
+
+const EMPTY_REGION: MemoryRegion = MemoryRegion {
+    base: PhysAddr::new(0),
+    len: 0,
+    kind: MemoryKind::Usable,
+};
+
+struct BootStateCell(UnsafeCell<BootState>);
+
+// SAFETY: the contents are only reached through `take_boot_state`, which
+// hands out one `&mut` per boot phase; see there.
+unsafe impl Sync for BootStateCell {}
+
+static BOOT_STATE: BootStateCell = BootStateCell(UnsafeCell::new(BootState {
+    regions: [EMPTY_REGION; MAX_REGIONS],
+    region_count: 0,
+    cmdline: [0; CMDLINE_MAX],
+    cmdline_len: 0,
+    vendor: [0; VENDOR_MAX],
+    vendor_len: 0,
+    acpi_rsdp: None,
+    firmware_revision: 0,
+    uefi_revision: 0,
+    kernel_image: EMPTY_REGION,
+    early: EarlyAlloc::EMPTY,
+}));
+
+/// Which boot phase may take the boot state next.
+static PHASE: AtomicU8 = AtomicU8::new(0);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum Phase {
+    /// `efi_main`, on firmware's identity map.
+    Firmware = 0,
+    /// `kernel_space_entry`, in the higher half.
+    HigherHalf = 1,
+}
+
+/// Hands out the boot state once per phase, in order.
+///
+/// The firmware-phase reference is moved into [`start`], which diverges
+/// into the higher half and abandons the firmware stack, so it is dead by
+/// the time the higher-half phase takes a new one. At no point are two
+/// usable references live.
+pub(crate) fn take_boot_state(phase: Phase) -> Option<&'static mut BootState> {
+    let p = phase as u8;
+    PHASE
+        .compare_exchange(p, p + 1, Ordering::AcqRel, Ordering::Acquire)
+        .ok()?;
+    // SAFETY: the compare-exchange admits each phase once, in order; the
+    // previous phase's reference is dead (see above).
+    Some(unsafe { &mut *BOOT_STATE.0.get() })
+}
+
+static MEMORY_MAP: SpinLock<&'static [MemoryRegion]> = SpinLock::new(&[]);
+static ACPI_RSDP: SpinLock<Option<PhysAddr>> = SpinLock::new(None);
+
+/// The firmware memory map (empty before the higher-half phase).
+pub(crate) fn memory_map() -> &'static [MemoryRegion] {
+    *MEMORY_MAP.lock()
+}
+
+/// The ACPI RSDP, if firmware provided one.
+pub(crate) fn acpi_rsdp() -> Option<PhysAddr> {
+    *ACPI_RSDP.lock()
+}
+
+/// Per-CPU initialization shared by the boot CPU and APs: protections,
+/// per-CPU block, GDT/TSS/IDT, x2APIC and timer. Marks the CPU online.
+pub(crate) fn init_cpu(id: CpuId) {
+    arch::cpu::enable_nx();
+    arch::cpu::enable_protections();
+    // Loading the GDT reloads GS with a null selector, which clears the GS
+    // base, so the per-CPU block is installed afterwards.
+    if arch::trap::init_cpu().is_none() {
+        fatal("out of memory for CPU tables");
+    }
+    crate::cpu::init_this_cpu(id);
+    if let Err(e) = arch::apic::init_local() {
+        fatal(e);
+    }
+    arch::apic::init_timer();
+    crate::cpu::mark_online();
+}
+
+/// Stops the machine during boot with a message.
+pub(crate) fn fatal(what: &str) -> ! {
+    println!("ichor: frame: fatal: {what}");
+    power::shutdown(ExitStatus::Failure)
+}
+
+/// Firmware phase, after boot services are gone: build the kernel address
+/// space and switch to it.
+fn start(state: &'static mut BootState) -> ! {
+    if !arch::cpu::enable_nx() {
+        fatal("CPU lacks no-execute support");
+    }
+    let Some(mut early) = EarlyAlloc::new(state.regions()) else {
+        fatal("no usable memory above 1 MiB");
+    };
+    let plan = match mm::kspace::build(state.regions(), state.kernel_image, &mut early) {
+        Ok(plan) => plan,
+        Err(e) => fatal(e),
+    };
+    state.early = early;
+    mm::kspace::switch(plan)
+}
+
+/// Higher-half phase: first code to run on the kernel's own page tables and
+/// boot stack.
+pub(crate) extern "sysv64" fn kernel_space_entry() -> ! {
+    let Some(state) = take_boot_state(Phase::HigherHalf) else {
+        fatal("higher-half entry reached twice");
+    };
+    mm::kspace::finish_switch();
+    let mut early = core::mem::replace(&mut state.early, EarlyAlloc::EMPTY);
+    if let Err(e) = mm::init(state.regions(), &mut early) {
+        fatal(e);
+    }
+    let state: &'static BootState = state;
+    *MEMORY_MAP.lock() = state.regions();
+    *ACPI_RSDP.lock() = state.acpi_rsdp;
+    println!("ichor: frame: running in the higher half");
+
+    arch::trap::init_idt();
+    arch::apic::mask_legacy_pic();
+    let hz = arch::apic::init_tsc();
+    init_cpu(CpuId::BOOT);
+    println!(
+        "ichor: frame: cpu0 ready (x2APIC id {}, TSC {} MHz, {} timer)",
+        arch::apic::apic_id(),
+        hz / 1_000_000,
+        if arch::cpu::features().tsc_deadline {
+            "TSC-deadline"
+        } else {
+            "one-shot"
+        }
+    );
+    enter_kernel(BootInfo {
+        cmdline: state.cmdline(),
+        memory_map: state.regions(),
+        acpi_rsdp: state.acpi_rsdp,
+        firmware_vendor: core::str::from_utf8(&state.vendor[..state.vendor_len]).unwrap_or(""),
+        firmware_revision: state.firmware_revision,
+        uefi_revision: state.uefi_revision,
+        kernel_image: state.kernel_image,
+    })
+}
 
 /// Declares the kernel's entry point.
 ///

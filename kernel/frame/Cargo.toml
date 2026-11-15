@@ -11,6 +11,9 @@ name = "frame"
 
 [dependencies]
 cmdline.workspace = true
+pe.workspace = true
+buddy.workspace = true
+acpi.workspace = true
 
 [lints]
 workspace = true

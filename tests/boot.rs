@@ -1,24 +1,40 @@
+//! Boot tests.
+//!
 //! Milestone 0: the kernel boots as a UEFI application, prints to serial,
 //! exits boot services and halts cleanly.
+//!
+//! Milestone 1: frame builds its own page tables and runs in the higher
+//! half, the page allocator and heap work, traps are handled (including a
+//! stack overflow caught by a guard page), and every CPU comes online and
+//! takes timer interrupts.
 
 use ichor_tests::{Exit, boot};
 
+const BOOT_MARKERS: &[&str] = &[
+    "ichor: frame: entered from UEFI",
+    "ichor: frame: boot services exited",
+    "ichor: frame: running in the higher half",
+    "ichor: frame: cpu0 ready (x2APIC id ",
+    "ichor: kernel ",
+    "ichor: memory: ",
+    "ichor: acpi: rsdp at 0x",
+    "ichor: kernel entry at 0xffffffff8",
+    "ichor: heap: selftest passed",
+    "ichor: trap: breakpoint handled (1 so far)",
+];
+
 #[test]
-fn m0_boots_exits_boot_services_and_halts() {
-    let out = boot("m0-boot", "memmap", 2);
+fn m1_boots_on_four_cpus() {
+    let out = boot("m1-smp4", "memmap", 4);
     out.assert_exit(Exit::Success);
+    out.assert_in_order(BOOT_MARKERS);
     out.assert_in_order(&[
-        "ichor: frame: entered from UEFI",
-        "ichor: frame: boot services exited",
-        "ichor: kernel ",
-        "ichor: cmdline: \"qemu_debug_exit memmap\"",
-        " Usable",
-        "ichor: memory: ",
-        "ichor: acpi: rsdp at 0x",
-        "ichor: milestone 0 complete; halting",
+        "ichor: smp: 4 CPUs online, every CPU took 5 timer interrupts",
+        "ichor: boot complete; halting",
     ]);
-    // Sanity-check the memory map against the 512 MiB the harness configures:
-    // somewhere between 300 MiB and 512 MiB should be usable.
+    // Every page the heap self-test used came back.
+    out.assert_in_order(&["(0 pages not returned)"]);
+    // Between 300 MiB and 512 MiB of the 512 MiB guest is usable.
     let usable_mib: u64 = out
         .serial
         .lines()
@@ -38,12 +54,34 @@ fn m0_boots_exits_boot_services_and_halts() {
 }
 
 #[test]
-fn panic_reports_failure() {
-    let out = boot("panic", "test_panic", 1);
+fn m1_boots_on_one_cpu() {
+    let out = boot("m1-smp1", "", 1);
+    out.assert_exit(Exit::Success);
+    out.assert_in_order(BOOT_MARKERS);
+    out.assert_in_order(&[
+        "ichor: smp: 1 CPUs online, every CPU took 5 timer interrupts",
+        "ichor: boot complete; halting",
+    ]);
+}
+
+#[test]
+fn panic_reports_failure_and_stops_other_cpus() {
+    let out = boot("panic", "test_panic", 2);
     out.assert_exit(Exit::Failure);
     out.assert_in_order(&[
-        "ichor: frame: boot services exited",
+        "ichor: smp: 2 CPUs online",
         "ichor: KERNEL PANIC: ",
         "test_panic requested",
+    ]);
+}
+
+#[test]
+fn stack_overflow_hits_the_guard_page() {
+    let out = boot("stack-overflow", "test_stack_overflow", 1);
+    out.assert_exit(Exit::Failure);
+    out.assert_in_order(&[
+        "ichor: overflowing the kernel stack",
+        "ichor: KERNEL PANIC: ",
+        "double fault (kernel stack overflow)",
     ]);
 }

@@ -11,6 +11,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ichor-acpi"
+version = "0.0.0"
+
+[[package]]
+name = "ichor-buddy"
+version = "0.0.0"
+
+[[package]]
 name = "ichor-cmdline"
 version = "0.0.0"
 
@@ -18,8 +26,15 @@ version = "0.0.0"
 name = "ichor-frame"
 version = "0.0.0"
 dependencies = [
+ "ichor-acpi",
+ "ichor-buddy",
  "ichor-cmdline",
+ "ichor-pe",
 ]
+
+[[package]]
+name = "ichor-pe"
+version = "0.0.0"
 
 [[package]]
 name = "ichor-tests"

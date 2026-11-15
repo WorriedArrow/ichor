@@ -20,12 +20,19 @@
 
 #![no_std]
 
+extern crate alloc;
+
+mod acpi;
 pub mod arch;
 pub mod boot;
 pub mod console;
+pub mod cpu;
+pub mod debug;
+pub mod irq;
 pub mod mm;
 pub mod power;
+pub mod smp;
 pub mod sync;
+pub mod time;
 
-#[cfg(target_os = "uefi")]
 mod panic;

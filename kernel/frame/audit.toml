@@ -8,6 +8,9 @@
 # unsafe_sites: `unsafe` keyword occurrences (blocks, fns, impls, externs,
 #               attributes) outside comments and strings
 #
-# Budget: ADR-0001, section 8 ("Frame budget"), milestone 0 row.
-max_code_lines = 900
-max_unsafe_sites = 48
+# Budget: ADR-0001, section 8 ("Frame budget"). Milestone 1 raises these in
+# steps up to its ceiling of 6,000 lines / 320 sites.
+# Step 1 (paging, page allocator, heap): 1,950 / 115.
+# Step 2 (traps, x2APIC, timer, ACPI access, SMP, per-CPU data): 3,000 / 160.
+max_code_lines = 3000
+max_unsafe_sites = 160
