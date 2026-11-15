@@ -20,6 +20,7 @@ members = [
     "kernel/blake3",
     "kernel/testprog",
     "kernel/gpt",
+    "kernel/net",
     "kernel/drivers/virtio-pci",
     "kernel/drivers/virtio-blk",
     "kernel/drivers/virtio-rng",
@@ -50,6 +51,7 @@ default-members = [
     "kernel/blake3",
     "kernel/testprog",
     "kernel/gpt",
+    "kernel/net",
     "tests",
     "xtask",
 ]

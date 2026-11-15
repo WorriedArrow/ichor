@@ -1,0 +1,13 @@
+[package]
+name = "ichor-net"
+description = "Ichor's network protocols as sans-I/O state machines: Ethernet, ARP, IPv4, ICMP, UDP, TCP (no_std, host-tested)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "net"
+
+[lints]
+workspace = true

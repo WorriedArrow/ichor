@@ -93,6 +93,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ichor-net"
+version = "0.0.0"
+
+[[package]]
 name = "ichor-nvme"
 version = "0.0.0"
 dependencies = [
