@@ -199,6 +199,8 @@ pub struct RunConfig {
     pub capture: bool,
     /// Extra raw QEMU arguments.
     pub extra_args: Vec<String>,
+    /// Show a window (GTK, serial console in it) instead of serial on stdio.
+    pub window: bool,
 }
 
 impl RunConfig {
@@ -213,6 +215,7 @@ impl RunConfig {
             timeout: None,
             capture: false,
             extra_args: Vec::new(),
+            window: false,
         }
     }
 }
@@ -441,14 +444,12 @@ pub fn command(cfg: &RunConfig) -> Result<Command> {
         .args(["-cpu", accel.cpu_model()])
         .args(["-smp", &cfg.smp.to_string()])
         .args(["-m", &format!("{}M", cfg.memory_mib)])
-        .args([
-            "-nodefaults",
-            "-no-user-config",
-            "-display",
-            "none",
-            "-no-reboot",
-        ])
-        .args(["-serial", "stdio"])
+        .args(["-nodefaults", "-no-user-config", "-no-reboot"])
+        .args(if cfg.window {
+            ["-display", "gtk,show-tabs=on", "-serial", "vc"]
+        } else {
+            ["-display", "none", "-serial", "stdio"]
+        })
         .args(["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"])
         .arg("-drive")
         .arg(format!(

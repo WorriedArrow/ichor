@@ -30,6 +30,8 @@ Options:
   --memory <MiB>         Guest memory for `run` (default 512)
   --timeout <secs>       Kill QEMU after this long (`run` only; default none)
   --gdb                  `run`: wait for a debugger on tcp::1234
+  --window               `run`: show a QEMU window with the serial console (run dir `window`)
+  --name NAME            `run`: run directory under target/qemu/ (default `run`)
   -- <args>              Extra arguments passed to QEMU (`run`)
 
 Environment:
@@ -47,6 +49,8 @@ struct Opts {
     memory_mib: u32,
     timeout: Option<Duration>,
     gdb: bool,
+    window: bool,
+    name: Option<String>,
     extra: Vec<String>,
 }
 
@@ -59,6 +63,8 @@ fn parse(args: &[String]) -> Result<Opts> {
         memory_mib: 512,
         timeout: None,
         gdb: false,
+        window: false,
+        name: None,
         extra: Vec::new(),
     };
     let mut it = args.iter();
@@ -85,6 +91,8 @@ fn parse(args: &[String]) -> Result<Opts> {
                 o.timeout = Some(Duration::from_secs(secs));
             }
             "--gdb" => o.gdb = true,
+            "--window" => o.window = true,
+            "--name" => o.name = Some(value("--name")?),
             "--" => {
                 o.extra.extend(it.by_ref().cloned());
                 break;
@@ -97,13 +105,18 @@ fn parse(args: &[String]) -> Result<Opts> {
 
 fn cmd_run(o: &Opts) -> Result<()> {
     let kernel = build::kernel(o.profile)?;
-    let mut cfg = RunConfig::new("run", kernel);
+    let name = o
+        .name
+        .clone()
+        .unwrap_or_else(|| if o.window { "window" } else { "run" }.to_string());
+    let mut cfg = RunConfig::new(name, kernel);
     cfg.cmdline = o.cmdline.clone();
     cfg.smp = o.smp;
     cfg.memory_mib = o.memory_mib;
     cfg.accel = o.accel;
     cfg.timeout = o.timeout;
     cfg.extra_args = o.extra.clone();
+    cfg.window = o.window;
     if o.gdb {
         cfg.extra_args.extend(["-s".into(), "-S".into()]);
         eprintln!("xtask: waiting for gdb on tcp::1234");

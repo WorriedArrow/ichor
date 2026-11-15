@@ -375,21 +375,38 @@ pub(crate) fn dispatch(p: &mut LinuxProcess, ctx: &mut frame::user::UserContext)
             Err(ENOSYS)
         }
     };
-    if TRACE_PID.load(core::sync::atomic::Ordering::Relaxed) == p.entry.pid {
+    let traced = TRACE_PID.load(core::sync::atomic::Ordering::Relaxed) == p.entry.pid
+        || (TRACE_ERRORS.load(core::sync::atomic::Ordering::Relaxed)
+            && result.is_err_and(|e| e != signal::ERESTARTSYS));
+    if traced {
+        // Name the path argument of path syscalls, so traces are readable.
+        let path_arg = match nr {
+            nr::OPEN
+            | nr::STAT
+            | nr::LSTAT
+            | nr::ACCESS
+            | nr::READLINK
+            | nr::EXECVE
+            | nr::UNLINK
+            | nr::MKDIR
+            | nr::RMDIR
+            | nr::CHDIR
+            | nr::RENAME
+            | nr::CHMOD => Some(a[0]),
+            nr::OPENAT
+            | nr::NEWFSTATAT
+            | nr::FACCESSAT
+            | nr::READLINKAT
+            | nr::UNLINKAT
+            | nr::MKDIRAT
+            | nr::FACCESSAT2 => Some(a[1]),
+            _ => None,
+        };
+        let path = path_arg
+            .and_then(|addr| fs::user_path(p, addr).ok())
+            .unwrap_or_default();
         frame::println!(
-            "ichor: trace: pid {} syscall {nr}({:#x}, {:#x}, {:#x}) = {result:?}",
-            p.entry.pid,
-            a[0],
-            a[1],
-            a[2]
-        );
-    }
-    if let Err(e) = result
-        && TRACE_ERRORS.load(core::sync::atomic::Ordering::Relaxed)
-        && e != signal::ERESTARTSYS
-    {
-        frame::println!(
-            "ichor: trace: pid {} syscall {nr}({:#x}, {:#x}, {:#x}) = -{e}",
+            "ichor: trace: pid {} syscall {nr}({:#x}, {:#x}, {:#x}) {path:?} = {result:?}",
             p.entry.pid,
             a[0],
             a[1],
