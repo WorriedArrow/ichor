@@ -45,11 +45,21 @@ First comparison, commit `2c2e830` (KVM, 4 vCPUs, 512 MiB, GitHub
 | fork + wait | 20.7 us | 43.2 us | 0.48x |
 | fork + exec + wait | 307.5 us | 109.9 us | 2.80x |
 
+After `e21529e` (programs' whole file pages mapped lazily on exec, no
+zero-fill on page-cache faults), same setup:
+
+| Benchmark | Ichor | Linux 6.6 | Ichor / Linux |
+|---|---|---|---|
+| null syscall | 239 ns | 366 ns | 0.65x |
+| pipe round trip | 10.2 us | 17.9 us | 0.57x |
+| page fault | 1988 ns | 1578 ns | 1.26x |
+| fork + wait | 21.1 us | 47.3 us | 0.45x |
+| fork + exec + wait | 148.8 us | 123.0 us | 1.21x (was 2.80x) |
+
 Reading it: Ichor's cheaper syscalls and switches are partly Linux's
 mitigations (Linux pays for page-table isolation and friends on this CPU;
-Ichor does not yet apply all of ADR-0004's). The clear gaps are exec,
-nearly 3x Linux, and page faults, about 1.2x. Those are the next Phase E
-targets.
+Ichor does not yet apply all of ADR-0004's). The remaining gaps are
+anonymous page faults and exec, each about 1.2x Linux.
 
 Caveats: Linux runs with its default CPU-vulnerability mitigations, which
 Ichor does not all apply yet (ADR-0004). Container start has no Linux
