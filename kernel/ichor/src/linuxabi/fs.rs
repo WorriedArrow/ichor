@@ -552,7 +552,12 @@ fn put_stat(p: &mut LinuxProcess, addr: u64, st: &[u8; 144]) -> Result<u64, i64>
 }
 
 pub(super) fn fstat(p: &mut LinuxProcess, fd: u64, addr: u64) -> Result<u64, i64> {
-    let st = match p.fd(fd).ok_or(EBADF)? {
+    let st = fstat_raw(p, fd)?;
+    put_stat(p, addr, &st)
+}
+
+fn fstat_raw(p: &mut LinuxProcess, fd: u64) -> Result<[u8; 144], i64> {
+    Ok(match p.fd(fd).ok_or(EBADF)? {
         Fd::Console => stat_bytes(0, S_IFCHR | 0o620, 1, 0),
         Fd::Pipe(_) => stat_bytes(0, S_IFIFO | 0o600, 1, 0),
         Fd::Object(o) => stat_bytes(0, o.obj.mode() | 0o600, 1, 0),
@@ -562,8 +567,7 @@ pub(super) fn fstat(p: &mut LinuxProcess, fd: u64, addr: u64) -> Result<u64, i64
             st
         }
         Fd::File(f) => to_stat(&p.fs().stat(f.ino)?),
-    };
-    put_stat(p, addr, &st)
+    })
 }
 
 pub(super) fn fstatat(
@@ -582,7 +586,9 @@ pub(super) fn fstatat(
         }
         return fstat(p, dirfd as u64, out);
     }
-    if path.starts_with("/proc") && procfs::lookup(p, &path, false).is_some() {
+    if (path.starts_with("/proc") || path.starts_with("/sys"))
+        && procfs::lookup(p, &path, false).is_some()
+    {
         let st = stat_proc(p, &path, flags & AT_SYMLINK_NOFOLLOW == 0, 0)?;
         return put_stat(p, out, &st);
     }
@@ -593,6 +599,79 @@ pub(super) fn fstatat(
         to_stat(&fs.stat(ino)?)
     };
     put_stat(p, out, &st)
+}
+
+/// `statx(dirfd, path, flags, mask, buf)`: the `fstatat` result in
+/// `struct statx` form, with `STATX_BASIC_STATS` (no birth time).
+pub(super) fn statx(
+    p: &mut LinuxProcess,
+    dirfd: i64,
+    addr: u64,
+    flags: u64,
+    buf: u64,
+) -> Result<u64, i64> {
+    const AT_NO_AUTOMOUNT: u64 = 0x800;
+    const AT_STATX_SYNC_TYPE: u64 = 0x6000;
+    const STATX_BASIC_STATS: u32 = 0x7ff;
+    if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH | AT_NO_AUTOMOUNT | AT_STATX_SYNC_TYPE) != 0
+        || flags & AT_STATX_SYNC_TYPE == AT_STATX_SYNC_TYPE
+    {
+        return Err(EINVAL);
+    }
+    // Build the `struct stat` in a scratch page of the caller's stack-free
+    // kernel buffer: fstatat writes user memory, so run it on a kernel copy.
+    let st = stat_raw(
+        p,
+        dirfd,
+        addr,
+        flags & (AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH),
+    )?;
+    let u64_at = |o: usize| u64::from_le_bytes(st[o..o + 8].try_into().unwrap_or([0; 8]));
+    let u32_at = |o: usize| u32::from_le_bytes(st[o..o + 4].try_into().unwrap_or([0; 4]));
+    let mut x = [0u8; 256];
+    x[0..4].copy_from_slice(&STATX_BASIC_STATS.to_le_bytes());
+    x[4..8].copy_from_slice(&(u64_at(56) as u32).to_le_bytes()); // blksize
+    x[16..20].copy_from_slice(&(u64_at(16) as u32).to_le_bytes()); // nlink
+    x[20..24].copy_from_slice(&u32_at(28).to_le_bytes()); // uid
+    x[24..28].copy_from_slice(&u32_at(32).to_le_bytes()); // gid
+    x[28..30].copy_from_slice(&(u32_at(24) as u16).to_le_bytes()); // mode
+    x[32..40].copy_from_slice(&u64_at(8).to_le_bytes()); // ino
+    x[40..48].copy_from_slice(&u64_at(48).to_le_bytes()); // size
+    x[48..56].copy_from_slice(&u64_at(64).to_le_bytes()); // blocks
+    for (src, dst) in [(72, 64), (104, 96), (88, 112)] {
+        // atime, ctime, mtime: tv_sec i64, tv_nsec u32
+        x[dst..dst + 8].copy_from_slice(&u64_at(src).to_le_bytes());
+        x[dst + 8..dst + 12].copy_from_slice(&(u64_at(src + 8) as u32).to_le_bytes());
+    }
+    let rdev = u64_at(40);
+    x[128..132].copy_from_slice(&(((rdev >> 8) & 0xfff) as u32).to_le_bytes());
+    x[132..136].copy_from_slice(&((rdev & 0xff) as u32).to_le_bytes());
+    x[140..144].copy_from_slice(&1u32.to_le_bytes()); // dev minor 1
+    if p.copy_to_user(buf, &x) != x.len() {
+        return Err(EFAULT);
+    }
+    Ok(0)
+}
+
+/// `fstatat`'s `struct stat`, in kernel memory.
+fn stat_raw(p: &mut LinuxProcess, dirfd: i64, addr: u64, flags: u64) -> Result<[u8; 144], i64> {
+    let path = user_path(p, addr)?;
+    if path.is_empty() && flags & AT_EMPTY_PATH != 0 {
+        if dirfd == AT_FDCWD {
+            let cwd = p.cwd();
+            return Ok(to_stat(&p.fs().stat(cwd)?));
+        }
+        return fstat_raw(p, dirfd as u64);
+    }
+    if (path.starts_with("/proc") || path.starts_with("/sys"))
+        && procfs::lookup(p, &path, false).is_some()
+    {
+        return stat_proc(p, &path, flags & AT_SYMLINK_NOFOLLOW == 0, 0);
+    }
+    let start = base(p, dirfd, &path)?;
+    let mut fs = p.fs();
+    let ino = fs.resolve(start, &path, flags & AT_SYMLINK_NOFOLLOW == 0)?;
+    Ok(to_stat(&fs.stat(ino)?))
 }
 
 pub(super) fn stat(p: &mut LinuxProcess, addr: u64, out: u64, follow: bool) -> Result<u64, i64> {

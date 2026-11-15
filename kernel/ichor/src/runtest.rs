@@ -69,6 +69,8 @@ mod sys {
     pub(super) const VFORK: u64 = 58;
     pub(super) const PPOLL: u64 = 271;
     pub(super) const EPOLL_PWAIT: u64 = 281;
+    pub(super) const MREMAP: u64 = 25;
+    pub(super) const PRCTL: u64 = 157;
 }
 
 const MOTD: &[u8] = b"hello from /etc/motd inside an Ichor image\n";
@@ -1489,6 +1491,92 @@ fn avx_program(magic: u64) -> Vec<u8> {
     static_elf(&a.finish(BLOB_VADDR).unwrap_or_else(|| fail("assembler")))
 }
 
+/// `mremap` and `prctl`. Two written anonymous pages move (with their
+/// data) when grown to four with `MREMAP_MAYMOVE`, the new tail is
+/// usable, and shrinking stays in place. `PR_SET_NAME` round-trips through
+/// `PR_GET_NAME`, and `PR_CAPBSET_READ` reports CAP_CHOWN in the cell
+/// bounding set and CAP_SYS_ADMIN outside it. Exits 0, or the failed check.
+fn mremap_program() -> Vec<u8> {
+    const PROT_RW: u64 = 3;
+    const PRIVATE_ANON: u64 = 0x22;
+    const MAYMOVE: u64 = 1;
+    let mut a = Asm::new();
+    let bad = a.label();
+    let name = a.data(b"ichortest\0");
+    let expect = |a: &mut Asm, n: u64, v: i32| {
+        a.mov_imm(Reg::R15, n);
+        a.cmp_imm(Reg::Rax, v);
+        a.jne(bad);
+    };
+    a.mov(Reg::Rbp, Reg::Rsp);
+    a.sub_imm(Reg::Rbp, 4096);
+    // r12 = 2 pages; markers 0x11 at 0 and 0x22 at 4096.
+    a.mov_imm(Reg::Rdi, 0);
+    a.mov_imm(Reg::Rsi, 8192);
+    a.mov_imm(Reg::Rdx, PROT_RW);
+    a.mov_imm(Reg::R10, PRIVATE_ANON);
+    a.mov_imm(Reg::R8, u64::MAX);
+    a.mov_imm(Reg::R9, 0);
+    a.sys(sys::MMAP);
+    a.mov(Reg::R12, Reg::Rax);
+    a.mov_imm(Reg::Rax, 0x11);
+    a.store(Reg::R12, 0, Reg::Rax);
+    a.mov_imm(Reg::Rax, 0x22);
+    a.store(Reg::R12, 4096, Reg::Rax);
+    // 1-3: grow to 4 pages (may move): data follows; the tail works.
+    a.mov(Reg::Rdi, Reg::R12);
+    a.mov_imm(Reg::Rsi, 8192);
+    a.mov_imm(Reg::Rdx, 16384);
+    a.mov_imm(Reg::R10, MAYMOVE);
+    a.sys(sys::MREMAP);
+    a.mov(Reg::R13, Reg::Rax);
+    a.load(Reg::Rax, Reg::R13, 0);
+    expect(&mut a, 1, 0x11);
+    a.load(Reg::Rax, Reg::R13, 4096);
+    expect(&mut a, 2, 0x22);
+    a.mov_imm(Reg::Rax, 0x33);
+    a.store(Reg::R13, 3 * 4096, Reg::Rax);
+    a.load(Reg::Rax, Reg::R13, 3 * 4096);
+    expect(&mut a, 3, 0x33);
+    // 4: shrinking to one page stays put.
+    a.mov(Reg::Rdi, Reg::R13);
+    a.mov_imm(Reg::Rsi, 16384);
+    a.mov_imm(Reg::Rdx, 4096);
+    a.mov_imm(Reg::R10, 0);
+    a.sys(sys::MREMAP);
+    a.mov_imm(Reg::R15, 4);
+    a.cmp(Reg::Rax, Reg::R13);
+    a.jne(bad);
+    // 5: PR_SET_NAME then PR_GET_NAME into rbp: "ichortes" comes back.
+    a.mov_imm(Reg::Rdi, 15);
+    a.mov_data(Reg::Rsi, name);
+    a.sys(sys::PRCTL);
+    expect(&mut a, 5, 0);
+    a.mov_imm(Reg::Rdi, 16);
+    a.mov(Reg::Rsi, Reg::Rbp);
+    a.sys(sys::PRCTL);
+    expect(&mut a, 5, 0);
+    a.load(Reg::Rax, Reg::Rbp, 0);
+    a.mov_imm(Reg::R14, u64::from_le_bytes(*b"ichortes"));
+    a.mov_imm(Reg::R15, 5);
+    a.cmp(Reg::Rax, Reg::R14);
+    a.jne(bad);
+    // 6-7: CAP_CHOWN is in the bounding set, CAP_SYS_ADMIN (21) is not.
+    a.mov_imm(Reg::Rdi, 23);
+    a.mov_imm(Reg::Rsi, 0);
+    a.sys(sys::PRCTL);
+    expect(&mut a, 6, 1);
+    a.mov_imm(Reg::Rdi, 23);
+    a.mov_imm(Reg::Rsi, 21);
+    a.sys(sys::PRCTL);
+    expect(&mut a, 7, 0);
+    a.mov_imm(Reg::R15, 0);
+    a.bind(bad);
+    a.mov(Reg::Rdi, Reg::R15);
+    a.sys(sys::EXIT_GROUP);
+    static_elf(&a.finish(BLOB_VADDR).unwrap_or_else(|| fail("assembler")))
+}
+
 /// POSIX record locks across fork: the parent write-locks bytes 0..10; the
 /// child's overlapping F_SETLK fails with EAGAIN, F_GETLK names the parent,
 /// a disjoint range locks fine, and F_SETLKW blocks until the parent
@@ -1709,6 +1797,15 @@ pub(crate) fn run() {
     }
     println!(
         "ichor: linux: MAP_SHARED anonymous memory and its futex are shared across fork ({syscalls} syscalls)"
+    );
+
+    let (status, syscalls) = run_linux(new_process(), &mremap_program(), None, &["mremaptest"]);
+    if status != 0 {
+        println!("ichor: linux: mremaptest failed check {status}");
+        fail("mremaptest");
+    }
+    println!(
+        "ichor: linux: mremap moves and resizes mappings; prctl names and bounding set ok ({syscalls} syscalls)"
     );
 
     let (status, syscalls) = run_linux(new_process(), &waits_program(), None, &["waitstest"]);

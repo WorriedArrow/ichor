@@ -159,6 +159,27 @@ pub(crate) struct Group {
     vfork: SpinLock<Option<Arc<Vfork>>>,
     /// Who the process is (ADR-0009).
     creds: SpinLock<crate::cred::Creds>,
+    /// `PR_SET_NAME` (per process here; Linux's is per thread), and the
+    /// `PR_SET_DUMPABLE` / `PR_SET_NO_NEW_PRIVS` flags.
+    pub(crate) prctl: SpinLock<Prctl>,
+}
+
+/// State `prctl` sets.
+#[derive(Clone, Debug)]
+pub(crate) struct Prctl {
+    pub(crate) name: Option<alloc::string::String>,
+    pub(crate) dumpable: bool,
+    pub(crate) no_new_privs: bool,
+}
+
+impl Default for Prctl {
+    fn default() -> Self {
+        Prctl {
+            name: None,
+            dumpable: true,
+            no_new_privs: false,
+        }
+    }
 }
 
 /// A `vfork` parent's wait for its child to exec or exit.
@@ -365,6 +386,7 @@ impl LinuxProcess {
             limits: SpinLock::new(default_limits()),
             vfork: SpinLock::new(None),
             creds: SpinLock::new(crate::cred::Creds::root()),
+            prctl: SpinLock::new(Prctl::default()),
         });
         Some(Self {
             entry,
@@ -409,6 +431,7 @@ impl LinuxProcess {
             limits: SpinLock::new(self.group.limits()),
             vfork: SpinLock::new(None),
             creds: SpinLock::new(self.group.creds()),
+            prctl: SpinLock::new(self.group.prctl.lock().clone()),
         });
         let c = group.creds();
         entry.set_uids(c.ruid, c.suid);

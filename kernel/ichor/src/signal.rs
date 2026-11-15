@@ -23,7 +23,7 @@ pub(crate) const SIGSEGV: u32 = 11;
 pub(crate) const SIGPIPE: u32 = 13;
 pub(crate) const SIGCHLD: u32 = 17;
 const SIGSTOP: u32 = 19;
-const NSIG: u32 = 64;
+pub(crate) const NSIG: u32 = 64;
 
 /// Internal errno: interrupted by a signal, maybe restart (never reaches
 /// user space).

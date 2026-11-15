@@ -40,6 +40,16 @@ const RUNS: &[(&[&str], i32)] = &[
         &[
             "dash",
             "-c",
+            "n=$(nproc) && [ \"$n\" -ge 1 ] && [ \"$(getconf _NPROCESSORS_ONLN)\" = \"$n\" ] && \
+             [ \"$(stat -c %s /etc/debian_version)\" -gt 0 ] && \
+             echo debian: nproc, getconf and stat agree",
+        ],
+        0,
+    ),
+    (
+        &[
+            "dash",
+            "-c",
             "export DEBIAN_FRONTEND=noninteractive; apt-get update -q &&              apt-get install -y -q --no-install-recommends hello jq && hello &&              [ \"$(echo '{\"a\":[1,2,3]}' | jq '.a|add')\" = 6 ] && dpkg -s libonig5 >/dev/null &&              echo debian: apt-get installed hello and jq from the local repository",
         ],
         0,

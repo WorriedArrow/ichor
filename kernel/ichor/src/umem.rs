@@ -571,6 +571,154 @@ impl Mm {
         }
     }
 
+    /// `mremap(old, old_len, new_len, flags, new_addr)`: shrinks in place,
+    /// grows in place when the pages after are free, or (with
+    /// `MREMAP_MAYMOVE`) moves the mapping, pages and all, without copying.
+    /// The old range must lie in one region. Partial: no `MREMAP_DONTUNMAP`,
+    /// and `old_len` 0 (duplicating a shared mapping) is EINVAL.
+    pub(crate) fn mremap(
+        &mut self,
+        old: u64,
+        old_len: u64,
+        new_len: u64,
+        flags: u64,
+        new_addr: u64,
+    ) -> Result<u64, i64> {
+        const MAYMOVE: u64 = 1;
+        const FIXED: u64 = 2;
+        const EFAULT: i64 = 14;
+        if !old.is_multiple_of(PAGE_SIZE)
+            || flags & !(MAYMOVE | FIXED) != 0
+            || (flags & FIXED != 0 && flags & MAYMOVE == 0)
+        {
+            return Err(EINVAL);
+        }
+        let old_len = vma::page_len(old_len).filter(|&l| l > 0).ok_or(EINVAL)?;
+        let new_len = vma::page_len(new_len).filter(|&l| l > 0).ok_or(EINVAL)?;
+        let old_end = old.checked_add(old_len).ok_or(EINVAL)?;
+        // The range may span adjacent regions (an earlier in-place grow adds
+        // one), as long as they have one protection: Linux merges those.
+        let region = self.regions.find(old).ok_or(EFAULT)?;
+        let prot = region.prot;
+        let mut at = region.end;
+        while at < old_end {
+            match self.regions.find(at) {
+                Some(r) if r.prot == prot => at = r.end,
+                _ => return Err(EFAULT),
+            }
+        }
+        if flags & FIXED == 0 && new_len <= old_len {
+            if new_len < old_len {
+                self.munmap(old + new_len, old_len - new_len)?;
+            }
+            return Ok(old);
+        }
+        let new_end_here = old.checked_add(new_len).ok_or(ENOMEM)?;
+        if flags & FIXED == 0
+            && new_end_here <= USER_TOP
+            && self.regions.is_free(old_end, new_end_here)
+        {
+            if !self.regions.insert(old_end, new_end_here, prot) {
+                return Err(ENOMEM);
+            }
+            self.extend_ranges(old_end, new_end_here);
+            return Ok(old);
+        }
+        if flags & MAYMOVE == 0 {
+            return Err(ENOMEM);
+        }
+        let dst = if flags & FIXED != 0 {
+            let end = new_addr.checked_add(new_len).ok_or(EINVAL)?;
+            if !new_addr.is_multiple_of(PAGE_SIZE)
+                || end > USER_TOP
+                || (new_addr < old_end && old < end)
+            {
+                return Err(EINVAL);
+            }
+            self.munmap(new_addr, new_len)?;
+            new_addr
+        } else {
+            self.regions.find_free(new_len).ok_or(ENOMEM)?
+        };
+        if !self.regions.insert(dst, dst + new_len, prot) {
+            return Err(ENOMEM);
+        }
+        let moved = old_len.min(new_len);
+        // Pages move with their frames and copy-on-write state.
+        let vas: Vec<u64> = self
+            .pages
+            .range(old..old + moved)
+            .map(|(&v, _)| v)
+            .collect();
+        for va in vas {
+            let Some(f) = self.pages.remove(&va) else {
+                continue;
+            };
+            let to = dst + (va - old);
+            let cow = self.cow.remove(&va);
+            let mapped = self.space.translate(va).map(|(_, p)| p);
+            if cow {
+                self.cow.insert(to);
+            }
+            if let Some(p) = mapped
+                && self.space.map(to, &f, p).is_err()
+            {
+                return Err(ENOMEM);
+            }
+            self.pages.insert(to, f);
+        }
+        self.space.unmap_range(old, old + moved);
+        // File and shared ranges follow; a grown tail continues them.
+        let shift = |v: u64| v.wrapping_sub(old).wrapping_add(dst);
+        let mut moved_files = Vec::new();
+        for r in &self.files {
+            if r.start < old_end && old < r.end {
+                let end = if r.end >= old_end {
+                    dst + new_len
+                } else {
+                    shift(r.end.min(old + moved))
+                };
+                moved_files.push(FileRange {
+                    start: shift(r.start.max(old)),
+                    end,
+                    base: shift(r.base),
+                    ..r.clone()
+                });
+            }
+        }
+        let mut moved_shared = Vec::new();
+        for &(s, e) in &self.shared {
+            if s < old_end && old < e {
+                let end = if e >= old_end {
+                    dst + new_len
+                } else {
+                    shift(e.min(old + moved))
+                };
+                moved_shared.push((shift(s.max(old)), end));
+            }
+        }
+        // What is left of the old range (if shrinking) is freed here.
+        self.munmap(old, old_len)?;
+        self.files.extend(moved_files);
+        self.shared.extend(moved_shared);
+        Ok(dst)
+    }
+
+    /// File and shared ranges ending at `at` extend to `to` (`mremap`
+    /// growing in place).
+    fn extend_ranges(&mut self, at: u64, to: u64) {
+        for r in &mut self.files {
+            if r.end == at {
+                r.end = to;
+            }
+        }
+        for r in &mut self.shared {
+            if r.1 == at {
+                r.1 = to;
+            }
+        }
+    }
+
     /// `mprotect`.
     pub(crate) fn mprotect(&mut self, addr: u64, len: u64, prot: u64) -> Result<u64, i64> {
         let prot = Prot::from_linux(prot).ok_or(EINVAL)?;

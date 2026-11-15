@@ -43,6 +43,9 @@ fn dir(names: &[(&str, u8)]) -> Node {
 /// `follow_last`, a link in the final component is reported as the link
 /// (the caller follows it; `self` is followed here).
 pub(crate) fn lookup(p: &LinuxProcess, path: &str, follow_last: bool) -> Option<Result<Node, i64>> {
+    if let Some(n) = sys(path) {
+        return Some(n);
+    }
     let rest = path.strip_prefix("/proc")?;
     if !(rest.is_empty() || rest.starts_with('/')) {
         return None;
@@ -114,6 +117,43 @@ pub(crate) fn lookup(p: &LinuxProcess, path: &str, follow_last: bool) -> Option<
     })
 }
 
+/// The few `/sys` files libc consults: the CPU lists
+/// (`/sys/devices/system/cpu/{online,possible,present}`, which glibc's
+/// `get_nprocs` reads) and the directories above them.
+fn sys(path: &str) -> Option<Result<Node, i64>> {
+    let rest = path.strip_prefix("/sys")?;
+    if !(rest.is_empty() || rest.starts_with('/')) {
+        return None;
+    }
+    let c: Vec<&str> = rest
+        .split('/')
+        .filter(|c| !c.is_empty() && *c != ".")
+        .collect();
+    let n = frame::cpu::online_count();
+    let list = if n <= 1 {
+        String::from("0\n")
+    } else {
+        alloc::format!("0-{}\n", n - 1)
+    };
+    Some(match c.as_slice() {
+        [] => Ok(dir(&[("devices", DT_DIR)])),
+        ["devices"] => Ok(dir(&[("system", DT_DIR)])),
+        ["devices", "system"] => Ok(dir(&[("cpu", DT_DIR)])),
+        ["devices", "system", "cpu"] => Ok(dir(&[
+            ("online", DT_REG),
+            ("possible", DT_REG),
+            ("present", DT_REG),
+        ])),
+        [
+            "devices",
+            "system",
+            "cpu",
+            "online" | "possible" | "present",
+        ] => Ok(Node::File(list.into_bytes())),
+        _ => Err(ENOENT),
+    })
+}
+
 fn process(p: &LinuxProcess, rest: &[&str], follow_last: bool) -> Result<Node, i64> {
     let _ = follow_last;
     match rest {
@@ -160,6 +200,9 @@ fn process(p: &LinuxProcess, rest: &[&str], follow_last: bool) -> Result<Node, i
 }
 
 fn comm(p: &LinuxProcess) -> String {
+    if let Some(n) = p.group.prctl.lock().name.clone() {
+        return n;
+    }
     let exe = p.group.exe();
     let base = exe.rsplit('/').next().unwrap_or("");
     base.chars().take(15).collect()

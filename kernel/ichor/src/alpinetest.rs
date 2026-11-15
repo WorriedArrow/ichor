@@ -158,6 +158,15 @@ const RUNS: &[(&[&str], i32)] = &[
         ],
         0,
     ),
+    (
+        &[
+            "sh",
+            "-c",
+            "[ \"$(free | awk '/^Mem:/ {print $2}')\" = 32768 ] && uptime | grep -q load && \
+             echo alpine: sysinfo shows the cell",
+        ],
+        0,
+    ),
 ];
 
 fn read(vfs: &Vfs, path: &str) -> Vec<u8> {

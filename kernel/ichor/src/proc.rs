@@ -47,6 +47,8 @@ pub(crate) struct ProcEntry {
     /// The process's real and saved uids (`ruid | suid << 32`), which
     /// `kill` checks senders against (ADR-0009 §4).
     uids: AtomicU64,
+    /// `PR_SET_PDEATHSIG`: posted to this process when its parent exits.
+    pub(crate) pdeathsig: core::sync::atomic::AtomicU32,
     /// When the thread was created, in clock ticks (`USER_HZ`, 100/s) since
     /// boot (`/proc/<pid>/stat` starttime).
     pub(crate) started: u64,
@@ -232,6 +234,7 @@ pub(crate) fn register(
         pgid: AtomicU64::new(pgid),
         sid: AtomicU64::new(sid),
         uids: AtomicU64::new(0),
+        pdeathsig: core::sync::atomic::AtomicU32::new(0),
         started: (frame::time::now().as_millis() / 10) as u64,
         status: SpinLock::new(None),
         children: WaitQueue::new(),
@@ -378,6 +381,10 @@ fn exited(e: &ProcEntry, status: u32) {
         for c in t.values() {
             if c.ppid() == e.pid {
                 c.ppid.store(0, Ordering::Release);
+                let sig = c.pdeathsig.load(Ordering::Acquire);
+                if sig != 0 && c.status.lock().is_none() {
+                    post(c, sig);
+                }
             }
         }
         // Orphans that already exited (and this process, if it has no

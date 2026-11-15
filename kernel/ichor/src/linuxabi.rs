@@ -48,6 +48,7 @@ mod nr {
     pub(super) const PIPE: u64 = 22;
     pub(super) const SELECT: u64 = 23;
     pub(super) const SCHED_YIELD: u64 = 24;
+    pub(super) const MREMAP: u64 = 25; // partial: no MREMAP_DONTUNMAP; old_len 0 is EINVAL
     pub(super) const MADVISE: u64 = 28; // partial: DONTNEED on the loaded image's own segments zero-fills
     pub(super) const PAUSE: u64 = 34;
     pub(super) const NANOSLEEP: u64 = 35;
@@ -83,10 +84,13 @@ mod nr {
     pub(super) const READLINK: u64 = 89;
     pub(super) const CHMOD: u64 = 90;
     pub(super) const FCHMOD: u64 = 91;
-    pub(super) const CHOWN: u64 = 92; // partial: recorded; every process is uid 0 (no checks yet)
-    pub(super) const FCHOWN: u64 = 93; // partial: recorded; every process is uid 0 (no checks yet)
-    pub(super) const LCHOWN: u64 = 94; // partial: recorded; every process is uid 0 (no checks yet)
+    pub(super) const CHOWN: u64 = 92;
+    pub(super) const FCHOWN: u64 = 93;
+    pub(super) const LCHOWN: u64 = 94;
     pub(super) const UMASK: u64 = 95;
+    pub(super) const GETRUSAGE: u64 = 98; // partial: no CPU-time accounting (times are zero; maxrss is the current rss)
+    pub(super) const SYSINFO: u64 = 99; // partial: the cell's memory; no load averages or swap
+    pub(super) const TIMES: u64 = 100; // partial: no CPU-time accounting (zeros; returns ticks since boot)
     pub(super) const GETTIMEOFDAY: u64 = 96; // firmware clock at boot plus monotonic time (no NTP)
     pub(super) const GETRLIMIT: u64 = 97;
     pub(super) const SETRLIMIT: u64 = 160; // partial: NOFILE and STACK enforced, others stored
@@ -118,9 +122,11 @@ mod nr {
     pub(super) const UMOUNT2: u64 = 166; // partial: always EPERM (cells cannot mount)
     pub(super) const STATFS: u64 = 137;
     pub(super) const FSTATFS: u64 = 138;
+    pub(super) const PRCTL: u64 = 157; // partial: NAME (per process), CAPBSET_READ, PDEATHSIG, KEEPCAPS, DUMPABLE, NO_NEW_PRIVS
     pub(super) const ARCH_PRCTL: u64 = 158; // partial: ARCH_SET_FS only
     pub(super) const GETTID: u64 = 186;
     pub(super) const TKILL: u64 = 200;
+    pub(super) const SCHED_GETAFFINITY: u64 = 204;
     pub(super) const FUTEX: u64 = 202; // partial: shared only within shared anonymous memory; no PI, no FUTEX_FD
     pub(super) const EPOLL_CREATE: u64 = 213;
     pub(super) const GETDENTS64: u64 = 217;
@@ -134,7 +140,7 @@ mod nr {
     pub(super) const TGKILL: u64 = 234;
     pub(super) const OPENAT: u64 = 257;
     pub(super) const MKDIRAT: u64 = 258;
-    pub(super) const FCHOWNAT: u64 = 260; // partial: recorded; every process is uid 0 (no checks yet)
+    pub(super) const FCHOWNAT: u64 = 260;
     pub(super) const NEWFSTATAT: u64 = 262;
     pub(super) const UNLINKAT: u64 = 263;
     pub(super) const LINKAT: u64 = 265;
@@ -154,6 +160,7 @@ mod nr {
     pub(super) const EPOLL_CREATE1: u64 = 291;
     pub(super) const DUP3: u64 = 292;
     pub(super) const PIPE2: u64 = 293;
+    pub(super) const STATX: u64 = 332;
     pub(super) const PRLIMIT64: u64 = 302; // partial: own process only; NOFILE and STACK enforced, others stored
     pub(super) const GETRANDOM: u64 = 318; // ChaCha20 seeded from RDSEED/RDRAND and virtio-rng
     pub(super) const RENAMEAT2: u64 = 316; // partial: RENAME_NOREPLACE only
@@ -212,6 +219,7 @@ pub(crate) fn dispatch(p: &mut LinuxProcess, ctx: &mut frame::user::UserContext)
         nr::STAT => fs::stat(p, a[0], a[1], true),
         nr::LSTAT => fs::stat(p, a[0], a[1], false),
         nr::NEWFSTATAT => fs::fstatat(p, i(a[0]), a[1], a[2], a[3]),
+        nr::STATX => fs::statx(p, i(a[0]), a[1], a[2], a[4]),
         nr::FSTAT => fs::fstat(p, a[0], a[1]),
         nr::LSEEK => fs::lseek(p, a[0], a[1] as i64, a[2]), // off_t: 64 bits
         nr::ACCESS => fs::access(p, AT_FDCWD, a[0], a[1], 0),
@@ -290,6 +298,7 @@ pub(crate) fn dispatch(p: &mut LinuxProcess, ctx: &mut frame::user::UserContext)
         nr::MUNMAP => p.mm().munmap(a[0], a[1]),
         nr::BRK => Ok(p.mm().brk(a[0])),
         nr::MADVISE => p.mm().madvise(a[0], a[1], a[2]),
+        nr::MREMAP => p.mm().mremap(a[0], a[1], a[2], a[3], a[4]),
         // Identity, time, limits, signals, threads.
         nr::UNAME => uname(p, a[0]),
         nr::CLOCK_GETTIME => clock_gettime(p, a[0], a[1]),
@@ -324,6 +333,11 @@ pub(crate) fn dispatch(p: &mut LinuxProcess, ctx: &mut frame::user::UserContext)
             Ok(0)
         }
         nr::GETPID => Ok(p.group.tgid),
+        nr::PRCTL => prctl(p, a[0], a[1], a[2]),
+        nr::SCHED_GETAFFINITY => sched_getaffinity(p, a[0], a[1], a[2]),
+        nr::SYSINFO => sysinfo(p, a[0]),
+        nr::GETRUSAGE => getrusage(p, i(a[0]), a[1]),
+        nr::TIMES => times(p, a[0]),
         nr::GETTID => Ok(p.entry.pid),
         nr::GETPPID => Ok(p.entry.ppid()),
         nr::GETUID => Ok(u64::from(p.group.creds().ruid)),
@@ -793,6 +807,170 @@ fn gettimeofday(p: &mut LinuxProcess, tv: u64) -> Result<u64, i64> {
     }
     let now = crate::vfs::wall_clock();
     put_pair(p, tv, now.as_secs(), u64::from(now.subsec_micros()))
+}
+
+/// `prctl(option, arg2, ...)`: the options libc, apt and service managers
+/// use. Anything else is EINVAL, as Linux answers for unknown options.
+fn prctl(p: &mut LinuxProcess, option: u64, arg2: u64, arg3: u64) -> Result<u64, i64> {
+    const PR_SET_PDEATHSIG: u64 = 1;
+    const PR_GET_PDEATHSIG: u64 = 2;
+    const PR_GET_DUMPABLE: u64 = 3;
+    const PR_SET_DUMPABLE: u64 = 4;
+    const PR_GET_KEEPCAPS: u64 = 7;
+    const PR_SET_KEEPCAPS: u64 = 8;
+    const PR_SET_NAME: u64 = 15;
+    const PR_GET_NAME: u64 = 16;
+    const PR_CAPBSET_READ: u64 = 23;
+    const PR_SET_NO_NEW_PRIVS: u64 = 38;
+    const PR_GET_NO_NEW_PRIVS: u64 = 39;
+    let _ = arg3;
+    match option {
+        PR_SET_PDEATHSIG => {
+            let sig = u32::try_from(arg2)
+                .ok()
+                .filter(|&s| s <= signal::NSIG)
+                .ok_or(EINVAL)?;
+            p.group
+                .leader
+                .pdeathsig
+                .store(sig, core::sync::atomic::Ordering::Release);
+            Ok(0)
+        }
+        PR_GET_PDEATHSIG => {
+            let sig = p
+                .group
+                .leader
+                .pdeathsig
+                .load(core::sync::atomic::Ordering::Acquire);
+            if p.copy_to_user(arg2, &sig.to_le_bytes()) != 4 {
+                return Err(EFAULT);
+            }
+            Ok(0)
+        }
+        PR_GET_DUMPABLE => Ok(u64::from(p.group.prctl.lock().dumpable)),
+        PR_SET_DUMPABLE if arg2 <= 1 => {
+            p.group.prctl.lock().dumpable = arg2 == 1;
+            Ok(0)
+        }
+        PR_GET_KEEPCAPS => Ok(u64::from(p.group.creds().keepcaps)),
+        PR_SET_KEEPCAPS if arg2 <= 1 => p.group.update_creds(|c| {
+            c.keepcaps = arg2 == 1;
+            Ok(0)
+        }),
+        PR_SET_NAME => {
+            let mut b = [0u8; 16];
+            let n = p.copy_from_user(arg2, &mut b);
+            let len = b[..n].iter().position(|&c| c == 0).unwrap_or(n.min(15));
+            let name = alloc::string::String::from_utf8_lossy(&b[..len.min(15)]).into_owned();
+            p.group.prctl.lock().name = Some(name);
+            Ok(0)
+        }
+        PR_GET_NAME => {
+            let name = p.group.prctl.lock().name.clone().unwrap_or_else(|| {
+                let exe = p.group.exe();
+                exe.rsplit('/')
+                    .next()
+                    .unwrap_or("")
+                    .chars()
+                    .take(15)
+                    .collect()
+            });
+            let mut b = [0u8; 16];
+            let n = name.len().min(15);
+            b[..n].copy_from_slice(&name.as_bytes()[..n]);
+            if p.copy_to_user(arg2, &b) != 16 {
+                return Err(EFAULT);
+            }
+            Ok(0)
+        }
+        PR_CAPBSET_READ => {
+            if arg2 > 40 {
+                return Err(EINVAL);
+            }
+            Ok(u64::from(crate::cred::BOUNDING & (1 << arg2) != 0))
+        }
+        PR_SET_NO_NEW_PRIVS if arg2 == 1 => {
+            // Nothing in a cell ever gains privilege at exec (ADR-0009), so
+            // the flag only has to be remembered and reported.
+            p.group.prctl.lock().no_new_privs = true;
+            Ok(0)
+        }
+        PR_GET_NO_NEW_PRIVS => Ok(u64::from(p.group.prctl.lock().no_new_privs)),
+        _ => Err(EINVAL),
+    }
+}
+
+/// `sched_getaffinity(pid, len, mask)`: every online CPU (threads may run
+/// on any of them). Returns the bytes written, as the raw syscall does.
+fn sched_getaffinity(p: &mut LinuxProcess, pid: u64, len: u64, mask: u64) -> Result<u64, i64> {
+    const ESRCH: i64 = 3;
+    let pid = u64::from(pid as u32);
+    if pid != 0 && crate::proc::uids_of(p.entry.cell, pid).is_err() {
+        return Err(ESRCH);
+    }
+    let n = frame::cpu::online_count();
+    let bytes = n.div_ceil(64) * 8;
+    if (len as usize) < bytes || !len.is_multiple_of(8) {
+        return Err(EINVAL);
+    }
+    let mut v = alloc::vec![0u8; bytes];
+    for cpu in 0..n {
+        v[cpu / 8] |= 1 << (cpu % 8);
+    }
+    if p.copy_to_user(mask, &v) != v.len() {
+        return Err(EFAULT);
+    }
+    Ok(bytes as u64)
+}
+
+/// `sysinfo`: uptime, the cell's memory (its account, as `/proc/meminfo`
+/// shows it), and its process count.
+fn sysinfo(p: &mut LinuxProcess, buf: u64) -> Result<u64, i64> {
+    let st = frame::mm::stats();
+    let account = p.cell.account();
+    let total = account.limit().min(st.total_pages as u64) * 4096;
+    let free = account.available().min(st.free_pages as u64) * 4096;
+    let (_, procs, _) = crate::proc::census(p.entry.cell);
+    let mut b = [0u8; 112];
+    b[0..8].copy_from_slice(&frame::time::now().as_secs().to_le_bytes());
+    b[32..40].copy_from_slice(&total.to_le_bytes());
+    b[40..48].copy_from_slice(&free.to_le_bytes());
+    b[80..82].copy_from_slice(&(procs.min(u16::MAX as usize) as u16).to_le_bytes());
+    b[104..108].copy_from_slice(&1u32.to_le_bytes()); // mem_unit
+    if p.copy_to_user(buf, &b) != b.len() {
+        return Err(EFAULT);
+    }
+    Ok(0)
+}
+
+/// `getrusage(who, usage)`: no CPU-time accounting yet, so times are zero;
+/// `ru_maxrss` is the current resident size (an under-estimate of the peak).
+fn getrusage(p: &mut LinuxProcess, who: i64, buf: u64) -> Result<u64, i64> {
+    const RUSAGE_SELF: i64 = 0;
+    const RUSAGE_CHILDREN: i64 = -1;
+    const RUSAGE_THREAD: i64 = 1;
+    let mut b = [0u8; 144];
+    match who {
+        RUSAGE_SELF | RUSAGE_THREAD => {
+            let rss_kb = p.mm().resident_pages() as u64 * 4;
+            b[32..40].copy_from_slice(&rss_kb.to_le_bytes());
+        }
+        RUSAGE_CHILDREN => {}
+        _ => return Err(EINVAL),
+    }
+    if p.copy_to_user(buf, &b) != b.len() {
+        return Err(EFAULT);
+    }
+    Ok(0)
+}
+
+/// `times(buf)`: no CPU-time accounting yet (all zero); returns clock
+/// ticks (`USER_HZ`, 100/s) since boot.
+fn times(p: &mut LinuxProcess, buf: u64) -> Result<u64, i64> {
+    if buf != 0 && p.copy_to_user(buf, &[0u8; 32]) != 32 {
+        return Err(EFAULT);
+    }
+    Ok((frame::time::now().as_millis() / 10) as u64)
 }
 
 /// `getresuid` / `getresgid`: three `u32`s (each pointer may be null).

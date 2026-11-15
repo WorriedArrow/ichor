@@ -3,9 +3,9 @@
 //! by the cell bounding set.
 //!
 //! Credentials are per process (libc makes them so anyway). The set*id
-//! rules follow Linux, including how capabilities follow the uids. Partial:
-//! no setuid/setgid executables (the bits are ignored at exec), no file
-//! capabilities, no `SECBIT_*` or `PR_SET_KEEPCAPS`.
+//! rules follow Linux, including how capabilities follow the uids and
+//! `PR_SET_KEEPCAPS`. Partial: no setuid/setgid executables (the bits are
+//! ignored at exec), no file capabilities, no `SECBIT_*`.
 
 use alloc::vec::Vec;
 
@@ -76,6 +76,8 @@ pub(crate) struct Creds {
     pub(crate) groups: Vec<u32>,
     pub(crate) permitted: u64,
     pub(crate) effective: u64,
+    /// `PR_SET_KEEPCAPS`: keep the permitted set when the last uid 0 goes.
+    pub(crate) keepcaps: bool,
 }
 
 /// `-1` in a set*id argument: leave that id alone.
@@ -98,6 +100,7 @@ impl Creds {
             groups: Vec::new(),
             permitted: BOUNDING,
             effective: BOUNDING,
+            keepcaps: false,
         }
     }
 
@@ -129,6 +132,7 @@ impl Creds {
     /// `execve`: saved ids take the effective ones, and capabilities follow
     /// the uids (no set-id or file-capability executables).
     pub(crate) fn exec(&mut self) {
+        self.keepcaps = false;
         self.suid = self.euid;
         self.sgid = self.egid;
         self.fsuid = self.euid;
@@ -148,7 +152,9 @@ impl Creds {
         let had_root = or == 0 || oe == 0 || os == 0;
         let has_root = self.ruid == 0 || self.euid == 0 || self.suid == 0;
         if had_root && !has_root {
-            self.permitted = 0;
+            if !self.keepcaps {
+                self.permitted = 0;
+            }
             self.effective = 0;
         }
         if oe == 0 && self.euid != 0 {
