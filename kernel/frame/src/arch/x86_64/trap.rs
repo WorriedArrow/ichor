@@ -347,7 +347,11 @@ extern "sysv64" fn trap_dispatch(f: &mut TrapFrame) {
             );
         }
         8 => {
-            let what = if in_stack_guard(f.rsp) {
+            // A kernel stack overflow faults on the guard page, and pushing
+            // the #PF frame onto the same stack faults again: a #DF. CR2
+            // still holds the guard address. The rsp alone is not enough: a
+            // faulting `push` leaves it just above the guard.
+            let what = if in_stack_guard(f.rsp) || in_stack_guard(regs::read_cr2()) {
                 " (kernel stack overflow)"
             } else {
                 ""
