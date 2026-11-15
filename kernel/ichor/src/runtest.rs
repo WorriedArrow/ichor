@@ -33,6 +33,8 @@ mod sys {
     pub(super) const MPROTECT: u64 = 10;
     pub(super) const MUNMAP: u64 = 11;
     pub(super) const BRK: u64 = 12;
+    pub(super) const FORK: u64 = 57;
+    pub(super) const WAIT4: u64 = 61;
     pub(super) const UNAME: u64 = 63;
     pub(super) const GETCWD: u64 = 79;
     pub(super) const CHDIR: u64 = 80;
@@ -409,6 +411,61 @@ fn fs_program() -> Vec<u8> {
     static_elf(&a.finish(BLOB_VADDR).unwrap_or_else(|| fail("assembler")))
 }
 
+/// Copy-on-write fork: the parent stores a value and forks; the child
+/// overwrites the same word, checks it reads its own value, and exits 42;
+/// the parent checks `wait4` saw 42 and that its own copy is unchanged.
+/// Exits 0 if every check held, else the number of the failed check.
+fn fork_program() -> Vec<u8> {
+    const PARENT: u64 = 0x1111_2222_3333_4444;
+    const CHILD: u64 = 0x5555_6666_7777_8888;
+    let mut a = Asm::new();
+    let bad = a.label();
+    let parent = a.label();
+    a.mov(Reg::Rbp, Reg::Rsp);
+    a.sub_imm(Reg::Rbp, 4096);
+    a.mov_imm(Reg::Rbx, PARENT);
+    a.store(Reg::Rbp, 0, Reg::Rbx);
+    a.sys(sys::FORK);
+    a.mov(Reg::R12, Reg::Rax);
+    a.cmp_imm(Reg::Rax, 0);
+    a.jne(parent);
+    // Child: write its own value over the shared word and read it back.
+    a.mov_imm(Reg::Rbx, CHILD);
+    a.store(Reg::Rbp, 0, Reg::Rbx);
+    a.load(Reg::Rax, Reg::Rbp, 0);
+    a.mov_imm(Reg::Rdi, 1);
+    a.cmp(Reg::Rax, Reg::Rbx);
+    a.jne(bad);
+    a.mov_imm(Reg::Rdi, 42);
+    a.sys(sys::EXIT_GROUP);
+    // Parent: wait4(-1, rbp + 16, 0, NULL) == child pid; status == 42 << 8.
+    a.bind(parent);
+    a.mov_imm(Reg::Rdi, u64::MAX);
+    a.mov(Reg::Rsi, Reg::Rbp);
+    a.add_imm(Reg::Rsi, 16);
+    a.mov_imm(Reg::Rdx, 0);
+    a.mov_imm(Reg::R10, 0);
+    a.sys(sys::WAIT4);
+    a.mov_imm(Reg::Rdi, 2);
+    a.cmp(Reg::Rax, Reg::R12);
+    a.jne(bad);
+    a.load(Reg::Rax, Reg::Rbp, 16);
+    a.mov_imm(Reg::R14, 42 << 8);
+    a.mov_imm(Reg::Rdi, 3);
+    a.cmp(Reg::Rax, Reg::R14);
+    a.jne(bad);
+    // The child's write must not show through.
+    a.load(Reg::Rax, Reg::Rbp, 0);
+    a.mov_imm(Reg::R14, PARENT);
+    a.mov_imm(Reg::Rdi, 4);
+    a.cmp(Reg::Rax, Reg::R14);
+    a.jne(bad);
+    a.mov_imm(Reg::Rdi, 0);
+    a.bind(bad);
+    a.sys(sys::EXIT_GROUP);
+    static_elf(&a.finish(BLOB_VADDR).unwrap_or_else(|| fail("assembler")))
+}
+
 /// The root image: `/usr/share/motd`, `/etc/motd -> /usr/share/motd`.
 fn root_image() -> &'static [u8] {
     let mut b = image::builder::Builder::new();
@@ -464,4 +521,11 @@ pub(crate) fn run() {
     println!(
         "ichor: linux: copy-on-write root: create, write, copy-up, rename, chdir, unlink, rmdir ok ({syscalls} syscalls)"
     );
+
+    let (status, syscalls) = run_linux(new_process(), &fork_program(), None, &["forktest"]);
+    if status != 0 {
+        println!("ichor: linux: forktest failed check {status}");
+        fail("forktest");
+    }
+    println!("ichor: linux: copy-on-write fork isolated parent and child ({syscalls} syscalls)");
 }

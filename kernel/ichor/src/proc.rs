@@ -250,7 +250,7 @@ pub(crate) fn run(mut p: LinuxProcess, mut ctx: UserContext) -> (u32, u32) {
 /// return value of 0 and, if `stack` is nonzero, that stack pointer.
 /// Returns the child's pid.
 pub(crate) fn fork(
-    p: &LinuxProcess,
+    p: &mut LinuxProcess,
     ctx: &UserContext,
     stack: u64,
 ) -> Result<(LinuxProcess, UserContext), i64> {

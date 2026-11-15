@@ -8,8 +8,14 @@
 //! or from user memory call [`Mm::populate`] first, so they see the same
 //! memory a user access would. A page made `PROT_NONE` is unmapped but kept,
 //! so its contents survive a later `mprotect` back.
+//!
+//! `fork` is copy-on-write: parent and child map the same pages read-only
+//! and mark them shared; the first write on either side (a fault, or a
+//! kernel copy into user memory) gives that side its own copy. The child
+//! is charged for every page up front, so breaking a share never fails on
+//! the account.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
@@ -69,6 +75,9 @@ pub(crate) struct Mm {
     regions: RegionMap,
     /// Every page the process owns, mapped or not (`PROT_NONE`).
     pages: BTreeMap<u64, UFrame>,
+    /// Pages possibly shared with another process after `fork`: mapped
+    /// read-only, copied on the first write.
+    cow: BTreeSet<u64>,
     brk_start: u64,
     brk: u64,
 }
@@ -81,6 +90,7 @@ impl Mm {
             account: account.clone(),
             regions: RegionMap::new(MMAP_LO, MMAP_HI),
             pages: BTreeMap::new(),
+            cow: BTreeSet::new(),
             brk_start: 0,
             brk: 0,
         })
@@ -91,24 +101,66 @@ impl Mm {
         &self.space
     }
 
-    /// A copy of this address space for `fork`: same regions, break and
-    /// contents, in fresh pages (eager copy; copy-on-write sharing needs
-    /// frame support and comes later). `None` if memory runs out.
-    pub(crate) fn fork(&self) -> Option<Mm> {
+    /// A copy-on-write copy of this address space for `fork`: same
+    /// regions and break; every page is shared read-only and marked
+    /// copy-on-write on both sides. `None` if memory or the account runs out.
+    pub(crate) fn fork(&mut self) -> Option<Mm> {
         let mut child = Mm::new(&self.account)?;
         child.regions = self.regions.clone();
         child.brk_start = self.brk_start;
         child.brk = self.brk;
-        let mut buf = alloc::vec![0u8; PAGE_SIZE as usize];
+        self.account.charge(self.pages.len() as u64).ok()?;
         for (&va, f) in &self.pages {
-            let copy = child.frame(va)?;
-            f.reader().read(&mut buf);
-            copy.writer().write(&buf);
+            child.pages.insert(va, f.clone());
+            child.cow.insert(va);
+            self.cow.insert(va);
             if let Some((_, prot)) = self.space.translate(va) {
-                child.space.map(va, &copy, prot).ok()?;
+                let ro = UserProt {
+                    write: false,
+                    exec: prot.exec,
+                };
+                if prot.write {
+                    // This space is the active one (we are its task), so
+                    // the local TLB flush `protect` does is enough.
+                    self.space.protect(va, ro);
+                }
+                if child.space.map(va, f, ro).is_err() {
+                    return None; // `child` drops and releases its charge
+                }
             }
         }
         Some(child)
+    }
+
+    /// Gives this process its own copy of a copy-on-write page at `va` and
+    /// maps it with the region's protection.
+    fn break_cow(&mut self, va: u64, prot: Prot) -> bool {
+        let Some(shared) = self.pages.get(&va).cloned() else {
+            return false;
+        };
+        let Some(copy) = UFrame::alloc_zeroed() else {
+            return false;
+        };
+        let mut buf = alloc::vec![0u8; PAGE_SIZE as usize];
+        shared.reader().read(&mut buf);
+        copy.writer().write(&buf);
+        self.space.unmap(va);
+        if self.space.map(va, &copy, user_prot(prot)).is_err() {
+            return false;
+        }
+        self.pages.insert(va, copy);
+        self.cow.remove(&va);
+        true
+    }
+
+    /// How `va` is mapped given its region protection: shared pages stay
+    /// read-only until written.
+    fn mapped_prot(&self, va: u64, prot: Prot) -> UserProt {
+        let mut p = user_prot(prot);
+        if self.cow.contains(&va) {
+            p.write = false;
+        }
+        p
     }
 
     /// Sets where the program break starts (the page after the image).
@@ -152,6 +204,9 @@ impl Mm {
         if !region.prot.permits(write, exec) {
             return false;
         }
+        if write && self.cow.contains(&va) {
+            return self.break_cow(va, region.prot);
+        }
         if self.space.translate(va).is_some() {
             // Present yet faulting: a protection violation the region map
             // does not explain. Never loop on it.
@@ -160,7 +215,8 @@ impl Mm {
         let Some(f) = self.frame(va) else {
             return false;
         };
-        self.space.map(va, &f, user_prot(region.prot)).is_ok()
+        let prot = self.mapped_prot(va, region.prot);
+        self.space.map(va, &f, prot).is_ok()
     }
 
     /// Faults in `[va, va+len)` ahead of a kernel copy, stopping at the
@@ -171,7 +227,8 @@ impl Mm {
         };
         let mut page = page_down(va);
         while page < end {
-            if self.space.translate(page).is_none() && !self.fault(page, write, false) {
+            let needs = self.space.translate(page).is_none() || (write && self.cow.contains(&page));
+            if needs && !self.fault(page, write, false) {
                 return;
             }
             page += PAGE_SIZE;
@@ -184,6 +241,7 @@ impl Mm {
         for va in vas {
             self.space.unmap(va);
             self.pages.remove(&va);
+            self.cow.remove(&va);
             self.account.release(1);
         }
     }
@@ -297,7 +355,8 @@ impl Mm {
                 continue; // Faulted in with the new protection on next use.
             }
             if prot.accessible() {
-                self.space.protect(va, user_prot(prot));
+                let mapped = self.mapped_prot(va, prot);
+                self.space.protect(va, mapped);
             } else {
                 self.space.unmap(va); // `pages` keeps the frame.
             }
