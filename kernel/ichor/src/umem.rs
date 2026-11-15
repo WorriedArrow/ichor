@@ -439,10 +439,14 @@ impl Mm {
         if write && self.cow.contains(&va) {
             return self.break_cow(va, region.prot);
         }
-        if self.space.translate(va).is_some() {
-            // Present yet faulting: a protection violation the region map
-            // does not explain. Never loop on it.
-            return false;
+        if let Some((_, p)) = self.space.translate(va) {
+            // Present: another thread (or a kernel copy for one) took this
+            // fault first, between the access and this lock. Retry the
+            // access if the mapping now allows it (the CPU drops the
+            // faulting translation, so the retry sees the new PTE). Any
+            // other present page is a protection violation the region map
+            // does not explain: never loop on it.
+            return (!write || p.write) && (!exec || p.exec);
         }
         let Some(f) = self.frame(va) else {
             return false;
