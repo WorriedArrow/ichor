@@ -262,7 +262,8 @@ report at the end of each phase. Do not rewrite `main`.
   console writes, a vDSO; first benchmarks (null syscall, context switch,
   page fault, fork+exec, container start) against Linux before and after.
   [in progress: `bench.rs` measures all six on Ichor (`bench` flag,
-  `benchmarks_run_and_report`); Linux reference numbers not yet.]
+  `benchmarks_run_and_report`; CI prints a KVM run to the job summary);
+  futexes are in 64 hashed buckets; Linux reference numbers not yet.]
 
 Carried over from milestone 3: per-cell pid namespaces (paging the root
 image in on demand, copy-on-write `fork`, `FD_CLOEXEC` and shared offsets

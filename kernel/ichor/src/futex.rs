@@ -5,9 +5,14 @@
 //! sharing the page meet on the same futex (with or without
 //! `FUTEX_PRIVATE_FLAG`: a wake that Linux would confine to one process
 //! may reach another, which futex users must tolerate as a spurious
-//! wakeup). There are no shared file mappings yet. The table lock is held while the user word is read
-//! atomically and the waiter queued, and wakers take the same lock, so a
-//! wake between "check the value" and "go to sleep" cannot be lost.
+//! wakeup). There are no shared file mappings yet.
+//!
+//! Waiters live in [`BUCKETS`] hashed buckets, each with its own lock, so
+//! unrelated futexes (other processes, other addresses) do not contend.
+//! A key's bucket lock is held while the user word is read atomically and
+//! the waiter queued, and wakers take the same lock, so a wake between
+//! "check the value" and "go to sleep" cannot be lost. Operations on two
+//! keys (requeue, wake-op) lock both buckets in index order.
 //!
 //! Supported: WAIT, WAKE, REQUEUE, CMP_REQUEUE, WAKE_OP, WAIT_BITSET,
 //! WAKE_BITSET. PI futexes and `FUTEX_FD` are not.
@@ -52,7 +57,13 @@ struct Waiter {
     queue: WaitQueue,
 }
 
-static FUTEXES: Mutex<BTreeMap<Key, VecDeque<Arc<Waiter>>>> = Mutex::new(BTreeMap::new());
+/// The waiters of the keys that hash to one bucket.
+type Table = BTreeMap<Key, VecDeque<Arc<Waiter>>>;
+
+/// Number of buckets (a power of two).
+const BUCKETS: usize = 64;
+
+static FUTEXES: [Mutex<Table>; BUCKETS] = [const { Mutex::new(BTreeMap::new()) }; BUCKETS];
 
 fn key(p: &LinuxProcess, addr: u64) -> Key {
     match p.mm().shared_phys(addr) {
@@ -61,13 +72,37 @@ fn key(p: &LinuxProcess, addr: u64) -> Key {
     }
 }
 
+/// The bucket `k` lives in: a multiplicative hash of the whole key.
+fn bucket(k: &Key) -> usize {
+    let mixed = (k.2 >> 2) ^ (k.1 as u64).rotate_left(29) ^ u64::from(k.0);
+    (mixed.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - BUCKETS.trailing_zeros())) as usize
+}
+
+/// Runs `f` with the tables of `a`'s and `b`'s buckets locked (lower index
+/// first); the second table is `None` when both keys share a bucket.
+fn with_two<R>(a: &Key, b: &Key, f: impl FnOnce(&mut Table, Option<&mut Table>) -> R) -> R {
+    let (i, j) = (bucket(a), bucket(b));
+    if i == j {
+        return f(&mut FUTEXES[i].lock(), None);
+    }
+    let (lo, hi) = (i.min(j), i.max(j));
+    let mut first = FUTEXES[lo].lock();
+    let mut second = FUTEXES[hi].lock();
+    if i < j {
+        f(&mut first, Some(&mut second))
+    } else {
+        f(&mut second, Some(&mut first))
+    }
+}
+
 /// Wakes up to `n` waiters on `addr` whose bitset meets `bitset`; returns
 /// how many.
 pub(crate) fn wake(p: &LinuxProcess, addr: u64, n: u32, bitset: u32) -> u64 {
-    wake_key(&mut FUTEXES.lock(), key(p, addr), n, bitset)
+    let k = key(p, addr);
+    wake_key(&mut FUTEXES[bucket(&k)].lock(), k, n, bitset)
 }
 
-fn wake_key(t: &mut BTreeMap<Key, VecDeque<Arc<Waiter>>>, k: Key, n: u32, bitset: u32) -> u64 {
+fn wake_key(t: &mut Table, k: Key, n: u32, bitset: u32) -> u64 {
     let mut woken = 0u64;
     if let Some(q) = t.get_mut(&k) {
         let mut keep = VecDeque::new();
@@ -120,7 +155,7 @@ fn wait(
         queue: WaitQueue::new(),
     });
     {
-        let mut t = FUTEXES.lock();
+        let mut t = FUTEXES[bucket(&k)].lock();
         let cur = p.mm().space().load_u32_atomic(addr).ok_or(EFAULT)?;
         if cur != val {
             return Err(EAGAIN);
@@ -139,16 +174,22 @@ fn wait(
     if w.woken.load(Ordering::SeqCst) {
         return Ok(0);
     }
-    // Leave the queue we are on (a requeue may have moved us).
-    {
-        let mut t = FUTEXES.lock();
+    // Leave the queue we are on. A requeue may move us, and changes our key
+    // only while holding our current bucket, so the key read under that
+    // bucket's lock is where we are.
+    loop {
         let k = *w.key.lock();
+        let mut t = FUTEXES[bucket(&k)].lock();
+        if *w.key.lock() != k {
+            continue; // moved meanwhile: try the new bucket
+        }
         if let Some(q) = t.get_mut(&k) {
             q.retain(|x| !Arc::ptr_eq(x, &w));
             if q.is_empty() {
                 t.remove(&k);
             }
         }
+        break;
     }
     if w.woken.load(Ordering::SeqCst) {
         return Ok(0); // woken while we were leaving
@@ -168,31 +209,34 @@ fn requeue(
     if expect.is_some() {
         p.mm().populate(addr, 4, false);
     }
-    let mut t = FUTEXES.lock();
-    if let Some(v) = expect {
-        let cur = p.mm().space().load_u32_atomic(addr).ok_or(EFAULT)?;
-        if cur != v {
-            return Err(EAGAIN);
+    with_two(&k1, &k2, |t1, t2| {
+        if let Some(v) = expect {
+            let cur = p.mm().space().load_u32_atomic(addr).ok_or(EFAULT)?;
+            if cur != v {
+                return Err(EAGAIN);
+            }
         }
-    }
-    let woken = wake_key(&mut t, k1, n_wake, u32::MAX);
-    let mut moved = 0u64;
-    let mut take = VecDeque::new();
-    if let Some(q) = t.get_mut(&k1) {
-        while moved < u64::from(n_move) {
-            let Some(w) = q.pop_front() else { break };
-            *w.key.lock() = k2;
-            take.push_back(w);
-            moved += 1;
+        let woken = wake_key(t1, k1, n_wake, u32::MAX);
+        let mut moved = 0u64;
+        let mut take = VecDeque::new();
+        if let Some(q) = t1.get_mut(&k1) {
+            while moved < u64::from(n_move) {
+                let Some(w) = q.pop_front() else { break };
+                // Both buckets are held, so a leaving waiter sees either
+                // key consistently.
+                *w.key.lock() = k2;
+                take.push_back(w);
+                moved += 1;
+            }
+            if q.is_empty() {
+                t1.remove(&k1);
+            }
         }
-        if q.is_empty() {
-            t.remove(&k1);
+        if !take.is_empty() {
+            t2.unwrap_or(t1).entry(k2).or_default().extend(take);
         }
-    }
-    if !take.is_empty() {
-        t.entry(k2).or_default().extend(take);
-    }
-    Ok(woken + moved)
+        Ok(woken + moved)
+    })
 }
 
 /// `FUTEX_WAKE_OP`: atomically applies `op` to `*addr2`, wakes `n1` on
@@ -214,7 +258,36 @@ fn wake_op(
         oparg = 1u32.checked_shl(oparg).unwrap_or(0);
     }
     p.mm().populate(addr2, 4, true);
-    let mut t = FUTEXES.lock();
+    let (k1, k2) = (key(p, addr), key(p, addr2));
+    with_two(&k1, &k2, |t1, t2| {
+        wake_op_locked(
+            p,
+            addr2,
+            kind,
+            cmp,
+            oparg,
+            cmparg,
+            n1,
+            n2,
+            (k1, t1),
+            (k2, t2),
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)] // the decoded fields of one futex op
+fn wake_op_locked(
+    p: &LinuxProcess,
+    addr2: u64,
+    kind: u32,
+    cmp: u32,
+    oparg: u32,
+    cmparg: u32,
+    n1: u32,
+    n2: u32,
+    (k1, t1): (Key, &mut Table),
+    (k2, t2): (Key, Option<&mut Table>),
+) -> Result<u64, i64> {
     let old = loop {
         let mm = p.mm();
         let space = mm.space();
@@ -241,9 +314,9 @@ fn wake_op(
         5 => (old as i32) >= (cmparg as i32),
         _ => return Err(ENOSYS),
     };
-    let mut n = wake_key(&mut t, key(p, addr), n1, u32::MAX);
+    let mut n = wake_key(t1, k1, n1, u32::MAX);
     if ok {
-        n += wake_key(&mut t, key(p, addr2), n2, u32::MAX);
+        n += wake_key(t2.unwrap_or(t1), k2, n2, u32::MAX);
     }
     Ok(n)
 }

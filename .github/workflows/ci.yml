@@ -60,6 +60,15 @@ jobs:
         env:
           ICHOR_TEST_VERBOSE: "1"
           ICHOR_REQUIRE_KVM: "1"
+      # Phase E baseline: one boot on its own, so the numbers are not
+      # disturbed by parallel test boots. Printed and summarized, not checked.
+      - name: Benchmarks (KVM, 4 vCPUs)
+        shell: bash
+        run: |
+          cargo xtask run --accel kvm --smp 4 --timeout 600 --name bench \
+            --cmdline "qemu_debug_exit bench" | tee bench.log
+          { echo '### Benchmarks (KVM, 4 vCPUs)'; echo '```'
+            grep -a 'ichor: bench:' bench.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
       - name: Upload QEMU run directories on failure
         if: failure()
         uses: actions/upload-artifact@v4
