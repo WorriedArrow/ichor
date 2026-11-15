@@ -130,8 +130,11 @@ impl Cpio {
     }
 }
 
-/// `/init`: runs every benchmark, then powers the machine off.
+/// `/init`: reports the CPU (runners vary), runs every benchmark, then
+/// powers the machine off.
 const INIT: &str = "#!/bin/sh
+/bin/busybox mount -t proc proc /proc
+echo \"ichor-linux-cpu: $(/bin/busybox grep -m1 'model name' /proc/cpuinfo | /bin/busybox cut -d: -f2-)\"
 for p in /bench/*; do
   \"$p\" || echo \"ichor-bench: $p failed\"
 done

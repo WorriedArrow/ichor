@@ -8,7 +8,12 @@ the cost per operation is the time difference over the iteration
 difference, so process start and exit cancel out.
 
 GitHub's hosted runners vary from run to run, so compare within a run or
-across several runs, not one number against another.
+across several runs, not one number against another. The variance is
+large: between two consecutive runs (`2e36e95` and `036189f`) Linux's null
+syscall went from 366 ns to 135 ns with no change to Linux, which points to a
+different host CPU (one that needs no page-table isolation). The table's
+footer names the host CPU since then; a change is only measured by
+several runs on the same CPU model.
 
 ## Baseline (Ichor, KVM, 4 vCPUs, GitHub `ubuntu-24.04` runner)
 

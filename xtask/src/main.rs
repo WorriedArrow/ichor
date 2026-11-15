@@ -191,8 +191,13 @@ fn cmd_bench(o: &Opts) -> Result<()> {
         }
     }
     println!();
+    let cpu = linux
+        .serial
+        .lines()
+        .find_map(|l| l.strip_prefix("ichor-linux-cpu:"))
+        .map_or("unknown CPU", str::trim);
     println!(
-        "{} vCPUs, {} MiB, accel {accel:?}. Each program times its own loop; Linux runs with its default mitigations.",
+        "{} vCPUs, {} MiB, accel {accel:?}, host CPU {cpu}. Each program times its own loop; Linux runs with its default mitigations. Runners differ: compare ratios within one run.",
         o.smp, o.memory_mib
     );
     Ok(())
