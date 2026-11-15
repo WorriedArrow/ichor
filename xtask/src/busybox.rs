@@ -11,6 +11,7 @@
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::Mutex;
 
 use crate::{Result, sha256, workspace_root};
 
@@ -28,8 +29,23 @@ fn check(bytes: &[u8], what: &str) -> Result<()> {
     Ok(())
 }
 
-/// The busybox binary's bytes, downloading and caching it if needed.
+/// The busybox binary's bytes, downloading and caching it if needed. Safe
+/// to call from parallel tests: one download per process, and concurrent
+/// processes each write their own partial file and rename it into place.
 pub fn bytes() -> Result<Vec<u8>> {
+    static ONCE: Mutex<Option<Vec<u8>>> = Mutex::new(None);
+    let mut once = ONCE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(b) = once.as_ref() {
+        return Ok(b.clone());
+    }
+    let b = fetch()?;
+    *once = Some(b.clone());
+    Ok(b)
+}
+
+fn fetch() -> Result<Vec<u8>> {
     if let Some(p) = std::env::var_os("ICHOR_BUSYBOX") {
         let p = PathBuf::from(p);
         let b = fs::read(&p).map_err(|e| format!("reading {}: {e}", p.display()))?;
@@ -47,7 +63,7 @@ pub fn bytes() -> Result<Vec<u8>> {
         return Ok(b);
     }
     fs::create_dir_all(&dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
-    let partial = dir.join("busybox.partial");
+    let partial = dir.join(format!("busybox.partial.{}", std::process::id()));
     let status = Command::new("curl")
         .args([
             "--silent",
