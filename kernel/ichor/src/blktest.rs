@@ -27,7 +27,9 @@ pub(crate) fn run() {
             println!("ichor: blk: virtio-blk init failed: {e:?}");
             fail("virtio-blk init")
         });
-        let m = mount("virtio-blk", d);
+        let Some(m) = mount("virtio-blk", d) else {
+            continue;
+        };
         let vfs =
             Arc::new(Vfs::mount_disk(&m).unwrap_or_else(|_| fail("disk is not an Ichor image")));
         // A disk carrying a distribution's userland is a container root.
@@ -47,20 +49,27 @@ pub(crate) fn run() {
             exercise("virtio-blk", &m, vfs);
         }
     }
-    match nvme::probe() {
-        None => println!("ichor: blk: no nvme controller"),
-        Some(Err(e)) => {
+    // Every NVMe controller: a cloud VM may have several (boot volume,
+    // instance storage, other volumes), in any order.
+    let controllers = nvme::probe_all();
+    if controllers.is_empty() {
+        println!("ichor: blk: no nvme controller");
+    }
+    for c in controllers {
+        let d = c.unwrap_or_else(|e| {
             println!("ichor: blk: nvme init failed: {e:?}");
-            fail("nvme init");
-        }
-        Some(Ok(d)) => {
-            println!("ichor: blk: nvme block size {} bytes", d.block_size());
-            let m = mount("nvme", d);
-            let vfs = Arc::new(
-                Vfs::mount_disk(&m).unwrap_or_else(|_| fail("disk is not an Ichor image")),
-            );
-            exercise("nvme", &m, vfs);
-        }
+            fail("nvme init")
+        });
+        println!("ichor: blk: nvme block size {} bytes", d.block_size());
+        let Some(m) = mount("nvme", d) else {
+            continue;
+        };
+        let vfs =
+            Arc::new(Vfs::mount_disk(&m).unwrap_or_else(|_| fail("disk is not an Ichor image")));
+        exercise("nvme", &m, vfs);
+    }
+    if !FIRST_DONE.load(core::sync::atomic::Ordering::Relaxed) {
+        fail("no Ichor root disk found");
     }
     tampering();
     let (pages, hits, misses, shared, mapped) = pagecache::stats();
@@ -73,8 +82,11 @@ pub(crate) fn run() {
 }
 
 /// Mounts a disk's image: from its Ichor root partition if it has a GPT
-/// (a cloud or bare-metal boot disk), else from its first sector.
-fn mount<D: BlockDevice + Send + 'static>(name: &str, disk: D) -> Mounted {
+/// (a cloud or bare-metal boot disk), else from its first sector. `None`
+/// for a disk that holds no Ichor image at all (a blank or foreign volume,
+/// instance storage), which is skipped; an Ichor image that fails its
+/// checks, or a read error, still stops the boot.
+fn mount<D: BlockDevice + Send + 'static>(name: &str, disk: D) -> Option<Mounted> {
     match crate::partition::root(disk) {
         Ok(part) => {
             println!(
@@ -89,12 +101,22 @@ fn mount<D: BlockDevice + Send + 'static>(name: &str, disk: D) -> Mounted {
 
 /// Mounts the image on `disk`: metadata read and checked against the root
 /// hash now, chunks paged in on demand.
-fn mount_image(name: &str, disk: impl BlockDevice + Send + 'static) -> Mounted {
+fn mount_image(name: &str, disk: impl BlockDevice + Send + 'static) -> Option<Mounted> {
     let bytes = disk.sector_count().saturating_mul(SECTOR_SIZE as u64);
-    let m = pagecache::mount_disk(disk).unwrap_or_else(|e| {
-        println!("ichor: blk: {name}: cannot mount: {e:?}");
-        fail("mounting the root disk")
-    });
+    let m = match pagecache::mount_disk(disk) {
+        Ok(m) => m,
+        Err(image::Error::BadMagic | image::Error::Truncated) => {
+            println!(
+                "ichor: blk: {name}: {} KiB, no Ichor image; skipped",
+                bytes / 1024
+            );
+            return None;
+        }
+        Err(e) => {
+            println!("ichor: blk: {name}: cannot mount: {e:?}");
+            fail("mounting the root disk")
+        }
+    };
     let image = Image::mount(m.metadata).unwrap_or_else(|e| {
         println!("ichor: blk: {name}: image rejected: {e:?}");
         fail("root disk image rejected")
@@ -113,7 +135,7 @@ fn mount_image(name: &str, disk: impl BlockDevice + Send + 'static) -> Mounted {
         h[7],
         m.metadata.len() / 1024
     );
-    m
+    Some(m)
 }
 
 /// Set once the first root disk has had the full checks.

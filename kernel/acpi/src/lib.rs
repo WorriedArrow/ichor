@@ -184,11 +184,77 @@ pub fn madt_local_apics(madt: &[u8]) -> impl Iterator<Item = LocalApic> + '_ {
     })
 }
 
+/// The ACPI power-management timer: a free-running counter at
+/// [`PM_TIMER_HZ`] that firmware puts at an I/O port.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PmTimer {
+    pub port: u16,
+    /// 32-bit counter (FADT `TMR_VAL_EXT`); otherwise 24-bit.
+    pub bits32: bool,
+}
+
+/// The PM timer's frequency (ACPI 6.5 §4.8.3.3).
+pub const PM_TIMER_HZ: u64 = 3_579_545;
+
+/// The PM timer of a validated FADT (`FACP`), if it has one in I/O space:
+/// `X_PM_TMR_BLK` (offset 208) when present and nonzero, else the legacy
+/// `PM_TMR_BLK` (offset 76). Flags are at offset 112.
+pub fn fadt_pm_timer(fadt: &[u8]) -> Option<PmTimer> {
+    let flags = u32_at(fadt, 112).ok()?;
+    let bits32 = flags & (1 << 8) != 0;
+    // Generic address structure: space id, width, offset, access size,
+    // 64-bit address.
+    if fadt.len() >= 220 && u8_at(fadt, 208).ok()? == 1 {
+        let addr = u64_at(fadt, 212).ok()?;
+        if addr != 0 {
+            return u16::try_from(addr)
+                .ok()
+                .map(|port| PmTimer { port, bits32 });
+        }
+    }
+    let port = u32_at(fadt, 76).ok()?;
+    (port != 0)
+        .then(|| u16::try_from(port).ok())
+        .flatten()
+        .map(|port| PmTimer { port, bits32 })
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;
     use super::*;
     use std::vec::Vec;
+
+    #[test]
+    fn fadt_pm_timer_prefers_the_extended_block() {
+        let mut body = std::vec![0u8; 276 - HEADER_LEN];
+        let at = |o: usize| o - HEADER_LEN;
+        body[at(76)..at(76) + 4].copy_from_slice(&0x608u32.to_le_bytes());
+        body[at(112)..at(112) + 4].copy_from_slice(&(1u32 << 8).to_le_bytes());
+        let legacy = table(b"FACP", &body);
+        assert_eq!(
+            fadt_pm_timer(&legacy),
+            Some(PmTimer {
+                port: 0x608,
+                bits32: true
+            })
+        );
+        body[at(208)] = 1; // system I/O
+        body[at(212)..at(212) + 8].copy_from_slice(&0xb008u64.to_le_bytes());
+        body[at(112)..at(112) + 4].copy_from_slice(&0u32.to_le_bytes());
+        let ext = table(b"FACP", &body);
+        assert_eq!(
+            fadt_pm_timer(&ext),
+            Some(PmTimer {
+                port: 0xb008,
+                bits32: false
+            })
+        );
+        // No timer at all.
+        let none = table(b"FACP", &std::vec![0u8; 276 - HEADER_LEN]);
+        assert_eq!(fadt_pm_timer(&none), None);
+        assert_eq!(fadt_pm_timer(&legacy[..100]), None);
+    }
 
     fn fix_checksum(b: &mut [u8], at: usize, range: core::ops::Range<usize>) {
         b[at] = 0;
@@ -302,6 +368,7 @@ mod tests {
             let _ = parse_header(&g);
             let _ = validate(&g, b"APIC");
             let _ = madt_local_apics(&g).count();
+            let _ = fadt_pm_timer(&g);
             let _ = root_entries(&g, Root::Rsdt(0)).count();
         }
     }

@@ -1631,6 +1631,14 @@ fn lock_program() -> Vec<u8> {
     flock(&mut a, WR, 0, 10);
     fcntl(&mut a, F_SETLK);
     expect(&mut a, 1, 0);
+    // fds 4, 5 = pipe: the child says when its conflict checks are done,
+    // so the parent's unlock cannot overtake them however slow the child
+    // is to run (a loaded host).
+    a.mov(Reg::Rdi, Reg::Rbp);
+    a.add_imm(Reg::Rdi, 128);
+    a.mov_imm(Reg::Rsi, 0);
+    a.sys(sys::PIPE2);
+    expect(&mut a, 1, 0);
     a.sys(sys::FORK);
     a.cmp_imm(Reg::Rax, 0);
     a.jne(parent);
@@ -1648,13 +1656,25 @@ fn lock_program() -> Vec<u8> {
     flock(&mut a, WR, 20, 10);
     fcntl(&mut a, F_SETLK);
     expect(&mut a, 4, 0);
+    // Tell the parent the checks that need its lock held are done.
+    a.mov_imm(Reg::Rdi, 5);
+    a.mov(Reg::Rsi, Reg::Rbp);
+    a.add_imm(Reg::Rsi, 160);
+    a.mov_imm(Reg::Rdx, 1);
+    a.sys(sys::WRITE);
     flock(&mut a, WR, 0, 1);
     fcntl(&mut a, F_SETLKW); // blocks until the parent unlocks
     expect(&mut a, 5, 0);
     a.mov_imm(Reg::Rdi, 0);
     a.sys(sys::EXIT_GROUP);
-    // Parent: give the child time to block, unlock, reap it.
+    // Parent: wait for the child's checks, give it time to block in
+    // F_SETLKW, unlock, reap it.
     a.bind(parent);
+    a.mov_imm(Reg::Rdi, 4);
+    a.mov(Reg::Rsi, Reg::Rbp);
+    a.add_imm(Reg::Rsi, 160);
+    a.mov_imm(Reg::Rdx, 1);
+    a.sys(sys::READ);
     a.mov_data(Reg::Rdi, ts);
     a.mov_imm(Reg::Rsi, 0);
     a.sys(sys::NANOSLEEP);

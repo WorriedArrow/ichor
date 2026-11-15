@@ -24,7 +24,7 @@
 //! official static busybox: echo, ls, cat, and a shell that forks, execs
 //! and waits.
 
-use ichor_tests::{Exit, boot, boot_disk};
+use ichor_tests::{Exit, boot, boot_disk, boot_disk_with};
 
 const BOOT_MARKERS: &[&str] = &[
     "ichor: frame: entered from UEFI",
@@ -370,6 +370,39 @@ fn cloud_disk_boots_from_gpt_on_nvme() {
         "ichor: blk: nvme: verified 300 KiB read across multiple requests",
         "ichor: blk: cat read /etc/motd from the nvme disk",
         "hello from busybox",
+        "ichor: busybox: all applets passed",
+        "ichor: boot complete; halting",
+    ]);
+}
+
+/// A less friendly cloud VM: a blank NVMe volume ahead of the boot disk in
+/// PCI order (as instance storage can be), a boot controller that allows
+/// only 8 KiB per transfer (MDTS 1), 4 GiB and 4 vCPUs. The blank volume
+/// is skipped, reads are split to fit, and the boot completes.
+#[test]
+fn cloud_disk_tolerates_blank_volumes_and_small_transfers() {
+    let blank = std::env::temp_dir().join(format!("ichor-blank-{}.img", std::process::id()));
+    std::fs::write(&blank, vec![0u8; 16 << 20]).unwrap();
+    let out = boot_disk_with("cloud-disk-awkward", "", 4, |cfg| {
+        cfg.memory_mib = 4096;
+        cfg.disk_nvme_props = "mdts=1".into();
+        cfg.disk_devices_before = vec![
+            "-drive".into(),
+            format!(
+                "if=none,id=blank,format=raw,readonly=on,file={}",
+                blank.display()
+            ),
+            "-device".into(),
+            "nvme,serial=ichor-blank,drive=blank".into(),
+        ];
+    });
+    let _ = std::fs::remove_file(&blank);
+    out.assert_exit(Exit::Success);
+    out.assert_in_order(&[
+        "ichor: smp: 4 CPUs online",
+        "ichor: blk: nvme: 16384 KiB, no Ichor image; skipped",
+        "ichor: blk: nvme: GPT disk, Ichor root partition at sector ",
+        "ichor: blk: nvme: verified 300 KiB read across multiple requests",
         "ichor: busybox: all applets passed",
         "ichor: boot complete; halting",
     ]);

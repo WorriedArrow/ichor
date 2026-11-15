@@ -13,6 +13,8 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
+extern crate alloc;
+
 use core::time::Duration;
 
 use block::{BlockDevice, BlockError, SECTOR_SIZE, check};
@@ -47,13 +49,20 @@ const ADMIN_IDENTIFY: u32 = 0x06;
 // I/O opcodes.
 const IO_READ: u32 = 0x02;
 
+/// Queue entries we ask for; a controller with a smaller maximum (CAP.MQES)
+/// gets its maximum.
 const QUEUE_SIZE: u16 = 64;
 const SQE: usize = 64;
 const CQE: usize = 16;
 const PAGE: usize = 4096;
-/// Largest single read: one data buffer, described by PRP1 plus a PRP list.
+/// Largest single read we issue: one data buffer, described by PRP1 plus a
+/// PRP list. A controller's MDTS can lower it.
 const MAX_REQUEST: usize = 64 * 1024;
 const NSID: u32 = 1;
+/// How long one command may take before it counts as lost: Linux's
+/// default I/O timeout. Cloud volumes can stall for seconds; CAP.TO (used
+/// for enabling the controller) is far shorter.
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Why the controller could not be brought up.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -71,6 +80,8 @@ pub enum InitError {
 #[derive(Debug)]
 struct Queue {
     id: u16,
+    /// Entries in each ring.
+    size: u16,
     sq: DmaBuf,
     cq: DmaBuf,
     tail: u16,
@@ -79,11 +90,12 @@ struct Queue {
 }
 
 impl Queue {
-    fn new(id: u16) -> Option<Queue> {
+    fn new(id: u16, size: u16) -> Option<Queue> {
         Some(Queue {
             id,
-            sq: DmaBuf::alloc(usize::from(QUEUE_SIZE) * SQE)?,
-            cq: DmaBuf::alloc(usize::from(QUEUE_SIZE) * CQE)?,
+            size,
+            sq: DmaBuf::alloc(usize::from(size) * SQE)?,
+            cq: DmaBuf::alloc(usize::from(size) * CQE)?,
             tail: 0,
             head: 0,
             phase: true,
@@ -118,14 +130,28 @@ pub struct Nvme {
     blocks: u64,
     /// log2 of the logical block size.
     lba_shift: u32,
+    /// Largest read issued at once (MAX_REQUEST, or less by MDTS).
+    max_request: usize,
+}
+
+fn is_nvme(d: &PciDevice) -> bool {
+    d.class == CLASS_STORAGE && d.subclass == SUBCLASS_NVM && d.prog_if == PROG_IF_NVME
 }
 
 /// Finds and initializes the first NVMe controller.
 pub fn probe() -> Option<Result<Nvme, InitError>> {
-    let dev = pci::devices().into_iter().find(|d| {
-        d.class == CLASS_STORAGE && d.subclass == SUBCLASS_NVM && d.prog_if == PROG_IF_NVME
-    })?;
+    let dev = pci::devices().into_iter().find(is_nvme)?;
     Some(Nvme::init(&dev))
+}
+
+/// Initializes every NVMe controller, in PCI order. A cloud VM often has
+/// several (the boot volume, instance storage, other volumes).
+pub fn probe_all() -> alloc::vec::Vec<Result<Nvme, InitError>> {
+    pci::devices()
+        .into_iter()
+        .filter(is_nvme)
+        .map(|d| Nvme::init(&d))
+        .collect()
 }
 
 impl Nvme {
@@ -134,10 +160,13 @@ impl Nvme {
         let regs = dev.map_bar(0).ok_or(InitError::MapFailed)?;
         let cap = regs.read64(REG_CAP);
         let doorbell_stride = 4u64 << ((cap >> 32) & 0xf);
-        // CAP.TO is in 500 ms units; allow at least a second.
+        // CAP.TO (500 ms units) bounds enabling and disabling the
+        // controller; allow at least a second.
         let timeout = Duration::from_millis(((cap >> 24) & 0xff).max(2) * 500);
-        let mqes = (cap & 0xffff) as u16 + 1;
-        if mqes < QUEUE_SIZE {
+        // CAP.MQES is zero-based; at least 2 entries are required.
+        let mqes = ((cap & 0xffff) as u16).saturating_add(1);
+        let qsize = QUEUE_SIZE.min(mqes);
+        if qsize < 2 {
             return Err(InitError::NotReady);
         }
 
@@ -145,19 +174,20 @@ impl Nvme {
             regs,
             doorbell_stride,
             timeout,
-            admin: Queue::new(0).ok_or(InitError::NoMemory)?,
-            io: Queue::new(1).ok_or(InitError::NoMemory)?,
+            admin: Queue::new(0, qsize).ok_or(InitError::NoMemory)?,
+            io: Queue::new(1, qsize).ok_or(InitError::NoMemory)?,
             next_cid: 0,
             data: DmaBuf::alloc(MAX_REQUEST).ok_or(InitError::NoMemory)?,
             prp_list: DmaBuf::alloc(PAGE).ok_or(InitError::NoMemory)?,
             blocks: 0,
             lba_shift: 9,
+            max_request: MAX_REQUEST,
         };
 
         // Reset, program the admin queues, enable.
         nvme.regs.write32(REG_CC, 0);
         nvme.wait_status(0)?;
-        let n = u32::from(QUEUE_SIZE - 1);
+        let n = u32::from(qsize - 1);
         nvme.regs.write32(REG_AQA, (n << 16) | n);
         let (asq, acq) = (addr(&nvme.admin.sq)?, addr(&nvme.admin.cq)?);
         nvme.regs.write64(REG_ASQ, asq);
@@ -166,8 +196,24 @@ impl Nvme {
         nvme.regs.write32(REG_CC, CC_EN | CC_IOSQES | CC_IOCQES);
         nvme.wait_status(CSTS_RDY)?;
 
-        // Identify namespace 1: size and logical block format.
+        // Identify the controller: MDTS (byte 77) caps a transfer at
+        // 2^MDTS minimum-size pages (4 KiB here, MPS = 0); 0 means no limit.
         let data = addr(&nvme.data)?;
+        nvme.admin_command(Command {
+            opcode: ADMIN_IDENTIFY,
+            prp1: data,
+            cdw: [1, 0, 0, 0, 0, 0], // CNS = 1: controller
+            ..Command::default()
+        })?;
+        let mut ctrl = [0u8; 80];
+        nvme.data.read(0, &mut ctrl);
+        let mdts = u32::from(ctrl[77]);
+        if mdts != 0 {
+            let limit = PAGE.checked_shl(mdts).unwrap_or(usize::MAX);
+            nvme.max_request = MAX_REQUEST.min(limit);
+        }
+
+        // Identify namespace 1: size and logical block format.
         let identify = Command {
             opcode: ADMIN_IDENTIFY,
             nsid: NSID,
@@ -193,9 +239,14 @@ impl Nvme {
         nvme.blocks = blocks;
         nvme.lba_shift = lba_shift;
 
+        // A request must be whole logical blocks.
+        if nvme.max_request < (1 << lba_shift) {
+            return Err(InitError::Namespace);
+        }
+
         // One I/O queue pair, polled (no interrupts).
         let (sq, cq) = (addr(&nvme.io.sq)?, addr(&nvme.io.cq)?);
-        let qsize = u32::from(QUEUE_SIZE - 1) << 16;
+        let qsize = u32::from(qsize - 1) << 16;
         nvme.admin_command(Command {
             opcode: ADMIN_CREATE_CQ,
             prp1: cq,
@@ -242,7 +293,7 @@ impl Nvme {
         let cid = self.next_cid;
         self.next_cid = self.next_cid.wrapping_add(1);
         let stride = self.doorbell_stride;
-        let timeout = self.timeout;
+        let timeout = COMMAND_TIMEOUT;
         let q = if admin { &mut self.admin } else { &mut self.io };
 
         let at = usize::from(q.tail) * SQE;
@@ -255,7 +306,7 @@ impl Nvme {
             sqe[40 + 4 * i..44 + 4 * i].copy_from_slice(&d.to_le_bytes());
         }
         q.sq.write(at, &sqe);
-        q.tail = (q.tail + 1) % QUEUE_SIZE;
+        q.tail = (q.tail + 1) % q.size;
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         let qid = u64::from(q.id);
         self.regs
@@ -268,7 +319,7 @@ impl Nvme {
             let phase = dw3 & (1 << 16) != 0;
             if phase == q.phase {
                 core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-                q.head = (q.head + 1) % QUEUE_SIZE;
+                q.head = (q.head + 1) % q.size;
                 if q.head == 0 {
                     q.phase = !q.phase;
                 }
@@ -278,13 +329,24 @@ impl Nvme {
                     continue; // Not ours (cannot happen with one in flight).
                 }
                 let status = (dw3 >> 17) & 0x7fff;
-                return if status == 0 {
-                    Ok(())
-                } else {
-                    Err(BlockError::Io)
-                };
+                if status != 0 {
+                    frame::println!(
+                        "ichor: nvme: command {:#x} (qid {qid}, cdw10 {:#x}) failed: status type {}, code {:#x}",
+                        cmd.opcode,
+                        cmd.cdw[0],
+                        (status >> 8) & 7,
+                        status & 0xff
+                    );
+                    return Err(BlockError::Io);
+                }
+                return Ok(());
             }
             if frame::time::now() >= deadline {
+                frame::println!(
+                    "ichor: nvme: command {:#x} (qid {qid}, cid {cid}) timed out after {} s",
+                    cmd.opcode,
+                    timeout.as_secs()
+                );
                 return Err(BlockError::Timeout);
             }
             core::hint::spin_loop();
@@ -348,7 +410,7 @@ impl BlockDevice for Nvme {
         }
         let mut done = 0;
         while done < buf.len() {
-            let n = MAX_REQUEST.min(buf.len() - done);
+            let n = self.max_request.min(buf.len() - done);
             let lba = (byte + done as u64) >> self.lba_shift;
             self.read_blocks(lba, &mut buf[done..done + n])?;
             done += n;

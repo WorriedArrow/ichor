@@ -15,8 +15,9 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::Duration;
 
+pub use xtask::qemu::RunConfig;
+use xtask::qemu::run;
 pub use xtask::qemu::{Exit, Outcome};
-use xtask::qemu::{RunConfig, run};
 
 /// Generous enough for OVMF under TCG on a slow CI machine. Under KVM a boot
 /// takes about a second.
@@ -36,6 +37,17 @@ fn kernel() -> PathBuf {
 /// `xtask::disk::image` with `cmdline` plus `qemu_debug_exit`) from NVMe,
 /// as a cloud VM boots, and returns the outcome.
 pub fn boot_disk(name: &str, cmdline: &str, smp: u32) -> Outcome {
+    boot_disk_with(name, cmdline, smp, |_| {})
+}
+
+/// [`boot_disk`], with `tweak` adjusting the run (memory, extra devices,
+/// controller properties) before it starts.
+pub fn boot_disk_with(
+    name: &str,
+    cmdline: &str,
+    smp: u32,
+    tweak: impl FnOnce(&mut RunConfig),
+) -> Outcome {
     let img = xtask::disk::image(&kernel(), &format!("qemu_debug_exit {cmdline}"))
         .expect("building the disk image");
     let dir = xtask::workspace_root()
@@ -50,6 +62,7 @@ pub fn boot_disk(name: &str, cmdline: &str, smp: u32) -> Outcome {
     cfg.capture = true;
     cfg.timeout = Some(BOOT_TIMEOUT);
     cfg.disk_image = Some(path);
+    tweak(&mut cfg);
     run(&cfg).expect("failed to run QEMU")
 }
 

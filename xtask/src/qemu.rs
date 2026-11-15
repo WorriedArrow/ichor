@@ -208,6 +208,13 @@ pub struct RunConfig {
     /// ESP and the separate test disks. `cmdline` is then ignored: the
     /// image carries its own.
     pub disk_image: Option<PathBuf>,
+    /// Disk mode: extra properties for the boot NVMe controller (for
+    /// example `mdts=1`, a small maximum transfer).
+    pub disk_nvme_props: String,
+    /// Disk mode: QEMU arguments placed before the boot disk, so devices
+    /// they add come first in PCI order (a blank volume ahead of the boot
+    /// disk, as instance storage can be).
+    pub disk_devices_before: Vec<String>,
 }
 
 impl RunConfig {
@@ -224,6 +231,8 @@ impl RunConfig {
             extra_args: Vec::new(),
             window: false,
             disk_image: None,
+            disk_nvme_props: String::new(),
+            disk_devices_before: Vec::new(),
         }
     }
 }
@@ -538,12 +547,22 @@ fn disk_command(cfg: &RunConfig, qemu: &Path, fw: &Firmware, img: &Path) -> Resu
             "if=pflash,format=raw,unit=1,file={}",
             drive_path(&dir.join("vars.fd"))
         ))
+        .args(&cfg.disk_devices_before)
         .arg("-drive")
         .arg(format!(
             "if=none,id=disk,format=raw,readonly=on,file={}",
             drive_path(img)
         ))
-        .args(["-device", "nvme,serial=ichor-boot,drive=disk,bootindex=0"])
+        .arg("-device")
+        .arg(format!(
+            "nvme,serial=ichor-boot,drive=disk,bootindex=0{}{}",
+            if cfg.disk_nvme_props.is_empty() {
+                ""
+            } else {
+                ","
+            },
+            cfg.disk_nvme_props
+        ))
         .args(["-device", "virtio-rng-pci,disable-legacy=on"])
         .args(&cfg.extra_args);
     Ok(cmd)

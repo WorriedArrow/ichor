@@ -193,10 +193,12 @@ pub(crate) extern "sysv64" fn kernel_space_entry() -> ! {
 
     arch::trap::init_idt();
     arch::apic::mask_legacy_pic();
-    let hz = arch::apic::init_tsc();
+    let Some((hz, source)) = arch::apic::init_tsc() else {
+        fatal("cannot determine the TSC frequency (no CPUID leaf, PM timer or PIT)");
+    };
     init_cpu(CpuId::BOOT);
     println!(
-        "ichor: frame: cpu0 ready (x2APIC id {}, TSC {} MHz, {} timer)",
+        "ichor: frame: cpu0 ready (x2APIC id {}, TSC {} MHz from {source}, {} timer)",
         arch::apic::apic_id(),
         hz / 1_000_000,
         if arch::cpu::features().tsc_deadline {

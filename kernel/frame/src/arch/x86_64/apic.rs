@@ -8,7 +8,7 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 
-use super::io::{inb, outb};
+use super::io::{inb, inl, outb};
 use super::regs::{self, cpuid, rdmsr, rdtsc, wrmsr};
 use super::trap::TrapFrame;
 use crate::sync::SpinLock;
@@ -134,30 +134,71 @@ pub(crate) fn start_ap(dest: u32, page: u8) {
 // ---------------------------------------------------------------------------
 
 /// Determines the TSC frequency: CPUID leaf 0x15, then the hypervisor
-/// timing leaf, then calibration against the PIT.
-pub(crate) fn init_tsc() -> u64 {
+/// timing leaf, then calibration against the ACPI PM timer, then against
+/// the PIT (absent on some cloud VMs). Returns the frequency and where it
+/// came from; `None` if every source failed.
+pub(crate) fn init_tsc() -> Option<(u64, &'static str)> {
     TSC_AT_BOOT.store(rdtsc(), Relaxed);
     let max = cpuid(0, 0)[0];
-    let mut hz = 0;
+    let mut found = None;
     if max >= 0x15 {
         let [den, num, crystal, _] = cpuid(0x15, 0);
         if den != 0 && num != 0 && crystal != 0 {
-            hz = u64::from(crystal) * u64::from(num) / u64::from(den);
+            found = Some((
+                u64::from(crystal) * u64::from(num) / u64::from(den),
+                "cpuid 0x15",
+            ));
         }
     }
-    if hz == 0 && super::cpu::features().hypervisor && cpuid(0x4000_0000, 0)[0] >= 0x4000_0010 {
-        hz = u64::from(cpuid(0x4000_0010, 0)[0]) * 1000;
+    if found.is_none()
+        && super::cpu::features().hypervisor
+        && cpuid(0x4000_0000, 0)[0] >= 0x4000_0010
+    {
+        let khz = u64::from(cpuid(0x4000_0010, 0)[0]);
+        found = (khz != 0).then_some((khz * 1000, "hypervisor leaf"));
     }
-    if hz == 0 {
-        hz = calibrate_with_pit();
+    if found.is_none() {
+        found = crate::acpi::find_table(b"FACP")
+            .and_then(|f| acpi::fadt_pm_timer(&f))
+            .and_then(calibrate_with_pm_timer)
+            .map(|hz| (hz, "ACPI PM timer"));
     }
+    if found.is_none() {
+        found = calibrate_with_pit().map(|hz| (hz, "PIT"));
+    }
+    let (hz, _) = found?;
     TSC_HZ.store(hz, Relaxed);
-    hz
+    found
+}
+
+/// Measures the TSC over 10 ms of the ACPI PM timer (3.579545 MHz). `None`
+/// if the counter does not advance (no timer at that port).
+fn calibrate_with_pm_timer(t: acpi::PmTimer) -> Option<u64> {
+    let mask: u32 = if t.bits32 { u32::MAX } else { 0x00ff_ffff };
+    // SAFETY: the FADT names this port as the PM timer, a read-only
+    // free-running counter: reading it has no side effects on any device.
+    let read = || unsafe { inl(t.port) } & mask;
+    let target = (acpi::PM_TIMER_HZ / 100) as u32; // 10 ms
+    let start = read();
+    let tsc_start = rdtsc();
+    let mut spins = 0u64;
+    let elapsed = loop {
+        let e = read().wrapping_sub(start) & mask;
+        if e >= target {
+            break e;
+        }
+        spins += 1;
+        if spins > 100_000_000 {
+            return None;
+        }
+    };
+    let ticks = rdtsc().wrapping_sub(tsc_start);
+    Some(ticks * acpi::PM_TIMER_HZ / u64::from(elapsed))
 }
 
 /// Measures the TSC over 10 ms of PIT channel 2. Frame owns ports 0x42,
-/// 0x43 and 0x61.
-fn calibrate_with_pit() -> u64 {
+/// 0x43 and 0x61. `None` if the PIT never signals (absent).
+fn calibrate_with_pit() -> Option<u64> {
     const PIT_HZ: u64 = 1_193_182;
     const COUNT: u64 = PIT_HZ / 100; // 10 ms
     // SAFETY: frame owns the PIT and the port-0x61 gate. Channel 2 drives
@@ -180,7 +221,7 @@ fn calibrate_with_pit() -> u64 {
     let elapsed = rdtsc().wrapping_sub(start);
     // SAFETY: as above: restore the original gate state.
     unsafe { outb(0x61, gate) };
-    elapsed * PIT_HZ / COUNT
+    (spins < 100_000_000).then_some(elapsed * PIT_HZ / COUNT)
 }
 
 pub(crate) fn tsc_hz() -> u64 {
