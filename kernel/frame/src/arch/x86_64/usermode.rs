@@ -155,6 +155,9 @@ pub enum UserEvent {
     Syscall,
     /// A CPU exception while in ring 3.
     Exception { vector: u8, error: u64, cr2: u64 },
+    /// The thread's timeslice ran out while it was in ring 3. The caller
+    /// should yield (`task::yield_now`) and then execute again.
+    Preempted,
 }
 
 /// Enables `syscall`/`sysret` on this CPU, and sets the kernel stack the CPU
@@ -238,6 +241,7 @@ impl<'a> UserMode<'a> {
         let info = block.event_info.load(Relaxed);
         match block.event_kind.load(Relaxed) {
             1 => UserEvent::Syscall,
+            3 => UserEvent::Preempted,
             _ => UserEvent::Exception {
                 vector: info as u8,
                 error: info >> 8,
@@ -291,6 +295,14 @@ pub(super) fn record_user_trap(frame: &trap::TrapFrame) {
     );
     block.event_cr2.store(cr2, Relaxed);
     block.event_kind.store(2, Relaxed);
+}
+
+/// Records the registers of ring-3 code interrupted when this CPU should
+/// reschedule, ending the user run with [`UserEvent::Preempted`].
+pub(super) fn record_user_preempt(frame: &trap::TrapFrame) {
+    use core::sync::atomic::Ordering::Relaxed;
+    record_user_trap(frame);
+    cpu::this_block().event_kind.store(3, Relaxed);
 }
 
 // GPR offsets within UserContext, shared with the stubs.

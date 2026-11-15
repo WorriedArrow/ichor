@@ -33,7 +33,13 @@ mod sys {
     pub(super) const MPROTECT: u64 = 10;
     pub(super) const MUNMAP: u64 = 11;
     pub(super) const BRK: u64 = 12;
+    pub(super) const SCHED_YIELD: u64 = 24;
+    pub(super) const NANOSLEEP: u64 = 35;
+    pub(super) const GETPID: u64 = 39;
+    pub(super) const CLONE: u64 = 56;
     pub(super) const FORK: u64 = 57;
+    pub(super) const EXIT: u64 = 60;
+    pub(super) const FUTEX: u64 = 202;
     pub(super) const WAIT4: u64 = 61;
     pub(super) const UNAME: u64 = 63;
     pub(super) const GETCWD: u64 = 79;
@@ -57,12 +63,12 @@ const ENVP: &[&str] = &["PATH=/bin:/usr/bin", "HOME=/", "TERM=dumb"];
 /// memory came back. Returns the exit code (or minus the signal that killed
 /// it) and the number of syscalls it made.
 pub(crate) fn run_linux(
-    mut p: LinuxProcess,
+    p: LinuxProcess,
     elf: &[u8],
     interp: Option<&[u8]>,
     argv: &[&str],
 ) -> (i32, u32) {
-    let loaded = match loader::load(&mut p.mm, elf, interp, argv, ENVP) {
+    let loaded = match loader::load(&mut p.mm(), elf, interp, argv, ENVP) {
         Ok(l) => l,
         Err(e) => {
             println!("ichor: runtest: load error {e:?}");
@@ -70,8 +76,17 @@ pub(crate) fn run_linux(
         }
     };
     let cell = p.cell.clone();
+    let leader = p.group.leader.clone();
     let ctx = UserContext::new(loaded.entry, loaded.stack_pointer);
-    let (status, syscalls) = proc::run(p, ctx);
+    let (_, syscalls) = proc::run(p, ctx);
+    // Other threads may still be on their way out; the process's status is
+    // known once the last one is.
+    let status = loop {
+        if let Some(s) = proc::exit_status(&leader) {
+            break s;
+        }
+        frame::task::yield_now();
+    };
     if cell.account().used() != 0 {
         println!(
             "ichor: runtest: {} pages still charged",
@@ -466,6 +481,169 @@ fn fork_program() -> Vec<u8> {
     static_elf(&a.finish(BLOB_VADDR).unwrap_or_else(|| fail("assembler")))
 }
 
+/// Threads and futexes: the main thread maps a stack and clones a thread
+/// (pthread-style flags, with PARENT_SETTID and CHILD_CLEARTID); the thread
+/// stores 42 into a shared word, futex-wakes, and exits alone (`exit`, not
+/// `exit_group`). The main thread futex-waits for the 42, then joins by
+/// futex-waiting until the kernel clears the tid word, and checks its pid
+/// is unchanged. Exits 0 if every check held, else the failed check.
+fn thread_program() -> Vec<u8> {
+    const FLAGS: u64 = 0x35_0f00; // VM FS FILES SIGHAND THREAD SYSVSEM PARENT_SETTID CHILD_CLEARTID
+    const FUTEX_WAIT_PRIVATE: u64 = 128;
+    const FUTEX_WAKE_PRIVATE: u64 = 129;
+    let mut a = Asm::new();
+    let bad = a.label();
+    let main = a.label();
+    let wait_value = a.label();
+    let got_value = a.label();
+    let join = a.label();
+    let join_wait = a.label();
+    let joined = a.label();
+    // rbp -> two shared words below the main stack: [rbp] value, [rbp+8] tid.
+    a.mov(Reg::Rbp, Reg::Rsp);
+    a.sub_imm(Reg::Rbp, 4096);
+    a.mov_imm(Reg::Rax, 0);
+    a.store(Reg::Rbp, 0, Reg::Rax);
+    a.store(Reg::Rbp, 8, Reg::Rax);
+    a.sys(sys::GETPID);
+    a.mov(Reg::R12, Reg::Rax);
+    // r13 = mmap(NULL, 64 KiB, RW, PRIVATE | ANONYMOUS): the thread's stack.
+    a.mov_imm(Reg::Rdi, 0);
+    a.mov_imm(Reg::Rsi, 0x1_0000);
+    a.mov_imm(Reg::Rdx, 3);
+    a.mov_imm(Reg::R10, 0x22);
+    a.mov_imm(Reg::R8, u64::MAX);
+    a.mov_imm(Reg::R9, 0);
+    a.sys(sys::MMAP);
+    a.mov(Reg::R13, Reg::Rax);
+    // clone(FLAGS, r13 + 64 KiB, &tid, &tid, 0)
+    a.mov_imm(Reg::Rdi, FLAGS);
+    a.mov(Reg::Rsi, Reg::R13);
+    a.add_imm(Reg::Rsi, 0x1_0000);
+    a.mov(Reg::Rdx, Reg::Rbp);
+    a.add_imm(Reg::Rdx, 8);
+    a.mov(Reg::R10, Reg::Rdx);
+    a.mov_imm(Reg::R8, 0);
+    a.sys(sys::CLONE);
+    a.mov_imm(Reg::R15, 1);
+    a.cmp_imm(Reg::Rax, 0);
+    a.jne(main);
+    // The thread: store 42, wake one waiter on [rbp], exit alone.
+    a.mov_imm(Reg::Rax, 42);
+    a.store(Reg::Rbp, 0, Reg::Rax);
+    a.mov(Reg::Rdi, Reg::Rbp);
+    a.mov_imm(Reg::Rsi, FUTEX_WAKE_PRIVATE);
+    a.mov_imm(Reg::Rdx, 1);
+    a.sys(sys::FUTEX);
+    a.mov_imm(Reg::Rdi, 0);
+    a.sys(sys::EXIT);
+    // Main: wait until [rbp] != 0, then check it is 42.
+    a.bind(main);
+    a.bind(wait_value);
+    a.load(Reg::Rax, Reg::Rbp, 0);
+    a.cmp_imm(Reg::Rax, 0);
+    a.jne(got_value);
+    a.mov(Reg::Rdi, Reg::Rbp);
+    a.mov_imm(Reg::Rsi, FUTEX_WAIT_PRIVATE);
+    a.mov_imm(Reg::Rdx, 0);
+    a.mov_imm(Reg::R10, 0);
+    a.sys(sys::FUTEX);
+    a.jmp(wait_value);
+    a.bind(got_value);
+    a.mov_imm(Reg::R15, 2);
+    a.cmp_imm(Reg::Rax, 42);
+    a.jne(bad);
+    // Join: wait until the kernel has cleared the tid word.
+    a.bind(join);
+    a.load(Reg::Rax, Reg::Rbp, 8);
+    a.cmp_imm(Reg::Rax, 0);
+    a.jne(join_wait);
+    a.jmp(joined);
+    a.bind(join_wait);
+    a.mov(Reg::Rdi, Reg::Rbp);
+    a.add_imm(Reg::Rdi, 8);
+    a.mov_imm(Reg::Rsi, FUTEX_WAIT_PRIVATE);
+    a.mov(Reg::Rdx, Reg::Rax);
+    a.mov_imm(Reg::R10, 0);
+    a.sys(sys::FUTEX);
+    a.jmp(join);
+    a.bind(joined);
+    // Still the same process after the thread left.
+    a.sys(sys::GETPID);
+    a.mov_imm(Reg::R15, 3);
+    a.cmp(Reg::Rax, Reg::R12);
+    a.jne(bad);
+    a.mov_imm(Reg::R15, 0);
+    a.bind(bad);
+    a.mov(Reg::Rdi, Reg::R15);
+    a.sys(sys::EXIT_GROUP);
+    static_elf(&a.finish(BLOB_VADDR).unwrap_or_else(|| fail("assembler")))
+}
+
+/// TLB shootdown: a thread spins reading a page (so its CPU caches the
+/// translation) while the main thread unmaps it and sleeps. The spinning
+/// thread must fault, and its SIGSEGV kills the process; if a stale
+/// translation survived, the main thread wakes and exits 0 instead.
+fn shootdown_program() -> Vec<u8> {
+    const FLAGS: u64 = 0x5_0f00; // VM FS FILES SIGHAND THREAD SYSVSEM
+    let mut a = Asm::new();
+    let main = a.label();
+    let spin = a.label();
+    let wait_ready = a.label();
+    let ready = a.label();
+    let sleep_ts = a.data(&[2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]); // 2 s
+    a.mov(Reg::Rbp, Reg::Rsp);
+    a.sub_imm(Reg::Rbp, 4096);
+    a.mov_imm(Reg::Rax, 0);
+    a.store(Reg::Rbp, 0, Reg::Rax);
+    // r14 = the page to unmap; r13 = the thread's stack.
+    for dst in [Reg::R14, Reg::R13] {
+        a.mov_imm(Reg::Rdi, 0);
+        a.mov_imm(Reg::Rsi, 0x1_0000);
+        a.mov_imm(Reg::Rdx, 3);
+        a.mov_imm(Reg::R10, 0x22);
+        a.mov_imm(Reg::R8, u64::MAX);
+        a.mov_imm(Reg::R9, 0);
+        a.sys(sys::MMAP);
+        a.mov(dst, Reg::Rax);
+    }
+    a.store(Reg::R14, 0, Reg::Rax); // touch it so it is mapped
+    a.mov_imm(Reg::Rdi, FLAGS);
+    a.mov(Reg::Rsi, Reg::R13);
+    a.add_imm(Reg::Rsi, 0x1_0000);
+    a.mov_imm(Reg::Rdx, 0);
+    a.mov_imm(Reg::R10, 0);
+    a.mov_imm(Reg::R8, 0);
+    a.sys(sys::CLONE);
+    a.cmp_imm(Reg::Rax, 0);
+    a.jne(main);
+    // The thread: say it is running, then read the page forever.
+    a.mov_imm(Reg::Rax, 1);
+    a.store(Reg::Rbp, 0, Reg::Rax);
+    a.bind(spin);
+    a.load(Reg::Rax, Reg::R14, 0);
+    a.jmp(spin);
+    // Main: wait for the thread, unmap the page, sleep, then exit 0 (which
+    // only happens if the thread never faulted).
+    a.bind(main);
+    a.bind(wait_ready);
+    a.load(Reg::Rax, Reg::Rbp, 0);
+    a.cmp_imm(Reg::Rax, 0);
+    a.jne(ready);
+    a.sys(sys::SCHED_YIELD);
+    a.jmp(wait_ready);
+    a.bind(ready);
+    a.mov(Reg::Rdi, Reg::R14);
+    a.mov_imm(Reg::Rsi, 0x1_0000);
+    a.sys(sys::MUNMAP);
+    a.mov_data(Reg::Rdi, sleep_ts);
+    a.mov_imm(Reg::Rsi, 0);
+    a.sys(sys::NANOSLEEP);
+    a.mov_imm(Reg::Rdi, 0);
+    a.sys(sys::EXIT_GROUP);
+    static_elf(&a.finish(BLOB_VADDR).unwrap_or_else(|| fail("assembler")))
+}
+
 /// The root image: `/usr/share/motd`, `/etc/motd -> /usr/share/motd`.
 fn root_image() -> &'static [u8] {
     let mut b = image::builder::Builder::new();
@@ -528,4 +706,20 @@ pub(crate) fn run() {
         fail("forktest");
     }
     println!("ichor: linux: copy-on-write fork isolated parent and child ({syscalls} syscalls)");
+
+    let (status, syscalls) = run_linux(new_process(), &thread_program(), None, &["threadtest"]);
+    if status != 0 {
+        println!("ichor: linux: threadtest failed check {status}");
+        fail("threadtest");
+    }
+    println!(
+        "ichor: linux: thread clone, futex wait/wake and join via CHILD_CLEARTID ok ({syscalls} syscalls)"
+    );
+
+    let (status, _) = run_linux(new_process(), &shootdown_program(), None, &["shootdown"]);
+    if status != -(crate::signal::SIGSEGV as i32) {
+        println!("ichor: linux: shootdown test exited {status}, expected SIGSEGV");
+        fail("tlb shootdown");
+    }
+    println!("ichor: linux: munmap shot down a page another thread was reading (it faulted)");
 }

@@ -105,6 +105,9 @@ pub(crate) fn activate_root(root: u64) {
     } else {
         root
     };
+    // Published before the load, so a TLB shootdown that misses it is
+    // ordered before our page walks (see `mm::tlb`).
+    crate::mm::tlb::note_loaded(target);
     if regs::read_cr3() & 0x000f_ffff_ffff_f000 != target {
         // SAFETY: `target` is the kernel PML4 or a user root built by frame,
         // which shares every kernel-half entry, so the running code, stack

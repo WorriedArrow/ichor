@@ -82,15 +82,11 @@ extern "sysv64" fn trap_common() {
         "mov rdi, rsp",
         "cld",
         "call {dispatch}",
-        // A CPU *exception* (vector < 32) taken in ring 3 does not return to
-        // ring 3: it longjmps back into `UserMode::execute`. CS is at frame
-        // offset 144, the vector at 120.
-        "mov rax, [rsp + 144]",
-        "test rax, 3",
+        // The dispatcher returns nonzero when a trap from ring 3 must not
+        // return to ring 3 but longjmp back into `UserMode::execute`: a CPU
+        // exception, or an interrupt after which this CPU should reschedule.
+        "test rax, rax",
         "jz 2f",
-        "mov rax, [rsp + 120]",
-        "cmp rax, 32",
-        "jae 2f",
         "jmp ichor_user_resume",
         "2:",
         "pop rax", "pop rbx", "pop rcx", "pop rdx", "pop rsi", "pop rdi", "pop rbp",
@@ -310,16 +306,18 @@ fn in_stack_guard(addr: u64) -> bool {
     addr >= STACKS_BASE && (addr - STACKS_BASE) % slot < PAGE_SIZE
 }
 
+/// Returns 1 if the stub must longjmp back into `UserMode::execute`
+/// instead of returning to the interrupted ring-3 code (see `trap_common`).
 #[allow(clippy::panic)] // Unexpected kernel exceptions are kernel bugs.
-extern "sysv64" fn trap_dispatch(f: &mut TrapFrame) {
+extern "sysv64" fn trap_dispatch(f: &mut TrapFrame) -> u64 {
     let vector = f.vector as u8;
+    let from_user = f.cs & 3 == 3;
     // An exception taken in ring 3 (not an interrupt, not NMI) is recorded
-    // into the thread's context; the stub tail longjmps back into
-    // `UserMode::execute`. We must not panic on it: user code faulting is
-    // routine.
-    if f.cs & 3 == 3 && vector < 32 && vector != 2 {
+    // into the thread's context and ends the user run. We must not panic on
+    // it: user code faulting is routine.
+    if from_user && vector < 32 && vector != 2 {
         super::usermode::record_user_trap(f);
-        return;
+        return 1;
     }
     match vector {
         3 => {
@@ -328,9 +326,17 @@ extern "sysv64" fn trap_dispatch(f: &mut TrapFrame) {
         2 => super::apic::handle_nmi(),
         FIRST_IRQ_VECTOR..=255 => {
             super::apic::handle_irq(vector, f);
-            // Preempt only code that ran with interrupts enabled (so it held
-            // no guard and no spinlock).
-            if f.rflags & (1 << 9) != 0 {
+            if from_user {
+                // `execute` holds a guard for the whole user run, so the
+                // task cannot be preempted here; end the run instead and let
+                // the caller yield.
+                if crate::task::resched_pending() {
+                    super::usermode::record_user_preempt(f);
+                    return 1;
+                }
+            } else if f.rflags & (1 << 9) != 0 {
+                // Preempt only code that ran with interrupts enabled (so it
+                // held no guard and no spinlock).
                 crate::task::preempt_point();
             }
         }
@@ -365,6 +371,7 @@ extern "sysv64" fn trap_dispatch(f: &mut TrapFrame) {
             f.rip
         ),
     }
+    0
 }
 
 /// Executes `int3`; frame's handler counts it and returns.

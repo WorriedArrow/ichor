@@ -72,10 +72,9 @@ pub(crate) struct Action {
     mask: u64,
 }
 
-/// A process's dispositions and mask.
+/// A thread's signal mask.
 #[derive(Clone, Debug)]
 pub(crate) struct Signals {
-    actions: [Action; NSIG as usize],
     pub(crate) mask: u64,
     /// The mask to restore after `rt_sigsuspend`'s handler.
     saved_mask: Option<u64>,
@@ -84,14 +83,31 @@ pub(crate) struct Signals {
 impl Signals {
     pub(crate) fn new() -> Signals {
         Signals {
-            actions: [Action::default(); NSIG as usize],
             mask: 0,
             saved_mask: None,
         }
     }
+}
+
+/// A process's signal dispositions, shared by its threads.
+#[derive(Clone, Debug)]
+pub(crate) struct Actions {
+    actions: [Action; NSIG as usize],
+}
+
+impl Actions {
+    pub(crate) fn new() -> Actions {
+        Actions {
+            actions: [Action::default(); NSIG as usize],
+        }
+    }
+
+    fn get(&self, sig: u32) -> Action {
+        self.actions[(sig - 1) as usize]
+    }
 
     /// `execve`: caught signals revert to the default; ignored ones stay
-    /// ignored, and the mask is kept.
+    /// ignored (the mask is kept too).
     pub(crate) fn exec_reset(&mut self) {
         for a in &mut self.actions {
             if a.handler != SIG_IGN {
@@ -104,7 +120,7 @@ impl Signals {
     pub(crate) fn ignored(&self) -> u64 {
         let mut set = 0;
         for sig in 1..=NSIG {
-            let a = self.actions[(sig - 1) as usize];
+            let a = self.get(sig);
             let ignore = a.handler == SIG_IGN
                 || (a.handler == SIG_DFL && matches!(default_action(sig), DefaultAction::Ignore));
             if ignore {
@@ -115,10 +131,18 @@ impl Signals {
     }
 }
 
-/// Publishes `p`'s mask and ignored set to its table entry, which senders
-/// and interruptible waits consult.
+/// Publishes `p`'s mask, and its process's ignored set to every thread's
+/// table entry, which senders and interruptible waits consult.
 pub(crate) fn sync(p: &LinuxProcess) {
-    proc::set_masks(&p.entry, p.sig.mask, p.sig.ignored());
+    let ignored = p.group.actions.lock().ignored();
+    for t in p.group.threads() {
+        let mask = if t.pid == p.entry.pid {
+            p.sig.mask
+        } else {
+            proc::blocked(&t)
+        };
+        proc::set_masks(&t, mask, ignored);
+    }
 }
 
 fn read_u64(p: &mut LinuxProcess, addr: u64) -> Result<u64, i64> {
@@ -151,7 +175,7 @@ pub(crate) fn sigaction(
     if size != 8 {
         return Err(EINVAL);
     }
-    let old = p.sig.actions[(sig - 1) as usize];
+    let old = p.group.actions.lock().get(sig);
     if act != 0 {
         if sig == SIGKILL || sig == SIGSTOP {
             return Err(EINVAL);
@@ -161,16 +185,22 @@ pub(crate) fn sigaction(
             return Err(EFAULT);
         }
         let word = |i: usize| u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap_or([0; 8]));
-        p.sig.actions[(sig - 1) as usize] = Action {
-            handler: word(0),
-            flags: word(1),
-            restorer: word(2),
-            mask: word(3) & !UNBLOCKABLE,
+        let ignored = {
+            let mut acts = p.group.actions.lock();
+            acts.actions[(sig - 1) as usize] = Action {
+                handler: word(0),
+                flags: word(1),
+                restorer: word(2),
+                mask: word(3) & !UNBLOCKABLE,
+            };
+            acts.ignored()
         };
         sync(p);
-        // Setting SIG_IGN discards a pending instance.
-        if p.sig.ignored() & bit(sig) != 0 {
-            proc::clear_pending(&p.entry, bit(sig));
+        // Setting SIG_IGN discards pending instances in every thread.
+        if ignored & bit(sig) != 0 {
+            for t in p.group.threads() {
+                proc::clear_pending(&t, bit(sig));
+            }
         }
     }
     if oact != 0 {
@@ -261,7 +291,7 @@ pub(crate) fn nanosleep(p: &mut LinuxProcess, req: u64, rem: u64) -> Result<u64,
     Err(EINTR)
 }
 
-/// `kill` (and `tkill`/`tgkill`, threads being processes for now).
+/// `kill`: process-directed (any thread of `pid` may take it).
 pub(crate) fn kill(p: &mut LinuxProcess, pid: i64, sig: u64) -> Result<u64, i64> {
     const EPERM: i64 = 1;
     let sig = u32::try_from(sig)
@@ -274,6 +304,16 @@ pub(crate) fn kill(p: &mut LinuxProcess, pid: i64, sig: u64) -> Result<u64, i64>
     }
     let _ = p;
     proc::send(pid as u64, sig)?;
+    Ok(0)
+}
+
+/// `tkill` / `tgkill`: thread-directed.
+pub(crate) fn tkill(tgid: Option<u64>, tid: u64, sig: u64) -> Result<u64, i64> {
+    let sig = u32::try_from(sig)
+        .ok()
+        .filter(|&s| s <= NSIG)
+        .ok_or(EINVAL)?;
+    proc::send_thread(tgid, tid, sig)?;
     Ok(0)
 }
 
@@ -300,7 +340,7 @@ pub(crate) fn deliver(
         }
         let sig = deliverable.trailing_zeros() + 1;
         proc::clear_pending(&p.entry, bit(sig));
-        let act = p.sig.actions[(sig - 1) as usize];
+        let act = p.group.actions.lock().get(sig);
         match act.handler {
             SIG_IGN if sig != SIGKILL => continue,
             SIG_DFL | SIG_IGN => match default_action(sig) {
@@ -331,7 +371,7 @@ pub(crate) fn fault(
     sig: u32,
     addr: u64,
 ) -> Option<u32> {
-    let act = p.sig.actions[(sig - 1) as usize];
+    let act = p.group.actions.lock().get(sig);
     let caught = act.handler != SIG_DFL && act.handler != SIG_IGN && p.sig.mask & bit(sig) == 0;
     if !caught {
         return Some(sig | 0x80);
@@ -407,7 +447,7 @@ fn setup_frame(
     }
     p.sig.mask = mask & !UNBLOCKABLE;
     if act.flags & SA_RESETHAND != 0 {
-        p.sig.actions[(sig - 1) as usize] = Action::default();
+        p.group.actions.lock().actions[(sig - 1) as usize] = Action::default();
     }
     sync(p);
     ctx.rdi = u64::from(sig);

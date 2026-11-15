@@ -53,6 +53,19 @@ Milestones 0-3 are done.
   up front. A test ELF checks isolation both ways. Each root gets a `/dev`
   (`dev.rs`, overlay `mknod`); busybox needed `/dev/null` for background
   jobs, which faster forks exposed.
+- M4 threads and futexes: `process.rs` splits a process (`Group`: memory,
+  files, cwd/umask, signal actions behind sleeping locks) from its threads
+  (`LinuxProcess`: tid entry, mask, clear-tid). `clone` with `CLONE_THREAD`
+  adds a thread (TLS, PARENT/CHILD_SETTID, CHILD_CLEARTID); `exit` ends a
+  thread, `exit_group` or a fatal signal ends the process; `kill` is
+  process-directed, `tgkill`/`tkill` thread-directed; `wait4` reaps whole
+  processes. `futex.rs`: WAIT/WAKE/REQUEUE/CMP_REQUEUE/WAKE_OP/*_BITSET
+  (private semantics) over frame's atomic user `u32` ops. Frame (ADR-0007):
+  per-CPU loaded roots and a TLB-shootdown IPI on every `unmap`/`protect`;
+  ring-3 code is now preempted (`UserEvent::Preempted`; `execute` holds a
+  guard, so a user spinner used to keep its CPU). Tests: clone + futex +
+  join, and a shootdown test where a spinning reader must fault after
+  another thread's `munmap`, on 1-8 vCPUs.
 
 - M0/M1: boots as a UEFI app into the higher half; buddy page allocator and
   heap; traps with IST stacks; x2APIC + tickless timer; SMP bring-up; per-CPU
@@ -123,8 +136,8 @@ demand (today the kernel reads the whole disk into memory, capped at
 
 Suggested order for milestone 4:
 
-1. Done: signals and timed waits. Next: real futexes with threads (`clone`
-   with `CLONE_VM|CLONE_THREAD`, TLB shootdown, per-thread contexts).
+1. Done: signals, timed waits, threads and futexes (PCID and robust lists
+   are still open).
 2. Done: copy-on-write fork (kernel-side, no frame change) and a minimal
    `/dev` (null, zero, full, random, urandom, tty, console) plus `getrandom`.
 3. `PT_INTERP` and PIE: done for musl (Alpine); glibc's `ld-linux` next with
@@ -139,7 +152,7 @@ are owed as multi-cell scheduling lands in milestone 4. Boot logs which apply.
 Frame budget: ADR-0005 sets the milestone 3 ceiling at 8,500 lines / 380
 sites; ADR-0007 raises it to 9,500 / 420 for milestone 4 (TLB shootdown,
 atomic user ops for futexes, PCID). `audit.toml` is at step 6 (5,800 / 250);
-frame is at 5,096 / 226.
+frame is at 5,230 / 229.
 
 The goal set for this effort is milestone 8, whose acceptance test needs
 cloud accounts and bare-metal hardware from the owner.

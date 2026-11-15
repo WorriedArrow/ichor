@@ -15,6 +15,7 @@ mod blktest;
 mod busytest;
 mod celltest;
 mod dev;
+mod futex;
 mod kcell;
 mod linuxabi;
 mod loader;

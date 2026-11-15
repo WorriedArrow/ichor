@@ -7,13 +7,14 @@
 //! never reach user space by construction.
 
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use super::frame::{self, UFrame};
 use super::meta::kind;
 use super::page_alloc;
 use super::{PhysAddr, align_down, phys_to_virt};
+use crate::arch;
 use crate::arch::paging::{self, MapError, UserProt};
-use crate::arch::{self, regs};
 use crate::sync::SpinLock;
 
 /// A user address space.
@@ -74,27 +75,94 @@ impl VmSpace {
         }
     }
 
-    /// Removes the mapping at `va`, if any.
+    /// Removes the mapping at `va`, if any. The page is released only
+    /// after every CPU running this space has forgotten the translation.
+    /// Must not be called in atomic mode.
     pub fn unmap(&self, va: u64) {
-        let mut inner = self.inner.lock();
-        // SAFETY: as in `map`; unmapping only clears a leaf of this space.
-        let unmapped = unsafe { paging::user_unmap(self.root, va) };
+        let (unmapped, frames) = {
+            let mut inner = self.inner.lock();
+            // SAFETY: as in `map`; unmapping only clears a leaf of this space.
+            let unmapped = unsafe { paging::user_unmap(self.root, va) };
+            let mut kept = Vec::new();
+            if unmapped.is_some() {
+                // Keep the `UFrame`s alive until the shootdown is done.
+                let (gone, rest): (Vec<_>, Vec<_>) = core::mem::take(&mut inner.frames)
+                    .into_iter()
+                    .partition(|(v, _)| *v == va);
+                inner.frames = rest;
+                kept = gone;
+            }
+            (unmapped, kept)
+        };
         if let Some(pa) = unmapped {
-            self.flush(va);
+            super::tlb::shootdown(self.root.as_u64(), Some(va));
             frame::drop_untyped(pa);
-            inner.frames.retain(|(v, _)| *v != va);
         }
+        drop(frames);
     }
 
-    /// Changes the permissions of the mapping at `va`.
+    /// Changes the permissions of the mapping at `va`; on return no CPU
+    /// running this space can still use the old permissions. Must not be
+    /// called in atomic mode.
     pub fn protect(&self, va: u64, prot: UserProt) -> bool {
-        let _inner = self.inner.lock();
-        // SAFETY: as in `map`.
-        let ok = unsafe { paging::user_protect(self.root, va, prot) };
+        let ok = {
+            let _inner = self.inner.lock();
+            // SAFETY: as in `map`.
+            unsafe { paging::user_protect(self.root, va, prot) }
+        };
         if ok {
-            self.flush(va);
+            super::tlb::shootdown(self.root.as_u64(), Some(va));
         }
         ok
+    }
+
+    /// The aligned user `u32` at `va` as an atomic, under the space lock
+    /// (so the page cannot be unmapped meanwhile), for futexes. `None` if
+    /// `va` is unaligned, unmapped, or (with `write`) not writable.
+    fn with_user_atomic<R>(
+        &self,
+        va: u64,
+        write: bool,
+        f: impl FnOnce(&AtomicU32) -> R,
+    ) -> Option<R> {
+        if !va.is_multiple_of(4) {
+            return None;
+        }
+        let _inner = self.inner.lock();
+        // SAFETY: as in `translate`; a read-only walk of this space.
+        let (pa, prot) =
+            unsafe { paging::user_translate(self.root, align_down(va, super::PAGE_SIZE)) }?;
+        if write && !prot.write {
+            return None;
+        }
+        let addr = phys_to_virt(pa) + (va & (super::PAGE_SIZE - 1));
+        let ptr = core::ptr::with_exposed_provenance::<AtomicU32>(addr as usize);
+        // SAFETY: `addr` is 4-byte aligned, inside a page mapped in this
+        // space (it stays mapped while `_inner` is held, and the mapping
+        // holds a page reference), and reachable through the linear map.
+        // User code may access the word concurrently, which is why it is
+        // only ever touched through atomic operations here.
+        let a = unsafe { &*ptr };
+        Some(f(a))
+    }
+
+    /// Atomically loads the user `u32` at `va` (4-byte aligned).
+    pub fn load_u32_atomic(&self, va: u64) -> Option<u32> {
+        self.with_user_atomic(va, false, |a| a.load(Ordering::SeqCst))
+    }
+
+    /// Atomically compares the user `u32` at `va` with `current` and, if
+    /// equal, stores `new`. `Ok(previous)` on success, `Err(actual)` if it
+    /// differed; `None` if `va` is not a writable, aligned, mapped word.
+    pub fn compare_exchange_u32(
+        &self,
+        va: u64,
+        current: u32,
+        new: u32,
+    ) -> Option<Result<u32, u32>> {
+        self.with_user_atomic(va, true, |a| {
+            a.compare_exchange(current, new, Ordering::SeqCst, Ordering::SeqCst)
+        })
     }
 
     /// The page and permissions mapped at page-aligned `va`.
@@ -102,16 +170,6 @@ impl VmSpace {
         let _inner = self.inner.lock();
         // SAFETY: as in `map`; a read-only walk.
         unsafe { paging::user_translate(self.root, align_down(va, super::PAGE_SIZE)) }
-    }
-
-    fn flush(&self, va: u64) {
-        // A full picture of which CPUs have this space active needs the TLB
-        // shootdown IPI (added with multi-threaded processes). For now a
-        // space is only modified while not running on another CPU, so a
-        // local flush suffices.
-        if regs::read_cr3() & 0x000f_ffff_ffff_f000 == self.root.as_u64() {
-            paging::flush_page(va);
-        }
     }
 
     /// Copies up to `out.len()` bytes from user virtual address `va` into

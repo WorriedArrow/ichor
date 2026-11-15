@@ -77,6 +77,20 @@ pub(super) fn execve(
         None => None,
     };
 
+    // Every other thread of the process goes away first.
+    let others: Vec<_> = p
+        .group
+        .threads()
+        .into_iter()
+        .filter(|t| t.pid != p.entry.pid)
+        .collect();
+    for t in &others {
+        crate::proc::post(t, crate::signal::SIGKILL);
+    }
+    while p.group.threads().len() > 1 {
+        frame::task::yield_now();
+    }
+
     let mut mm = Mm::new(p.cell.account()).ok_or(ENOMEM)?;
     let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
     let envp_refs: Vec<&str> = envp.iter().map(String::as_str).collect();
@@ -91,8 +105,8 @@ pub(super) fn execve(
 
     // Switch to the new space, then drop the old one (no longer active).
     mm.space().bind_to_current_task();
-    drop(core::mem::replace(&mut p.mm, mm));
-    p.sig.exec_reset();
+    drop(p.replace_mm(mm));
+    p.group.actions.lock().exec_reset();
     crate::signal::sync(p);
     *ctx = UserContext::new(loaded.entry, loaded.stack_pointer);
     Ok(())
@@ -100,8 +114,9 @@ pub(super) fn execve(
 
 /// Reads an executable (or interpreter) from the process's root.
 fn read_executable(p: &LinuxProcess, path: &str) -> Result<Vec<u8>, i64> {
+    let cwd = p.cwd();
     let mut fs = p.vfs.lock();
-    let ino = fs.resolve(p.cwd, path, true)?;
+    let ino = fs.resolve(cwd, path, true)?;
     let st = fs.stat(ino)?;
     if st.kind != Kind::File || st.mode & 0o111 == 0 {
         return Err(EACCES);

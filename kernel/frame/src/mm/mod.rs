@@ -19,6 +19,7 @@ mod heap;
 pub(crate) mod kspace;
 pub(crate) mod meta;
 pub(crate) mod page_alloc;
+pub(crate) mod tlb;
 mod vmspace;
 
 use core::fmt;

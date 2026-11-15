@@ -50,11 +50,11 @@ mod nr {
     pub(super) const DUP2: u64 = 33; // partial: the copy has its own offset
     pub(super) const GETPID: u64 = 39;
     pub(super) const SENDFILE: u64 = 40;
-    pub(super) const CLONE: u64 = 56; // partial: fork-like flags only (no threads)
+    pub(super) const CLONE: u64 = 56; // partial: fork, vfork-style and thread clones
     pub(super) const FORK: u64 = 57;
     pub(super) const VFORK: u64 = 58; // partial: a full copy, the parent does not wait
     pub(super) const EXECVE: u64 = 59; // partial: static ELF binaries
-    pub(super) const EXIT: u64 = 60; // partial: ends the whole process (single-threaded)
+    pub(super) const EXIT: u64 = 60;
     pub(super) const WAIT4: u64 = 61; // partial: no rusage, no process groups
     pub(super) const KILL: u64 = 62; // partial: pid > 0 only (no process groups)
     pub(super) const UNAME: u64 = 63;
@@ -91,15 +91,15 @@ mod nr {
     pub(super) const RT_SIGSUSPEND: u64 = 130;
     pub(super) const SIGALTSTACK: u64 = 131; // stub: no alternate stacks yet
     pub(super) const ARCH_PRCTL: u64 = 158; // partial: ARCH_SET_FS only
-    pub(super) const GETTID: u64 = 186; // partial: the pid (single-threaded)
-    pub(super) const TKILL: u64 = 200; // partial: threads are processes
-    pub(super) const FUTEX: u64 = 202; // partial: WAIT/WAKE for one thread
+    pub(super) const GETTID: u64 = 186;
+    pub(super) const TKILL: u64 = 200;
+    pub(super) const FUTEX: u64 = 202; // partial: private semantics only (no PI, no FUTEX_FD)
     pub(super) const GETDENTS64: u64 = 217;
-    pub(super) const SET_TID_ADDRESS: u64 = 218; // stub: returns TID 1
+    pub(super) const SET_TID_ADDRESS: u64 = 218;
     pub(super) const CLOCK_GETTIME: u64 = 228; // partial: every clock counts from boot
     pub(super) const CLOCK_NANOSLEEP: u64 = 230; // partial: relative sleeps only
     pub(super) const EXIT_GROUP: u64 = 231;
-    pub(super) const TGKILL: u64 = 234; // partial: threads are processes
+    pub(super) const TGKILL: u64 = 234;
     pub(super) const OPENAT: u64 = 257;
     pub(super) const MKDIRAT: u64 = 258;
     pub(super) const NEWFSTATAT: u64 = 262;
@@ -109,7 +109,7 @@ mod nr {
     pub(super) const READLINKAT: u64 = 267;
     pub(super) const FCHMODAT: u64 = 268;
     pub(super) const FACCESSAT: u64 = 269; // partial: existence only (every process is root)
-    pub(super) const SET_ROBUST_LIST: u64 = 273; // stub: accepted (single-threaded)
+    pub(super) const SET_ROBUST_LIST: u64 = 273; // stub: robust lists are not walked at exit
     pub(super) const DUP3: u64 = 292; // partial: the copy has its own offset
     pub(super) const PIPE2: u64 = 293; // partial: O_CLOEXEC is accepted and ignored
     pub(super) const PRLIMIT64: u64 = 302; // partial: reads limits, ignores new ones
@@ -119,7 +119,6 @@ mod nr {
 
 const EPERM: i64 = 1;
 const EBADF: i64 = 9;
-const EAGAIN: i64 = 11;
 const EACCES: i64 = 13;
 const EFAULT: i64 = 14;
 const ENODEV: i64 = 19;
@@ -207,9 +206,9 @@ pub(crate) fn dispatch(p: &mut LinuxProcess, ctx: &mut frame::user::UserContext)
         nr::IOCTL => ioctl(p, a[0], a[1], a[2]),
         // Memory.
         nr::MMAP => mmap(p, &a),
-        nr::MPROTECT => p.mm.mprotect(a[0], a[1], a[2]),
-        nr::MUNMAP => p.mm.munmap(a[0], a[1]),
-        nr::BRK => Ok(p.mm.brk(a[0])),
+        nr::MPROTECT => p.mm().mprotect(a[0], a[1], a[2]),
+        nr::MUNMAP => p.mm().munmap(a[0], a[1]),
+        nr::BRK => Ok(p.mm().brk(a[0])),
         nr::MADVISE => Ok(0),
         // Identity, time, limits, signals, threads.
         nr::UNAME => uname(p, a[0]),
@@ -230,19 +229,25 @@ pub(crate) fn dispatch(p: &mut LinuxProcess, ctx: &mut frame::user::UserContext)
         nr::CLOCK_NANOSLEEP if a[1] == 0 => signal::nanosleep(p, a[2], a[3]),
         nr::CLOCK_NANOSLEEP => Err(EINVAL), // TIMER_ABSTIME
         nr::KILL => signal::kill(p, i(a[0]), a[1]),
-        nr::TKILL => signal::kill(p, i(a[0]), a[1]),
-        nr::TGKILL => signal::kill(p, i(a[1]), a[2]),
+        nr::TKILL => signal::tkill(None, a[0], a[1]),
+        nr::TGKILL => signal::tkill(Some(a[0]), a[1], a[2]),
         nr::SETPGID => Ok(0),
-        nr::GETPGRP | nr::SETSID | nr::GETPGID | nr::GETSID => Ok(p.entry.pid),
+        nr::GETPGRP | nr::SETSID | nr::GETPGID | nr::GETSID => Ok(p.group.tgid),
         nr::SIGALTSTACK => zero_out(p, a[1], 24),
-        nr::FUTEX => futex(p, a[0], a[1]),
-        nr::SCHED_YIELD | nr::SET_ROBUST_LIST => Ok(0),
-        nr::GETPID | nr::GETTID => Ok(p.entry.pid),
+        nr::FUTEX => crate::futex::futex(p, &a),
+        nr::SCHED_YIELD => {
+            frame::task::yield_now();
+            Ok(0)
+        }
+        nr::SET_ROBUST_LIST => Ok(0),
+        nr::GETPID => Ok(p.group.tgid),
+        nr::GETTID => Ok(p.entry.pid),
         nr::GETPPID => Ok(p.entry.ppid()),
         nr::GETUID | nr::GETGID | nr::GETEUID | nr::GETEGID => Ok(0),
         // Processes.
-        nr::FORK | nr::VFORK => fork(p, ctx, 0, 0, 0),
-        nr::CLONE => fork(p, ctx, a[0], a[1], a[3]),
+        nr::FORK => clone(p, ctx, 17, 0, 0, 0, 0), // SIGCHLD
+        nr::VFORK => clone(p, ctx, 0x4000 | 0x100 | 17, 0, 0, 0, 0), // CLONE_VFORK | CLONE_VM
+        nr::CLONE => clone(p, ctx, a[0], a[1], a[2], a[3], a[4]),
         nr::WAIT4 => wait4(p, i(a[0]), a[1], a[2]),
         nr::EXECVE => match exec::execve(p, ctx, a[0], a[1], a[2]) {
             // The context now starts the new program: no return value.
@@ -250,8 +255,15 @@ pub(crate) fn dispatch(p: &mut LinuxProcess, ctx: &mut frame::user::UserContext)
             Err(e) => Err(e),
         },
         nr::ARCH_PRCTL => arch_prctl(ctx, a[0], a[1]),
-        nr::SET_TID_ADDRESS => Ok(1),
-        nr::EXIT | nr::EXIT_GROUP => return Outcome::Exit(a[0] as i32),
+        nr::SET_TID_ADDRESS => {
+            p.clear_tid = a[0];
+            Ok(p.entry.pid)
+        }
+        nr::EXIT => return Outcome::Exit(a[0] as i32),
+        nr::EXIT_GROUP => {
+            p.group.begin_exit((a[0] as u32 & 0xff) << 8, &p.entry);
+            return Outcome::Exit(a[0] as i32);
+        }
         _ => {
             frame::println!(
                 "ichor: linux: pid {}: syscall {nr} is not implemented",
@@ -362,7 +374,7 @@ fn fcntl(p: &mut LinuxProcess, fd: u64, cmd: u64, arg: u64) -> Result<u64, i64> 
 fn mmap(p: &mut LinuxProcess, a: &[u64; 6]) -> Result<u64, i64> {
     let (addr, len, prot, map_flags, fd, offset) = (a[0], a[1], a[2], a[3], a[4], a[5]);
     if map_flags & umem::flags::MAP_ANONYMOUS != 0 {
-        return p.mm.mmap(addr, len, prot, map_flags, None);
+        return p.mm().mmap(addr, len, prot, map_flags, None);
     }
     if !matches!(p.fd(fd).ok_or(EBADF)?, Fd::File(_)) {
         return Err(ENODEV);
@@ -376,47 +388,97 @@ fn mmap(p: &mut LinuxProcess, a: &[u64; 6]) -> Result<u64, i64> {
         bytes: &bytes,
         offset,
     };
-    p.mm.mmap(addr, len, prot, map_flags, Some(src))
+    p.mm().mmap(addr, len, prot, map_flags, Some(src))
 }
 
 // ---------------------------------------------------------------------------
 // Processes.
 // ---------------------------------------------------------------------------
 
-/// `fork`, `vfork` and `clone` with fork-like flags: the child is a copy
-/// of the caller, on its own task. Thread creation (`CLONE_THREAD`,
-/// `CLONE_VM` without `CLONE_VFORK`) is milestone 4.
-fn fork(
+/// `fork`, `vfork` and `clone`. Without `CLONE_THREAD` the child is a new
+/// process (a copy-on-write copy; `CLONE_VM | CLONE_VFORK`, as
+/// `posix_spawn` uses, is served the same way, which is correct because the
+/// child only execs or exits). With `CLONE_THREAD` it is a new thread in the
+/// caller's process, on `stack`, with TLS `tls` if `CLONE_SETTLS`.
+fn clone(
     p: &mut LinuxProcess,
     ctx: &frame::user::UserContext,
     flags: u64,
     stack: u64,
+    parent_tid: u64,
     child_tid: u64,
+    tls: u64,
 ) -> Result<u64, i64> {
     const CSIGNAL: u64 = 0xff;
     const CLONE_VM: u64 = 0x100;
+    const CLONE_FS: u64 = 0x200;
+    const CLONE_FILES: u64 = 0x400;
+    const CLONE_SIGHAND: u64 = 0x800;
     const CLONE_VFORK: u64 = 0x4000;
+    const CLONE_THREAD: u64 = 0x1_0000;
+    const CLONE_SYSVSEM: u64 = 0x4_0000;
+    const CLONE_SETTLS: u64 = 0x8_0000;
+    const CLONE_PARENT_SETTID: u64 = 0x10_0000;
     const CLONE_CHILD_CLEARTID: u64 = 0x20_0000;
+    const CLONE_DETACHED: u64 = 0x40_0000;
     const CLONE_CHILD_SETTID: u64 = 0x100_0000;
-    let allowed = CSIGNAL | CLONE_VM | CLONE_VFORK | CLONE_CHILD_CLEARTID | CLONE_CHILD_SETTID;
-    if flags & !allowed != 0 || (flags & CLONE_VM != 0 && flags & CLONE_VFORK == 0) {
+    let thread = flags & CLONE_THREAD != 0;
+    let allowed = CSIGNAL
+        | CLONE_VM
+        | CLONE_FS
+        | CLONE_FILES
+        | CLONE_SIGHAND
+        | CLONE_VFORK
+        | CLONE_THREAD
+        | CLONE_SYSVSEM
+        | CLONE_SETTLS
+        | CLONE_PARENT_SETTID
+        | CLONE_CHILD_CLEARTID
+        | CLONE_DETACHED
+        | CLONE_CHILD_SETTID;
+    if flags & !allowed != 0 {
         return Err(ENOSYS);
     }
-    let (mut child, cctx) = proc::fork(p, ctx, stack)?;
-    if flags & CLONE_CHILD_SETTID != 0 {
-        let tid = (child.entry.pid as u32).to_le_bytes();
-        if child.copy_to_user(child_tid, &tid) != tid.len() {
-            return Err(EFAULT);
+    if thread {
+        // A thread shares memory and signal handlers (Linux requires both).
+        let need = CLONE_VM | CLONE_SIGHAND;
+        if flags & need != need || stack == 0 {
+            return Err(EINVAL);
         }
+    } else if flags & (CLONE_VM | CLONE_VFORK) == CLONE_VM
+        || flags & (CLONE_SIGHAND | CLONE_FILES | CLONE_FS) != 0
+    {
+        // Sharing memory or files between processes is not supported.
+        return Err(ENOSYS);
     }
-    // The child's space was built while ours stays active; starting it on
-    // its own task binds it there.
+    let (mut child, mut cctx) = if thread {
+        let mut c = *ctx;
+        c.set_return(0);
+        c.rsp = stack;
+        (p.new_thread(), c)
+    } else {
+        proc::fork(p, ctx, stack)?
+    };
+    if flags & CLONE_SETTLS != 0 {
+        cctx.fs_base = tls;
+    }
+    let tid = (child.entry.pid as u32).to_le_bytes();
+    if flags & CLONE_PARENT_SETTID != 0 && p.copy_to_user(parent_tid, &tid) != tid.len() {
+        return Err(EFAULT);
+    }
+    if flags & CLONE_CHILD_SETTID != 0 && child.copy_to_user(child_tid, &tid) != tid.len() {
+        return Err(EFAULT);
+    }
+    if flags & CLONE_CHILD_CLEARTID != 0 {
+        child.clear_tid = child_tid;
+    }
+    signal::sync(&child);
     proc::start(child, cctx)
 }
 
 fn wait4(p: &mut LinuxProcess, pid: i64, wstatus: u64, options: u64) -> Result<u64, i64> {
     const WNOHANG: u64 = 1;
-    match proc::wait(&p.entry, pid, options & WNOHANG != 0)? {
+    match proc::wait(&p.group.leader, &p.entry, pid, options & WNOHANG != 0)? {
         None => Ok(0),
         Some((cpid, status)) => {
             if wstatus != 0 && p.copy_to_user(wstatus, &status.to_le_bytes()) != 4 {
@@ -504,24 +566,6 @@ fn zero_out(p: &mut LinuxProcess, addr: u64, len: usize) -> Result<u64, i64> {
         Ok(0)
     } else {
         Err(EFAULT)
-    }
-}
-
-fn futex(p: &mut LinuxProcess, uaddr: u64, op: u64) -> Result<u64, i64> {
-    const FUTEX_WAIT: u64 = 0;
-    const FUTEX_WAKE: u64 = 1;
-    match op & 0x7f {
-        // With one thread nobody could wake a waiter, so a wait would hang
-        // forever; report the value as already changed.
-        FUTEX_WAIT => {
-            let mut b = [0u8; 4];
-            if p.copy_from_user(uaddr, &mut b) != 4 {
-                return Err(EFAULT);
-            }
-            Err(EAGAIN)
-        }
-        FUTEX_WAKE => Ok(0),
-        _ => Err(ENOSYS),
     }
 }
 

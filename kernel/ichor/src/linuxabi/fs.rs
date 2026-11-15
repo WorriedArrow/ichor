@@ -56,7 +56,7 @@ pub(super) fn user_path(p: &mut LinuxProcess, addr: u64) -> Result<String, i64> 
 /// The directory a relative path in an `*at` call starts from.
 fn base(p: &LinuxProcess, dirfd: i64, path: &str) -> Result<Ino, i64> {
     if dirfd == AT_FDCWD || path.starts_with('/') {
-        return Ok(p.cwd);
+        return Ok(p.cwd());
     }
     match p.fd(dirfd as u64).ok_or(EBADF)? {
         Fd::File(f) => Ok(f.ino),
@@ -94,7 +94,7 @@ pub(super) fn open(
     if acc == O_ACCMODE {
         return Err(EINVAL);
     }
-    let umask = p.umask;
+    let umask = p.umask();
     let ino = {
         let mut fs = p.vfs.lock();
         let ino = if flags & O_CREAT != 0 {
@@ -228,9 +228,9 @@ pub(super) fn read(p: &mut LinuxProcess, fd: u64, buf: u64, count: usize) -> Res
         }
         Fd::File(f) => {
             let n = read_file(p, f, f.offset, buf, count)?;
-            if let Some(of) = p.file_mut(fd) {
+            p.with_file(fd, |of| {
                 of.offset += n;
-            }
+            });
             Ok(n)
         }
     }
@@ -249,9 +249,9 @@ pub(super) fn write(p: &mut LinuxProcess, fd: u64, buf: u64, count: usize) -> Re
                 f.offset
             };
             let n = write_file(p, f, offset, buf, count)?;
-            if let Some(of) = p.file_mut(fd) {
+            p.with_file(fd, |of| {
                 of.offset = offset + n;
-            }
+            });
             Ok(n)
         }
     }
@@ -324,9 +324,9 @@ pub(super) fn lseek(p: &mut LinuxProcess, fd: u64, offset: i64, whence: u64) -> 
         _ => return Err(EINVAL),
     };
     let new = base.checked_add(offset).filter(|&n| n >= 0).ok_or(EINVAL)?;
-    if let Some(of) = p.file_mut(fd) {
+    p.with_file(fd, |of| {
         of.offset = new as u64;
-    }
+    });
     Ok(new as u64)
 }
 
@@ -443,7 +443,8 @@ pub(super) fn fstatat(
     let path = user_path(p, addr)?;
     if path.is_empty() && flags & AT_EMPTY_PATH != 0 {
         if dirfd == AT_FDCWD {
-            let st = to_stat(&p.vfs.lock().stat(p.cwd)?);
+            let cwd = p.cwd();
+            let st = to_stat(&p.vfs.lock().stat(cwd)?);
             return put_stat(p, out, &st);
         }
         return fstat(p, dirfd as u64, out);
@@ -537,15 +538,15 @@ pub(super) fn getdents64(
     if p.copy_to_user(buf, &out) != out.len() {
         return Err(EFAULT);
     }
-    if let Some(of) = p.file_mut(fd) {
+    p.with_file(fd, |of| {
         of.offset = index;
-    }
+    });
     Ok(out.len() as u64)
 }
 
 pub(super) fn mkdir(p: &mut LinuxProcess, dirfd: i64, addr: u64, mode: u64) -> Result<u64, i64> {
     let (start, path) = path_at(p, dirfd, addr)?;
-    let umask = p.umask;
+    let umask = p.umask();
     let mut fs = p.vfs.lock();
     let (dir, name) = fs.resolve_parent(start, &path)?;
     fs.mkdir(dir, &name, mode as u32 & !umask)?;
@@ -667,7 +668,8 @@ pub(super) fn fchdir(p: &mut LinuxProcess, fd: u64) -> Result<u64, i64> {
 }
 
 pub(super) fn getcwd(p: &mut LinuxProcess, buf: u64, size: u64) -> Result<u64, i64> {
-    let mut path = p.vfs.lock().path(p.cwd)?;
+    let cwd = p.cwd();
+    let mut path = p.vfs.lock().path(cwd)?;
     path.push('\0');
     if (size as usize) < path.len() {
         return Err(ERANGE);
@@ -679,9 +681,7 @@ pub(super) fn getcwd(p: &mut LinuxProcess, buf: u64, size: u64) -> Result<u64, i
 }
 
 pub(super) fn umask(p: &mut LinuxProcess, mask: u64) -> Result<u64, i64> {
-    let old = p.umask;
-    p.umask = mask as u32 & 0o777;
-    Ok(u64::from(old))
+    Ok(u64::from(p.set_umask(mask as u32 & 0o777)))
 }
 
 /// `sendfile`: copies from file `in_fd` (at `*offp`, or its offset) to
@@ -735,9 +735,9 @@ pub(super) fn sendfile(
                     o.offset
                 };
                 p.vfs.lock().write(o.ino, at, &buf[..n])?;
-                if let Some(of) = p.file_mut(out_fd) {
+                p.with_file(out_fd, |of| {
                     of.offset = at + n as u64;
-                }
+                });
             }
         }
         offset += n as u64;
@@ -747,8 +747,8 @@ pub(super) fn sendfile(
         if p.copy_to_user(offp, &offset.to_le_bytes()) != 8 {
             return Err(EFAULT);
         }
-    } else if let Some(f) = p.file_mut(in_fd) {
-        f.offset = offset;
+    } else {
+        p.with_file(in_fd, |f| f.offset = offset);
     }
     Ok(done as u64)
 }

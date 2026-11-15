@@ -91,6 +91,7 @@ pub(crate) fn run() {
                 ctx.set_return(args[0] + 1);
             }
             UserEvent::Exception { vector, cr2, .. } => break (vector, cr2),
+            UserEvent::Preempted => frame::task::yield_now(),
         }
         if syscalls > 4 {
             fail("user did not fault");

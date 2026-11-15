@@ -119,6 +119,7 @@ pub(crate) fn run() {
                 }
             }
             UserEvent::Exception { .. } => fail("native process faulted unexpectedly"),
+            UserEvent::Preempted => frame::task::yield_now(),
         }
         traps += 1;
         if traps > 10 {

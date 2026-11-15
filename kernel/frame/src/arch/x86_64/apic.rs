@@ -338,6 +338,11 @@ pub(crate) fn handle_irq(vector: u8, _frame: &mut TrapFrame) {
             on_timer_interrupt();
             return;
         }
+        crate::mm::tlb::VECTOR => {
+            eoi();
+            crate::mm::tlb::on_ipi();
+            return;
+        }
         IPI_VECTOR => {
             eoi();
             let handler = *IPI_HANDLER.lock();

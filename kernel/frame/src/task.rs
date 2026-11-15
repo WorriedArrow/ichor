@@ -236,6 +236,11 @@ pub(crate) fn register_cpu() {
 }
 
 /// Wakes `cpu` if it is idle so it re-checks its run queue.
+/// `cpu`'s local APIC id (`u32::MAX` before it is online).
+pub(crate) fn apic_id_of(cpu: CpuId) -> u32 {
+    APIC_IDS.get_on(cpu).load(Ordering::Relaxed)
+}
+
 pub fn kick(cpu: CpuId) {
     let id = APIC_IDS.get_on(cpu).load(Ordering::Relaxed);
     if id != u32::MAX && cpu != cpu::current() {
@@ -574,6 +579,12 @@ pub(crate) fn on_tick() {
         // the next tick must still come.
         crate::time::arm_slice(sched.timeslice());
     }
+}
+
+/// Whether the scheduler asked this CPU to switch tasks.
+pub(crate) fn resched_pending() -> bool {
+    let g = IrqGuard::new();
+    SCHED.get(&g).need_resched.load(Ordering::Relaxed)
 }
 
 /// Called at the end of an interrupt that arrived while interrupts were
