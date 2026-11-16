@@ -114,7 +114,7 @@ pub(crate) fn run() {
     loop {
         match UserMode::new(&mut ctx).execute() {
             UserEvent::Syscall => {
-                if !crate::nativeabi::dispatch(&proc_cell, &mut ctx) {
+                if !crate::nativeabi::dispatch(&proc_cell, None, &mut ctx) {
                     break; // EXIT
                 }
             }

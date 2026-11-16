@@ -776,6 +776,71 @@ pub(super) fn recvmsg(p: &mut LinuxProcess, fd: u64, msg: u64, flags: u64) -> Re
     Ok(n as u64)
 }
 
+/// Sockets for the native personality (`native.rs`): the same objects on
+/// the same per-cell stack, driven without a Linux process and never
+/// blocking.
+pub(crate) mod native {
+    use super::*;
+
+    fn new(cell: &crate::kcell::Cell, dgram: bool) -> Socket {
+        let stack = netstack::stack_for(cell);
+        let (id, wait) = stack.socket(dgram);
+        Socket::new(stack, id, wait, dgram)
+    }
+
+    /// Starts a TCP connection to `to`.
+    pub(crate) fn tcp_connect(cell: &crate::kcell::Cell, to: Addr) -> Result<Arc<dyn Object>, i64> {
+        let s = new(cell, false);
+        s.stack.connect(s.id(), to)?;
+        Ok(Arc::new(s))
+    }
+
+    /// A TCP listener on `port` of every address the cell has.
+    pub(crate) fn tcp_listen(
+        cell: &crate::kcell::Cell,
+        port: u16,
+        backlog: usize,
+    ) -> Result<Arc<dyn Object>, i64> {
+        let s = new(cell, false);
+        s.stack.set_reuse_addr(s.id(), true)?;
+        s.stack.bind(s.id(), (net::Ipv4Addr::UNSPECIFIED, port))?;
+        s.stack.listen(s.id(), backlog)?;
+        s.listening.store(true, Ordering::Release);
+        Ok(Arc::new(s))
+    }
+
+    /// A pending connection of a listener, if any.
+    pub(crate) fn accept(l: &Arc<dyn Object>) -> Result<Option<Arc<dyn Object>>, i64> {
+        let s = l.socket().ok_or(ENOTSOCK)?;
+        Ok(s.stack.accept(s.id())?.map(|(cid, wait, _)| {
+            Arc::new(Socket::new(s.stack.clone(), cid, wait, false)) as Arc<dyn Object>
+        }))
+    }
+
+    /// A UDP socket on `port` (0: ephemeral).
+    pub(crate) fn udp_bind(cell: &crate::kcell::Cell, port: u16) -> Result<Arc<dyn Object>, i64> {
+        let s = new(cell, true);
+        s.stack.bind(s.id(), (net::Ipv4Addr::UNSPECIFIED, port))?;
+        Ok(Arc::new(s))
+    }
+
+    pub(crate) fn udp_send(o: &Arc<dyn Object>, data: &[u8], to: Addr) -> Result<usize, i64> {
+        let s = o.socket().ok_or(ENOTSOCK)?;
+        s.stack.send_to(s.id(), Some(to), data)
+    }
+
+    pub(crate) fn udp_recv(o: &Arc<dyn Object>) -> Result<Option<(Addr, Vec<u8>)>, i64> {
+        let s = o.socket().ok_or(ENOTSOCK)?;
+        s.stack.recv_from(s.id())
+    }
+
+    /// A connecting socket's outcome, once known.
+    pub(crate) fn connect_result(o: &Arc<dyn Object>) -> Result<Option<Result<(), i64>>, i64> {
+        let s = o.socket().ok_or(ENOTSOCK)?;
+        Ok(s.stack.connect_result(s.id()))
+    }
+}
+
 pub(super) fn shutdown(p: &mut LinuxProcess, fd: u64, how: u64) -> Result<u64, i64> {
     if let Some((o, _)) = unix::of(p, fd) {
         return unix::shutdown(unix::sock(&o)?, how);

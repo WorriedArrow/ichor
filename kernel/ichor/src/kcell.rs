@@ -20,27 +20,41 @@ pub(crate) mod rights {
     pub(crate) const READ: Rights = Rights(1 << 8);
     pub(crate) const WRITE: Rights = Rights(1 << 9);
     pub(crate) const MAP: Rights = Rights(1 << 10);
-    #[allow(dead_code)] // Granted when cell-creation syscalls land (milestone 3).
     pub(crate) const CREATE_CELL: Rights = Rights(1 << 11);
 }
 
 /// A kernel object a capability can refer to. Cloning a handle to one clones
 /// the `Arc`, keeping the object alive while any cell holds a capability.
 #[derive(Clone)]
-#[allow(dead_code)] // `Cell`: capabilities to child cells (milestone 3).
 pub(crate) enum Object {
     /// An untyped page of memory.
     Memory(UFrame),
-    /// Another cell.
+    /// A cell (with `CREATE_CELL`, the right to create cells under it).
     Cell(Arc<Cell>),
+    /// The cell switch: publishing uplink ports (ADR-0010 §3).
+    Switch,
+    /// A TCP or UDP socket on the holder's cell stack (native ABI v2).
+    Socket(Arc<dyn crate::poll::Object>),
+    /// A verified Ichor image, kept for the life of the system.
+    Image(&'static crate::pagecache::Mounted),
+    /// A cell created from an image: the cell and its root.
+    Container(Arc<crate::native::Container>),
+    /// A Linux process started in a container, with its captured output.
+    Process(Arc<crate::native::Process>),
 }
 
 impl core::fmt::Debug for Object {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Object::Memory(_) => write!(f, "Object::Memory"),
-            Object::Cell(_) => write!(f, "Object::Cell"),
-        }
+        let name = match self {
+            Object::Memory(_) => "Memory",
+            Object::Cell(_) => "Cell",
+            Object::Switch => "Switch",
+            Object::Socket(_) => "Socket",
+            Object::Image(_) => "Image",
+            Object::Container(_) => "Container",
+            Object::Process(_) => "Process",
+        };
+        write!(f, "Object::{name}")
     }
 }
 
@@ -129,6 +143,11 @@ impl Cell {
             Object::Memory(f) => Some(f.clone()),
             _ => None,
         }
+    }
+
+    /// The object a handle names, if the capability grants `required`.
+    pub(crate) fn object(&self, handle: Handle, required: Rights) -> Option<Object> {
+        self.cspace.lock().access(handle, required).cloned()
     }
 
     /// Returns a clone of the object a handle names, if the capability grants

@@ -15,8 +15,14 @@ use ichor_abi::{Error, sys};
 use crate::kcell::{Cell, Object};
 
 /// Dispatches one native syscall against `cell`, writing the result into
-/// `ctx.rax`. Returns `false` if the process asked to exit.
-pub(crate) fn dispatch(cell: &Arc<Cell>, ctx: &mut UserContext) -> bool {
+/// `ctx.rax`. Returns `false` if the process asked to exit. Version 2's
+/// calls (`native.rs`) need the process's address space `mm`; without one
+/// (the version-1 self-test maps its pages by hand) they are `NoSys`.
+pub(crate) fn dispatch(
+    cell: &Arc<Cell>,
+    mm: Option<&mut crate::umem::Mm>,
+    ctx: &mut UserContext,
+) -> bool {
     let (nr, args) = ctx.syscall_args();
     let result = match nr {
         sys::VERSION => Ok(ichor_abi::VERSION),
@@ -33,7 +39,10 @@ pub(crate) fn dispatch(cell: &Arc<Cell>, ctx: &mut UserContext) -> bool {
             ctx.set_return(0);
             return false;
         }
-        _ => Err(Error::NoSys),
+        _ => match mm {
+            Some(mm) => crate::native::call(cell, mm, nr, args),
+            None => Err(Error::NoSys),
+        },
     };
     ctx.set_return(match result {
         Ok(v) => ichor_abi::ok(v),

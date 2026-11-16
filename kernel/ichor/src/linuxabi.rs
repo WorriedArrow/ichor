@@ -8,7 +8,7 @@
 //! User memory is only ever copied (`VmSpace::copy_{from,to}_user`), never
 //! borrowed. Coverage is tracked in `docs/linux-abi.md`.
 
-mod exec;
+pub(crate) mod exec;
 mod fs;
 pub(crate) mod socket;
 pub(crate) mod unix;

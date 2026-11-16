@@ -25,7 +25,9 @@ mod kcell;
 mod linuxabi;
 mod loader;
 mod locks;
+mod native;
 mod nativeabi;
+mod nativetest;
 mod netstack;
 mod nettest;
 mod pagecache;
@@ -147,6 +149,7 @@ fn kmain(info: BootInfo) -> ! {
     nettest::run();
     netstack::accounting_selftest();
     linuxabi::unix::accounting_selftest();
+    nativetest::run();
     blktest::run();
 
     if cmdline.flag("test_stack_overflow") {

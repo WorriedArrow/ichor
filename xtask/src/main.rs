@@ -282,8 +282,12 @@ const KERNEL_ONLY: &[&str] = &[
     "ichor-nvme",
 ];
 
+/// Crates that only build for the services target (the native runtime
+/// and the binaries on it, ADR-0012).
+const SERVICE_ONLY: &[&str] = &["ichor-rt", "ichor-nativetest"];
+
 fn exclude_kernel_only(cmd: &mut std::process::Command) -> &mut std::process::Command {
-    for c in KERNEL_ONLY {
+    for c in KERNEL_ONLY.iter().chain(SERVICE_ONLY) {
         cmd.args(["--exclude", c]);
     }
     cmd
@@ -337,6 +341,20 @@ fn cmd_lint() -> Result<()> {
             "warnings",
         ]),
     )?;
+    let mut services_clippy = cargo();
+    services_clippy.arg("clippy");
+    for c in SERVICE_ONLY {
+        services_clippy.args(["--package", c]);
+    }
+    run_cmd(
+        services_clippy
+            .args(["--target", build::SERVICES_TARGET])
+            .arg("--target-dir")
+            .arg(build::services_target_dir())
+            .args(["--", "-D", "warnings"]),
+    )?;
+    // The kernel embeds the services' binaries.
+    let services = build::services(build::Profile::Dev)?;
     let mut kernel_clippy = cargo();
     kernel_clippy.arg("clippy");
     for c in KERNEL_ONLY {
@@ -347,10 +365,12 @@ fn cmd_lint() -> Result<()> {
             .args(["--target", KERNEL_TARGET])
             .arg("--target-dir")
             .arg(build::kernel_target_dir())
+            .env("ICHOR_SERVICES_DIR", &services)
             .args(["--", "-D", "warnings"]),
     )?;
     audit::check_forbid_unsafe()?;
     audit::check_frame_budget()?;
+    audit::check_rt_budget()?;
     linux_abi::check_table()?;
     Ok(())
 }
@@ -365,7 +385,9 @@ fn main() -> ExitCode {
         "run" => cmd_run(&o),
         "test" => cmd_test(&o),
         "lint" => cmd_lint(),
-        "frame-audit" => audit::check_frame_budget().map(|_| ()),
+        "frame-audit" => {
+            audit::check_frame_budget().and_then(|_| audit::check_rt_budget().map(|_| ()))
+        }
         "linux-abi-table" => linux_abi::write_table(),
         "bench" => cmd_bench(&o),
         "disk-image" => cmd_disk_image(&o, rest),

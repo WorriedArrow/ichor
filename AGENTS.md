@@ -42,8 +42,24 @@ gRPC, then the end-to-end pull-and-run test.
   out: every Docker Hub endpoint accepts ChaCha20-Poly1305. Refresh a
   recording with `cargo test -p ichor-tls -- --ignored record_live` (or
   `-p ichor-oci`); it needs the internet and the Windows-exported roots in
-  `services/x509/testdata/roots.pem`. Next: native ABI v2, `services/rt`,
-  the loader.
+  `services/x509/testdata/roots.pem`.
+- M6 native ABI v2 (`docs/abi/native.md`): `kernel/ichor/src/native.rs`
+  runs native processes (a demand-paged `Mm` charged to the cell, the ELF
+  loader, faults) and the v2 calls: LOG, CLOCK, RANDOM, MEM_MAP/UNMAP,
+  OBJECT_WAIT (over `poll::Watchers`), TCP/UDP sockets on the cell's own
+  stack (`socket::native`), PORT_PUBLISH (switch handle), IMAGE_CREATE
+  (pages behind the page cache as a RAM disk, root hash checked),
+  CELL_CREATE, CELL_SPAWN (a Linux process through `exec::exec`, stdout
+  and stderr on one pipe), PROCESS_READ/WAIT, CELL_ADDR. `services/rt`
+  (the only unsafe services crate, budget in `services/rt/audit.toml`):
+  `_start`, syscalls behind slice-taking wrappers, a size-class heap,
+  the panic handler, `rt::main!`. Services build for
+  `x86_64-unknown-none` (static, small code model; `.cargo/config.toml`)
+  and the kernel embeds them (`ICHOR_SERVICES_DIR`, set by xtask). Boot
+  runs `services/nativetest`: clock, CSPRNG, heap, loopback TCP and UDP,
+  refused handles, and Docker's recorded `hello-world` layer converted in
+  the service, made a cell and run. Next: HTTP/2 + HPACK and gRPC
+  (`services/http/src/hpack.rs` is started), then `services/control`.
 
 Roadmap from the founding brief (the brief is not checked in; this is
 its milestone list as an earlier session recorded it):
@@ -436,7 +452,7 @@ cargo xtask run            # boot in QEMU + OVMF, serial on stdio, exits on halt
 cargo xtask run --cmdline "memmap"   # without qemu_debug_exit: halts; Ctrl-C to quit
 cargo xtask test           # host unit tests, then QEMU integration tests (tests/)
 cargo xtask lint           # fmt check, clippy (host + UEFI target), forbid check, frame budget
-cargo xtask frame-audit    # frame line and unsafe-site counts against the budget
+cargo xtask frame-audit    # frame's and services/rt's line and unsafe-site counts against their budgets
 cargo xtask run --cmdline "qemu_debug_exit bench" --smp 4 --release   # benchmarks (use KVM for real numbers)
 cargo xtask bench --accel kvm --smp 4   # Ichor vs Linux, same machine and programs (Markdown table)
 cargo xtask disk-image     # target/ichor-disk.img: bootable GPT disk (ESP + Ichor root) for clouds/bare metal
@@ -526,6 +542,8 @@ services/http    sans-I/O HTTP/1.1 client messages (host-tested)
 services/layer   gzip/DEFLATE + tar layers (OCI whiteouts) into images; xtask uses it (host-tested)
 services/oci     image references, the registry pull protocol, conversion, image config (host-tested)
 services/dns     stub resolver messages (host-tested)
+services/rt      native services' runtime: entry, syscalls, heap, panic (the only unsafe services crate; x86_64-unknown-none)
+services/nativetest  native ABI v2 boot self-test, embedded in the kernel image
 xtask/           build/run/test/lint tooling (lib + bin, no dependencies)
 tests/           QEMU integration tests (host crate using xtask's runner)
 docs/adr/        architecture decision records
@@ -566,8 +584,10 @@ vfs,block,net,linux-abi,native-abi}`, `kernel/drivers/*`, `abi/`, `services/`.
 
 ## Toolchain
 
-Pinned stable `1.100.0` (`rust-toolchain.toml`) with target
-`x86_64-unknown-uefi`.
+Pinned stable `1.100.0` (`rust-toolchain.toml`) with targets
+`x86_64-unknown-uefi` (the kernel) and `x86_64-unknown-none` (native
+services, built into `target/services`; xtask's `SERVICE_ONLY` list keeps
+them out of host builds and lints them for that target).
 
 ### Unstable features
 

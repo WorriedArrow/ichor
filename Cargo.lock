@@ -117,6 +117,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ichor-nativetest"
+version = "0.0.0"
+dependencies = [
+ "ichor-layer",
+ "ichor-rt",
+]
+
+[[package]]
 name = "ichor-net"
 version = "0.0.0"
 
@@ -150,6 +158,13 @@ dependencies = [
 [[package]]
 name = "ichor-pe"
 version = "0.0.0"
+
+[[package]]
+name = "ichor-rt"
+version = "0.0.0"
+dependencies = [
+ "ichor-abi",
+]
 
 [[package]]
 name = "ichor-sched"

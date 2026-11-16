@@ -1,0 +1,18 @@
+[package]
+name = "ichor-rt"
+description = "The native-ABI services' runtime: entry point, syscalls, heap, panic handler (the only services crate allowed unsafe; ADR-0012)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "rt"
+test = false
+bench = false
+
+[dependencies]
+ichor-abi.workspace = true
+
+[lints]
+workspace = true

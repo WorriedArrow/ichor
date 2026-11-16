@@ -34,6 +34,8 @@ members = [
     "services/http",
     "services/oci",
     "services/dns",
+    "services/rt",
+    "services/nativetest",
     "tests",
     "xtask",
 ]
@@ -108,6 +110,7 @@ x509 = { package = "ichor-x509", path = "services/x509" }
 layer = { package = "ichor-layer", path = "services/layer" }
 http = { package = "ichor-http", path = "services/http" }
 tls = { package = "ichor-tls", path = "services/tls" }
+rt ={ package = "ichor-rt", path = "services/rt" }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
