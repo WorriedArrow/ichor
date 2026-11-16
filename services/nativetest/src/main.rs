@@ -103,7 +103,7 @@ fn run(cell: &Handle, switch: &Handle) -> Result<(), &'static str> {
 
 fn tcp() -> Result<(), &'static str> {
     const LOOPBACK: [u8; 4] = [127, 0, 0, 1];
-    let listener = rt::tcp_listen(7070, 4).map_err(|_| "TCP_LISTEN")?;
+    let listener = rt::tcp_listen([0, 0, 0, 0], 7070, 4).map_err(|_| "TCP_LISTEN")?;
     if rt::tcp_accept(&listener).err() != Some(Error::WouldBlock) {
         return Err("TCP_ACCEPT with nothing pending did not say WouldBlock");
     }

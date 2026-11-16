@@ -27,8 +27,10 @@ by `cargo xtask workloads` into `docs/workloads.md`, with floors in
 Owner's order of work for milestone 7 (2026-11-16), all before any
 milestone 8 preparation: (1) fuzz every parser, score certificate
 validation on x509-limbo, write up the gaps [done]; (2) an ADR for
-`services/rt` as the second trusted crate; (3) the control-plane listener
-local unless configured, with a test, then API authentication and
+`services/rt` as the second trusted crate [done: ADR-0014, and lint now
+fails if frame or rt relaxes an unsafe-code lint]; (3) the control-plane
+listener local unless configured, with a test [done:
+`the_control_api_is_local_unless_configured`], then API authentication and
 Signal/Inspect/Destroy before any cloud boot; (4) io_uring completions
 without an enter (epoll on the ring fd, registered eventfd), with a test,
 before the Node.js suite; (5) extra layers in PullImage, each pinned and
@@ -566,8 +568,11 @@ comment.
 | `bench` | run the Phase E benchmarks (`bench.rs`) after the root disk's self-tests and print them |
 | `net_echo_port=N` | the kernel's TCP, then a Debian cell through NAT, echo 256 KiB with the host's echo server at 10.0.2.2:N |
 | `net_publish=N` | publish uplink port N to a Debian cell's port 80 and serve one HTTP request from the host (QEMU forwards a host port to N) |
-| `control=PORT` | after the self-tests, run the control plane serving gRPC on PORT, published on the uplink |
+| `control=PORT` | after the self-tests, run the control plane serving gRPC on PORT, on the system cell's loopback only (the API has no authentication yet) |
+| `control_listen=ADDR` | the address the API listens on (`0.0.0.0`: all of the system cell's, reachable from other cells) |
+| `control_publish=PORT` | publish the API on uplink port PORT (without `control_listen`, listens on all addresses) |
 | `control_exit` | with `control`: stop when the first API client hangs up, then shut down (tests) |
+| `control_exit_after=SECONDS` | with `control`: stop after that long once no client is connected (tests) |
 | `dns=A.B.C.D` | the control plane's DNS resolver (default `10.0.2.3`, QEMU's) |
 
 ## Layout

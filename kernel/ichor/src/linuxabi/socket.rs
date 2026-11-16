@@ -798,12 +798,13 @@ pub(crate) mod native {
     /// A TCP listener on `port` of every address the cell has.
     pub(crate) fn tcp_listen(
         cell: &crate::kcell::Cell,
+        addr: net::Ipv4Addr,
         port: u16,
         backlog: usize,
     ) -> Result<Arc<dyn Object>, i64> {
         let s = new(cell, false);
         s.stack.set_reuse_addr(s.id(), true)?;
-        s.stack.bind(s.id(), (net::Ipv4Addr::UNSPECIFIED, port))?;
+        s.stack.bind(s.id(), (addr, port))?;
         s.stack.listen(s.id(), backlog)?;
         s.listening.store(true, Ordering::Release);
         Ok(Arc::new(s))

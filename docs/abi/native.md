@@ -45,8 +45,9 @@ At boot the kernel embeds and runs its services in the system cell
 (ADR-0012 §1). The boot self-test (`services/nativetest`) is given the
 system cell's handle and the switch's, as hexadecimal `argv[1]` and
 `argv[2]`. The control plane (`services/control`, started by the
-`control=PORT` kernel option) gets those, the CA bundle's blob handle,
-the API port and the DNS resolver (`dns=`, default `10.0.2.3`).
+`control=PORT` kernel option) gets those and the CA bundle's blob
+handle, then named options (`port=`, `listen=`, `publish=`, `dns=`,
+`exit-on-close`, `exit-after=`; see `services/control/src/main.rs`).
 
 ## Results
 
@@ -83,7 +84,7 @@ moves at most 256 KiB (`LOG`, `RANDOM`, the socket calls, `PROCESS_READ`).
 | 8 | `MEM_MAP` | length | the address of that many bytes (rounded up to pages) of zeroed read-write memory |
 | 9 | `OBJECT_WAIT` | items, count (≤ 256), timeout ns (`u64::MAX`: none) | how many items are ready; writes each one's `revents` |
 | 10 | `TCP_CONNECT` | IPv4 (`u32`, `a.b.c.d` big-endian), port | a socket handle; writable once the outcome is known (`SOCK_ERROR`) |
-| 11 | `TCP_LISTEN` | port, backlog | a listener handle, on all of the cell's addresses; readable with a pending connection |
+| 11 | `TCP_LISTEN` | port, backlog, IPv4 (`127.0.0.1`: this cell only; 0: every address it has) | a listener handle; readable with a pending connection |
 | 12 | `TCP_ACCEPT` | listener | a socket handle, or `WouldBlock` |
 | 13 | `SOCK_SEND` | socket, buffer | bytes taken, or `WouldBlock` |
 | 14 | `SOCK_RECV` | socket, buffer | bytes read; 0 is the end of the stream |

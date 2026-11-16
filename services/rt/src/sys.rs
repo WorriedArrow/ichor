@@ -158,8 +158,14 @@ pub fn tcp_connect(addr: [u8; 4], port: u16) -> Result<Handle> {
     call(sys::TCP_CONNECT, [ip(addr), u64::from(port), 0, 0, 0]).map(Handle)
 }
 
-pub fn tcp_listen(port: u16, backlog: usize) -> Result<Handle> {
-    call(sys::TCP_LISTEN, [u64::from(port), backlog as u64, 0, 0, 0]).map(Handle)
+/// Listens on `port` of the cell's address `addr` (`[127, 0, 0, 1]`: this
+/// cell only; `[0, 0, 0, 0]`: every address it has).
+pub fn tcp_listen(addr: [u8; 4], port: u16, backlog: usize) -> Result<Handle> {
+    call(
+        sys::TCP_LISTEN,
+        [u64::from(port), backlog as u64, ip(addr), 0, 0],
+    )
+    .map(Handle)
 }
 
 pub fn tcp_accept(listener: &Handle) -> Result<Handle> {

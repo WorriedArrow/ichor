@@ -46,8 +46,9 @@ pub mod sys {
     /// (`a.b.c.d` as the big-endian `u32`) port `arg1`; returns a socket
     /// handle. Completion: writable, then [`SOCK_ERROR`].
     pub const TCP_CONNECT: u64 = 10;
-    /// Listen on TCP port `arg0` (all of the cell's addresses), backlog
-    /// `arg1`; returns a listener handle.
+    /// Listen on TCP port `arg0`, backlog `arg1`, on the cell's address
+    /// `arg2` (IPv4 as a big-endian `u32`; `127.0.0.1` for this cell only,
+    /// 0 for every address it has); returns a listener handle.
     pub const TCP_LISTEN: u64 = 11;
     /// Accept a connection from listener `arg0`; [`super::Error::WouldBlock`]
     /// if none is pending.

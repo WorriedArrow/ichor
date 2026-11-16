@@ -32,10 +32,12 @@ cargo xtask disk-image --release --size-gib 1 --gcp
 This writes `target/ichor-disk.img` (raw, 1 GiB, for AWS) and
 `target/ichor-gcp.tar.gz` (`disk.raw` in a gzip'd GNU tar, for GCP). The
 kernel command line is empty unless `--cmdline` is given; useful options:
-`trace_errors` (log failing syscalls), `control=50051` (serve the control
-plane's gRPC API on the uplink; no TLS or authentication yet, so only
-behind a firewall) and `dns=A.B.C.D` (its resolver; the cloud's, e.g.
-`169.254.169.253` on AWS). The disk's ESP carries the pinned CA bundle as
+`trace_errors` (log failing syscalls), `control=50051` (run the control
+plane; its gRPC API stays local to the system cell unless
+`control_publish=PORT` publishes it on the uplink, which must wait for
+the API's authentication: no cloud boot publishes it before then) and
+`dns=A.B.C.D` (its resolver; the cloud's, e.g. `169.254.169.253` on
+AWS). The disk's ESP carries the pinned CA bundle as
 `\ichor\roots.pem`.
 
 ## AWS (Nitro instances: NVMe boot volume, COM1 serial console)

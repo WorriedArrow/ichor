@@ -8,9 +8,18 @@
 //! One thread, one loop over `OBJECT_WAIT`; every protocol under it is a
 //! sans-I/O state machine.
 //!
-//! Arguments (from the kernel): the system cell's handle, the switch's,
-//! the CA bundle's (hex), the API port, the DNS resolver, and optionally
-//! `exit-on-close` (tests: stop when the first API client hangs up).
+//! Arguments (from the kernel): the system cell's handle, the switch's and
+//! the CA bundle's (hex), then options: `port=N` (default 50051),
+//! `listen=A.B.C.D`, `publish=N`, `dns=A.B.C.D`, `exit-on-close` (tests:
+//! stop when the first API client hangs up) and `exit-after=SECONDS`.
+//!
+//! The API has no authentication yet, so it is local by default: it
+//! listens on the system cell's loopback only, reachable neither from other
+//! cells (through the switch) nor from the uplink. `listen=` binds another
+//! address (`0.0.0.0`: all of the cell's), and `publish=N` publishes it on
+//! uplink port N (and, without `listen=`, listens on all addresses). At
+//! start the service checks that its switch address refuses connections
+//! when it is not meant to listen there.
 
 #![no_std]
 #![no_main]
@@ -94,6 +103,25 @@ fn parse_ip(s: &str) -> Option<[u8; 4]> {
     parts.next().is_none().then_some(out)
 }
 
+fn ip_text(a: [u8; 4]) -> String {
+    format!("{}.{}.{}.{}", a[0], a[1], a[2], a[3])
+}
+
+/// Whether a TCP connection to `addr:port` from this cell is accepted
+/// (within 5 s).
+fn reachable(addr: [u8; 4], port: u16) -> bool {
+    let Ok(s) = rt::tcp_connect(addr, port) else {
+        return false;
+    };
+    let mut items = [WaitItem {
+        handle: s.raw(),
+        events: rt::WRITABLE,
+        revents: 0,
+    }];
+    let _ = rt::wait(&mut items, 5_000_000_000);
+    rt::sock_error(&s).is_ok()
+}
+
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
@@ -107,12 +135,29 @@ fn main(args: &[&str]) -> i32 {
         rt::log("control: missing handles");
         return 2;
     };
-    let port: u16 = args.get(4).and_then(|p| p.parse().ok()).unwrap_or(50051);
-    let resolver = args
-        .get(5)
-        .and_then(|s| parse_ip(s))
-        .unwrap_or([10, 0, 2, 3]);
+    let opt = |key: &str| {
+        args.iter()
+            .skip(4)
+            .find_map(|a| a.strip_prefix(key).and_then(|v| v.strip_prefix('=')))
+    };
+    let port: u16 = opt("port").and_then(|p| p.parse().ok()).unwrap_or(50051);
+    let resolver = opt("dns").and_then(parse_ip).unwrap_or([10, 0, 2, 3]);
+    let publish: Option<u16> = opt("publish").and_then(|p| p.parse().ok());
+    let listen = match opt("listen") {
+        Some(a) => match parse_ip(a) {
+            Some(ip) => ip,
+            None => {
+                rt::log!("control: bad listen address {a:?}");
+                return 2;
+            }
+        },
+        // Publishing is an explicit choice to be reachable.
+        None if publish.is_some() => [0, 0, 0, 0],
+        None => [127, 0, 0, 1],
+    };
     let exit_on_close = args.contains(&"exit-on-close");
+    let exit_after: Option<u64> = opt("exit-after").and_then(|s| s.parse().ok());
+    let started = rt::monotonic();
 
     let pem = rt::blob_read(&roots).unwrap_or_default();
     drop(roots);
@@ -121,23 +166,49 @@ fn main(args: &[&str]) -> i32 {
     if store.is_empty() {
         rt::log("control: no CA bundle on the boot volume; HTTPS pulls will fail");
     }
-    let listener = match rt::tcp_listen(port, 16) {
+    let listener = match rt::tcp_listen(listen, port, 16) {
         Ok(l) => l,
         Err(e) => {
-            rt::log!("control: cannot listen on {port}: {e:?}");
+            rt::log!(
+                "control: cannot listen on {}:{port}: {e:?}",
+                ip_text(listen)
+            );
             return 1;
         }
     };
-    let published = rt::port_publish(&switch, port, &cell, port).is_ok();
+    let published = match publish {
+        Some(_) if listen[0] == 127 => {
+            rt::log("control: not publishing a loopback listener");
+            false
+        }
+        Some(outside) => rt::port_publish(&switch, outside, &cell, port).is_ok(),
+        None => false,
+    };
+    drop(switch);
     rt::log!(
-        "control: serving ichor.v1.Control on port {port} ({} roots{})",
+        "control: serving ichor.v1.Control on {}:{port} ({} roots, {})",
+        ip_text(listen),
         store.len(),
-        if published {
-            ", published on the uplink"
-        } else {
-            ", not published"
+        match (published, publish) {
+            (true, Some(p)) => format!("published on uplink port {p}"),
+            _ => "not published".into(),
         }
     );
+    // Not meant to listen on the switch address: check that it refuses.
+    let own = rt::cell_addr(&cell).ok();
+    if let Some(own) = own
+        && listen != [0, 0, 0, 0]
+        && listen != own
+    {
+        if reachable(own, port) {
+            rt::log!("control: FAILED: reachable at {}:{port}", ip_text(own));
+            return 1;
+        }
+        rt::log!(
+            "control: not reachable at {}:{port} (refused)",
+            ip_text(own)
+        );
+    }
     let mut c = Control {
         cell,
         net: Net::new(resolver, Arc::new(store)),
@@ -163,6 +234,16 @@ fn main(args: &[&str]) -> i32 {
         }
         if exit_on_close && c.served && c.conns.iter().all(Option::is_none) {
             rt::log("control: the API client is gone; exiting");
+            return 0;
+        }
+        if let Some(secs) = exit_after
+            && rt::monotonic() - started > secs * 1_000_000_000
+            && c.conns.iter().all(Option::is_none)
+        {
+            rt::log!(
+                "control: exiting after {secs} s ({} API connections)",
+                if c.served { "some" } else { "no" }
+            );
             return 0;
         }
     }

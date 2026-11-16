@@ -245,7 +245,8 @@ pub(crate) fn call(cell: &Arc<Cell>, mm: &mut Mm, nr: u64, a: [u64; 6]) -> Resul
         sys::TCP_LISTEN => {
             let port = u16::try_from(a[0]).map_err(|_| Error::Invalid)?;
             let backlog = (a[1] as usize).clamp(1, 4096);
-            let s = sock::tcp_listen(cell, port, backlog).map_err(errno)?;
+            let ip = u32::try_from(a[2]).map_err(|_| Error::Invalid)?;
+            let s = sock::tcp_listen(cell, Ipv4Addr::from(ip), port, backlog).map_err(errno)?;
             install(cell, Object::Socket(s), SOCKET_RIGHTS)
         }
         sys::TCP_ACCEPT => {

@@ -199,6 +199,62 @@ fn session(port: u16) -> Result<(Ran, Ran), String> {
     Ok((hello, alpine))
 }
 
+/// The API has no authentication yet, so by default it is local to the
+/// system cell: with only `control=PORT`, the port QEMU forwards from the
+/// host never answers HTTP/2, and the system cell's own switch address
+/// (where other cells could reach it) refuses connections.
+#[test]
+fn the_control_api_is_local_unless_configured() {
+    let host_port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let halt = stop.clone();
+    // Keeps trying for the whole boot; any byte back is a failure.
+    let prober = std::thread::spawn(move || {
+        let (mut tries, mut answers) = (0u32, 0u32);
+        while !halt.load(std::sync::atomic::Ordering::Acquire) {
+            tries += 1;
+            if let Ok(mut s) = TcpStream::connect(("127.0.0.1", host_port)) {
+                let mut c = Client::new("ichor");
+                let _ = s.set_read_timeout(Some(Duration::from_secs(3)));
+                if s.write_all(&c.conn.take_output()).is_ok() {
+                    let mut buf = [0u8; 64];
+                    if matches!(s.read(&mut buf), Ok(n) if n > 0) {
+                        answers += 1;
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        (tries, answers)
+    });
+    let out = ichor_tests::boot_with(
+        "control-local",
+        "control=50051 control_exit_after=30",
+        2,
+        |c| {
+            c.net_user_opts = format!("hostfwd=tcp:127.0.0.1:{host_port}-:50051");
+            c.timeout = Some(Duration::from_secs(600));
+        },
+    );
+    stop.store(true, std::sync::atomic::Ordering::Release);
+    let (tries, answers) = prober.join().unwrap();
+    out.assert_exit(Exit::Success);
+    out.assert_in_order(&[
+        "control: serving ichor.v1.Control on 127.0.0.1:50051 (",
+        "not published)",
+        "control: not reachable at 10.88.",
+        ":50051 (refused)",
+        "control: exiting after 30 s (no API connections)",
+        "ichor: control: exited with Some(0)",
+    ]);
+    assert!(tries > 10, "the host only tried {tries} times");
+    assert_eq!(answers, 0, "the API answered the host {answers} times");
+}
+
 #[test]
 fn the_control_plane_pulls_and_runs_an_image_from_docker_hub() {
     let host_port = std::net::TcpListener::bind("127.0.0.1:0")
@@ -207,7 +263,9 @@ fn the_control_plane_pulls_and_runs_an_image_from_docker_hub() {
         .unwrap()
         .port();
     let client = std::thread::spawn(move || session(host_port));
-    let out = ichor_tests::boot_with("control", "control=50051 control_exit", 2, |c| {
+    // Exposure is explicit: published on the uplink.
+    let cmdline = "control=50051 control_publish=50051 control_exit";
+    let out = ichor_tests::boot_with("control", cmdline, 2, |c| {
         c.net_user_opts = format!("hostfwd=tcp:127.0.0.1:{host_port}-:50051");
         c.timeout = Some(Duration::from_secs(900));
     });
@@ -215,7 +273,8 @@ fn the_control_plane_pulls_and_runs_an_image_from_docker_hub() {
     out.assert_exit(Exit::Success);
     out.assert_in_order(&[
         "ichor: control: starting (",
-        "control: serving ichor.v1.Control on port 50051 (",
+        "control: serving ichor.v1.Control on 0.0.0.0:50051 (",
+        "published on uplink port 50051)",
         "control: pulling docker.io/library/hello-world@sha256:cf1b20a0",
         "control: pulled sha256:",
         "control: cell 1 at 10.88.",

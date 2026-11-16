@@ -176,12 +176,11 @@ fn kmain(info: BootInfo) -> ! {
     }
 
     // The control plane (milestone 6): `control=PORT` serves the API there,
-    // published on the uplink; `control_exit` stops (and the machine with
-    // it) once the first API client hangs up, for tests.
-    if let Some(port) = cmdline.get("control").and_then(|v| v.parse().ok()) {
-        let resolver = cmdline.get("dns").unwrap_or("10.0.2.3");
-        let once = cmdline.flag("control_exit");
-        let code = control::run(info.roots(), port, resolver, once);
+    // local to the system cell unless `control_listen`/`control_publish`
+    // say otherwise; `control_exit` and `control_exit_after` end it (and
+    // the machine with it), for tests.
+    if let Some(options) = control::options(&cmdline) {
+        let code = control::run(info.roots(), &options);
         println!("ichor: control: exited with {code:?}");
         if code != Some(0) {
             shutdown(ExitStatus::Failure);
