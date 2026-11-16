@@ -184,6 +184,61 @@ fn check_budget(name: &str, src: &str, budget: &str) -> Result<FrameMetrics> {
     }
 }
 
+/// The crates allowed `unsafe` (ADR-0001, ADR-0014).
+pub const TRUSTED: [&str; 2] = ["kernel/frame", "services/rt"];
+
+/// The lints that keep their `unsafe` reviewable (ADR-0001 §6).
+const UNSAFE_LINTS: [&str; 4] = [
+    "undocumented_unsafe_blocks",
+    "multiple_unsafe_ops_per_block",
+    "missing_safety_doc",
+    "unsafe_op_in_unsafe_fn",
+];
+
+/// Fails if a trusted crate stops inheriting the workspace lints, or
+/// relaxes one of the unsafe-code lints anywhere in its sources.
+pub fn check_trusted_lints() -> Result<()> {
+    let root = workspace_root();
+    let mut errors = Vec::new();
+    for dir in TRUSTED {
+        let manifest = root.join(dir).join("Cargo.toml");
+        let text =
+            fs::read_to_string(&manifest).map_err(|e| format!("{}: {e}", manifest.display()))?;
+        let inherits = text.split("[lints]").nth(1).is_some_and(|rest| {
+            rest.lines().map(str::trim).find(|l| !l.is_empty()) == Some("workspace = true")
+        });
+        if !inherits {
+            errors.push(format!(
+                "{} does not inherit the workspace lints",
+                manifest.display()
+            ));
+        }
+        let mut files = Vec::new();
+        rust_files(&root.join(dir).join("src"), &mut files)?;
+        for file in files {
+            let src = fs::read_to_string(&file).map_err(|e| format!("{}: {e}", file.display()))?;
+            for (n, line) in src.lines().enumerate() {
+                let code = code_part(line);
+                let relaxes = (code.contains("allow(") || code.contains("expect("))
+                    && UNSAFE_LINTS.iter().any(|l| code.contains(l));
+                if relaxes {
+                    errors.push(format!(
+                        "{}:{}: relaxes an unsafe-code lint",
+                        file.display(),
+                        n + 1
+                    ));
+                }
+            }
+        }
+    }
+    if errors.is_empty() {
+        println!("unsafe-code lints: enforced in {}", TRUSTED.join(" and "));
+        Ok(())
+    } else {
+        Err(errors.join("\n"))
+    }
+}
+
 /// Fails unless every kernel crate except frame forbids unsafe code.
 pub fn check_forbid_unsafe() -> Result<usize> {
     let root = workspace_root();
@@ -197,7 +252,7 @@ pub fn check_forbid_unsafe() -> Result<usize> {
     for manifest in manifests {
         let dir = manifest.parent().unwrap_or(&root).to_path_buf();
         // The two crates allowed `unsafe`, each under a budget.
-        if dir == root.join("kernel/frame") || dir == root.join("services/rt") {
+        if TRUSTED.iter().any(|t| dir == root.join(t)) {
             continue;
         }
         for crate_root in ["src/lib.rs", "src/main.rs"] {

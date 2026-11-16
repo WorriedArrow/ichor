@@ -3,6 +3,8 @@
 - Status: Accepted
 - Date: 2026-11-14
 - Amended: 2026-11-14 (milestone 1 implementation notes, at the end)
+- Amended: 2026-11-16 by ADR-0014 (`services/rt`, user-mode services'
+  runtime, is a second crate allowed `unsafe`, under the same rules)
 - Supersedes: nothing (amends the founding brief only where noted)
 
 ## Context

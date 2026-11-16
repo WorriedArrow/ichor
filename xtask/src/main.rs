@@ -404,6 +404,7 @@ fn cmd_lint() -> Result<()> {
     audit::check_forbid_unsafe()?;
     audit::check_frame_budget()?;
     audit::check_rt_budget()?;
+    audit::check_trusted_lints()?;
     linux_abi::check_table()?;
     Ok(())
 }
