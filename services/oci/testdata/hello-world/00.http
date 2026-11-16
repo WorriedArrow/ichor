@@ -1,0 +1,11 @@
+HTTP/1.1 401 Unauthorized
+Date: Mon, 16 Nov 2026 00:08:47 GMT
+Content-Type: application/json
+Content-Length: 162
+Connection: close
+docker-distribution-api-version: registry/2.0
+www-authenticate: Bearer realm="https://auth.docker.io/token",service="registry.docker.io",scope="repository:library/hello-world:pull"
+docker-ratelimit-source: 2001:5a8:4172:7d00::
+strict-transport-security: max-age=31536000
+
+{"errors":[{"code":"UNAUTHORIZED","message":"authentication required","detail":[{"Type":"repository","Class":"","Name":"library/hello-world","Action":"pull"}]}]}

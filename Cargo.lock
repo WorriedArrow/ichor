@@ -76,6 +76,10 @@ name = "ichor-csprng"
 version = "0.0.0"
 
 [[package]]
+name = "ichor-dns"
+version = "0.0.0"
+
+[[package]]
 name = "ichor-elf"
 version = "0.0.0"
 
@@ -95,10 +99,21 @@ name = "ichor-gpt"
 version = "0.0.0"
 
 [[package]]
+name = "ichor-http"
+version = "0.0.0"
+
+[[package]]
 name = "ichor-image"
 version = "0.0.0"
 dependencies = [
  "ichor-blake3",
+]
+
+[[package]]
+name = "ichor-layer"
+version = "0.0.0"
+dependencies = [
+ "ichor-image",
 ]
 
 [[package]]
@@ -111,6 +126,18 @@ version = "0.0.0"
 dependencies = [
  "ichor-block",
  "ichor-frame",
+]
+
+[[package]]
+name = "ichor-oci"
+version = "0.0.0"
+dependencies = [
+ "ichor-crypto",
+ "ichor-http",
+ "ichor-image",
+ "ichor-layer",
+ "ichor-tls",
+ "ichor-x509",
 ]
 
 [[package]]
@@ -197,5 +224,6 @@ version = "0.0.0"
 dependencies = [
  "ichor-gpt",
  "ichor-image",
+ "ichor-layer",
  "ichor-testprog",
 ]

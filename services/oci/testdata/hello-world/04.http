@@ -1,0 +1,9 @@
+HTTP/1.1 307 Temporary Redirect
+Date: Mon, 16 Nov 2026 00:08:48 GMT
+Content-Type: application/octet-stream
+Content-Length: 0
+Connection: close
+docker-distribution-api-version: registry/2.0
+location: https://production.cloudfront.docker.com/registry-v2/docker/registry/v2/blobs/sha256/e2/e2ac70e7319a02c5a477f5825259bd118b94e8b02c279c67afa63adab6d8685b/data?Expires=1794790728&Signature=S-3tOu5EONnZfQqhqgX8rfJvx2akURTn4g74ie2mpz3E5mfTFcQs2utm3T5NqADOHG0hcIvZZuixTikLbiVpfkR419LO5z5zwqgASiJMU~02SAOPnpK16u3n0mz-K3LwQhdhKI5INuvpeWP5UelJZshEPKJ7a6Q7KxpglQxcKe1tTVALh1aSRXB1C5-JOt1a6BWmEgAHqDNt37Yx5SyAxq~qZvioYYdIpwY8WVppOStvLLubGYlQFrxC0wL3J9yVVImSyylDri-bdd9Qk~8PUC61V9bs9wNgh2zvLslb2Ne9Hae-u5TF9GCRqi~sCNwLAEiI62HjMv6AkbEUFl~rYg__&Key-Pair-Id=K31B9XRZB58O8Z
+strict-transport-security: max-age=31536000
+

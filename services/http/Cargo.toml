@@ -1,0 +1,13 @@
+[package]
+name = "ichor-http"
+description = "Sans-I/O HTTP/1.1 client messages for the control plane (no_std, host-tested)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "http"
+
+[lints]
+workspace = true

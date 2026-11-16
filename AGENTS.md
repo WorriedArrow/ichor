@@ -27,6 +27,24 @@ Order: crypto, X.509, TLS, HTTP + OCI + layer (host-tested against
 recorded traffic), native ABI v2 + `services/rt` + the loader, HTTP/2 +
 gRPC, then the end-to-end pull-and-run test.
 
+- M6 so far (host crates, all `no_std`, our own code): `services/crypto`
+  (SHA-2, HMAC/HKDF/TLS PRF, ChaCha20-Poly1305, X25519, RSA and ECDSA
+  P-256/P-384 verification; RFC vectors and OpenSSL-made signatures),
+  `services/x509` (DER, certificates, chain verification; Docker Hub's
+  real chains), `services/tls` (TLS 1.3 + 1.2 client; live sessions with
+  Docker Hub recorded with fixed randomness and replayed offline),
+  `services/http` (HTTP/1.1 client messages), `services/layer` (gzip +
+  tar layers with OCI whiteouts into images; xtask uses it through thin
+  shims), `services/oci` (references, Bearer token flow, index to
+  linux/amd64, digest-verified manifests and blobs, CDN redirects without
+  the token, conversion, image config; a real `hello-world` pull recorded
+  and replayed), `services/dns` (A records, CNAME chains). AES-GCM is left
+  out: every Docker Hub endpoint accepts ChaCha20-Poly1305. Refresh a
+  recording with `cargo test -p ichor-tls -- --ignored record_live` (or
+  `-p ichor-oci`); it needs the internet and the Windows-exported roots in
+  `services/x509/testdata/roots.pem`. Next: native ABI v2, `services/rt`,
+  the loader.
+
 Roadmap from the founding brief (the brief is not checked in; this is
 its milestone list as an earlier session recorded it):
 
@@ -501,6 +519,13 @@ xtask/src/inflate.rs       gzip/DEFLATE decoder; rootfs.rs: tar -> Ichor image
 xtask/src/disk.rs, fat.rs  bootable GPT disk image (FAT32 ESP + Ichor root partition)
 xtask/src/linuxref.rs      Linux reference boot for `cargo xtask bench` (Alpine linux-virt + initramfs)
 kernel/ichor     the kernel binary; frame::main!(kmain); kcell/nativeabi tie it together
+services/crypto  SHA-2, HMAC/HKDF, ChaCha20-Poly1305, X25519, RSA/ECDSA verify (host-tested; ADR-0012)
+services/x509    DER, X.509, PEM root stores, chain verification (host-tested)
+services/tls     sans-I/O TLS 1.3 + 1.2 client (host-tested, recorded sessions)
+services/http    sans-I/O HTTP/1.1 client messages (host-tested)
+services/layer   gzip/DEFLATE + tar layers (OCI whiteouts) into images; xtask uses it (host-tested)
+services/oci     image references, the registry pull protocol, conversion, image config (host-tested)
+services/dns     stub resolver messages (host-tested)
 xtask/           build/run/test/lint tooling (lib + bin, no dependencies)
 tests/           QEMU integration tests (host crate using xtask's runner)
 docs/adr/        architecture decision records
