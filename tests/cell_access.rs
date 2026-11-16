@@ -12,14 +12,53 @@ use std::sync::OnceLock;
 
 use ichor_tests::{Exit, Outcome};
 
-fn suite() -> &'static Outcome {
-    static OUT: OnceLock<Outcome> = OnceLock::new();
-    OUT.get_or_init(|| ichor_tests::boot("cell-access", "cell_access", 2))
+/// B's uplink-facing port inside the guest (`B_UPLINK_PORT` in
+/// cellaccess.rs).
+const B_UPLINK_PORT: u16 = 7300;
+
+/// The boot, and how many of the host's connections B answered.
+fn suite() -> &'static (Outcome, usize) {
+    static OUT: OnceLock<(Outcome, usize)> = OnceLock::new();
+    OUT.get_or_init(|| {
+        use std::io::Read;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+        // A host client that keeps connecting to B's uplink port through a
+        // QEMU forward: the guest checks it is refused until the port is
+        // published for B, and counts what reaches B.
+        let host_port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let halt = stop.clone();
+        let client = std::thread::spawn(move || {
+            let mut answers = 0;
+            while !halt.load(Ordering::Acquire) {
+                if let Ok(mut s) = std::net::TcpStream::connect(("127.0.0.1", host_port)) {
+                    let _ = s.set_read_timeout(Some(Duration::from_secs(10)));
+                    let mut resp = String::new();
+                    let _ = s.read_to_string(&mut resp);
+                    if resp.contains("hello from cell B") {
+                        answers += 1;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            answers
+        });
+        let out = ichor_tests::boot_with("cell-access", "cell_access cell_access_uplink", 2, |c| {
+            c.net_user_opts = format!("hostfwd=tcp:127.0.0.1:{host_port}-:{B_UPLINK_PORT}");
+        });
+        stop.store(true, Ordering::Release);
+        (out, client.join().unwrap())
+    })
 }
 
 /// Panics unless `rule`'s section passed, quoting its failed checks.
 fn assert_rule(rule: &str) {
-    let out = suite();
+    let out = &suite().0;
     let failures: Vec<&str> = out
         .serial
         .lines()
@@ -43,7 +82,7 @@ fn assert_rule(rule: &str) {
 #[test]
 fn the_harness_gives_a_only_what_b_reports() {
     assert_rule("harness");
-    suite().assert_in_order(&[
+    suite().0.assert_in_order(&[
         "ichor: cellaccess: cell A is cell ",
         "ichor: cellaccess: cell B is cell ",
         "ichor: cellaccess: B's helper reports pid=",
@@ -58,7 +97,7 @@ fn the_harness_gives_a_only_what_b_reports() {
 #[test]
 fn process_ids_and_signals_are_scoped_to_their_cell() {
     assert_rule("process_ids_and_signals_are_scoped_to_their_cell");
-    suite().assert_in_order(&[
+    suite().0.assert_in_order(&[
         "finds only A's processes: ok",
         "ichor: cellaccess: process_ids_and_signals_are_scoped_to_their_cell passed",
         "ichor: cellaccess: B alive and unchanged after process_ids_and_signals_are_scoped_to_their_cell",
@@ -70,7 +109,7 @@ fn process_ids_and_signals_are_scoped_to_their_cell() {
 #[test]
 fn proc_and_sys_show_only_their_cell() {
     assert_rule("proc_and_sys_show_only_their_cell");
-    suite().assert_in_order(&[
+    suite().0.assert_in_order(&[
         "/proc lists only A's process: ok",
         "cellaccess: global: /proc/loadavg: ",
         "ichor: cellaccess: proc_and_sys_show_only_their_cell passed",
@@ -87,7 +126,7 @@ fn proc_and_sys_show_only_their_cell() {
 #[test]
 fn shared_cache_pages_never_carry_writes_between_cells() {
     assert_rule("shared_cache_pages_never_carry_writes_between_cells");
-    suite().assert_in_order(&[
+    suite().0.assert_in_order(&[
         "B's mapping and file are unchanged after A's CPU store: ok",
         "FUTEX_WAKE at B's futex wakes nobody: ok",
         "the shared cache page B's root maps kept its bytes: ok",
@@ -97,9 +136,30 @@ fn shared_cache_pages_never_carry_writes_between_cells() {
     ]);
 }
 
+/// Section 5: A cannot bind B's address; cell to cell TCP is allowed
+/// (ADR-0010) and comes from A's address; loopback is per cell; B's Unix
+/// path and abstract names do not reach from A, and SCM_RIGHTS stays in
+/// A. At the uplink, B's port is refused until it is published for B (a
+/// port published for A never reaches B); then the host gets B's answer.
+#[test]
+fn networks_are_scoped_to_their_cell() {
+    assert_rule("networks_are_scoped_to_their_cell");
+    let (out, answers) = suite();
+    out.assert_in_order(&[
+        "bind(B's address) (EADDRNOTAVAIL): ok",
+        "connect(B's Unix path) (ENOENT): ok",
+        "B saw A's connection come from A's own address: ok",
+        "an unpublished uplink port refuses the host while B listens on it: ok",
+        "a port published for A delivers to A, never to B: ok",
+        "published for B, the host reaches B's listener: ok",
+        "ichor: cellaccess: networks_are_scoped_to_their_cell passed",
+    ]);
+    assert!(*answers >= 1, "the host never got B's answer");
+}
+
 #[test]
 fn cells_clean_up_after_themselves() {
-    let out = suite();
+    let out = &suite().0;
     out.assert_in_order(&[
         "ichor: cellaccess: every section passed; both cells exited and their memory returned",
     ]);

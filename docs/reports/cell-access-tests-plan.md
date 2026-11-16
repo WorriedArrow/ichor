@@ -74,7 +74,9 @@ Status: [ ] to do, [x] done and committed.
   MAP_PRIVATE store, copy-up, read() into a private mapping, EFAULT into
   PROT_READ, futex wake at B's offset wakes 0, private root not evicted
   and charged to its cell.
-- [ ] **5. networks_are_scoped_to_their_cell**: bind B's address
+- [x] **5. networks_are_scoped_to_their_cell** (28 checks; the uplink
+  part needs `cell_access_uplink` and the host client in
+  tests/cell_access.rs): bind B's address
   EADDRNOTAVAIL, cross-cell TCP allowed (ADR-0010) with A's source
   address, loopback per cell ECONNREFUSED, uplink refuses an unpublished
   port, Unix path ENOENT, abstract ECONNREFUSED, SO_PEERCRED,
@@ -112,3 +114,9 @@ Status: [ ] to do, [x] done and committed.
   cell. mounts and hostname are fixed strings.
 - Section 4 copies up `/usr/bin/dash` in A's root, so later A scripts
   must not run `/bin/sh` (perl's `system`).
+- Section 5: ADR-0010 has no cell-to-cell deny policy, so the denied case
+  is loopback (127.0.0.1 is per cell: ECONNREFUSED). A has no raw or
+  packet sockets (ESOCKTNOSUPPORT, EAFNOSUPPORT), so the switch's
+  anti-spoofing cannot be reached from the Linux ABI. B's reported peer
+  address shows the switch delivered A's real address. A may bind B's
+  abstract names in its own namespace (they are per cell).

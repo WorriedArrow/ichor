@@ -50,6 +50,7 @@ const S2_PROC: &str = include_str!("cellaccess/s2_proc.pl");
 const S4_PAGES: &str = include_str!("cellaccess/s4_pages.pl");
 const S4_FILL: &str = include_str!("cellaccess/s4_fill.pl");
 const S4_PRIVATE: &str = include_str!("cellaccess/s4_private.pl");
+const S5_NET: &str = include_str!("cellaccess/s5_net.pl");
 /// The file both cells map (B's helper reports it too); the checks use its
 /// page 1.
 const SHARED_FILE: &str = "/usr/bin/dash";
@@ -58,10 +59,18 @@ static ENABLED: AtomicBool = AtomicBool::new(false);
 /// Set once the harness has ended B's futex wait (section 4); until then
 /// B's futex child must still be waiting after every section.
 static FUTEX_RELEASED: AtomicBool = AtomicBool::new(false);
+static UPLINK: AtomicBool = AtomicBool::new(false);
 
 /// Asks for the suite to run (`cell_access` on the command line).
 pub(crate) fn enable() {
     ENABLED.store(true, Ordering::Relaxed);
+}
+
+/// `cell_access_uplink`: a host client is connecting to B's uplink port
+/// through a QEMU forward (tests/cell_access.rs), so section 5 checks the
+/// uplink too.
+pub(crate) fn enable_uplink() {
+    UPLINK.store(true, Ordering::Relaxed);
 }
 
 pub(crate) fn enabled() -> bool {
@@ -80,6 +89,7 @@ const SECTIONS: &[Section] = &[
     }),
     ("proc_and_sys_show_only_their_cell", |c| in_a(c, S2_PROC)),
     ("shared_cache_pages_never_carry_writes_between_cells", s4),
+    ("networks_are_scoped_to_their_cell", s5),
 ];
 
 /// One cell with its own root.
@@ -338,9 +348,12 @@ fn word<'a>(status: &'a str, key: &str) -> &'a str {
 /// makes on purpose), and its objects are as it made them.
 fn b_intact(ctx: &Ctx, after: &str) -> bool {
     let s = b_status(ctx);
+    // Only section 5's own connections: A's to B's address (from A's
+    // address) and the host's through the uplink once published for B.
+    let from_a = alloc::format!("tcp@{}", ctx.a.ip);
     let accepted_ok = word(&s, "accepted")
         .split(';')
-        .all(|a| a == "none" || a.starts_with("tcp from ") || a.starts_with("uplink from "));
+        .all(|a| a == "none" || a == from_a || a == "uplink@10.0.2.2");
     let ok = word(&s, "alive") == "1"
         && word(&s, "child") == "live"
         && word(&s, "signals") == "none"
@@ -576,6 +589,90 @@ fn opted_out(ctx: &Ctx) -> bool {
         "the opted-out cell's private pages were returned with its root",
         crate::pagecache::private_pages(ns) == 0 && cell.account().used() == 0,
         &alloc::format!("{} still charged", cell.account().used()),
+    );
+    ok
+}
+
+/// Waits up to `secs` for `cond`; true if it came true.
+fn wait_until(secs: u64, mut cond: impl FnMut() -> bool) -> bool {
+    let deadline = frame::time::now() + Duration::from_secs(secs);
+    loop {
+        if cond() {
+            return true;
+        }
+        if frame::time::now() > deadline {
+            return false;
+        }
+        frame::task::sleep_until(frame::time::now() + Duration::from_millis(100));
+    }
+}
+
+/// Section 5: networks. The perl part runs in A; then B reports where
+/// A's connection came from, and (with `cell_access_uplink`) the host's
+/// connections through the uplink reach B only once its port is published
+/// for B.
+fn s5(ctx: &Ctx) -> bool {
+    const RULE: &str = "networks_are_scoped_to_their_cell";
+    use crate::switch;
+    let mut ok = in_a(ctx, S5_NET);
+    let s = b_status(ctx);
+    let from_a = alloc::format!("tcp@{}", ctx.a.ip);
+    ok &= report(
+        RULE,
+        "B saw A's connection come from A's own address",
+        word(&s, "accepted").split(';').any(|a| a == from_a),
+        &alloc::format!("B accepted: {}", word(&s, "accepted")),
+    );
+    if !UPLINK.load(Ordering::Relaxed) {
+        println!("ichor: cellaccess: uplink checks skipped (no cell_access_uplink)");
+        return ok;
+    }
+    if !switch::has_uplink() {
+        return report(RULE, "the machine has an uplink", false, "none");
+    }
+    let port = B_UPLINK_PORT;
+    let uplinks = |s: &str| {
+        word(s, "accepted")
+            .split(';')
+            .filter(|a| a.starts_with("uplink@"))
+            .count()
+    };
+    // Nothing published: the host's connection requests are refused at
+    // the uplink, though B listens on that port.
+    let r0 = switch::uplink_stats().refused;
+    let refused = wait_until(120, || switch::uplink_stats().refused >= r0 + 3);
+    let n = uplinks(&b_status(ctx));
+    ok &= report(
+        RULE,
+        "an unpublished uplink port refuses the host while B listens on it",
+        refused && n == 0,
+        &alloc::format!("refused: {refused}; B accepted {n} uplink connections"),
+    );
+    // Published for A, where nothing listens: delivered to A, not to B.
+    if !switch::publish(net::wire::PROTO_TCP, port, ctx.a.cell.id(), port) {
+        return report(RULE, "publish the port for A", false, "refused");
+    }
+    let d0 = switch::uplink_stats().delivered;
+    let delivered = wait_until(120, || switch::uplink_stats().delivered >= d0 + 3);
+    let n = uplinks(&b_status(ctx));
+    switch::unpublish(net::wire::PROTO_TCP, port);
+    ok &= report(
+        RULE,
+        "a port published for A delivers to A, never to B",
+        delivered && n == 0,
+        &alloc::format!("delivered: {delivered}; B accepted {n} uplink connections"),
+    );
+    // Published for B: the host reaches B's listener.
+    if !switch::publish(net::wire::PROTO_TCP, port, ctx.b.cell.id(), port) {
+        return report(RULE, "publish the port for B", false, "refused");
+    }
+    let reached = wait_until(120, || uplinks(&b_status(ctx)) >= 1);
+    switch::unpublish(net::wire::PROTO_TCP, port);
+    ok &= report(
+        RULE,
+        "published for B, the host reaches B's listener",
+        reached,
+        "no uplink connection reached B in 120 s",
     );
     ok
 }

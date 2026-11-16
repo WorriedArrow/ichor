@@ -102,11 +102,15 @@ put("ids", join(" ",
 sub status {
     my @s = ("alive=1");
     push @s, "child=" . (kill(0, $child) ? "live" : "gone");
-    push @s, "futex=" . (slurp("/run/ichor/futex-result") // "waiting");
+    my $fx = slurp("/run/ichor/futex-result") // "waiting";
+    chomp $fx;
+    push @s, "futex=$fx";
     my $sig = slurp("/run/ichor/signals") // "";
+    chomp $sig;
     $sig =~ s/\n/;/g;
     push @s, "signals=" . ($sig eq "" ? "none" : $sig);
     my $acc = slurp("/run/ichor/accepted") // "";
+    chomp $acc;
     $acc =~ s/\n/;/g;
     push @s, "accepted=" . ($acc eq "" ? "none" : $acc);
     push @s, "hostname=" . (POSIX::uname())[1];
@@ -130,7 +134,7 @@ while (1) {
             next unless vec($rout, fileno($l), 1);
             my $peer = accept(my $c, $l) or next;
             my $from = $what =~ /^unix/ ? "unix" : inet_ntoa((unpack_sockaddr_in($peer))[1]);
-            record("accepted", "$what from $from");
+            record("accepted", "$what\@$from");
             syswrite($c, $what eq "uplink"
                 ? "HTTP/1.0 200 OK\r\nContent-Length: 18\r\n\r\nhello from cell B\n"
                 : "B $what\n");
