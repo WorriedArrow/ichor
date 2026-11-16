@@ -140,6 +140,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ichor-tls"
+version = "0.0.0"
+dependencies = [
+ "ichor-crypto",
+ "ichor-x509",
+]
+
+[[package]]
 name = "ichor-virtio-blk"
 version = "0.0.0"
 dependencies = [
@@ -174,6 +182,14 @@ dependencies = [
 [[package]]
 name = "ichor-vma"
 version = "0.0.0"
+
+[[package]]
+name = "ichor-x509"
+version = "0.0.0"
+dependencies = [
+ "ichor-civil",
+ "ichor-crypto",
+]
 
 [[package]]
 name = "xtask"

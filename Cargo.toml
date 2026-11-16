@@ -29,6 +29,7 @@ members = [
     "kernel/ichor",
     "services/crypto",
     "services/x509",
+    "services/tls",
     "tests",
     "xtask",
 ]
@@ -57,6 +58,7 @@ default-members = [
     "kernel/net",
     "services/crypto",
     "services/x509",
+    "services/tls",
     "tests",
     "xtask",
 ]
@@ -94,6 +96,7 @@ net = { package = "ichor-net", path = "kernel/net" }
 virtio-blk = { package = "ichor-virtio-blk", path = "kernel/drivers/virtio-blk" }
 nvme = { package = "ichor-nvme", path = "kernel/drivers/nvme" }
 crypto = { package = "ichor-crypto", path = "services/crypto" }
+x509 = { package = "ichor-x509", path = "services/x509" }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
