@@ -346,6 +346,63 @@ fn cmd_test(o: &Opts) -> Result<()> {
     run_cmd(&mut cmd)
 }
 
+/// `cargo xtask workloads SUITE [--tests "a b"] [--cmd "shell command"]
+/// [--accel A]`: a runtime's own test suite through the control plane
+/// (ADR-0013 §2); prints the pass rate.
+fn cmd_workloads(args: &[String]) -> Result<()> {
+    use xtask::workloads;
+    let mut it = args.iter();
+    let mut suite = None;
+    let (mut tests, mut cmd, mut accel) = (None, None, None);
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--tests" => tests = Some(it.next().ok_or("--tests needs a value")?.clone()),
+            "--cmd" => cmd = Some(it.next().ok_or("--cmd needs a value")?.clone()),
+            "--accel" => accel = Some(it.next().ok_or("--accel needs a value")?.clone()),
+            s if !s.starts_with('-') => {
+                suite = Some(
+                    workloads::SUITES
+                        .iter()
+                        .find(|x| x.name == s)
+                        .ok_or_else(|| format!("no suite {s:?}"))?,
+                );
+            }
+            other => return Err(format!("workloads: unknown option {other:?}")),
+        }
+    }
+    let suite = suite.ok_or("which suite? (python)")?;
+    let argv: Vec<String> = match &cmd {
+        Some(c) => vec!["/bin/sh".into(), "-c".into(), c.clone()],
+        None => {
+            let mut v: Vec<String> = suite.argv.iter().map(|s| s.to_string()).collect();
+            if let Some(t) = &tests {
+                v.extend(t.split_whitespace().map(str::to_string));
+            }
+            v
+        }
+    };
+    let kernel = build::kernel(Profile::Release)?;
+    let accel = match accel.as_deref() {
+        Some(a) => a.parse().map_err(|e| format!("--accel: {e}"))?,
+        None => Accel::Auto,
+    };
+    let (out, status) = workloads::run(suite, argv, kernel, |c| c.accel = accel)?;
+    print!("{out}");
+    println!("workloads: {} exited with status {status:#x}", suite.name);
+    if cmd.is_none() {
+        let s = workloads::parse_python(&out);
+        let total = s.passed.len() + s.failed.len();
+        println!(
+            "workloads: {}: {} of {total} test modules passed ({} skipped); failed: {}",
+            suite.name,
+            s.passed.len(),
+            s.skipped.len(),
+            s.failed.join(" ")
+        );
+    }
+    Ok(())
+}
+
 /// `cargo xtask fuzz [TARGET] [--iterations N] [--seed S]`: the fuzz
 /// targets, longer than CI's run, with overflow checks (the dev profile).
 fn cmd_fuzz(args: &[String]) -> Result<()> {
@@ -423,8 +480,12 @@ fn main() -> ExitCode {
     let (command, rest) = args
         .split_first()
         .map_or(("help", &[][..]), |(c, r)| (c.as_str(), r));
-    // `fuzz` takes its own arguments.
-    let rest_for_parse = if command == "fuzz" { &[][..] } else { rest };
+    // `fuzz` and `workloads` take their own arguments.
+    let rest_for_parse = if command == "fuzz" || command == "workloads" {
+        &[][..]
+    } else {
+        rest
+    };
     let result = parse(rest_for_parse).and_then(|o| match command {
         "build" => build::kernel(o.profile).map(|p| println!("{}", p.display())),
         "run" => cmd_run(&o),
@@ -437,6 +498,7 @@ fn main() -> ExitCode {
         "bench" => cmd_bench(&o),
         "x509-limbo" => xtask::limbo::run(),
         "fuzz" => cmd_fuzz(rest),
+        "workloads" => cmd_workloads(rest),
         "disk-image" => cmd_disk_image(&o, rest),
         "help" | "--help" | "-h" => {
             print!("{HELP}");

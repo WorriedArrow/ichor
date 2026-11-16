@@ -7,13 +7,14 @@
 //! 10.0.2.3), so this test needs it; the host reaches the API through a
 //! forwarded port published on the uplink.
 
-use std::io::{ErrorKind, Read, Write};
+use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
+use grpc::Client;
 use grpc::control::{self, RunEvent};
-use grpc::{Client, Response};
 use ichor_tests::Exit;
+use xtask::api::Session;
 
 /// Docker's `hello-world`, pinned by its index digest (the image the OCI
 /// crate's recorded pull is of).
@@ -25,121 +26,6 @@ const ALPINE: &str = "docker.io/library/alpine@sha256:1e42bbe2508154c9126d48c2b8
 
 /// The API token the pull-and-run boot gets on its boot volume.
 const API_TOKEN: &str = "test-token-3f9a1c2b7d4e";
-
-/// One API session: the socket and the gRPC client over it.
-struct Session {
-    sock: TcpStream,
-    client: Client,
-    /// Responses per call: messages so far, and the status once it ended.
-    pending: std::collections::HashMap<u32, Messages>,
-}
-
-type Messages = (Vec<Vec<u8>>, Option<(u32, String)>);
-
-impl Session {
-    /// Connects once the guest serves: QEMU accepts forwarded connections
-    /// at once and drops them until the guest listens, so a session counts
-    /// only once the server's HTTP/2 SETTINGS arrive.
-    fn connect(port: u16, token: Option<&str>, deadline: Instant) -> Result<Session, String> {
-        while Instant::now() < deadline {
-            if let Ok(mut sock) = TcpStream::connect(("127.0.0.1", port)) {
-                let mut client = match token {
-                    Some(t) => Client::with_token("ichor", t),
-                    None => Client::new("ichor"),
-                };
-                sock.set_read_timeout(Some(Duration::from_secs(10)))
-                    .unwrap();
-                if sock.write_all(&client.conn.take_output()).is_ok() {
-                    let mut buf = [0u8; 4096];
-                    if let Ok(n) = sock.read(&mut buf)
-                        && n > 0
-                        && client.receive(&buf[..n]).is_ok()
-                    {
-                        return Ok(Session {
-                            sock,
-                            client,
-                            pending: Default::default(),
-                        });
-                    }
-                }
-            }
-            std::thread::sleep(Duration::from_millis(500));
-        }
-        Err("the control plane never answered".into())
-    }
-
-    /// Makes a call; returns its messages and final status.
-    fn call(
-        &mut self,
-        path: &str,
-        msg: &[u8],
-        timeout: Duration,
-    ) -> Result<(Vec<Vec<u8>>, u32, String), String> {
-        let id = self.start(path, msg);
-        self.wait(id, timeout)
-    }
-
-    /// Starts a call without waiting for it (several can be in flight).
-    fn start(&mut self, path: &str, msg: &[u8]) -> u32 {
-        self.client.call(path, msg)
-    }
-
-    /// Waits for call `id` to end; returns its messages and final status.
-    /// Other calls' responses are kept for their own `wait`.
-    fn wait(&mut self, id: u32, timeout: Duration) -> Result<(Vec<Vec<u8>>, u32, String), String> {
-        let deadline = Instant::now() + timeout;
-        self.sock
-            .set_read_timeout(Some(Duration::from_secs(1)))
-            .unwrap();
-        let mut buf = vec![0u8; 64 * 1024];
-        loop {
-            if let Some((_, Some(_))) = self.pending.get(&id) {
-                let (messages, status) = self.pending.remove(&id).unwrap();
-                let (code, message) = status.unwrap();
-                // Flush acknowledgements before the next call.
-                let out = self.client.conn.take_output();
-                let _ = self.sock.write_all(&out);
-                return Ok((messages, code, message));
-            }
-            if Instant::now() >= deadline {
-                break;
-            }
-            let out = self.client.conn.take_output();
-            if !out.is_empty() {
-                self.sock
-                    .write_all(&out)
-                    .map_err(|e| format!("send: {e}"))?;
-            }
-            let n = match self.sock.read(&mut buf) {
-                Ok(0) => return Err("the server closed the connection".into()),
-                Ok(n) => n,
-                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
-                    continue;
-                }
-                Err(e) => return Err(format!("receive: {e}")),
-            };
-            for r in self
-                .client
-                .receive(&buf[..n])
-                .map_err(|e| format!("HTTP/2: {e:?}"))?
-            {
-                match r {
-                    Response::Message { stream, message } => {
-                        self.pending.entry(stream).or_default().0.push(message);
-                    }
-                    Response::Status {
-                        stream,
-                        code,
-                        message,
-                    } => {
-                        self.pending.entry(stream).or_default().1 = Some((code, message));
-                    }
-                }
-            }
-        }
-        Err(format!("call {id} timed out"))
-    }
-}
 
 /// Pulls `reference`, makes a cell of it and runs `argv` (empty: the
 /// image's command); returns the pull, the cell's address, the output and

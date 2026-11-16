@@ -9,6 +9,7 @@
 #![forbid(unsafe_code)]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // host tool
 
+pub mod api;
 pub mod artifact;
 pub mod audit;
 pub mod build;
@@ -22,6 +23,7 @@ pub mod linuxref;
 pub mod qemu;
 pub mod rootfs;
 pub mod sha256;
+pub mod workloads;
 
 use std::path::{Path, PathBuf};
 

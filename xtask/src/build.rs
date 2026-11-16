@@ -52,13 +52,17 @@ pub fn services(profile: Profile) -> Result<PathBuf> {
     cmd.args(["--target", SERVICES_TARGET])
         .arg("--target-dir")
         .arg(services_target_dir());
-    if profile == Profile::Release {
-        cmd.arg("--release");
-    }
+    // Release services use their own profile: whole-program LTO cannot mix
+    // the small code model they are built with and the kernel code model of
+    // the target's prebuilt `core`/`alloc`.
+    let dir = if profile == Profile::Release {
+        cmd.args(["--profile", "services-release"]);
+        "services-release"
+    } else {
+        profile.dir()
+    };
     run_cmd(&mut cmd)?;
-    Ok(services_target_dir()
-        .join(SERVICES_TARGET)
-        .join(profile.dir()))
+    Ok(services_target_dir().join(SERVICES_TARGET).join(dir))
 }
 
 /// Builds the kernel and returns the path to `ichor.efi`.
