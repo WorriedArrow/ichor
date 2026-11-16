@@ -12,7 +12,7 @@ use core::ffi::c_void;
 use core::ptr;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use super::{MemoryKind, MemoryRegion, Phase, ROOTS_MAX, take_boot_state};
+use super::{MemoryKind, MemoryRegion, Phase, ROOTS_MAX, TOKEN_MAX, take_boot_state};
 use crate::mm::{PAGE_SIZE, PhysAddr};
 use crate::power::{self, ExitStatus};
 use crate::{arch, println};
@@ -277,6 +277,8 @@ const fn ucs2<const N: usize>(s: &str) -> [u16; N] {
 const CMDLINE_PATH: [u16; 15] = ucs2("\\ichor\\cmdline");
 /// Where the control plane's CA bundle lives.
 const ROOTS_PATH: [u16; 17] = ucs2("\\ichor\\roots.pem");
+/// Where the control plane's API token lives.
+const TOKEN_PATH: [u16; 16] = ucs2("\\ichor\\apitoken");
 
 // ---------------------------------------------------------------------------
 // Firmware: boot services as a typestate. Holding a `Firmware` means boot
@@ -649,6 +651,16 @@ extern "efiapi" fn efi_main(image: Handle, system_table: *const SystemTable) -> 
     state.roots_len = match fw.read_boot_file(&ROOTS_PATH, &mut state.roots) {
         Ok(n) if n == ROOTS_MAX => {
             println!(r"ichor: frame: warning: \ichor\roots.pem is larger than {ROOTS_MAX} bytes");
+            0
+        }
+        Ok(n) => n,
+        Err(_) => 0,
+    };
+    state.token_len = match fw.read_boot_file(&TOKEN_PATH, &mut state.token) {
+        Ok(n) if n == TOKEN_MAX => {
+            println!(
+                r"ichor: frame: warning: \ichor\apitoken is larger than {TOKEN_MAX} bytes; ignored"
+            );
             0
         }
         Ok(n) => n,

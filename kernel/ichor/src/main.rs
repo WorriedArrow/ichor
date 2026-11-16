@@ -189,7 +189,7 @@ fn kmain(info: BootInfo) -> ! {
     // say otherwise; `control_exit` and `control_exit_after` end it (and
     // the machine with it), for tests.
     if let Some(options) = control::options(&cmdline) {
-        let code = control::run(info.roots(), &options);
+        let code = control::run(info.roots(), info.api_token(), &options);
         println!("ichor: control: exited with {code:?}");
         if code != Some(0) {
             shutdown(ExitStatus::Failure);

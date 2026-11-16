@@ -36,6 +36,8 @@ pub(crate) const MAX_REGIONS: usize = 1638;
 pub(crate) const CMDLINE_MAX: usize = 4096;
 /// Room for `\ichor\roots.pem` (Mozilla's bundle is about 200 KiB).
 pub(crate) const ROOTS_MAX: usize = 512 * 1024;
+/// Room for `\ichor\apitoken` (the control plane's API credential).
+pub(crate) const TOKEN_MAX: usize = 256;
 pub(crate) const VENDOR_MAX: usize = 64;
 
 /// What boot learns from firmware, kept in `.bss` and handed from the
@@ -49,6 +51,9 @@ pub(crate) struct BootState {
     /// `\ichor\roots.pem`, the control plane's CA bundle (ADR-0012 §4).
     pub(crate) roots: [u8; ROOTS_MAX],
     pub(crate) roots_len: usize,
+    /// `\ichor\apitoken`, the control plane's API credential.
+    pub(crate) token: [u8; TOKEN_MAX],
+    pub(crate) token_len: usize,
     pub(crate) vendor: [u8; VENDOR_MAX],
     pub(crate) vendor_len: usize,
     pub(crate) acpi_rsdp: Option<PhysAddr>,
@@ -87,6 +92,8 @@ static BOOT_STATE: BootStateCell = BootStateCell(UnsafeCell::new(BootState {
     cmdline_len: 0,
     roots: [0; ROOTS_MAX],
     roots_len: 0,
+    token: [0; TOKEN_MAX],
+    token_len: 0,
     vendor: [0; VENDOR_MAX],
     vendor_len: 0,
     acpi_rsdp: None,
@@ -259,6 +266,7 @@ pub(crate) extern "sysv64" fn kernel_space_entry() -> ! {
     enter_kernel(BootInfo {
         cmdline: state.cmdline(),
         roots: &state.roots[..state.roots_len],
+        api_token: Secret(&state.token[..state.token_len]),
         memory_map: state.regions(),
         acpi_rsdp: state.acpi_rsdp,
         firmware_vendor: core::str::from_utf8(&state.vendor[..state.vendor_len]).unwrap_or(""),
@@ -316,6 +324,7 @@ fn enter_kernel(info: BootInfo) -> ! {
 pub struct BootInfo {
     cmdline: &'static str,
     roots: &'static [u8],
+    api_token: Secret,
     memory_map: &'static [MemoryRegion],
     acpi_rsdp: Option<PhysAddr>,
     firmware_vendor: &'static str,
@@ -336,6 +345,23 @@ impl BootInfo {
         self.roots
     }
 
+    /// The contents of `\ichor\apitoken` on the boot volume (empty if
+    /// there is none): the control plane's API credential.
+    pub fn api_token(&self) -> &'static [u8] {
+        self.api_token.0
+    }
+}
+
+/// Bytes that `Debug` does not print.
+struct Secret(&'static [u8]);
+
+impl fmt::Debug for Secret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "<{} bytes, redacted>", self.0.len())
+    }
+}
+
+impl BootInfo {
     /// The firmware memory map, captured at the moment boot services exited.
     pub fn memory_map(&self) -> &'static [MemoryRegion] {
         self.memory_map

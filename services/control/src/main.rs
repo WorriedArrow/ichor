@@ -102,6 +102,9 @@ struct Control {
     cells: BTreeMap<String, CellEntry>,
     next_cell: u64,
     served: bool,
+    /// The API token every call must carry (empty: none configured, and
+    /// the API is then on loopback only).
+    token: Vec<u8>,
 }
 
 fn handle(arg: Option<&&str>) -> Option<Handle> {
@@ -156,8 +159,15 @@ fn main(args: &[&str]) -> i32 {
     };
     let port: u16 = opt("port").and_then(|p| p.parse().ok()).unwrap_or(50051);
     let resolver = opt("dns").and_then(parse_ip).unwrap_or([10, 0, 2, 3]);
-    let publish: Option<u16> = opt("publish").and_then(|p| p.parse().ok());
-    let listen = match opt("listen") {
+    // The API token (`\ichor\apitoken`; surrounding whitespace ignored).
+    let token: Vec<u8> = opt("token-blob")
+        .and_then(|h| u64::from_str_radix(h, 16).ok())
+        .map(Handle::from_raw)
+        .and_then(|b| rt::blob_read(&b).ok())
+        .map(|t| t.trim_ascii().to_vec())
+        .unwrap_or_default();
+    let mut publish: Option<u16> = opt("publish").and_then(|p| p.parse().ok());
+    let mut listen = match opt("listen") {
         Some(a) => match parse_ip(a) {
             Some(ip) => ip,
             None => {
@@ -169,6 +179,14 @@ fn main(args: &[&str]) -> i32 {
         None if publish.is_some() => [0, 0, 0, 0],
         None => [127, 0, 0, 1],
     };
+    // Reachable beyond this cell only with authentication.
+    if token.is_empty() && (publish.is_some() || listen[0] != 127) {
+        rt::log(
+            "control: no API token (\\ichor\\apitoken): serving on loopback only, not published",
+        );
+        listen = [127, 0, 0, 1];
+        publish = None;
+    }
     let exit_on_close = args.contains(&"exit-on-close");
     let exit_after: Option<u64> = opt("exit-after").and_then(|s| s.parse().ok());
     let started = rt::monotonic();
@@ -234,6 +252,7 @@ fn main(args: &[&str]) -> i32 {
         cells: BTreeMap::new(),
         next_cell: 1,
         served: false,
+        token,
     };
     loop {
         c.wait();
@@ -360,6 +379,17 @@ impl Control {
 
     fn dispatch(&mut self, conn: usize, call: Call) {
         let stream = call.stream;
+        // With a token configured, every call must carry it.
+        if !self.token.is_empty()
+            && !grpc::bearer_matches(call.authorization.as_deref(), &self.token)
+        {
+            return self.fail(
+                conn,
+                stream,
+                status::UNAUTHENTICATED,
+                "missing or wrong API token",
+            );
+        }
         match call.path.as_str() {
             control::PULL_IMAGE => {
                 let Ok(req) = control::PullImageRequest::decode(&call.message) else {

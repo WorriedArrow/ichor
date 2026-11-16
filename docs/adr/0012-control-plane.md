@@ -169,3 +169,25 @@ above:
   before boot services exit.
 - The acceptance test pulls `hello-world` and Alpine 3.20.3 by digest
   from Docker Hub (so it needs the internet) and runs a command in each.
+
+## Amendment (2026-11-16): exposure and authentication
+
+§4's "no authentication in milestone 6" is narrowed before any cloud
+boot:
+
+- The API listens on the system cell's loopback by default; other cells
+  and the uplink cannot reach it. `control_listen=` and
+  `control_publish=` expose it explicitly.
+- **Bearer token.** The operator puts a token in `\ichor\apitoken` on the
+  boot volume (`cargo xtask disk-image --api-token-file F`). Frame reads
+  it with the command line (never logged), and the kernel hands it to the
+  service as a read-only Blob. When a token is configured, every call
+  must carry `authorization: Bearer <token>`, compared in constant time;
+  anything else gets `UNAUTHENTICATED`. Without a token the service
+  refuses to listen beyond loopback or to publish, whatever the command
+  line asks.
+- **Still owed before Ichor runs anywhere reachable from the internet:**
+  TLS for the API. The token travels in the clear over h2c, so today it
+  protects only on a network the operator controls (a private subnet or
+  an SSH tunnel). TLS needs a server side in `services/tls` and signing
+  in `services/crypto`.

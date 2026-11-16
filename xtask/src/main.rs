@@ -30,7 +30,8 @@ Commands:
   disk-image   Write target/ichor-disk.img: a bootable GPT disk (FAT32 ESP with
                ichor.efi, Ichor root partition), for cloud import or bare metal;
                the kernel command line is --cmdline (default: empty);
-               --size-gib N pads it; --gcp also writes target/ichor-gcp.tar.gz
+               --size-gib N pads it; --gcp also writes target/ichor-gcp.tar.gz;
+               --api-token-file F puts the control plane's API token on it
   help         Show this message
 
 Options:
@@ -69,6 +70,8 @@ struct Opts {
     size_gib: Option<u64>,
     /// `disk-image`: also write the GCP import archive.
     gcp: bool,
+    /// `disk-image`: the control plane's API token, from this file.
+    api_token_file: Option<std::path::PathBuf>,
     /// `run`: boot this whole-disk image from NVMe instead.
     disk: Option<std::path::PathBuf>,
     extra: Vec<String>,
@@ -87,6 +90,7 @@ fn parse(args: &[String]) -> Result<Opts> {
         name: None,
         size_gib: None,
         gcp: false,
+        api_token_file: None,
         disk: None,
         extra: Vec::new(),
     };
@@ -124,6 +128,7 @@ fn parse(args: &[String]) -> Result<Opts> {
                 )
             }
             "--gcp" => o.gcp = true,
+            "--api-token-file" => o.api_token_file = Some(value("--api-token-file")?.into()),
             "--disk" => o.disk = Some(value("--disk")?.into()),
             "--" => {
                 o.extra.extend(it.by_ref().cloned());
@@ -246,7 +251,11 @@ fn cmd_disk_image(o: &Opts, args: &[String]) -> Result<()> {
     let kernel = build::kernel(o.profile)?;
     // GCP requires a whole number of GiB; cloud volumes are sized in GiB.
     let gib = o.size_gib.unwrap_or(if o.gcp { 1 } else { 0 });
-    let img = xtask::disk::image_sized(&kernel, &cmdline, gib << 30)?;
+    let token = match &o.api_token_file {
+        Some(p) => Some(std::fs::read(p).map_err(|e| format!("reading {}: {e}", p.display()))?),
+        None => None,
+    };
+    let img = xtask::disk::image_sized(&kernel, &cmdline, gib << 30, token.as_deref())?;
     if o.gcp && !img.len().is_multiple_of(1 << 30) {
         return Err(format!(
             "the disk is {} MiB, more than --size-gib {gib}; give a larger size",

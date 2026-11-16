@@ -38,6 +38,25 @@ pub mod status {
     pub const UNIMPLEMENTED: u32 = 12;
     pub const INTERNAL: u32 = 13;
     pub const UNAVAILABLE: u32 = 14;
+    pub const UNAUTHENTICATED: u32 = 16;
+}
+
+/// Whether `authorization` is `Bearer <token>`, compared in constant time
+/// (for a given token length), so timing does not reveal how much of a
+/// guess was right. An empty token matches nothing.
+pub fn bearer_matches(authorization: Option<&str>, token: &[u8]) -> bool {
+    let Some(given) = authorization.and_then(|a| a.strip_prefix("Bearer ")) else {
+        return false;
+    };
+    let given = given.as_bytes();
+    if token.is_empty() || given.len() != token.len() {
+        return false;
+    }
+    given
+        .iter()
+        .zip(token)
+        .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+        == 0
 }
 
 /// A message with gRPC's length prefix.
@@ -132,12 +151,15 @@ pub struct Call {
     pub stream: u32,
     /// `/package.Service/Method`.
     pub path: String,
+    /// The `authorization` metadata, if the client sent it.
+    pub authorization: Option<String>,
     pub message: Vec<u8>,
 }
 
 #[derive(Debug, Default)]
 struct Incoming {
     path: String,
+    authorization: Option<String>,
     body: Deframer,
     message: Option<Vec<u8>>,
     answered: bool,
@@ -183,10 +205,12 @@ impl Server {
                         continue;
                     }
                     let path = header(&fields, ":path").unwrap_or("").into();
+                    let authorization = header(&fields, "authorization").map(String::from);
                     self.calls.insert(
                         stream,
                         Incoming {
                             path,
+                            authorization,
                             ..Incoming::default()
                         },
                     );
@@ -236,6 +260,7 @@ impl Server {
             Some(message) if c.body.is_empty() => done.push(Call {
                 stream,
                 path: core::mem::take(&mut c.path),
+                authorization: c.authorization.take(),
                 message,
             }),
             _ => self.fail(
@@ -323,6 +348,8 @@ pub enum Response {
 pub struct Client {
     pub conn: Connection,
     authority: String,
+    /// Sent as `authorization: Bearer <token>` with every call.
+    token: Option<String>,
     bodies: BTreeMap<u32, Deframer>,
 }
 
@@ -331,25 +358,33 @@ impl Client {
         Client {
             conn: Connection::client(),
             authority: authority.into(),
+            token: None,
             bodies: BTreeMap::new(),
         }
+    }
+
+    /// A client that authenticates every call with `token`.
+    pub fn with_token(authority: &str, token: &str) -> Client {
+        let mut c = Client::new(authority);
+        c.token = Some(format!("Bearer {token}"));
+        c
     }
 
     /// Starts a call of `path` with one request message.
     pub fn call(&mut self, path: &str, message: &[u8]) -> u32 {
         let id = self.conn.open();
-        self.conn.send_headers(
-            id,
-            &[
-                (":method", "POST"),
-                (":scheme", "http"),
-                (":path", path),
-                (":authority", &self.authority),
-                ("content-type", "application/grpc"),
-                ("te", "trailers"),
-            ],
-            false,
-        );
+        let mut fields: Vec<(&str, &str)> = alloc::vec![
+            (":method", "POST"),
+            (":scheme", "http"),
+            (":path", path),
+            (":authority", &self.authority),
+            ("content-type", "application/grpc"),
+            ("te", "trailers"),
+        ];
+        if let Some(t) = &self.token {
+            fields.push(("authorization", t));
+        }
+        self.conn.send_headers(id, &fields, false);
         self.conn.send_data(id, &frame(message), true);
         self.bodies.insert(id, Deframer::default());
         id
@@ -465,6 +500,27 @@ mod tests {
                 message: "no such cell: 50% gone".into()
             }
         );
+    }
+
+    #[test]
+    fn tokens_travel_and_are_checked() {
+        let (mut c, mut s) = (Client::with_token("ichor", "s3cret"), Server::new());
+        c.call("/x/y", b"m");
+        let mut anon = Client::new("ichor");
+        anon.call("/x/y", b"m");
+        let (calls, _) = pump(&mut c, &mut s);
+        assert_eq!(calls[0].authorization.as_deref(), Some("Bearer s3cret"));
+        assert!(bearer_matches(calls[0].authorization.as_deref(), b"s3cret"));
+        assert!(!bearer_matches(
+            calls[0].authorization.as_deref(),
+            b"s3crex"
+        ));
+        assert!(!bearer_matches(calls[0].authorization.as_deref(), b"s3cre"));
+        assert!(!bearer_matches(None, b"s3cret"));
+        assert!(!bearer_matches(Some("Bearer "), b""));
+        let mut s2 = Server::new();
+        let (calls, _) = pump(&mut anon, &mut s2);
+        assert_eq!(calls[0].authorization, None);
     }
 
     #[test]

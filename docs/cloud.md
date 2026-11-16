@@ -34,8 +34,10 @@ This writes `target/ichor-disk.img` (raw, 1 GiB, for AWS) and
 kernel command line is empty unless `--cmdline` is given; useful options:
 `trace_errors` (log failing syscalls), `control=50051` (run the control
 plane; its gRPC API stays local to the system cell unless
-`control_publish=PORT` publishes it on the uplink, which must wait for
-the API's authentication: no cloud boot publishes it before then) and
+`control_publish=PORT` publishes it on the uplink, which also needs a
+token: `--api-token-file F` puts one on the disk, and clients send
+`authorization: Bearer <token>`; the API is not yet TLS, so publish it
+only on a private network or through an SSH tunnel) and
 `dns=A.B.C.D` (its resolver; the cloud's, e.g. `169.254.169.253` on
 AWS). The disk's ESP carries the pinned CA bundle as
 `\ichor\roots.pem`.

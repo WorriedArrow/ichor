@@ -23,6 +23,9 @@ const IMAGE: &str = "docker.io/library/hello-world@sha256:cf1b20a0c89a666b6950fe
 /// digest: ADR-0012's acceptance image.
 const ALPINE: &str = "docker.io/library/alpine@sha256:1e42bbe2508154c9126d48c2b8a75420c3544343bf86fd041fb7527e017a4b4a";
 
+/// The API token the pull-and-run boot gets on its boot volume.
+const API_TOKEN: &str = "test-token-3f9a1c2b7d4e";
+
 /// One API session: the socket and the gRPC client over it.
 struct Session {
     sock: TcpStream,
@@ -33,10 +36,13 @@ impl Session {
     /// Connects once the guest serves: QEMU accepts forwarded connections
     /// at once and drops them until the guest listens, so a session counts
     /// only once the server's HTTP/2 SETTINGS arrive.
-    fn connect(port: u16, deadline: Instant) -> Result<Session, String> {
+    fn connect(port: u16, token: Option<&str>, deadline: Instant) -> Result<Session, String> {
         while Instant::now() < deadline {
             if let Ok(mut sock) = TcpStream::connect(("127.0.0.1", port)) {
-                let mut client = Client::new("ichor");
+                let mut client = match token {
+                    Some(t) => Client::with_token("ichor", t),
+                    None => Client::new("ichor"),
+                };
                 sock.set_read_timeout(Some(Duration::from_secs(10)))
                     .unwrap();
                 if sock.write_all(&client.conn.take_output()).is_ok() {
@@ -205,7 +211,29 @@ fn serve(body: Vec<u8>) -> u16 {
 /// The whole flow, from the host: hello-world, then Alpine with an extra
 /// layer (and, first, the same layer with a wrong digest, refused).
 fn session(port: u16, layer_port: u16) -> Result<(Ran, Ran), String> {
-    let mut s = Session::connect(port, Instant::now() + Duration::from_secs(600))?;
+    // Without the token, or with a wrong one, every call is refused. (The
+    // sessions stay open until the real one is: `control_exit` ends the
+    // service when no client is left.)
+    let mut refused = Vec::new();
+    for token in [None, Some("not-the-token")] {
+        let mut s = Session::connect(port, token, Instant::now() + Duration::from_secs(600))?;
+        let req = control::PullImageRequest {
+            reference: IMAGE.into(),
+            layers: vec![],
+        };
+        let (_, code, _) = s.call(control::PULL_IMAGE, &req.encode(), Duration::from_secs(60))?;
+        if code != grpc::status::UNAUTHENTICATED {
+            return Err(format!("a call with token {token:?} gave status {code}"));
+        }
+        refused.push(s);
+    }
+    eprintln!("host: unauthenticated calls refused");
+    let mut s = Session::connect(
+        port,
+        Some(API_TOKEN),
+        Instant::now() + Duration::from_secs(60),
+    )?;
+    drop(refused);
     eprintln!("host: connected to the control plane");
 
     // An unknown method and a bad reference are errors, not hangs.
@@ -292,9 +320,11 @@ fn the_control_api_is_local_unless_configured() {
         }
         (tries, answers)
     });
+    // Publishing is asked for, but there is no API token on the boot volume:
+    // the API stays on loopback.
     let out = ichor_tests::boot_with(
         "control-local",
-        "control=50051 control_exit_after=30",
+        "control=50051 control_publish=50051 control_exit_after=30",
         2,
         |c| {
             c.net_user_opts = format!("hostfwd=tcp:127.0.0.1:{host_port}-:50051");
@@ -305,6 +335,9 @@ fn the_control_api_is_local_unless_configured() {
     let (tries, answers) = prober.join().unwrap();
     out.assert_exit(Exit::Success);
     out.assert_in_order(&[
+        "ichor: control: starting (",
+        "no API token)",
+        "control: no API token (\\ichor\\apitoken): serving on loopback only, not published",
         "control: serving ichor.v1.Control on 127.0.0.1:50051 (",
         "not published)",
         "control: not reachable at 10.88.",
@@ -330,6 +363,7 @@ fn the_control_plane_pulls_and_runs_an_image_from_docker_hub() {
     let out = ichor_tests::boot_with("control", cmdline, 2, |c| {
         c.net_user_opts = format!("hostfwd=tcp:127.0.0.1:{host_port}-:50051");
         c.timeout = Some(Duration::from_secs(900));
+        c.api_token = Some(API_TOKEN.into());
     });
     let result = client.join().unwrap();
     out.assert_exit(Exit::Success);

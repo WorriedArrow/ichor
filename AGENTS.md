@@ -588,7 +588,7 @@ comment.
 | `net_publish=N` | publish uplink port N to a Debian cell's port 80 and serve one HTTP request from the host (QEMU forwards a host port to N) |
 | `control=PORT` | after the self-tests, run the control plane serving gRPC on PORT, on the system cell's loopback only (the API has no authentication yet) |
 | `control_listen=ADDR` | the address the API listens on (`0.0.0.0`: all of the system cell's, reachable from other cells) |
-| `control_publish=PORT` | publish the API on uplink port PORT (without `control_listen`, listens on all addresses) |
+| `control_publish=PORT` | publish the API on uplink port PORT (without `control_listen`, listens on all addresses); needs an API token in `\ichor\apitoken` (`RunConfig::api_token`, `disk-image --api-token-file`), else the API stays on loopback |
 | `control_exit` | with `control`: stop when the first API client hangs up, then shut down (tests) |
 | `control_exit_after=SECONDS` | with `control`: stop after that long once no client is connected (tests) |
 | `dns=A.B.C.D` | the control plane's DNS resolver (default `10.0.2.3`, QEMU's) |

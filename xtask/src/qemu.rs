@@ -7,6 +7,7 @@
 //! esp/EFI/BOOT/BOOTX64.EFI   the kernel
 //! esp/ichor/cmdline          the kernel command line
 //! esp/ichor/roots.pem        the control plane's CA bundle (Mozilla's, pinned)
+//! esp/ichor/apitoken         the control plane's API token (when configured)
 //! root.img                   the root image, attached as virtio-blk and NVMe disks
 //! ```
 //!
@@ -228,6 +229,8 @@ pub struct RunConfig {
     /// Extra options for the user-mode network backend (for example
     /// `hostfwd=tcp:127.0.0.1:8080-:80`).
     pub net_user_opts: String,
+    /// The control plane's API token, written to `\ichor\apitoken`.
+    pub api_token: Option<String>,
 }
 
 impl RunConfig {
@@ -285,6 +288,7 @@ impl RunConfig {
             machine_props: String::new(),
             smp_topology: String::new(),
             net_user_opts: String::new(),
+            api_token: None,
         }
     }
 }
@@ -364,6 +368,9 @@ fn prepare_run_dir(cfg: &RunConfig, fw: &Firmware) -> Result<PathBuf> {
         crate::artifact::MOZILLA_ROOTS.bytes()?,
     )
     .map_err(|e| format!("writing roots.pem: {e}"))?;
+    if let Some(t) = &cfg.api_token {
+        fs::write(cfg_dir.join("apitoken"), t).map_err(|e| format!("writing apitoken: {e}"))?;
+    }
     fs::write(dir.join("root.img"), root_image()?)
         .map_err(|e| format!("writing root image: {e}"))?;
     fs::write(dir.join("alpine.img"), alpine_image()?)
