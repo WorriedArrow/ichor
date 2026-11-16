@@ -469,6 +469,9 @@ pub(crate) fn wait(
 /// its exit. Returns the wait status and how many syscalls it made.
 pub(crate) fn run(mut p: LinuxProcess, mut ctx: UserContext) -> (u32, u32) {
     p.mm().space().bind_to_current_task();
+    // Separates this cell's user code from other cells' on each CPU
+    // (ADR-0004 §2).
+    frame::task::set_current_domain(p.cell.id());
     *p.entry.task.lock() = Some(frame::task::current());
     signal::sync(&p);
     let mut syscalls = 0u32;

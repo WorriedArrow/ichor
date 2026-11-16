@@ -99,6 +99,12 @@ pub(crate) struct CpuBlock {
     /// 80: address of this CPU's TSS RSP0 field; the user-entry stub writes
     /// the kernel stack a ring-3 trap should land on here.
     pub(crate) rsp0_ptr: AtomicU64,
+    /// 88: the security domain (cell) of the task running here, set on
+    /// every switch (ADR-0004 §2).
+    pub(crate) task_domain: AtomicU64,
+    /// 96: the domain whose user code last ran on this CPU (IBPB when the
+    /// next one differs).
+    pub(crate) user_domain: AtomicU64,
 }
 
 impl CpuBlock {
@@ -115,6 +121,8 @@ impl CpuBlock {
             event_info: AtomicU64::new(0),
             event_cr2: AtomicU64::new(0),
             rsp0_ptr: AtomicU64::new(0),
+            task_domain: AtomicU64::new(0),
+            user_domain: AtomicU64::new(0),
         }
     }
 }

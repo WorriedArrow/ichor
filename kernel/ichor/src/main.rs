@@ -164,6 +164,13 @@ fn kmain(info: BootInfo) -> ! {
         }
     }
 
+    // ADR-0004: how often user code of one cell followed another's on a
+    // CPU that needs a predictor barrier between them.
+    println!(
+        "ichor: mitigations: {} IBPBs between cells' user code",
+        frame::user::ibpb_count()
+    );
+
     // Nothing may need more contiguous memory than MAX_ORDER (4 MiB).
     let largest = frame::mm::stats().largest_request_order;
     println!(

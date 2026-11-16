@@ -101,6 +101,38 @@ kernel address-space layout randomization, which Ichor does not implement
 yet anyway. Fix: switch to a `swapgs`-based entry with the NMI window
 handled once ring 3 needs GS-based TLS or KASLR lands. Tracked here.
 
+## Amendment (2026-11-16): VERW and IBPB implemented; page-table isolation next
+
+What §2 owed since multi-cell scheduling landed (milestone 4), as built:
+
+- **VERW** (MDS, TAA): `ichor_enter_user`, the single path into ring 3,
+  executes `verw` on the kernel data selector after loading every user
+  register and immediately before `iretq`, when the boot CPU reports MDS
+  or TAA and has MD_CLEAR microcode. A CPU that needs it but lacks
+  MD_CLEAR is logged as `MISSING`: VERW would not clear its buffers, and
+  the node is not safe for untrusted cells until the microcode is
+  updated. The `force_verw` command-line option turns it on everywhere
+  (tests: the instruction runs on any CPU), and one boot test runs the
+  whole boot that way.
+- **IBPB between cells**: every task carries a security domain, the
+  kernel's cell id (`frame::task::set_current_domain`, set by the Linux
+  and native personalities when a task starts running a cell's user
+  code). The context switch copies it into the per-CPU block, and
+  `UserMode::execute` issues IBPB (`IA32_PRED_CMD`) when this CPU last
+  ran user code of a different domain. It is on wherever CPUID
+  enumerates IBPB; switches within a cell, and kernel-only tasks, cost
+  nothing. The boot reports how many barriers were issued.
+- **Boot log**: `ichor: frame: mitigations (ADR-0004): VERW ..., IBPB
+  ..., page-table isolation ...`, each `on`, `off (not needed)` or
+  `MISSING`.
+- **Page-table isolation** (Meltdown-affected Intel CPUs, Skylake-SP
+  among them, so common cloud instance types) is not built yet; the boot
+  logs it as `MISSING` on such CPUs. It is the next frame change (a user
+  root per address space mapping only the entry trampolines and per-CPU
+  entry state, CR3 switched on entry and exit, PCID so the switch does
+  not flush the TLB), and it raises frame's budget step within ADR-0007's
+  ceiling.
+
 ## Consequences
 
 - Nodes on modern cloud CPUs (Ice Lake and later, EPYC Milan and later)

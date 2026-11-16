@@ -17,12 +17,63 @@
 //! loads the kernel's, and [`UserContext`] only exposes a safe RFLAGS subset.
 
 use core::arch::global_asm;
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64};
 
 use super::regs::{self, rdmsr, wrmsr};
 use super::trap::{self, KERNEL_CS};
 use crate::cpu;
 
 const USER_CS: u16 = 0x23; // GDT 0x20 (user code) | RPL 3
+
+/// `IA32_PRED_CMD`: writing bit 0 is an indirect branch prediction barrier.
+const MSR_PRED_CMD: u32 = 0x49;
+
+/// Side-channel mitigations on the way to ring 3 (ADR-0004 §2), chosen at
+/// boot from the CPU's enumerated vulnerabilities.
+/// VERW before `iretq` (MDS/TAA, with MD_CLEAR microcode); tested by the
+/// entry stub, so a byte.
+static VERW_ON: AtomicU8 = AtomicU8::new(0);
+/// IBPB when this CPU starts running user code of another domain (cell).
+static IBPB_ON: AtomicBool = AtomicBool::new(false);
+/// IBPBs issued (all CPUs).
+static IBPBS: AtomicU64 = AtomicU64::new(0);
+/// VERW's operand: a valid, writable data segment selector.
+static VERW_SELECTOR: u16 = trap::KERNEL_SS;
+
+/// What the boot CPU's vulnerabilities call for, switched on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Mitigations {
+    /// VERW on every return to ring 3.
+    pub verw: bool,
+    /// MDS or TAA applies but the microcode lacks MD_CLEAR: VERW would not
+    /// clear the buffers, so cells are not separated (an operator must
+    /// update microcode).
+    pub verw_missing: bool,
+    /// IBPB between user code of different cells.
+    pub ibpb: bool,
+}
+
+/// Switches on the mitigations `v` calls for (once, on the boot CPU,
+/// before any user code runs; all CPUs are assumed alike). `force_verw`
+/// turns VERW on regardless (tests: the instruction runs on any CPU, it
+/// only clears buffers with MD_CLEAR microcode).
+pub(crate) fn enable_mitigations(v: &super::cpu::Vulnerabilities, force_verw: bool) -> Mitigations {
+    use core::sync::atomic::Ordering::Relaxed;
+    let needs_verw = v.mds || v.taa;
+    let verw = (needs_verw && v.md_clear) || force_verw;
+    VERW_ON.store(u8::from(verw), Relaxed);
+    IBPB_ON.store(v.ibpb, Relaxed);
+    Mitigations {
+        verw,
+        verw_missing: needs_verw && !v.md_clear,
+        ibpb: v.ibpb,
+    }
+}
+
+/// How many IBPBs cross-cell switches have issued since boot.
+pub fn ibpb_count() -> u64 {
+    IBPBS.load(core::sync::atomic::Ordering::Relaxed)
+}
 
 const MSR_STAR: u32 = 0xC000_0081;
 const MSR_LSTAR: u32 = 0xC000_0082;
@@ -191,6 +242,18 @@ impl<'a> UserMode<'a> {
         // SAFETY: FS base holds a user TLS pointer; it never affects kernel
         // memory safety.
         unsafe { wrmsr(regs::MSR_FS_BASE, self.ctx.fs_base) };
+        // A predictor barrier when this CPU last ran another cell's user
+        // code (ADR-0004 §2), so its training cannot steer this one's.
+        if IBPB_ON.load(Relaxed) {
+            let domain = block.task_domain.load(Relaxed);
+            if block.user_domain.swap(domain, Relaxed) != domain {
+                // SAFETY: IA32_PRED_CMD exists: IBPB_ON is set only when
+                // CPUID enumerates IBRS/IBPB. Writing bit 0 issues the
+                // barrier and has no other effect.
+                unsafe { wrmsr(MSR_PRED_CMD, 1) };
+                IBPBS.fetch_add(1, Relaxed);
+            }
+        }
         // Interrupts stay off from here until the save below, and the kernel
         // never uses the FPU, so the registers hold only this thread's state.
         self.ctx.fpu.restore();
@@ -335,6 +398,12 @@ global_asm!(
     "mov r14, [rdi + UC_R14]",
     "mov r15, [rdi + UC_R15]",
     "mov rdi, [rdi + UC_RDI]",
+    // MDS/TAA: clear the CPU buffers last, with every user register loaded
+    // (VERW changes only ZF, and iretq reloads RFLAGS).
+    "test byte ptr [rip + {verw_on}], 1",
+    "jz 2f",
+    "verw word ptr [rip + {verw_sel}]",
+    "2:",
     "iretq",
     // The syscall/exception stubs jump here to return to the kernel caller.
     "ichor_user_resume:",
@@ -372,4 +441,6 @@ global_asm!(
     "mov [rdi + UC_RDI], rax",
     "mov qword ptr gs:[GS_EVENT], 1", // Syscall
     "jmp ichor_user_resume",
+    verw_on = sym VERW_ON,
+    verw_sel = sym VERW_SELECTOR,
 );

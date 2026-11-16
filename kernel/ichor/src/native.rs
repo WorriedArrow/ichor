@@ -623,6 +623,7 @@ pub(crate) fn run(cell: &Arc<Cell>, elf: &[u8], argv: &[&str]) -> Option<u64> {
             }
         };
     mm.space().bind_to_current_task();
+    frame::task::set_current_domain(cell.id());
     let mut ctx = UserContext::new(loaded.entry, loaded.stack_pointer);
     let code = loop {
         match UserMode::new(&mut ctx).execute() {

@@ -70,6 +70,9 @@ pub struct Task {
     data: Box<dyn Any + Send + Sync>,
     /// Page table root to run with (0: the kernel's).
     vm_root: AtomicU64,
+    /// Security domain (the kernel's cell id; 0: none), for cross-domain
+    /// predictor barriers (ADR-0004 §2).
+    domain: AtomicU64,
 }
 
 impl Task {
@@ -300,6 +303,7 @@ impl TaskOptions {
             entry: SpinLock::new(Some(self.entry)),
             data: self.data,
             vm_root: AtomicU64::new(0),
+            domain: AtomicU64::new(0),
         }))
     }
 
@@ -337,6 +341,7 @@ fn adopt(is_idle: bool) -> Arc<Task> {
         entry: SpinLock::new(None),
         data: Box::new(()),
         vm_root: AtomicU64::new(0),
+        domain: AtomicU64::new(0),
     })
 }
 
@@ -344,6 +349,19 @@ fn adopt(is_idle: bool) -> Arc<Task> {
 /// the scheduler re-activates it on every resume, and activates it now.
 pub fn set_current_vm_root(root: u64) {
     current().set_vm_root(root);
+}
+
+/// Sets the current task's security domain: tasks running user code of
+/// different domains (cells) on one CPU are separated by a predictor
+/// barrier where the CPU needs one (ADR-0004 §2).
+pub fn set_current_domain(domain: u64) {
+    let task = current();
+    // Not preempted between the two stores: the block is this CPU's.
+    let _g = IrqGuard::new();
+    task.domain.store(domain, Ordering::Relaxed);
+    crate::cpu::this_block()
+        .task_domain
+        .store(domain, Ordering::Relaxed);
 }
 
 /// The task running on this CPU. The first call on a CPU adopts whatever is
@@ -542,6 +560,7 @@ fn schedule_inner(why: Enqueue, from_idle: bool) {
     };
     let next_rsp = next.saved_rsp.load(Ordering::SeqCst);
     let next_root = next.vm_root();
+    let next_domain = next.domain.load(Ordering::Relaxed);
     let next_is_idle = next.is_idle;
     let requeue = (runnable && !cur.is_idle).then_some(why);
     {
@@ -551,6 +570,9 @@ fn schedule_inner(why: Enqueue, from_idle: bool) {
         *s.current.lock() = Some(next);
     }
     arch::activate_root(next_root);
+    crate::cpu::this_block()
+        .task_domain
+        .store(next_domain, Ordering::Relaxed);
     if !next_is_idle {
         crate::time::arm_slice(sched.timeslice());
     }

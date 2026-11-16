@@ -233,6 +233,29 @@ pub(crate) extern "sysv64" fn kernel_space_entry() -> ! {
             ""
         },
     );
+    let force_verw = cmdline::Cmdline::new(state.cmdline()).flag("force_verw");
+    let m = arch::usermode::enable_mitigations(&v, force_verw);
+    let on = |b: bool| if b { "on" } else { "off (not needed)" };
+    println!(
+        "ichor: frame: mitigations (ADR-0004): VERW on return to ring 3 {}, IBPB between cells {}, page-table isolation {}",
+        if m.verw_missing {
+            "MISSING (no MD_CLEAR microcode)"
+        } else if force_verw && !(v.mds || v.taa) {
+            "on (forced)"
+        } else {
+            on(m.verw)
+        },
+        if m.ibpb {
+            "on"
+        } else {
+            "off (IBPB not enumerated)"
+        },
+        if v.meltdown {
+            "MISSING (Meltdown-affected CPU)"
+        } else {
+            "off (not needed)"
+        },
+    );
     enter_kernel(BootInfo {
         cmdline: state.cmdline(),
         roots: &state.roots[..state.roots_len],

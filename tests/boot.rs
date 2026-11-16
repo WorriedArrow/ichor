@@ -41,9 +41,16 @@ const BOOT_MARKERS: &[&str] = &[
 
 #[test]
 fn m1_boots_on_four_cpus() {
-    let out = boot("m1-smp4", "memmap", 4);
+    // VERW on every return to ring 3, forced (ADR-0004): everything below
+    // runs through that path too.
+    let out = boot("m1-smp4", "memmap force_verw", 4);
     out.assert_exit(Exit::Success);
     out.assert_in_order(BOOT_MARKERS);
+    out.assert_in_order(&[
+        "ichor: frame: mitigations (ADR-0004): VERW on return to ring 3 on",
+        "ichor: mitigations: ",
+        "ichor: boot complete",
+    ]);
     out.assert_in_order(&[
         "ichor: smp: 4 CPUs online, every CPU took 5 timer interrupts",
         "ichor: random: ChaCha20 seeded",
