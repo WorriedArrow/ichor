@@ -10,12 +10,14 @@
 //! shared page cache: `read` and `stat` into read-only pages return
 //! `EFAULT` and leave them alone; `read` into a writable private file
 //! mapping gets its own copy; a second cell and the cache page itself still
-//! see the original bytes. A stress program then races large `read`s in
-//! one thread against `munmap`/`mmap`/`mprotect` of the buffer in another.
+//! see the original bytes. [`mm_unlocked`] shows a copy runs without the
+//! process's `Mm` lock and takes it only to fault. A stress program then
+//! races large `read`s in one thread against `munmap`/`mmap`/`mprotect` of
+//! the buffer in another.
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use frame::mm::{PAGE_SIZE, UFrame, UserProt, VmSpace};
 use frame::println;
@@ -170,6 +172,68 @@ pub(crate) fn frame_race() {
         "ichor: usercopy: frame refuses kernel writes through read-only PTEs; no copy landed after unmap ({ROUNDS} rounds, {hit} written while mapped, {} ms)",
         frame::time::now().saturating_sub(start).as_millis()
     );
+}
+
+/// A Linux process's copies run without its `Mm` lock (ADR-0011 as
+/// amended): while this task holds the lock, as another thread's `mmap`,
+/// `munmap`, `mprotect` or page fault would, a kernel task copies four
+/// resident pages into the process and finishes; its next copy, into four
+/// pages not yet faulted in, waits for the lock and finishes once it is
+/// released.
+fn mm_unlocked(p: LinuxProcess) {
+    const LEN: usize = 4 * PAGE_SIZE as usize;
+    const RESIDENT: u32 = 1;
+    const FAULTED: u32 = 2;
+    const SHORT: u32 = u32::MAX;
+    let va = p
+        .mm()
+        .mmap(0, 2 * LEN as u64, PROT_RW, MAP_PRIVATE | MAP_ANON, None)
+        .unwrap_or_else(|_| fail("usercopy: mmap"));
+    p.mm().populate(va, LEN, true);
+    let step = Arc::new((AtomicU32::new(0), WaitQueue::new()));
+    let mut copier = p.helper();
+    let shared = step.clone();
+    let mm = p.mm();
+    let spawned = TaskOptions::new(move || {
+        let (at, woken) = &*shared;
+        let data = alloc::vec![0x5au8; LEN];
+        for (k, next) in [RESIDENT, FAULTED].into_iter().enumerate() {
+            let n = copier.copy_to_user(va + (k * LEN) as u64, &data);
+            at.store(if n == LEN { next } else { SHORT }, Ordering::Release);
+            woken.wake_all();
+        }
+        crate::proc::discard(copier);
+    })
+    .spawn();
+    if spawned.is_none() {
+        fail("usercopy: could not spawn the copier");
+    }
+    let (at, woken) = &*step;
+    let reached = |want: u32, ms: u64| {
+        let deadline = frame::time::now() + core::time::Duration::from_millis(ms);
+        woken.wait_until_deadline(deadline, || {
+            let s = at.load(Ordering::Acquire);
+            (s == want || s == SHORT).then_some(())
+        });
+        at.load(Ordering::Acquire)
+    };
+    if reached(RESIDENT, 10_000) != RESIDENT {
+        fail("usercopy: a copy into resident pages waited for the Mm lock");
+    }
+    // The next copy needs four faults, so it must wait for the lock.
+    if reached(FAULTED, 20) != RESIDENT {
+        fail("usercopy: a copy faulted pages in without the Mm lock");
+    }
+    drop(mm);
+    if reached(FAULTED, 10_000) != FAULTED {
+        fail("usercopy: a copy waiting for the Mm lock did not finish");
+    }
+    let mut back = alloc::vec![0u8; 2 * LEN];
+    let mut p = p;
+    if p.copy_from_user(va, &mut back) != back.len() || back.iter().any(|&b| b != 0x5a) {
+        fail("usercopy: the copies did not land");
+    }
+    crate::proc::discard(p);
 }
 
 /// `mov r15, n; cmp x, imm; jne bad`.
@@ -510,6 +574,11 @@ pub(crate) fn run(vfs: &Arc<Vfs>) {
     }
     println!(
         "ichor: usercopy: read and stat into read-only pages return EFAULT; read into a private file mapping broke copy-on-write; another cell and the page cache kept the original bytes"
+    );
+
+    mm_unlocked(process());
+    println!(
+        "ichor: usercopy: a copy into resident pages ran while the Mm lock was held; one that needed faults waited for it"
     );
 
     let start = frame::time::now();
