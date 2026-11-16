@@ -13,8 +13,13 @@ path = "lib.rs"
 name = "boot"
 path = "boot.rs"
 
+[[test]]
+name = "control"
+path = "control.rs"
+
 [dependencies]
 xtask = { path = "../xtask" }
+grpc.workspace = true
 
 [lints]
 workspace = true

@@ -348,6 +348,15 @@ pub(crate) fn call(cell: &Arc<Cell>, mm: &mut Mm, nr: u64, a: [u64; 6]) -> Resul
             .exited()
             .map(u64::from)
             .ok_or(Error::WouldBlock),
+        sys::BLOB_READ => {
+            let Object::Blob(b) = object(cell, a[0], rights::READ)? else {
+                return Err(Error::BadHandle);
+            };
+            let at = usize::try_from(a[1]).unwrap_or(usize::MAX).min(b.len());
+            let n = io_len(a[3])?.min(b.len() - at);
+            write_user(mm, a[2], &b[at..at + n])?;
+            Ok(n as u64)
+        }
         sys::CELL_ADDR => {
             let c = cell_of(cell, a[0], Rights::INSPECT)?;
             crate::netstack::stack_for(&c)

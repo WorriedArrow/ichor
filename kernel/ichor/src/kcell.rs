@@ -41,6 +41,9 @@ pub(crate) enum Object {
     Container(Arc<crate::native::Container>),
     /// A Linux process started in a container, with its captured output.
     Process(Arc<crate::native::Process>),
+    /// Read-only bytes the kernel holds for the life of the system (boot
+    /// configuration such as the CA bundle).
+    Blob(&'static [u8]),
 }
 
 impl core::fmt::Debug for Object {
@@ -53,6 +56,7 @@ impl core::fmt::Debug for Object {
             Object::Image(_) => "Image",
             Object::Container(_) => "Container",
             Object::Process(_) => "Process",
+            Object::Blob(_) => "Blob",
         };
         write!(f, "Object::{name}")
     }

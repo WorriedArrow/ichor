@@ -65,6 +65,20 @@ name = "ichor-cmdline"
 version = "0.0.0"
 
 [[package]]
+name = "ichor-control"
+version = "0.0.0"
+dependencies = [
+ "ichor-dns",
+ "ichor-grpc",
+ "ichor-http",
+ "ichor-image",
+ "ichor-oci",
+ "ichor-rt",
+ "ichor-tls",
+ "ichor-x509",
+]
+
+[[package]]
 name = "ichor-crypto"
 version = "0.0.0"
 dependencies = [
@@ -97,6 +111,13 @@ dependencies = [
 [[package]]
 name = "ichor-gpt"
 version = "0.0.0"
+
+[[package]]
+name = "ichor-grpc"
+version = "0.0.0"
+dependencies = [
+ "ichor-http",
+]
 
 [[package]]
 name = "ichor-http"
@@ -178,6 +199,7 @@ version = "0.0.0"
 name = "ichor-tests"
 version = "0.0.0"
 dependencies = [
+ "ichor-grpc",
  "xtask",
 ]
 

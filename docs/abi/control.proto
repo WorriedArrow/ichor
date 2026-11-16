@@ -1,0 +1,64 @@
+// The control plane's API (ADR-0012 §5), served by services/control as
+// gRPC over h2c on a published port. services/grpc implements these
+// messages by hand (no code generation); this file is the reference for
+// other clients.
+
+syntax = "proto3";
+
+package ichor.v1;
+
+service Control {
+  // Pulls an image from its registry, verifies every blob against its
+  // digest, and converts it into an Ichor image kept by the kernel.
+  rpc PullImage(PullImageRequest) returns (PullImageResponse);
+  // Creates a cell rooted at a pulled image, attached to the switch.
+  rpc CreateCell(CreateCellRequest) returns (CreateCellResponse);
+  // Runs a process in a cell; streams its output, then its exit status.
+  rpc Run(RunRequest) returns (stream RunEvent);
+}
+
+message PullImageRequest {
+  // A reference: [registry/]repository[:tag][@sha256:digest].
+  string reference = 1;
+}
+
+message PullImageResponse {
+  // The manifest's digest (sha256:...).
+  string digest = 1;
+  // The converted image's BLAKE3 root hash, hex: its id from now on.
+  string image_id = 2;
+  // The converted image's size in bytes.
+  uint64 size = 3;
+  // The image config's entrypoint plus cmd, and environment.
+  repeated string argv = 4;
+  repeated string env = 5;
+}
+
+message CreateCellRequest {
+  string image_id = 1;
+  // The cell's memory limit; 0 is the default (256 MiB).
+  uint64 memory_bytes = 2;
+}
+
+message CreateCellResponse {
+  string cell_id = 1;
+  // The IPv4 address the switch gave the cell.
+  string address = 2;
+}
+
+message RunRequest {
+  string cell_id = 1;
+  // Empty: the image's entrypoint and cmd.
+  repeated string argv = 2;
+  // Added to the image's environment.
+  repeated string env = 3;
+}
+
+message RunEvent {
+  oneof event {
+    // Output, stdout and stderr together, as the process wrote it.
+    bytes output = 1;
+    // The wait status, last: exit code << 8, or the signal number.
+    uint32 exit_status = 2;
+  }
+}

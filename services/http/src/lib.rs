@@ -12,6 +12,9 @@
 
 extern crate alloc;
 
+pub mod h2;
+pub mod hpack;
+
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;

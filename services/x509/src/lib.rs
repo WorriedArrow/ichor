@@ -234,6 +234,31 @@ mod tests {
         );
     }
 
+    /// The boot volume's CA bundle (Mozilla's, which xtask fetches pinned
+    /// to `target/roots/`): most of it parses, and Docker Hub's chains
+    /// verify against it. `ICHOR_ROOTS=<file> cargo test -p ichor-x509 --
+    /// --ignored mozilla`.
+    #[test]
+    #[ignore = "needs the fetched CA bundle (ICHOR_ROOTS)"]
+    fn mozilla_bundle_verifies_docker_hub() {
+        extern crate std;
+        let path = std::env::var("ICHOR_ROOTS").expect("ICHOR_ROOTS");
+        let pem = std::fs::read_to_string(path).unwrap();
+        let roots = RootStore::from_pem(&pem);
+        let total = pem_certificates(&pem).len();
+        std::println!("{} of {total} roots parse", roots.len());
+        assert!(roots.len() * 10 >= total * 9);
+        for (pem, host) in [
+            (REGISTRY, "registry-1.docker.io"),
+            (AUTH, "auth.docker.io"),
+            (CLOUDFLARE, "production.cloudflare.docker.com"),
+        ] {
+            let ders = pem_certificates(pem);
+            let chain: Vec<&[u8]> = ders.iter().map(Vec::as_slice).collect();
+            assert_eq!(verify_chain(&chain, &roots, host, NOW), Ok(()), "{host}");
+        }
+    }
+
     #[test]
     fn the_wrong_host_time_or_root_is_refused() {
         assert_eq!(check(AUTH, "auth.docker.com", NOW), Err(Error::WrongHost));

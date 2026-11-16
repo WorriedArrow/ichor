@@ -94,6 +94,9 @@ pub mod sys {
     pub const CELL_ADDR: u64 = 25;
     /// Unmap `arg1` bytes at `arg0` (pages from [`MEM_MAP`]).
     pub const MEM_UNMAP: u64 = 26;
+    /// Copy up to `arg3` bytes of blob `arg0` from offset `arg1` into
+    /// `arg2`; returns the count (0 past the end). Needs READ.
+    pub const BLOB_READ: u64 = 27;
 }
 
 /// [`sys::CLOCK`] clocks.

@@ -116,6 +116,18 @@ fn bearer_token(url: &str) -> Result<String> {
     Ok(body[start..end].to_string())
 }
 
+/// Mozilla's CA bundle as PEM, from curl's official extract: the control
+/// plane's root store, carried on the boot volume as `\ichor\roots.pem`
+/// (ADR-0012 §4). Configuration, not code; MPL-2.0 data, never committed.
+pub const MOZILLA_ROOTS: Artifact = Artifact {
+    dir: "roots",
+    file: "cacert-2026-11-05.pem",
+    url: "https://curl.se/ca/cacert-2026-11-05.pem",
+    sha256: "427c064216761a1e72a8b30f0d954d08cb6e4435a82091fb865afd20c8497285",
+    env: "ICHOR_ROOTS",
+    token_url: None,
+};
+
 /// The official static busybox 1.35.0 (musl, x86-64) from busybox.net.
 pub const BUSYBOX: Artifact = Artifact {
     dir: "busybox/1.35.0",

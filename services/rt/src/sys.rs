@@ -299,6 +299,31 @@ pub fn process_wait(p: &Handle) -> Result<u32> {
     call(sys::PROCESS_WAIT, [p.0, 0, 0, 0, 0]).map(|s| s as u32)
 }
 
+/// The whole of a read-only blob (boot configuration).
+pub fn blob_read(blob: &Handle) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut buf = alloc::vec![0u8; 64 * 1024];
+    loop {
+        // SAFETY: the kernel writes at most `buf.len()` bytes at `buf`.
+        let n = decode(unsafe {
+            syscall(
+                sys::BLOB_READ,
+                [
+                    blob.0,
+                    out.len() as u64,
+                    buf.as_mut_ptr() as u64,
+                    buf.len() as u64,
+                    0,
+                ],
+            )
+        })? as usize;
+        if n == 0 {
+            return Ok(out);
+        }
+        out.extend_from_slice(&buf[..n]);
+    }
+}
+
 /// The address the switch gave a cell.
 pub fn cell_addr(cell: &Handle) -> Result<[u8; 4]> {
     call(sys::CELL_ADDR, [cell.0, 0, 0, 0, 0]).map(|a| (a as u32).to_be_bytes())

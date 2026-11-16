@@ -44,7 +44,9 @@ is demand-paged and charged to its cell. It has one thread.
 At boot the kernel embeds and runs its services in the system cell
 (ADR-0012 §1). The boot self-test (`services/nativetest`) is given the
 system cell's handle and the switch's, as hexadecimal `argv[1]` and
-`argv[2]`.
+`argv[2]`. The control plane (`services/control`, started by the
+`control=PORT` kernel option) gets those, the CA bundle's blob handle,
+the API port and the DNS resolver (`dns=`, default `10.0.2.3`).
 
 ## Results
 
@@ -97,6 +99,7 @@ moves at most 256 KiB (`LOG`, `RANDOM`, the socket calls, `PROCESS_READ`).
 | 24 | `PROCESS_WAIT` | process | its wait status (`code << 8`, or the signal number), or `WouldBlock` while it runs |
 | 25 | `CELL_ADDR` | cell or container | the IPv4 address the switch assigned it |
 | 26 | `MEM_UNMAP` | address, length | 0; unmaps memory from `MEM_MAP` |
+| 27 | `BLOB_READ` | blob, offset, buffer | bytes copied from the blob at the offset (0 past its end); needs READ |
 
 ### `OBJECT_WAIT` items
 
@@ -133,6 +136,7 @@ stderr. A program that cannot be loaded exits with status `127 << 8`.
 | Image | `IMAGE_CREATE` | DUPLICATE, INSPECT, READ |
 | Container | `CELL_CREATE` | DUPLICATE, INSPECT, WAIT, WRITE |
 | Process | `CELL_SPAWN` | DUPLICATE, INSPECT, WAIT, READ |
+| Blob | the kernel, at boot (the boot volume's `\ichor\roots.pem`) | DUPLICATE, INSPECT, READ |
 
 An image's pages are charged to the creating cell and kept for the life of
 the system (version 2 has no image deletion). A socket closes when its

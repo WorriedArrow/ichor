@@ -284,7 +284,7 @@ const KERNEL_ONLY: &[&str] = &[
 
 /// Crates that only build for the services target (the native runtime
 /// and the binaries on it, ADR-0012).
-const SERVICE_ONLY: &[&str] = &["ichor-rt", "ichor-nativetest"];
+const SERVICE_ONLY: &[&str] = &["ichor-rt", "ichor-nativetest", "ichor-control"];
 
 fn exclude_kernel_only(cmd: &mut std::process::Command) -> &mut std::process::Command {
     for c in KERNEL_ONLY.iter().chain(SERVICE_ONLY) {
@@ -315,6 +315,7 @@ fn cmd_test(o: &Opts) -> Result<()> {
     // the integration tests.
     let kernel = build::kernel(o.profile)?;
     xtask::artifact::BUSYBOX.bytes()?;
+    xtask::artifact::MOZILLA_ROOTS.bytes()?;
     xtask::artifact::ALPINE_MINIROOTFS.bytes()?;
     for a in xtask::artifact::ALPINE_PACKAGES {
         a.bytes()?;

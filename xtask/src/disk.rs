@@ -49,6 +49,7 @@ pub fn image_sized(kernel: &Path, cmdline: &str, min_bytes: u64) -> Result<Vec<u
     let mut esp = Volume::default();
     esp.add("EFI/BOOT/BOOTX64.EFI", &efi)?;
     esp.add("ICHOR/CMDLINE", cmdline.as_bytes())?;
+    esp.add("ICHOR/ROOTS.PEM", &crate::artifact::MOZILLA_ROOTS.bytes()?)?;
     let esp = esp.image(ESP_SECTORS, ESP_START)?;
     let root = qemu::root_image()?;
     let (img, starts) = disk(

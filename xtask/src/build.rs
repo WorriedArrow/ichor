@@ -34,7 +34,7 @@ pub fn kernel_target_dir() -> PathBuf {
 pub const SERVICES_TARGET: &str = "x86_64-unknown-none";
 
 /// The service binaries the kernel image embeds.
-pub const SERVICES: &[&str] = &["ichor-nativetest"];
+pub const SERVICES: &[&str] = &["ichor-nativetest", "ichor-control"];
 
 /// Where service builds go (their own directory, like the kernel's).
 pub fn services_target_dir() -> PathBuf {
