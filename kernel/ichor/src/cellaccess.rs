@@ -45,6 +45,7 @@ const B_UPLINK_PORT: u16 = 7300;
 const PRELUDE: &str = include_str!("cellaccess/prelude.pl");
 const B_HELPER: &str = include_str!("cellaccess/b_helper.pl");
 const SMOKE: &str = include_str!("cellaccess/smoke.pl");
+const S1_PROCESS: &str = include_str!("cellaccess/s1_process.pl");
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
 /// Set once the harness has ended B's futex wait (section 4); until then
@@ -65,7 +66,12 @@ pub(crate) fn enabled() -> bool {
 type Section = (&'static str, fn(&Ctx) -> bool);
 
 /// Every section, in order.
-const SECTIONS: &[Section] = &[("harness", smoke)];
+const SECTIONS: &[Section] = &[
+    ("harness", smoke),
+    ("process_ids_and_signals_are_scoped_to_their_cell", |c| {
+        in_a(c, S1_PROCESS)
+    }),
+];
 
 /// One cell with its own root.
 struct Side {
@@ -265,7 +271,8 @@ fn perl(side: (&Arc<Cell>, &Arc<Vfs>), script: &str, args: &[String]) -> i32 {
         .unwrap_or_else(|| fail("cellaccess: no process"));
     let mut text = String::from(PRELUDE);
     text.push_str(script);
-    let mut argv: Vec<&str> = alloc::vec!["perl", "-e", &text];
+    // argv[0] is also what /proc/self/exe names, so it is the full path.
+    let mut argv: Vec<&str> = alloc::vec!["/usr/bin/perl", "-e", &text];
     argv.extend(args.iter().map(String::as_str));
     run_linux(p, &exe, Some(&interp), &argv).0
 }

@@ -89,7 +89,8 @@ sub done {
 # syscall() may write through any string argument, so a literal must be
 # passed as a variable: syscall(4, my $p = "/etc", ...). Numbers from the
 # harness arrive as strings and must be made numbers (+ 0), or they would
-# be passed as pointers.
+# be passed as pointers; so must $$ (it is magic, and syscall() would
+# pass it as a string).
 #
 # A pointer to a perl string's bytes (for syscall arguments that are
 # structures holding pointers), and memory read at an address.

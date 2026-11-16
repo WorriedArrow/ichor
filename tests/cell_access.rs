@@ -51,6 +51,20 @@ fn the_harness_gives_a_only_what_b_reports() {
     ]);
 }
 
+/// Section 1: B's pids and tids are ESRCH (wait4: ECHILD) from A for kill,
+/// tkill, tgkill, getpgid, getsid, setpgid, prlimit64 and
+/// sched_getaffinity; a kill(p, 0) sweep over every pid finds only A's;
+/// group signals and kill(-1) reach only A; B received nothing.
+#[test]
+fn process_ids_and_signals_are_scoped_to_their_cell() {
+    assert_rule("process_ids_and_signals_are_scoped_to_their_cell");
+    suite().assert_in_order(&[
+        "finds only A's processes: ok",
+        "ichor: cellaccess: process_ids_and_signals_are_scoped_to_their_cell passed",
+        "ichor: cellaccess: B alive and unchanged after process_ids_and_signals_are_scoped_to_their_cell",
+    ]);
+}
+
 #[test]
 fn cells_clean_up_after_themselves() {
     let out = suite();

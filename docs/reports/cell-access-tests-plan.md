@@ -50,7 +50,7 @@ Status: [ ] to do, [x] done and committed.
 
 - [x] **Harness**: cells, roots, B's helper and its report, the channel,
   one trivial check each way, the host test file. Commit.
-- [ ] **1. signals_and_process_ids_are_scoped_to_their_cell**
+- [x] **1. process_ids_and_signals_are_scoped_to_their_cell** (83 checks)
   - kill(B pid, 0/SIGUSR1/SIGKILL) ESRCH (`signal::kill` -> `proc::uids_of`
     filters `e.cell == cell`); tkill/tgkill(B tid) ESRCH
     (`proc::send_thread`); kill(-B pgid) ESRCH, kill(-1) and kill(0)
