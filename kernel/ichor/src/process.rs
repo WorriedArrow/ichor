@@ -16,13 +16,14 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
+use frame::mm::VmSpace;
 use frame::sync::{Mutex, MutexGuard, SpinLock};
 
 use crate::kcell::Cell;
 use crate::pipe::Pipe;
 use crate::proc::{self, ProcEntry};
 use crate::signal::{Actions, Signals};
-use crate::umem::Mm;
+use crate::umem::{self, Mm, UserBuf};
 use crate::vfs::{Ino, ROOT, Vfs};
 
 /// Most descriptors a process may hold: the hard `RLIMIT_NOFILE` ceiling.
@@ -149,6 +150,9 @@ pub(crate) struct Group {
     pub(crate) leader: Arc<ProcEntry>,
     vfs: Arc<Vfs>,
     mm: Mutex<Mm>,
+    /// `mm`'s address space, for copies that run without the `Mm` lock
+    /// (changed only with `mm` locked, by `replace_mm`).
+    space: SpinLock<Arc<VmSpace>>,
     files: Mutex<Files>,
     pub(crate) actions: Mutex<Actions>,
     /// Live threads.
@@ -384,6 +388,7 @@ impl LinuxProcess {
             tgid: entry.pid,
             leader: entry.clone(),
             vfs: vfs.clone(),
+            space: SpinLock::new(mm.shared_space()),
             mm: Mutex::new(mm),
             files: Mutex::new(Files {
                 // One console description on 0, 1 and 2, as a terminal is.
@@ -441,6 +446,7 @@ impl LinuxProcess {
             tgid: entry.pid,
             leader: entry.clone(),
             vfs: self.vfs.clone(),
+            space: SpinLock::new(mm.shared_space()),
             mm: Mutex::new(mm),
             files: Mutex::new(Files { fds, cwd, umask }),
             actions: Mutex::new(actions),
@@ -526,20 +532,39 @@ impl LinuxProcess {
 
     /// Replaces the address space (`execve`), returning the old one.
     pub(crate) fn replace_mm(&self, mm: Mm) -> Mm {
-        core::mem::replace(&mut *self.group.mm.lock(), mm)
+        let mut cur = self.group.mm.lock();
+        // Not the old space's last reference: the old `Mm` holds one.
+        *self.group.space.lock() = mm.shared_space();
+        core::mem::replace(&mut *cur, mm)
     }
 
     /// Copies `data` to user memory at `va` with the permissions a user
     /// store has (faulting pages in, breaking copy-on-write). Returns how
     /// many bytes were copied.
     pub(crate) fn copy_to_user(&mut self, va: u64, data: &[u8]) -> usize {
-        self.mm().copy_to_user(va, data)
+        self.copy_user(va, UserBuf::To(data))
     }
 
     /// Copies user memory at `va` into `out` with the permissions a user
     /// load has (faulting pages in). Returns how many bytes were copied.
     pub(crate) fn copy_from_user(&mut self, va: u64, out: &mut [u8]) -> usize {
-        self.mm().copy_from_user(va, out)
+        self.copy_user(va, UserBuf::From(out))
+    }
+
+    /// Both copies. The `Mm` lock is taken only to fault a page in where
+    /// frame's copy stopped (`umem::copy_user`), so a copy into resident
+    /// pages never waits for it, and other threads' `mmap`, `munmap`,
+    /// `mprotect` and page faults do not wait for the copy. If an `execve`
+    /// (by another thread, for a helper) replaced the space meanwhile, the
+    /// copy ends where it stopped: it never faults pages into the new
+    /// space for a copy into the old one.
+    fn copy_user(&self, va: u64, buf: UserBuf<'_>) -> usize {
+        let space = self.group.space.lock().clone();
+        let me: &LinuxProcess = self;
+        umem::copy_user(&space, va, buf, |at, write| {
+            let mut mm = me.mm();
+            (mm.owns(&space) && mm.fault(at, write, false)).then_some(mm)
+        })
     }
 
     /// The working directory.

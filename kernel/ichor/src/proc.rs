@@ -598,6 +598,12 @@ pub(crate) fn fork(
 /// [`LinuxProcess::helper`]), then takes it out of the table and lets the
 /// process's last thread see its reference gone. Returns false if no task
 /// could be started.
+///
+/// The task stays on the kernel address space: a helper never runs user
+/// code, and its copies to and from the process's memory go through the
+/// linear map (ADR-0011). Binding it to the process's space would leave it
+/// bound to a freed space once `execve` replaced that space, since
+/// `execve` does not wait for helpers.
 pub(crate) fn start_helper(
     p: LinuxProcess,
     work: impl FnOnce(&mut LinuxProcess) + Send + 'static,
@@ -606,9 +612,7 @@ pub(crate) fn start_helper(
     let task = TaskOptions::new(move || {
         let mut p = p;
         *p.entry.task.lock() = Some(frame::task::current());
-        p.mm().space().bind_to_current_task();
         work(&mut p);
-        frame::mm::activate_kernel_space();
         *p.entry.task.lock() = None;
         let gone = p.group.gone.clone();
         drop(p);

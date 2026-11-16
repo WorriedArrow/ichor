@@ -4,6 +4,8 @@
 - Date: 2026-11-15
 - Amends: ADR-0001 (the "fallible user-memory copies" paragraph) and
   ADR-0003's planned exception table for user copies
+- Amended: 2026-11-15, "Copies without the Mm lock" (Phase E's step this
+  ADR unblocked)
 
 ## Context
 
@@ -72,6 +74,52 @@ Frame keeps the software walk and makes it correct.
    that waits for the lock. A shootdown IPI to a CPU in a copy is answered
    within one page copy.
 
+### Copies without the Mm lock (amended 2026-11-15)
+
+Until this amendment a Linux process's copies held its `Mm` mutex for the
+whole copy, so a multi-page `read` or `recv` blocked every other thread's
+`mmap`, `munmap`, `mprotect` and page fault. Frame's copy no longer needs
+that lock, so the kernel now takes it only for faults. No frame change.
+
+5. **The space is shared.** `Mm` holds its `VmSpace` in an `Arc`, and the
+   process group keeps a second reference behind a spinlock, set by
+   `replace_mm` (`execve`) with the `Mm` locked. A copy takes that
+   reference and runs `umem::copy_user` with it, without the `Mm` lock.
+   A copy racing an `execve` therefore writes into the old space, which
+   lives until the copy drops its reference, never into a freed one.
+6. **The `Mm` lock covers a fault and that page's copy.** Where frame's
+   copy stops, the loop locks `Mm`, checks that the space is still the
+   process's, runs `Mm::fault`, copies that one page and unlocks. A
+   concurrent `munmap` or `mprotect` either runs before the fault (which
+   then fails, and the copy ends short) or after that page's copy. A page
+   that is still not copyable after its fault ends the copy, so a copy
+   never loops, as decision 3 required. A copy of resident pages takes no
+   sleeping lock at all.
+7. **The last reference is dropped on a task not bound to the space.**
+   Frame's `VmSpace` must be dropped only while no CPU runs it. `execve`
+   and the last thread out wait for every other thread of the process to
+   leave, so their copies are done. The only copier that can outlive the
+   `Mm` is a helper thread (the io_uring worker), which `execve` does not
+   wait for. Helpers therefore stay on the kernel address space; they
+   never run user code. Before this, a helper stayed bound to the space
+   that `execve` freed.
+8. **Spaces nothing else can reach keep the old shape.**
+   `Mm::copy_to_user`/`copy_from_user` hold the `Mm` throughout. The
+   loader (a new image's stack) and native processes (which own their
+   `Mm` outright) use them.
+
+The cost: a copy that races an `execve` finishes into pages the old `Mm`
+already released from the cell's account, for at most the length of that
+copy. A helper copy that starts after `execve` still lands in the new
+image at the old request's address, as it did before this amendment;
+Linux cancels a ring's requests at `execve`, which is left for
+io_uring's own work.
+
+Rejected on the way: taking the `Mm` lock just long enough to clone the
+space reference. Every copy would still wait for whoever holds the lock,
+including a page fault reading a file, and the new boot test
+(`copytest::mm_unlocked`) fails that way.
+
 ## Alternatives considered
 
 - **Hardware-enforced copies** (`stac`, `rep movsb` through the user
@@ -132,7 +180,8 @@ Frame keeps the software walk and makes it correct.
 - **Phase E's Mm-lock item is unblocked.** Frame's copies no longer rely
   on the kernel's `Mm` mutex for soundness. The kernel can stop holding
   `Mm` across a whole multi-page copy, as long as the fault-and-retry loop
-  takes it again for each fault.
+  takes it again for each fault. (Done: "Copies without the Mm lock"
+  above.)
 - **Budget:** +3 code lines and +1 unsafe site (5,608 / 243 to 5,611 /
   244), inside `audit.toml`'s step 6 (5,800 / 250). No budget change.
 - **Tests:** `kernel/ichor/src/copytest.rs` runs on every boot (1, 4 and
@@ -141,4 +190,8 @@ Frame keeps the software walk and makes it correct.
   ABI over the shared page cache (`read`/`stat` into read-only pages
   return `EFAULT`, a private file mapping breaks copy-on-write, a second
   cell and the cache page keep their bytes), and a stress race of large
-  `read`s against `munmap`/`mmap`/`mprotect`.
+  `read`s against `munmap`/`mmap`/`mprotect`. Since the amendment,
+  `mm_unlocked` checks that a copy into resident pages finishes while
+  another task holds the `Mm` lock, and that one which needs faults
+  waits for it; the stress race now runs with no lock between the reader
+  and the remapping thread.
