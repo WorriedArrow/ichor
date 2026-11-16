@@ -124,7 +124,7 @@ if ($pid == 0) {
     my $back = "";
     while (1) {
         my $r = sysread($s, my $buf, 65536);
-        defined $r or POSIX::_exit(13);
+        defined $r or do { print "debian: sockets: client read: $!\n"; POSIX::_exit(13) };
         last if !$r;
         $back .= $buf;
     }

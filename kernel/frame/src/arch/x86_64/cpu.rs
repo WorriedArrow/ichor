@@ -93,9 +93,10 @@ pub(crate) fn enable_protections() -> Features {
     if f.pge {
         cr4 |= regs::CR4_PGE;
     }
-    // SMEP/SMAP: the kernel never executes user pages and, until frame's
-    // user-copy routines exist (milestone 2, which toggle AC around each
-    // copy), never touches them either.
+    // SMEP/SMAP: the kernel never executes user pages and never touches
+    // them through user addresses either: frame's user copies go through
+    // the linear map, checking the PTE under the space lock (ADR-0011), so
+    // AC is never set.
     if f.smep {
         cr4 |= regs::CR4_SMEP;
     }

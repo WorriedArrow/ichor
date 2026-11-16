@@ -16,7 +16,7 @@ brief where they conflict with it.
 | [0008](0008-extended-cpu-state.md) | Extended CPU state: XSAVE, saved eagerly | Accepted |
 | [0009](0009-identity-model.md) | Identity inside a cell: uids, what uid 0 means, enforcement | Accepted |
 | [0010](0010-network-stack-and-cell-switch.md) | Network stack (own, sans-I/O, per cell) and the cell switch | Accepted |
-| 0011 | User copies in frame (on branch `fix-user-copy`, not yet merged) | Proposed |
+| [0011](0011-user-copies.md) | Kernel copies to and from user memory: a checked walk under the space lock | Accepted |
 | [0012](0012-control-plane.md) | The control plane: a native-ABI service, native ABI v2, our own TLS/HTTP/OCI crates | Accepted |
 | [0013](0013-workloads-and-io-uring.md) | Milestone 7: io_uring, and real workloads' own test suites through the control plane | Accepted |
 | [0014](0014-services-runtime-trusted-crate.md) | `services/rt`, the second crate allowed `unsafe`: scope, rules, budget | Accepted |

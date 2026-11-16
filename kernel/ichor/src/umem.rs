@@ -439,10 +439,14 @@ impl Mm {
         if write && self.cow.contains(&va) {
             return self.break_cow(va, region.prot);
         }
-        if self.space.translate(va).is_some() {
-            // Present yet faulting: a protection violation the region map
-            // does not explain. Never loop on it.
-            return false;
+        if let Some((_, p)) = self.space.translate(va) {
+            // Present: another thread (or a kernel copy for one) took this
+            // fault first, between the access and this lock. Retry the
+            // access if the mapping now allows it (the CPU drops the
+            // faulting translation, so the retry sees the new PTE). Any
+            // other present page is a protection violation the region map
+            // does not explain: never loop on it.
+            return (!write || p.write) && (!exec || p.exec);
         }
         let Some(f) = self.frame(va) else {
             return false;
@@ -452,6 +456,57 @@ impl Mm {
         }
         let prot = self.mapped_prot(va, region.prot);
         self.space.map(va, &f, prot).is_ok()
+    }
+
+    /// Copies `data` to user memory at `va` as user stores would: frame
+    /// copies up to the first page not mapped writable, that page is
+    /// faulted as a user write would fault it (demand paging, or breaking
+    /// copy-on-write), and the copy goes on. Stops at the first page the
+    /// process may not write. Returns the bytes copied.
+    pub(crate) fn copy_to_user(&mut self, va: u64, data: &[u8]) -> usize {
+        self.copy_user(va, data.len(), true, |space, at, done| {
+            space.copy_to_user(at, &data[done..])
+        })
+    }
+
+    /// Copies user memory at `va` into `out` as user loads would (unmapped
+    /// pages are faulted in). Stops at the first page the process may not
+    /// read. Returns the bytes copied.
+    pub(crate) fn copy_from_user(&mut self, va: u64, out: &mut [u8]) -> usize {
+        self.copy_user(va, out.len(), false, |space, at, done| {
+            space.copy_from_user(at, &mut out[done..])
+        })
+    }
+
+    /// The fault-and-retry loop behind both copies. `copy(space, at, done)`
+    /// copies from byte `done` (user address `at`) on and returns how far
+    /// it got. A page is faulted at most once in a row, so a fault that
+    /// does not make it accessible can never loop.
+    fn copy_user(
+        &mut self,
+        va: u64,
+        len: usize,
+        write: bool,
+        mut copy: impl FnMut(&VmSpace, u64, usize) -> usize,
+    ) -> usize {
+        let mut done = 0usize;
+        let mut faulted = None;
+        loop {
+            let Some(at) = va.checked_add(done as u64) else {
+                return done;
+            };
+            done += copy(&self.space, at, done);
+            if done >= len {
+                return done;
+            }
+            let Some(at) = va.checked_add(done as u64) else {
+                return done;
+            };
+            if faulted == Some(at) || !self.fault(at, write, false) {
+                return done;
+            }
+            faulted = Some(at);
+        }
     }
 
     /// Faults in `[va, va+len)` ahead of a kernel copy, stopping at the

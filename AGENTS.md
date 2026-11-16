@@ -216,9 +216,18 @@ uplink; virtio-net (polled). Open from it: IPv6, ICMP errors for UDP,
   and `unix::accounting_selftest`.
 
 Milestones 0-4 are done (4's acceptance test: Debian's `apt-get install`
-from a local mirror). Phase E (scalability) is done except the vDSO and
-the Mm-lock item, both blocked, and the per-CPU page lists, held back on
-`pcp-page-lists`.
+from a local mirror). Phase E (scalability) is done except the vDSO
+(blocked), the Mm-lock item (unblocked by ADR-0011's user-copy fix), and
+the per-CPU page lists, held back on `pcp-page-lists`.
+
+- User copies (ADR-0011): `VmSpace::copy_to_user`/`copy_from_user` copy
+  through the linear map one page at a time under the space lock, after
+  checking the PTE (writes need it writable), so they stop where a user
+  access would fault. The kernel's `Mm::copy_*` fault that page (demand
+  paging, copy-on-write break) and copy on; `LinuxProcess::copy_*` and the
+  loader use them. `copytest.rs` checks it on every boot: the frame API
+  under a concurrent unmap, `read`/`stat` into read-only and
+  page-cache-backed pages, a second cell, and a read/munmap stress race.
 
 - M4 so far: Alpine 3.20.3's own userland runs unmodified in a cell. xtask
   fetches the minirootfs (pinned SHA-256, `artifact.rs`), gunzips and reads
@@ -473,10 +482,10 @@ report at the end of each phase. Do not rewrite `main`.
   held back: one unexplained user page fault (dpkg's decompressor) in 20
   one-CPU boots, against 0 in 20 without it. Baseline in `docs/benchmarks.md`; Linux reference
   numbers come from `cargo xtask bench` (Alpine `linux-virt` booted with
-  the same `testprog::bench` programs; CI job summary). Open: frame's
-  `VmSpace` user copy ignores the page's
-  write permission and copies after dropping its lock (owner deciding how
-  to handle it; the Mm-lock item waits on it).]
+  the same `testprog::bench` programs; CI job summary). Frame's user
+  copies now check the PTE and copy each page under the space lock
+  (ADR-0011, `docs/reports/user-copy-fix.md`), so the Mm-lock item is
+  unblocked.]
 
 Carried over from milestone 3: per-cell pid namespaces (paging the root
 image in on demand, copy-on-write `fork`, `FD_CLOEXEC` and shared offsets
@@ -501,10 +510,10 @@ are owed as multi-cell scheduling lands in milestone 4. Boot logs which apply.
 Frame budget: ADR-0005 sets the milestone 3 ceiling at 8,500 lines / 380
 sites; ADR-0007 raises it to 9,500 / 420 for milestone 4 (TLB shootdown,
 atomic user ops for futexes, PCID). `audit.toml` is at step 6 (5,800 / 250);
-frame is at 5,627 / 243 (A5 added RDSEED/RDRAND and UEFI GetTime; B
+frame is at 5,630 / 244 (A5 added RDSEED/RDRAND and UEFI GetTime; B
 added XSAVE; C the frames tree and request tracking; M6 reading
-`\ichor\roots.pem`). `services/rt` has its own budget
-(`services/rt/audit.toml`: 500 / 40; at 402 / 29).
+`\ichor\roots.pem`; ADR-0011 the checked user copy). `services/rt` has
+its own budget (`services/rt/audit.toml`: 500 / 40; at 402 / 29).
 
 The goal set for this effort is milestone 8, whose acceptance test needs
 cloud accounts and bare-metal hardware from the owner.
@@ -639,6 +648,7 @@ fuzz/            mutation fuzzing of every untrusted-input parser (host-only)
 xtask/           build/run/test/lint tooling (lib + bin, no dependencies)
 tests/           QEMU integration tests (host crate using xtask's runner)
 docs/adr/        architecture decision records
+docs/reports/    write-ups of fixes and investigations (user-copy-fix.md)
 ```
 
 Planned crates (create as milestones need them): `kernel/{mm,sched,cap,cell,

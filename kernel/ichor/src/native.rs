@@ -124,16 +124,16 @@ impl block::BlockDevice for PageDisk {
 /// Copies `len` bytes of the process's memory at `va` into the kernel.
 fn read_user(mm: &mut Mm, va: u64, len: usize) -> Result<Vec<u8>, Error> {
     let mut v = alloc::vec![0u8; len];
-    mm.populate(va, len, false);
-    if mm.space().copy_from_user(va, &mut v) != len {
+    if mm.copy_from_user(va, &mut v) != len {
         return Err(Error::Invalid);
     }
     Ok(v)
 }
 
+/// Copies `data` into the process's memory at `va`, with the permissions
+/// a user store has (ADR-0011).
 fn write_user(mm: &mut Mm, va: u64, data: &[u8]) -> Result<(), Error> {
-    mm.populate(va, data.len(), true);
-    if mm.space().copy_to_user(va, data) != data.len() {
+    if mm.copy_to_user(va, data) != data.len() {
         return Err(Error::Invalid);
     }
     Ok(())
@@ -449,8 +449,7 @@ fn image_create(cell: &Cell, mm: &mut Mm, ptr: u64, len: u64) -> Result<u64, Err
         for i in 0..npages {
             let at = i * PAGE_SIZE;
             let n = (len - at).min(PAGE_SIZE) as usize;
-            mm.populate(ptr + at, n, false);
-            if mm.space().copy_from_user(ptr + at, &mut buf[..n]) != n {
+            if mm.copy_from_user(ptr + at, &mut buf[..n]) != n {
                 return Err(Error::Invalid);
             }
             buf[n..].fill(0);

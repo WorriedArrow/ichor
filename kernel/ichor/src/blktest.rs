@@ -168,6 +168,7 @@ fn exercise(name: &str, m: &Mounted, vfs: Arc<Vfs>) {
     }
     println!("ichor: blk: cat read /etc/motd from the {name} disk ({syscalls} syscalls)");
     if first {
+        crate::copytest::run(&vfs);
         crate::busytest::run(&vfs);
         if crate::bench::enabled() {
             crate::bench::run(m, &vfs, &crate::busytest::read_busybox(&vfs));

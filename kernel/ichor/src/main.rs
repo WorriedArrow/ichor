@@ -16,6 +16,7 @@ mod blktest;
 mod busytest;
 mod celltest;
 mod control;
+mod copytest;
 mod cred;
 mod debiantest;
 mod dev;
@@ -145,6 +146,7 @@ fn kmain(info: BootInfo) -> ! {
     selftest::user_mode();
     celltest::run();
     proctest::run();
+    copytest::frame_race();
     runtest::run();
     // The network first: the disks' cell tests use its uplink.
     nettest::run();
