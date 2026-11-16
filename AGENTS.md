@@ -33,7 +33,7 @@ listener local unless configured, with a test [done:
 `the_control_api_is_local_unless_configured`], then API authentication and
 Signal/Inspect/Destroy before any cloud boot; (4) io_uring completions
 without an enter (epoll on the ring fd, registered eventfd), with a test,
-before the Node.js suite; (5) extra layers in PullImage, each pinned and
+before the Node.js suite [done]; (5) extra layers in PullImage, each pinned and
 verified by digest, with a refusal test; (6) ADR-0004's owed mitigations
 (VERW, IBPB on cross-cell switches, page-table isolation), logged at
 boot. The cell access-control suite is written in another worktree: do
@@ -64,9 +64,15 @@ not write it; merge its branch when it lands.
   Ops: NOP, READ/WRITE(V) (positional on files), FSYNC, POLL_ADD/REMOVE,
   SEND/RECV(MSG), ACCEPT, CONNECT, SHUTDOWN, CLOSE, OPENAT, STATX,
   RENAMEAT/UNLINKAT/MKDIRAT, TIMEOUT/TIMEOUT_REMOVE, ASYNC_CANCEL.
-  `runtest::uring_program` checks it from ring 3 on every boot. Not yet:
-  a kernel worker so armed ops complete without an enter, registered
-  files/buffers, LINK_TIMEOUT, the EXT_ARG signal mask, liburing's tests.
+  `runtest::uring_program` checks it from ring 3 on every boot. The
+  ring's worker (`uring::worker`, a `LinuxProcess::helper` thread: shares
+  the process, blocks signals but SIGKILL, is not one of the group's
+  threads, ends when the ring closes or the process has no threads)
+  completes armed SQEs with nobody in `io_uring_enter`; armed SQEs are
+  claimed (`running`) so they run once. `runtest::uring_worker_program`
+  checks completion while blocked on a registered eventfd and on
+  `epoll_wait` of the ring fd. Not yet: registered files/buffers,
+  LINK_TIMEOUT, the EXT_ARG signal mask, liburing's tests.
 
 **Milestone 6 is done** (2026-11-15): the control plane pulls a real OCI
 image from a registry, verifies it, converts it, and runs it through the

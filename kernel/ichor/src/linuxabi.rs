@@ -189,7 +189,7 @@ mod nr {
     pub(super) const GETRANDOM: u64 = 318; // ChaCha20 seeded from RDSEED/RDRAND and virtio-rng
     pub(super) const RENAMEAT2: u64 = 316; // partial: RENAME_NOREPLACE only
     pub(super) const IO_URING_SETUP: u64 = 425; // partial: no SQPOLL/IOPOLL rings
-    pub(super) const IO_URING_ENTER: u64 = 426; // partial: armed operations complete only while a thread is in io_uring_enter; the EXT_ARG signal mask is not applied
+    pub(super) const IO_URING_ENTER: u64 = 426; // partial: the EXT_ARG signal mask is not applied; the worker completes armed pipe and socket operations but CONNECT runs on the submitter (it may block it); a forked child's submissions run on the parent's worker
     pub(super) const IO_URING_REGISTER: u64 = 427; // partial: probe and eventfd only (no registered files or buffers)
 }
 

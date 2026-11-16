@@ -575,6 +575,35 @@ pub(crate) fn fork(
     Ok((child, cctx))
 }
 
+/// Runs `work` on a new kernel task as the helper thread `p` (from
+/// [`LinuxProcess::helper`]), then takes it out of the table and lets the
+/// process's last thread see its reference gone. Returns false if no task
+/// could be started.
+pub(crate) fn start_helper(
+    p: LinuxProcess,
+    work: impl FnOnce(&mut LinuxProcess) + Send + 'static,
+) -> bool {
+    let pid = p.entry.pid;
+    let task = TaskOptions::new(move || {
+        let mut p = p;
+        *p.entry.task.lock() = Some(frame::task::current());
+        p.mm().space().bind_to_current_task();
+        work(&mut p);
+        frame::mm::activate_kernel_space();
+        *p.entry.task.lock() = None;
+        let gone = p.group.gone.clone();
+        drop(p);
+        TABLE.lock().remove(&pid);
+        gone.wake_all();
+    })
+    .spawn();
+    if task.is_none() {
+        TABLE.lock().remove(&pid);
+        return false;
+    }
+    true
+}
+
 /// Drops a process that never ran (its program failed to load), taking it
 /// out of the table.
 pub(crate) fn discard(p: LinuxProcess) {

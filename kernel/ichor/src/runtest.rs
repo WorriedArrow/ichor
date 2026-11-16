@@ -80,6 +80,182 @@ mod sys {
     pub(super) const IO_URING_REGISTER: u64 = 427;
 }
 
+/// io_uring completions without `io_uring_enter` (the ring's worker): a
+/// READ armed on an empty pipe completes, after a forked child writes, while
+/// the program blocks reading an eventfd registered with the ring; then
+/// again while it waits on the ring descriptor with `epoll_wait`. Exiting
+/// with the worker alive must not hang. The exit code is the failing check.
+fn uring_worker_program() -> Vec<u8> {
+    use ::uring::abi;
+    let Ok(l) = ::uring::setup(8, 0, 0) else {
+        fail("uring layout");
+    };
+    let mut a = Asm::new();
+    let bad = a.label();
+    let x = a.data(b"x");
+    let ms50 = a.data(&[0, 0, 0, 0, 0, 0, 0, 0, 0x80, 0xf0, 0xfa, 0x02, 0, 0, 0, 0]);
+    let expect = |a: &mut Asm, n: u64, v: u64| {
+        a.mov_imm(Reg::R15, n);
+        a.mov_imm(Reg::R14, v);
+        a.cmp(Reg::Rax, Reg::R14);
+        a.jne(bad);
+    };
+    // A READ of one byte from fd 3 into rbp+512+slot, in SQE `slot`.
+    let read_sqe = |a: &mut Asm, slot: i32, ud: u64| {
+        let words = [u64::from(abi::OP_READ) | (3 << 32), 0, 0, 1, ud, 0, 0, 0];
+        for (k, w) in words.iter().enumerate() {
+            a.mov_imm(Reg::Rax, *w);
+            a.store(Reg::R13, slot * 64 + 8 * k as i32, Reg::Rax);
+        }
+        a.mov(Reg::Rax, Reg::Rbp);
+        a.add_imm(Reg::Rax, 512 + slot);
+        a.store(Reg::R13, slot * 64 + 16, Reg::Rax);
+        a.mov_imm(Reg::Rax, slot as u64);
+        a.store32(Reg::R12, l.sq.array as i32 + 4 * slot, Reg::Rax);
+        a.mov_imm(Reg::Rax, slot as u64 + 1);
+        a.store32(Reg::R12, l.sq.tail as i32, Reg::Rax);
+        // Submit only: no GETEVENTS, nobody waits in the ring.
+        a.mov_imm(Reg::Rdi, 5);
+        a.mov_imm(Reg::Rsi, 1);
+        a.mov_imm(Reg::Rdx, 0);
+        a.mov_imm(Reg::R10, 0);
+        a.mov_imm(Reg::R8, 0);
+        a.mov_imm(Reg::R9, 0);
+        a.sys(sys::IO_URING_ENTER);
+    };
+    // A child that writes one byte to the pipe after 50 ms.
+    let child_writes = |a: &mut Asm| {
+        let parent = a.label();
+        a.sys(sys::FORK);
+        a.cmp_imm(Reg::Rax, 0);
+        a.jne(parent);
+        a.mov_data(Reg::Rdi, ms50);
+        a.mov_imm(Reg::Rsi, 0);
+        a.sys(sys::NANOSLEEP);
+        a.mov_imm(Reg::Rdi, 4);
+        a.mov_data(Reg::Rsi, x);
+        a.mov_imm(Reg::Rdx, 1);
+        a.sys(sys::WRITE);
+        a.mov_imm(Reg::Rdi, 0);
+        a.sys(sys::EXIT_GROUP);
+        a.bind(parent);
+    };
+    let reap = |a: &mut Asm| {
+        a.mov_imm(Reg::Rdi, u64::MAX);
+        a.mov_imm(Reg::Rsi, 0);
+        a.mov_imm(Reg::Rdx, 0);
+        a.mov_imm(Reg::R10, 0);
+        a.sys(sys::WAIT4);
+    };
+    let cqe = |a: &mut Asm, n: u64, i: i32, ud: u64, res: u64| {
+        a.load32(Reg::Rax, Reg::R12, l.cq.tail as i32);
+        expect(a, n, i as u64 + 1);
+        a.load(Reg::Rax, Reg::R12, l.cq.cqes as i32 + 16 * i);
+        expect(a, n, ud);
+        a.load32(Reg::Rax, Reg::R12, l.cq.cqes as i32 + 16 * i + 8);
+        expect(a, n, res);
+        a.mov_imm(Reg::Rax, i as u64 + 1);
+        a.store32(Reg::R12, l.cq.head as i32, Reg::Rax);
+    };
+    a.mov(Reg::Rbp, Reg::Rsp);
+    a.sub_imm(Reg::Rbp, 8192);
+    // 1: the pipe (3, 4), the ring (5), an eventfd (6).
+    a.mov(Reg::Rdi, Reg::Rbp);
+    a.add_imm(Reg::Rdi, 256);
+    a.mov_imm(Reg::Rsi, 0);
+    a.sys(sys::PIPE2);
+    expect(&mut a, 1, 0);
+    a.mov_imm(Reg::Rax, 0);
+    for k in 0..15 {
+        a.store(Reg::Rbp, 8 * k, Reg::Rax);
+    }
+    a.mov_imm(Reg::Rdi, 8);
+    a.mov(Reg::Rsi, Reg::Rbp);
+    a.sys(sys::IO_URING_SETUP);
+    expect(&mut a, 1, 5);
+    a.mov_imm(Reg::Rdi, 0);
+    a.mov_imm(Reg::Rsi, 0);
+    a.sys(sys::EVENTFD2);
+    expect(&mut a, 1, 6);
+    for (reg, len, off) in [
+        (Reg::R12, l.ring_bytes, abi::OFF_SQ_RING),
+        (Reg::R13, l.sqes_bytes, abi::OFF_SQES),
+    ] {
+        a.mov_imm(Reg::Rdi, 0);
+        a.mov_imm(Reg::Rsi, len);
+        a.mov_imm(Reg::Rdx, 3);
+        a.mov_imm(Reg::R10, 1);
+        a.mov_imm(Reg::R8, 5);
+        a.mov_imm(Reg::R9, off);
+        a.sys(sys::MMAP);
+        a.mov_imm(Reg::R15, 2);
+        a.mov_imm(Reg::R14, (-4096i64) as u64);
+        a.cmp(Reg::Rax, Reg::R14);
+        a.ja(bad);
+        a.mov(reg, Reg::Rax);
+    }
+    // 3: register the eventfd.
+    a.mov_imm(Reg::Rax, 6);
+    a.store(Reg::Rbp, 128, Reg::Rax);
+    a.mov_imm(Reg::Rdi, 5);
+    a.mov_imm(Reg::Rsi, u64::from(abi::REGISTER_EVENTFD));
+    a.mov(Reg::Rdx, Reg::Rbp);
+    a.add_imm(Reg::Rdx, 128);
+    a.mov_imm(Reg::R10, 1);
+    a.sys(sys::IO_URING_REGISTER);
+    expect(&mut a, 3, 0);
+    // 4: a READ armed on the empty pipe; nothing completes yet.
+    read_sqe(&mut a, 0, 1);
+    expect(&mut a, 4, 1);
+    a.load32(Reg::Rax, Reg::R12, l.cq.tail as i32);
+    expect(&mut a, 4, 0);
+    // 5: the child writes; the parent blocks on the eventfd, not the ring.
+    child_writes(&mut a);
+    a.mov_imm(Reg::Rdi, 6);
+    a.mov(Reg::Rsi, Reg::Rbp);
+    a.add_imm(Reg::Rsi, 160);
+    a.mov_imm(Reg::Rdx, 8);
+    a.sys(sys::READ);
+    expect(&mut a, 5, 8);
+    cqe(&mut a, 6, 0, 1, 1);
+    reap(&mut a);
+    // 7: again, waiting on the ring descriptor with epoll (fd 7).
+    a.mov_imm(Reg::Rdi, 0);
+    a.sys(sys::EPOLL_CREATE1);
+    expect(&mut a, 7, 7);
+    a.mov_imm(Reg::Rax, 1 | (0x5a << 32)); // EPOLLIN, data 0x5a
+    a.store(Reg::Rbp, 32, Reg::Rax);
+    a.mov_imm(Reg::Rax, 0);
+    a.store(Reg::Rbp, 40, Reg::Rax);
+    a.mov_imm(Reg::Rdi, 7);
+    a.mov_imm(Reg::Rsi, 1); // EPOLL_CTL_ADD
+    a.mov_imm(Reg::Rdx, 5);
+    a.mov(Reg::R10, Reg::Rbp);
+    a.add_imm(Reg::R10, 32);
+    a.sys(sys::EPOLL_CTL);
+    expect(&mut a, 7, 0);
+    read_sqe(&mut a, 1, 2);
+    expect(&mut a, 8, 1);
+    child_writes(&mut a);
+    a.mov_imm(Reg::Rdi, 7);
+    a.mov(Reg::Rsi, Reg::Rbp);
+    a.add_imm(Reg::Rsi, 64);
+    a.mov_imm(Reg::Rdx, 4);
+    a.mov_imm(Reg::R10, 10_000); // ms; a hang shows as a timeout
+    a.sys(sys::EPOLL_WAIT);
+    expect(&mut a, 9, 1);
+    a.load(Reg::Rax, Reg::Rbp, 64);
+    expect(&mut a, 9, 1 | (0x5a << 32));
+    cqe(&mut a, 10, 1, 2, 1);
+    reap(&mut a);
+    // 11: exit with the worker still running (it must not hold us up).
+    a.mov_imm(Reg::R15, 0);
+    a.bind(bad);
+    a.mov(Reg::Rdi, Reg::R15);
+    a.sys(sys::EXIT_GROUP);
+    static_elf(&a.finish(BLOB_VADDR).unwrap_or_else(|| fail("assembler")))
+}
+
 /// io_uring (ADR-0013 §1) from ring 3: a ring set up and mapped; a write
 /// linked to a read through a pipe, beside a NOP, all completed by one
 /// `io_uring_enter`; a read of an empty pipe armed, then completed by a
@@ -2221,6 +2397,20 @@ pub(crate) fn run() {
     }
     println!(
         "ichor: linux: io_uring: linked write and read, armed read woken by a child, timeout, probe ok ({syscalls} syscalls)"
+    );
+
+    let (status, syscalls) = run_linux(
+        new_process(),
+        &uring_worker_program(),
+        None,
+        &["uringworker"],
+    );
+    if status != 0 {
+        println!("ichor: linux: uringworker failed check {status}");
+        fail("uringworker");
+    }
+    println!(
+        "ichor: linux: io_uring: armed reads completed with nobody in io_uring_enter (registered eventfd, epoll on the ring) ({syscalls} syscalls)"
     );
 
     let (status, syscalls) = run_linux(new_process(), &lock_program(), None, &["locktest"]);

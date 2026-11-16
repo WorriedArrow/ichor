@@ -487,6 +487,32 @@ impl LinuxProcess {
         }
     }
 
+    /// A kernel helper thread of this process (an io_uring worker): it
+    /// shares the process's memory, files and credentials, has its own
+    /// thread id, blocks every signal SIGKILL and SIGSTOP aside, and is not
+    /// one of the group's threads, so it neither keeps the process alive
+    /// nor is waited for by `exit_group` or `execve`. Start it with
+    /// [`crate::proc::start_helper`].
+    pub(crate) fn helper(&self) -> Self {
+        let entry = proc::register(
+            self.cell.id(),
+            self.entry.ppid(),
+            Some(self.group.tgid),
+            None,
+        );
+        let mut sig = Signals::new();
+        sig.mask = !(crate::signal::bit(crate::signal::SIGKILL) | crate::signal::bit(19));
+        proc::set_masks(&entry, sig.mask, 0);
+        Self {
+            entry,
+            group: self.group.clone(),
+            cell: self.cell.clone(),
+            vfs: self.vfs.clone(),
+            sig,
+            clear_tid: 0,
+        }
+    }
+
     /// The process's address space (locked).
     /// The root, locked and checked against this process's filesystem
     /// credentials (ADR-0009).

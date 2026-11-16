@@ -9,11 +9,13 @@
 //!
 //! An SQE runs on the thread that submits it, through the same code as the
 //! synchronous syscall (`linuxabi::dispatch`). One on a pipe or socket that
-//! is not ready is armed instead and runs once it is, while some thread of
-//! the process is in `io_uring_enter` (waiting for completions wakes on
-//! the armed objects): the armed operation never blocks a submitter, but
-//! it also does not complete while nobody enters the ring (Linux completes
-//! it from a kernel worker). POLL_ADD and TIMEOUT wait the same way.
+//! is not ready is armed instead and runs once it is: by a thread waiting
+//! in `io_uring_enter`, or by the ring's worker, a helper thread of the
+//! process (`LinuxProcess::helper`) started the first time an SQE is
+//! armed, so completions arrive while the program waits on the ring
+//! descriptor with epoll or on a registered eventfd, as on Linux. An armed
+//! SQE is claimed before it runs, so it runs once. POLL_ADD and TIMEOUT
+//! wait the same way.
 //! SQPOLL and IOPOLL rings, registered files and buffers, and LINK_TIMEOUT
 //! are refused (`-EINVAL`), so libraries fall back.
 
@@ -138,6 +140,9 @@ struct Op {
     /// early (0: only the deadline).
     deadline: Option<Duration>,
     until: Option<u64>,
+    /// A thread is running it (a submitter or the ring's worker): no other
+    /// may run or cancel it.
+    running: bool,
 }
 
 #[derive(Debug, Default)]
@@ -158,6 +163,13 @@ pub(crate) struct Ring {
     eventfd: SpinLock<Option<Arc<dyn Object>>>,
     /// CQEs posted so far (TIMEOUT counts).
     completed: AtomicU64,
+    /// Bumped whenever an SQE is armed or completes (the worker re-reads
+    /// what to wait on).
+    epoch: AtomicU64,
+    /// Whether the worker runs (started the first time an SQE is armed).
+    worker: core::sync::atomic::AtomicBool,
+    /// This ring, for the worker (which must not keep it alive).
+    me: alloc::sync::Weak<Ring>,
 }
 
 impl core::fmt::Debug for Ring {
@@ -223,6 +235,7 @@ impl Ring {
             self.flush_overflow(&mut st);
         }
         self.completed.fetch_add(1, Ordering::AcqRel);
+        self.epoch.fetch_add(1, Ordering::AcqRel);
         self.watchers.notify();
         if let Some(e) = self.eventfd.lock().clone() {
             let _ = e.write(&1u64.to_le_bytes(), true, &|| false);
@@ -281,6 +294,7 @@ impl Ring {
                     armed: false,
                     deadline: None,
                     until: None,
+                    running: false,
                 },
             );
         }
@@ -335,21 +349,30 @@ impl Ring {
             for (id, sqe) in ready {
                 self.start(p, id, sqe);
             }
+            // Armed SQEs nobody else is running, claimed.
             let armed: Vec<(u64, Sqe)> = {
-                let st = self.state.lock();
+                let mut st = self.state.lock();
                 st.ops
-                    .iter()
-                    .filter(|(_, o)| o.armed)
-                    .map(|(&id, o)| (id, o.sqe))
+                    .iter_mut()
+                    .filter(|(_, o)| o.armed && !o.running)
+                    .map(|(&id, o)| {
+                        o.running = true;
+                        (id, o.sqe)
+                    })
                     .collect()
             };
             for (id, sqe) in armed {
-                progress |= self.retry(p, id, sqe);
+                let done = self.retry(p, id, sqe);
+                if !done && let Some(o) = self.state.lock().ops.get_mut(&id) {
+                    o.running = false;
+                }
+                progress |= done;
             }
             if !progress {
-                return;
+                break;
             }
         }
+        self.start_worker(p);
     }
 
     fn arm(&self, id: u64, deadline: Option<Duration>, until: Option<u64>) {
@@ -358,20 +381,43 @@ impl Ring {
             o.deadline = deadline;
             o.until = until;
         }
+        self.epoch.fetch_add(1, Ordering::AcqRel);
+        self.watchers.notify();
     }
 
-    /// Finds an armed or pending SQE by `user_data` and cancels it.
+    /// Starts the ring's worker the first time something is armed: a
+    /// helper thread of the process that runs armed SQEs as they become
+    /// ready, so they complete even while no thread is in
+    /// `io_uring_enter` (a program may wait on the ring descriptor with
+    /// epoll, or on a registered eventfd).
+    fn start_worker(&self, p: &LinuxProcess) {
+        let armed = self.state.lock().ops.values().any(|o| o.armed);
+        if !armed || self.worker.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let me = self.me.clone();
+        if !crate::proc::start_helper(p.helper(), move |p| worker(&me, p)) {
+            self.worker.store(false, Ordering::Release);
+        }
+    }
+
+    /// Finds an armed SQE by `user_data` that no thread is running, claims
+    /// it, and cancels it.
     fn cancel(&self, user_data: u64, only: Option<u8>) -> bool {
         let found = {
-            let st = self.state.lock();
+            let mut st = self.state.lock();
             st.ops
-                .iter()
+                .iter_mut()
                 .find(|(_, o)| {
                     o.armed
+                        && !o.running
                         && o.sqe.user_data == user_data
                         && only.is_none_or(|op| o.sqe.opcode == op)
                 })
-                .map(|(&id, _)| id)
+                .map(|(&id, o)| {
+                    o.running = true;
+                    id
+                })
         };
         match found {
             Some(id) => {
@@ -512,6 +558,42 @@ impl Ring {
             }
         }
         (fds, deadline)
+    }
+}
+
+/// How often the worker re-checks that it should still run: the process
+/// exiting or exec'ing, or the ring closing, does not wake it.
+const WORKER_RECHECK: Duration = Duration::from_millis(100);
+
+/// The ring's worker: runs armed SQEs as their objects become ready (and
+/// fires timeouts), sleeping on those objects and on the ring itself (new
+/// armed SQEs, completions) in between. It ends when the ring closes, the
+/// process has no threads left, or it is killed.
+fn worker(me: &alloc::sync::Weak<Ring>, p: &mut LinuxProcess) {
+    loop {
+        if p.group.threads().is_empty() || crate::proc::interrupted(&p.entry) {
+            return;
+        }
+        let Some(ring) = me.upgrade() else {
+            return;
+        };
+        let epoch = ring.epoch.load(Ordering::Acquire);
+        ring.run(p);
+        let (fds, deadline) = ring.waits(p);
+        let mut until = frame::time::now() + WORKER_RECHECK;
+        if let Some(d) = deadline {
+            until = until.min(d);
+        }
+        let watched: Vec<&Watchers> = fds
+            .iter()
+            .filter_map(|(f, _)| poll::watchers(f))
+            .chain(core::iter::once(&ring.watchers))
+            .collect();
+        poll::wait_watchers(&watched, Some(until), || {
+            let changed = ring.epoch.load(Ordering::Acquire) != epoch;
+            let ready = fds.iter().any(|(f, need)| poll::readiness(f) & need != 0);
+            (changed || ready).then_some(())
+        });
     }
 }
 
@@ -709,7 +791,7 @@ pub(super) fn setup(p: &mut LinuxProcess, entries: u64, params: u64) -> Result<u
     for (off, v) in layout.constants() {
         rings.set(off, v);
     }
-    let ring = Arc::new(Ring {
+    let ring = Arc::new_cyclic(|me| Ring {
         layout,
         rings,
         sqes,
@@ -717,6 +799,9 @@ pub(super) fn setup(p: &mut LinuxProcess, entries: u64, params: u64) -> Result<u
         watchers: Watchers::new(),
         eventfd: SpinLock::new(None),
         completed: AtomicU64::new(0),
+        epoch: AtomicU64::new(0),
+        worker: core::sync::atomic::AtomicBool::new(false),
+        me: me.clone(),
     });
     let fd = p
         .install_flags(

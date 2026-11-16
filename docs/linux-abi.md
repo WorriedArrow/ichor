@@ -170,6 +170,6 @@ stale. Do not edit by hand.
 | 318 | `getrandom` | implemented | ChaCha20 seeded from RDSEED/RDRAND and virtio-rng |
 | 332 | `statx` | implemented |  |
 | 425 | `io_uring_setup` | partial | no SQPOLL/IOPOLL rings |
-| 426 | `io_uring_enter` | partial | armed operations complete only while a thread is in io_uring_enter; the EXT_ARG signal mask is not applied |
+| 426 | `io_uring_enter` | partial | the EXT_ARG signal mask is not applied; the worker completes armed pipe and socket operations but CONNECT runs on the submitter (it may block it); a forked child's submissions run on the parent's worker |
 | 427 | `io_uring_register` | partial | probe and eventfd only (no registered files or buffers) |
 | 439 | `faccessat2` | implemented |  |
