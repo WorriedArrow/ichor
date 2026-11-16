@@ -64,9 +64,9 @@ Status: [ ] to do, [x] done and committed.
     process_vm_readv, process_vm_writev, kcmp.
   - kill(p, 0) for every pid up to the highest allocated finds only A's.
   - B reports no signal arrived.
-- [ ] **2. proc_and_sys_show_only_their_cell**: /proc/B ENOENT
+- [x] **2. proc_and_sys_show_only_their_cell**: /proc/B ENOENT
   (`procfs::lookup`: only `me`), listing, self links, global files
-  recorded.
+  recorded. (66 checks)
 - [ ] **3. file_systems_are_scoped_to_their_root** (BLOCKED, see notes): `..` at the root,
   symlinks into B's paths ENOENT, created files invisible both ways, link
   and rename stay in A, B's ptys ENOENT in A (`Vfs::ptys` per root).
@@ -101,3 +101,14 @@ Status: [ ] to do, [x] done and committed.
 - pids are global numbers filtered by cell (`proc.rs` header), not a
   per-cell pid space with init as 1 as ADR-0002 §3 says: an ADR conflict
   for the report.
+- procfs gaps seen in section 2 (not cell scoping): no `/proc/<pid>/root`
+  or `mem`; a link in the middle of a path (`/proc/self/cwd/x`) is not
+  followed; fd links of files read `anon_inode:[file]`.
+- Global files: `/proc/loadavg`'s last field and `/proc/stat`'s
+  `processes` are the global last pid (`proc::census` returns
+  `NEXT_PID - 1`), so A sees how many processes every cell has started.
+  meminfo shows A's account (65536 kB = its 16384 pages). cpuinfo,
+  `/sys` cpu lists, uptime and version are host-wide, the same for every
+  cell. mounts and hostname are fixed strings.
+- Section 4 copies up `/usr/bin/dash` in A's root, so later A scripts
+  must not run `/bin/sh` (perl's `system`).

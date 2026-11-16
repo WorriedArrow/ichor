@@ -65,6 +65,19 @@ fn process_ids_and_signals_are_scoped_to_their_cell() {
     ]);
 }
 
+/// Section 2: /proc/<B pid> is absent in A, /proc lists only A, and
+/// /proc/self's links stay in A. Global files are printed for the report.
+#[test]
+fn proc_and_sys_show_only_their_cell() {
+    assert_rule("proc_and_sys_show_only_their_cell");
+    suite().assert_in_order(&[
+        "/proc lists only A's process: ok",
+        "cellaccess: global: /proc/loadavg: ",
+        "ichor: cellaccess: proc_and_sys_show_only_their_cell passed",
+        "ichor: cellaccess: B alive and unchanged after proc_and_sys_show_only_their_cell",
+    ]);
+}
+
 #[test]
 fn cells_clean_up_after_themselves() {
     let out = suite();

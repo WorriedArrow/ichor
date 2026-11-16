@@ -46,6 +46,7 @@ const PRELUDE: &str = include_str!("cellaccess/prelude.pl");
 const B_HELPER: &str = include_str!("cellaccess/b_helper.pl");
 const SMOKE: &str = include_str!("cellaccess/smoke.pl");
 const S1_PROCESS: &str = include_str!("cellaccess/s1_process.pl");
+const S2_PROC: &str = include_str!("cellaccess/s2_proc.pl");
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
 /// Set once the harness has ended B's futex wait (section 4); until then
@@ -71,6 +72,7 @@ const SECTIONS: &[Section] = &[
     ("process_ids_and_signals_are_scoped_to_their_cell", |c| {
         in_a(c, S1_PROCESS)
     }),
+    ("proc_and_sys_show_only_their_cell", |c| in_a(c, S2_PROC)),
 ];
 
 /// One cell with its own root.
