@@ -51,6 +51,7 @@ const S4_PAGES: &str = include_str!("cellaccess/s4_pages.pl");
 const S4_FILL: &str = include_str!("cellaccess/s4_fill.pl");
 const S4_PRIVATE: &str = include_str!("cellaccess/s4_private.pl");
 const S5_NET: &str = include_str!("cellaccess/s5_net.pl");
+const S6_STATE: &str = include_str!("cellaccess/s6_state.pl");
 /// The file both cells map (B's helper reports it too); the checks use its
 /// page 1.
 const SHARED_FILE: &str = "/usr/bin/dash";
@@ -90,6 +91,7 @@ const SECTIONS: &[Section] = &[
     ("proc_and_sys_show_only_their_cell", |c| in_a(c, S2_PROC)),
     ("shared_cache_pages_never_carry_writes_between_cells", s4),
     ("networks_are_scoped_to_their_cell", s5),
+    ("other_kernel_state_is_per_cell", |c| in_a(c, S6_STATE)),
 ];
 
 /// One cell with its own root.

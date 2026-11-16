@@ -81,7 +81,7 @@ Status: [ ] to do, [x] done and committed.
   address, loopback per cell ECONNREFUSED, uplink refuses an unpublished
   port, Unix path ENOENT, abstract ECONNREFUSED, SO_PEERCRED,
   SCM_RIGHTS stays in A.
-- [ ] **6. other_kernel_state_is_per_cell**: SysV IPC (ENOSYS today),
+- [x] **6. other_kernel_state_is_per_cell** (18 checks): SysV IPC (ENOSYS today),
   sethostname (ENOSYS today) and B's uname, io_uring ops on B's names.
 - [ ] **7. uid_0_in_a_cell_has_no_authority_outside_it**: mount/umount2
   EPERM, mknod/reboot/clock_settime/settimeofday/adjtimex (ENOSYS today),

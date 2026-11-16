@@ -86,6 +86,11 @@ for (1 .. 2) {
     push @pts, [$m, unpack("i", $n)];
 }
 
+# A descriptor at a fixed number (200): A names the same number in its
+# io_uring checks.
+open(my $held, "<", "/b-only/secret") or die "secret: $!";
+POSIX::dup2(fileno($held), 200) // die "dup2: $!";
+
 # Wait until the futex child is in (or about to enter) its wait.
 for (1 .. 500) { last if -e "/run/ichor/futex-ready"; select(undef, undef, undef, 0.02) }
 -e "/run/ichor/futex-ready" or die "the futex child never got ready";
@@ -96,7 +101,7 @@ put("ids", join(" ",
     "hostname=$host", "only=/b-only/secret", "ip=$ARG{ip}", "port=$ARG{port}",
     "uplink=$ARG{uplink}", "upath=$UPATH", "abstract=ichor-b-stream", "dgram=ichor-b-dgram",
     "pts=" . join(",", map { $_->[1] } @pts), "futex_va=$FVA", "futex_off=$FOFF",
-    "file=/usr/bin/dash"));
+    "file=/usr/bin/dash", "fd=200"));
 
 # What A's checks may have changed, as B sees it now.
 sub status {

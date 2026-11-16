@@ -157,6 +157,21 @@ fn networks_are_scoped_to_their_cell() {
     assert!(*answers >= 1, "the host never got B's answer");
 }
 
+/// Section 6: io_uring operations from A that name B's path, abstract
+/// socket or descriptor number fail as the plain syscalls do; SysV IPC,
+/// mq_open and sethostname are ENOSYS today (recorded), and B's hostname
+/// is unchanged.
+#[test]
+fn other_kernel_state_is_per_cell() {
+    assert_rule("other_kernel_state_is_per_cell");
+    suite().0.assert_in_order(&[
+        "IORING_OP_OPENAT(B's path) (ENOENT): ok",
+        "IORING_OP_CONNECT(B's abstract name) (ECONNREFUSED): ok",
+        "ichor: cellaccess: other_kernel_state_is_per_cell passed",
+        "ichor: cellaccess: B alive and unchanged after other_kernel_state_is_per_cell",
+    ]);
+}
+
 #[test]
 fn cells_clean_up_after_themselves() {
     let out = &suite().0;
