@@ -114,10 +114,12 @@ impl Session {
 fn pull_and_run(
     s: &mut Session,
     reference: &str,
+    layers: Vec<control::LayerSource>,
     argv: &[&str],
 ) -> Result<(control::PullImageResponse, String, Vec<u8>, u32), String> {
     let req = control::PullImageRequest {
         reference: reference.into(),
+        layers,
     };
     let t0 = Instant::now();
     let (m, code, msg) = s.call(control::PULL_IMAGE, &req.encode(), Duration::from_secs(600))?;
@@ -166,8 +168,43 @@ fn pull_and_run(
 
 type Ran = (control::PullImageResponse, String, Vec<u8>, u32);
 
-/// The whole flow, from the host: hello-world, then Alpine.
-fn session(port: u16) -> Result<(Ran, Ran), String> {
+/// The extra layer the host serves: a source-style archive whose `src/`
+/// goes to `/opt/extra/` in the image.
+fn extra_layer() -> Vec<u8> {
+    xtask::deflate::gzip(&xtask::deflate::tar(
+        "src/greeting",
+        b"hello from an extra layer\n",
+    ))
+}
+
+fn sha256(b: &[u8]) -> String {
+    format!("sha256:{}", xtask::sha256::hex(&xtask::sha256::digest(b)))
+}
+
+/// Serves `body` to every HTTP request on 127.0.0.1 (the guest's
+/// 10.0.2.2) until the process ends; returns the port.
+fn serve(body: Vec<u8>) -> u16 {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for mut s in l.incoming().flatten() {
+            let mut req = [0u8; 4096];
+            let _ = s.set_read_timeout(Some(Duration::from_secs(10)));
+            let _ = s.read(&mut req);
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/gzip\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = s.write_all(head.as_bytes());
+            let _ = s.write_all(&body);
+        }
+    });
+    port
+}
+
+/// The whole flow, from the host: hello-world, then Alpine with an extra
+/// layer (and, first, the same layer with a wrong digest, refused).
+fn session(port: u16, layer_port: u16) -> Result<(Ran, Ran), String> {
     let mut s = Session::connect(port, Instant::now() + Duration::from_secs(600))?;
     eprintln!("host: connected to the control plane");
 
@@ -178,20 +215,44 @@ fn session(port: u16) -> Result<(Ran, Ran), String> {
     }
     let bad = control::PullImageRequest {
         reference: "UPPER/case!".into(),
+        layers: vec![],
     };
     let (_, code, _) = s.call(control::PULL_IMAGE, &bad.encode(), Duration::from_secs(60))?;
     if code != grpc::status::INVALID_ARGUMENT {
         return Err(format!("a bad reference gave status {code}"));
     }
 
-    let hello = pull_and_run(&mut s, IMAGE, &[])?;
+    let hello = pull_and_run(&mut s, IMAGE, vec![], &[])?;
+
+    let body = extra_layer();
+    let layer = |digest: String| control::LayerSource {
+        url: format!("http://10.0.2.2:{layer_port}/extra.tar.gz"),
+        digest,
+        from: "src/".into(),
+        to: "/opt/extra/".into(),
+    };
+    // A layer that does not hash to its pinned digest fails the pull.
+    let wrong = format!("sha256:{}", "0".repeat(64));
+    let req = control::PullImageRequest {
+        reference: ALPINE.into(),
+        layers: vec![layer(wrong.clone())],
+    };
+    let (_, code, msg) = s.call(control::PULL_IMAGE, &req.encode(), Duration::from_secs(600))?;
+    if code == 0 || !msg.contains(&wrong) || !msg.contains(&sha256(&body)) {
+        return Err(format!(
+            "a layer with the wrong digest was not refused: ({code}) {msg}"
+        ));
+    }
+    eprintln!("host: refused as it should be: {msg}");
+
     let alpine = pull_and_run(
         &mut s,
         ALPINE,
+        vec![layer(sha256(&body))],
         &[
             "sh",
             "-c",
-            "cat /etc/alpine-release; echo \"$((6 * 7)) from $(uname -s)\"; ls /bin/busybox; exit 3",
+            "cat /etc/alpine-release; echo \"$((6 * 7)) from $(uname -s)\"; ls /bin/busybox; cat /opt/extra/greeting; exit 3",
         ],
     )?;
     // Hanging up ends the control plane (`control_exit`) and the boot.
@@ -262,7 +323,8 @@ fn the_control_plane_pulls_and_runs_an_image_from_docker_hub() {
         .local_addr()
         .unwrap()
         .port();
-    let client = std::thread::spawn(move || session(host_port));
+    let layer_port = serve(extra_layer());
+    let client = std::thread::spawn(move || session(host_port, layer_port));
     // Exposure is explicit: published on the uplink.
     let cmdline = "control=50051 control_publish=50051 control_exit";
     let out = ichor_tests::boot_with("control", cmdline, 2, |c| {
@@ -280,6 +342,10 @@ fn the_control_plane_pulls_and_runs_an_image_from_docker_hub() {
         "control: cell 1 at 10.88.",
         "control: cell 1 runs [\"/hello\"]",
         "control: pulling docker.io/library/alpine@sha256:1e42bbe2",
+        ", not its pinned sha256:0000000000000000000000000000000000000000000000000000000000000000; refused",
+        "control: pulling docker.io/library/alpine@sha256:1e42bbe2",
+        "control: layer http://10.0.2.2:",
+        "verified (",
         "control: cell 2 at 10.88.",
         "control: the API client is gone; exiting",
         "ichor: control: exited with Some(0)",
@@ -302,6 +368,9 @@ fn the_control_plane_pulls_and_runs_an_image_from_docker_hub() {
         pulled.env
     );
     let text = String::from_utf8_lossy(&output);
-    assert_eq!(text, "3.20.3\n42 from Linux\n/bin/busybox\n");
+    assert_eq!(
+        text,
+        "3.20.3\n42 from Linux\n/bin/busybox\nhello from an extra layer\n"
+    );
     assert_eq!(exit, 3 << 8);
 }

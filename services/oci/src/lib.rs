@@ -233,11 +233,11 @@ impl Puller {
     }
 
     fn url(&self, path: &str) -> Url {
-        Url {
-            host: self.r.registry.clone(),
-            port: 443,
-            path: format!("/v2/{}/{path}", self.r.repository),
-        }
+        Url::https(
+            &self.r.registry,
+            443,
+            &format!("/v2/{}/{path}", self.r.repository),
+        )
     }
 
     fn authed(&self, req: Request) -> Request {
@@ -464,6 +464,22 @@ fn encode(v: &str) -> String {
 
 /// The pulled layers as one Ichor image.
 pub fn convert(p: &Pulled) -> Result<Vec<u8>, Error> {
+    convert_with(p, &[])
+}
+
+/// A layer added on top of an image's own, already verified against its
+/// pinned digest: a gzip'd or plain tar, of which only the entries under
+/// `from` are taken, moved to `to` (both empty: the whole archive, as an
+/// image layer, whiteouts included).
+#[derive(Clone, Copy, Debug)]
+pub struct Extra<'a> {
+    pub data: &'a [u8],
+    pub from: &'a str,
+    pub to: &'a str,
+}
+
+/// The pulled layers, then `extras` above them, as one Ichor image.
+pub fn convert_with(p: &Pulled, extras: &[Extra<'_>]) -> Result<Vec<u8>, Error> {
     let mut t = layer::Tree::new();
     for (d, data) in &p.layers {
         let tar = if d.media_type.ends_with("gzip") || data.starts_with(&[0x1f, 0x8b]) {
@@ -474,6 +490,19 @@ pub fn convert(p: &Pulled) -> Result<Vec<u8>, Error> {
             return Err(Error::Unsupported(d.media_type.clone()));
         };
         t.add_tar(&tar).map_err(|e| Error::Unsupported(e.0))?;
+    }
+    for x in extras {
+        let tar = if x.data.starts_with(&[0x1f, 0x8b]) {
+            layer::gunzip_all(x.data).map_err(|e| Error::Unsupported(e.0))?
+        } else {
+            x.data.to_vec()
+        };
+        let r = if x.from.is_empty() && x.to.is_empty() {
+            t.add_tar(&tar)
+        } else {
+            t.add_tar_at(&tar, x.from, x.to)
+        };
+        r.map_err(|e| Error::Unsupported(e.0))?;
     }
     Ok(t.image())
 }

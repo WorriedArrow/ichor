@@ -34,6 +34,8 @@ pub enum Error {
 /// An HTTPS URL, split.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Url {
+    /// `https` (otherwise plain `http`).
+    pub https: bool,
     pub host: String,
     pub port: u16,
     /// Path and query, starting with `/`.
@@ -41,12 +43,22 @@ pub struct Url {
 }
 
 impl Url {
+    /// An `https` URL.
+    pub fn https(host: &str, port: u16, path: &str) -> Url {
+        Url {
+            https: true,
+            host: host.into(),
+            port,
+            path: path.into(),
+        }
+    }
+
     /// Parses `https://host[:port]/path`; plain `http://` too (port 80).
     pub fn parse(s: &str) -> Option<Url> {
-        let (rest, default_port) = if let Some(r) = s.strip_prefix("https://") {
-            (r, 443)
+        let (rest, https, default_port) = if let Some(r) = s.strip_prefix("https://") {
+            (r, true, 443)
         } else {
-            (s.strip_prefix("http://")?, 80)
+            (s.strip_prefix("http://")?, false, 80)
         };
         let (authority, path) = match rest.find('/') {
             Some(i) => (&rest[..i], &rest[i..]),
@@ -60,6 +72,7 @@ impl Url {
             return None;
         }
         Some(Url {
+            https,
             host: host.into(),
             port,
             path: path.into(),
@@ -67,7 +80,7 @@ impl Url {
     }
 
     pub fn is_https(&self) -> bool {
-        self.port != 80
+        self.https
     }
 
     /// Resolves `location` (absolute, or a path) against this URL.
@@ -76,10 +89,16 @@ impl Url {
             return Url::parse(location);
         }
         location.starts_with('/').then(|| Url {
+            https: self.https,
             host: self.host.clone(),
             port: self.port,
             path: location.into(),
         })
+    }
+
+    /// Whether the port is the scheme's own (so `Host` leaves it out).
+    fn default_port(&self) -> bool {
+        self.port == if self.https { 443 } else { 80 }
     }
 }
 
@@ -109,7 +128,7 @@ impl Request {
 
     /// The bytes to send.
     pub fn encode(&self) -> Vec<u8> {
-        let host = if self.url.port == 443 || self.url.port == 80 {
+        let host = if self.url.default_port() {
             self.url.host.clone()
         } else {
             format!("{}:{}", self.url.host, self.url.port)
@@ -311,6 +330,25 @@ impl ResponseParser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_scheme_is_kept_whatever_the_port() {
+        let u = Url::parse("http://10.0.2.2:8000/layer.tar.gz").unwrap();
+        assert!(!u.is_https());
+        assert!(
+            String::from_utf8(Request::get(u.clone()).encode())
+                .unwrap()
+                .contains("Host: 10.0.2.2:8000\r\n")
+        );
+        assert!(!u.join("/other").unwrap().is_https());
+        let s = Url::parse("https://example.com:80/").unwrap();
+        assert!(s.is_https());
+        assert!(
+            String::from_utf8(Request::get(s).encode())
+                .unwrap()
+                .contains("Host: example.com:80\r\n")
+        );
+    }
 
     #[test]
     fn urls() {

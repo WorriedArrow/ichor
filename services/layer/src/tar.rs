@@ -260,7 +260,45 @@ impl Tree {
     /// its whiteouts first, against the layers below, then its entries in
     /// order (a later entry replaces an earlier one).
     pub fn add_tar(&mut self, tar: &[u8]) -> Result<()> {
-        let ms = members(tar)?;
+        self.apply(members(tar)?)
+    }
+
+    /// [`Tree::add_tar`] for an archive that is not an image layer (a
+    /// source release): only its entries under `from` are applied, moved
+    /// to `to` (`Python-3.12.7/Lib/` to `usr/local/lib/python3.12/`, say).
+    /// Hard link targets move with them.
+    pub fn add_tar_at(&mut self, tar: &[u8], from: &str, to: &str) -> Result<()> {
+        let norm = |s: &str| {
+            s.trim_start_matches("./")
+                .trim_start_matches('/')
+                .to_string()
+        };
+        let (from, to) = (norm(from), norm(to));
+        let moved = |name: &str| -> Option<String> {
+            let rest = norm(name).strip_prefix(from.as_str())?.to_string();
+            let joined = if to.is_empty() || to.ends_with('/') || rest.is_empty() {
+                format!("{to}{rest}")
+            } else {
+                format!("{to}/{rest}")
+            };
+            (!joined.is_empty()).then_some(joined)
+        };
+        let mut ms = Vec::new();
+        for mut m in members(tar)? {
+            let Some(name) = moved(&m.name) else {
+                continue;
+            };
+            m.name = name;
+            if m.kind == b'1' {
+                m.link = moved(&m.link)
+                    .ok_or_else(|| format!("tar: hard link {} leaves {from}", m.name))?;
+            }
+            ms.push(m);
+        }
+        self.apply(ms)
+    }
+
+    fn apply(&mut self, ms: Vec<Member<'_>>) -> Result<()> {
         for m in &ms {
             let ps = parts(&m.name)?;
             let Some((base, dir)) = ps.split_last() else {
@@ -416,6 +454,46 @@ mod tests {
         );
         assert_eq!(image.lookup("/bin/hard").unwrap().size(), 4);
         assert!(image.lookup("/dev/null").is_none());
+    }
+
+    #[test]
+    fn a_subtree_of_an_archive_moves_into_place() {
+        let mut src = Vec::new();
+        src.extend(entry("Python-3.12.7/", b'5', "", b"", 0o755));
+        src.extend(entry("Python-3.12.7/README", b'0', "", b"no", 0o644));
+        src.extend(entry(
+            "Python-3.12.7/Lib/test/test_os.py",
+            b'0',
+            "",
+            b"os",
+            0o644,
+        ));
+        src.extend(entry(
+            "Python-3.12.7/Lib/test/same.py",
+            b'1',
+            "Python-3.12.7/Lib/test/test_os.py",
+            b"",
+            0o644,
+        ));
+        src.extend(vec![0u8; 1024]);
+        let mut t = Tree::new();
+        t.add_file("usr/local/lib/python3.12/os.py", b"base", 0o644)
+            .unwrap();
+        t.add_tar_at(&src, "Python-3.12.7/Lib/", "/usr/local/lib/python3.12/")
+            .unwrap();
+        let img = t.image();
+        let lib = "/usr/local/lib/python3.12";
+        assert_eq!(
+            read(&img, &format!("{lib}/test/test_os.py")).unwrap(),
+            b"os"
+        );
+        assert_eq!(read(&img, &format!("{lib}/test/same.py")).unwrap(), b"os");
+        assert_eq!(read(&img, &format!("{lib}/os.py")).unwrap(), b"base");
+        assert!(read(&img, "/README").is_none() && read(&img, &format!("{lib}/README")).is_none());
+        // A hard link out of the subtree is refused.
+        let mut bad = entry("a/x", b'1', "b/y", b"", 0o644);
+        bad.extend(vec![0u8; 1024]);
+        assert!(Tree::new().add_tar_at(&bad, "a/", "c/").is_err());
     }
 
     #[test]

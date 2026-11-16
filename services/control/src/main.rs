@@ -59,6 +59,20 @@ struct Pull {
     puller: oci::Puller,
     fetch: Option<Fetch>,
     started: u64,
+    /// The image, once pulled and verified.
+    pulled: Option<oci::Pulled>,
+    /// Layers to add, and those fetched and verified so far.
+    layers: Vec<control::LayerSource>,
+    extras: Vec<Vec<u8>>,
+}
+
+/// Whether `d` is a digest we can check (`sha256:` and 64 hex digits).
+fn valid_digest(d: &str) -> bool {
+    d.strip_prefix("sha256:").is_some_and(|h| {
+        h.len() == 64
+            && h.bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    })
 }
 
 struct Run {
@@ -360,7 +374,20 @@ impl Control {
                     let m = format!("bad image reference {:?}", req.reference);
                     return self.fail(conn, stream, status::INVALID_ARGUMENT, &m);
                 };
-                rt::log!("control: pulling {}", req.reference);
+                for l in &req.layers {
+                    if !valid_digest(&l.digest) || http::Url::parse(&l.url).is_none() {
+                        let m = format!(
+                            "a layer needs an http(s) URL and a sha256 digest (got {:?}, {:?})",
+                            l.url, l.digest
+                        );
+                        return self.fail(conn, stream, status::INVALID_ARGUMENT, &m);
+                    }
+                }
+                rt::log!(
+                    "control: pulling {} (+{} layers)",
+                    req.reference,
+                    req.layers.len()
+                );
                 self.pulls.push(Pull {
                     conn,
                     stream,
@@ -368,6 +395,9 @@ impl Control {
                     puller: oci::Puller::new(r),
                     fetch: None,
                     started: rt::monotonic(),
+                    pulled: None,
+                    layers: req.layers,
+                    extras: Vec::new(),
                 });
             }
             control::CREATE_CELL => {
@@ -481,7 +511,9 @@ impl Control {
         }
     }
 
-    /// True once the pull is finished (and answered).
+    /// True once the pull is finished (and answered). The image first,
+    /// then each extra layer, verified against its pinned digest before it
+    /// is used, as the image's own blobs are.
     fn advance_pull(&mut self, i: usize) -> Result<bool, String> {
         loop {
             let p = &mut self.pulls[i];
@@ -491,18 +523,60 @@ impl Control {
                     Some(resp) => {
                         p.fetch = None;
                         let (status, len) = (resp.status, resp.body.len());
-                        p.puller.on_response(resp).map_err(|e| format!("{e:?}"))?;
-                        rt::log!("control: {} answered {status} ({len} bytes)", p.reference);
+                        if p.pulled.is_none() {
+                            p.puller.on_response(resp).map_err(|e| format!("{e:?}"))?;
+                            rt::log!("control: {} answered {status} ({len} bytes)", p.reference);
+                        } else {
+                            let l = &p.layers[p.extras.len()];
+                            if status != 200 {
+                                return Err(format!("layer {}: HTTP {status}", l.url));
+                            }
+                            let got = oci::digest_of(&resp.body);
+                            if got != l.digest {
+                                return Err(format!(
+                                    "layer {} hashes to {got}, not its pinned {}; refused",
+                                    l.url, l.digest
+                                ));
+                            }
+                            rt::log!("control: layer {} verified ({len} bytes)", l.url);
+                            p.extras.push(resp.body);
+                        }
                     }
                 }
             }
-            match p.puller.step() {
-                oci::Step::Fetch(req) => {
-                    p.fetch = Some(Fetch::start(req, &mut self.net)?);
+            if p.pulled.is_none() {
+                match p.puller.step() {
+                    oci::Step::Fetch(req) => {
+                        p.fetch = Some(Fetch::start(req, &mut self.net)?);
+                        continue;
+                    }
+                    oci::Step::Done(pulled) => p.pulled = Some(pulled),
                 }
-                oci::Step::Done(pulled) => {
+            }
+            if let Some(l) = p.layers.get(p.extras.len()) {
+                let url = http::Url::parse(&l.url).ok_or("a layer URL does not parse")?;
+                p.fetch = Some(Fetch::start(http::Request::get(url), &mut self.net)?);
+                continue;
+            }
+            {
+                let Some(pulled) = p.pulled.take() else {
+                    return Err("no image".into());
+                };
+                let extras: Vec<oci::Extra<'_>> = p
+                    .layers
+                    .iter()
+                    .zip(&p.extras)
+                    .map(|(l, data)| oci::Extra {
+                        data,
+                        from: &l.from,
+                        to: &l.to,
+                    })
+                    .collect();
+                {
                     let (conn, stream, started) = (p.conn, p.stream, p.started);
-                    let img = oci::convert(&pulled).map_err(|e| format!("converting: {e:?}"))?;
+                    let img = oci::convert_with(&pulled, &extras)
+                        .map_err(|e| format!("converting: {e:?}"))?;
+                    drop(extras);
                     let id = image::Image::mount(&img)
                         .map(|m| hex(&m.root_hash()))
                         .map_err(|e| format!("the converted image: {e:?}"))?;

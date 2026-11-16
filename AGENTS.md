@@ -34,7 +34,10 @@ listener local unless configured, with a test [done:
 Signal/Inspect/Destroy before any cloud boot; (4) io_uring completions
 without an enter (epoll on the ring fd, registered eventfd), with a test,
 before the Node.js suite [done]; (5) extra layers in PullImage, each pinned and
-verified by digest, with a refusal test; (6) ADR-0004's owed mitigations
+verified by digest, with a refusal test [done: `LayerSource` (url, sha256
+digest, `from`/`to` remap via `layer::Tree::add_tar_at`), fetched after
+the image, checked with `oci::digest_of` before `oci::convert_with`;
+tests/control.rs serves one from the host and refuses a wrong digest]; (6) ADR-0004's owed mitigations
 (VERW, IBPB on cross-cell switches, page-table isolation), logged at
 boot. The cell access-control suite is written in another worktree: do
 not write it; merge its branch when it lands.

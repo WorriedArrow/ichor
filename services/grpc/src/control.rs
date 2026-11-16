@@ -22,21 +22,70 @@ fn each<'a>(
     Ok(())
 }
 
+/// A layer added on top of a pulled image, pinned by digest.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LayerSource {
+    /// Where to fetch it (`https://` or `http://`: the digest, not the
+    /// transport, makes it trustworthy).
+    pub url: String,
+    /// `sha256:<hex>` of the bytes as fetched; required.
+    pub digest: String,
+    /// Take only the archive's entries under this path...
+    pub from: String,
+    /// ...and put them under this one (empty: as they are).
+    pub to: String,
+}
+
+impl LayerSource {
+    fn encode(&self) -> Vec<u8> {
+        Writer::new()
+            .string(1, &self.url)
+            .string(2, &self.digest)
+            .string(3, &self.from)
+            .string(4, &self.to)
+            .finish()
+    }
+
+    fn decode(b: &[u8]) -> Result<Self, Error> {
+        let mut m = Self::default();
+        each(b, |f, v| {
+            match f {
+                1 => m.url = v.as_string()?,
+                2 => m.digest = v.as_string()?,
+                3 => m.from = v.as_string()?,
+                4 => m.to = v.as_string()?,
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(m)
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PullImageRequest {
     pub reference: String,
+    /// Layers to add on top of the image's own, lowest first.
+    pub layers: Vec<LayerSource>,
 }
 
 impl PullImageRequest {
     pub fn encode(&self) -> Vec<u8> {
-        Writer::new().string(1, &self.reference).finish()
+        let mut w = Writer::new();
+        w.string(1, &self.reference);
+        for l in &self.layers {
+            w.bytes(2, &l.encode());
+        }
+        w.finish()
     }
 
     pub fn decode(b: &[u8]) -> Result<Self, Error> {
         let mut m = Self::default();
         each(b, |f, v| {
-            if f == 1 {
-                m.reference = v.as_string()?;
+            match f {
+                1 => m.reference = v.as_string()?,
+                2 => m.layers.push(LayerSource::decode(v.as_bytes()?)?),
+                _ => {}
             }
             Ok(())
         })?;
@@ -222,6 +271,16 @@ mod tests {
             env: vec![],
         };
         assert_eq!(RunRequest::decode(&r.encode()), Ok(r));
+        let pull = PullImageRequest {
+            reference: "alpine".into(),
+            layers: vec![LayerSource {
+                url: "https://example.com/l.tar.gz".into(),
+                digest: "sha256:00".into(),
+                from: "src/".into(),
+                to: "/opt/".into(),
+            }],
+        };
+        assert_eq!(PullImageRequest::decode(&pull.encode()), Ok(pull));
         for e in [
             RunEvent::Output(b"hi\n".to_vec()),
             RunEvent::ExitStatus(0),

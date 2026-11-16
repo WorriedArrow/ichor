@@ -20,6 +20,21 @@ service Control {
 message PullImageRequest {
   // A reference: [registry/]repository[:tag][@sha256:digest].
   string reference = 1;
+  // Layers added on top of the image's own, lowest first (a test suite's
+  // sources, say). Each is verified against its digest like the image's
+  // blobs; a mismatch fails the pull.
+  repeated LayerSource layers = 2;
+}
+
+message LayerSource {
+  // https:// or http:// (the digest, not the transport, is the check).
+  string url = 1;
+  // sha256:<hex> of the bytes as fetched. Required.
+  string digest = 2;
+  // A gzip'd or plain tar; only entries under `from` are taken, moved to
+  // `to` (both empty: the archive as a layer, whiteouts included).
+  string from = 3;
+  string to = 4;
 }
 
 message PullImageResponse {

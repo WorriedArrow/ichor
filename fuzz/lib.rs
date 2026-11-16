@@ -263,6 +263,12 @@ fn h2_traffic() -> (Vec<u8>, Vec<u8>) {
     let mut c = grpc::Client::new("ichor");
     let req = grpc::control::PullImageRequest {
         reference: "docker.io/library/alpine:3.20".into(),
+        layers: vec![grpc::control::LayerSource {
+            url: "http://10.0.2.2:8000/l.tar.gz".into(),
+            digest: "sha256:00".into(),
+            from: "src/".into(),
+            to: "/opt/".into(),
+        }],
     };
     c.call(grpc::control::PULL_IMAGE, &req.encode());
     c.call(
