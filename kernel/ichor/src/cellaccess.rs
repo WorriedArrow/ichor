@@ -47,6 +47,12 @@ const B_HELPER: &str = include_str!("cellaccess/b_helper.pl");
 const SMOKE: &str = include_str!("cellaccess/smoke.pl");
 const S1_PROCESS: &str = include_str!("cellaccess/s1_process.pl");
 const S2_PROC: &str = include_str!("cellaccess/s2_proc.pl");
+const S4_PAGES: &str = include_str!("cellaccess/s4_pages.pl");
+const S4_FILL: &str = include_str!("cellaccess/s4_fill.pl");
+const S4_PRIVATE: &str = include_str!("cellaccess/s4_private.pl");
+/// The file both cells map (B's helper reports it too); the checks use its
+/// page 1.
+const SHARED_FILE: &str = "/usr/bin/dash";
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
 /// Set once the harness has ended B's futex wait (section 4); until then
@@ -73,6 +79,7 @@ const SECTIONS: &[Section] = &[
         in_a(c, S1_PROCESS)
     }),
     ("proc_and_sys_show_only_their_cell", |c| in_a(c, S2_PROC)),
+    ("shared_cache_pages_never_carry_writes_between_cells", s4),
 ];
 
 /// One cell with its own root.
@@ -90,6 +97,12 @@ struct Ctx {
     ids: Vec<String>,
     /// The helper's exit code, once it has exited.
     helper: Arc<SpinLock<Option<i32>>>,
+    /// Page 1 of the shared file as B first saw it (hex, 16 bytes).
+    view0: String,
+    /// The disk both roots come from, and the account cells are carved
+    /// from (for section 4's opted-out cell).
+    disk: Mounted,
+    accounts: Arc<cell::Account>,
 }
 
 impl Ctx {
@@ -135,12 +148,19 @@ pub(crate) fn run(m: &Mounted) {
     );
     let ids = take(&b.root, "ids", &helper);
     println!("ichor: cellaccess: B's helper reports {ids}");
-    let ctx = Ctx {
+    let mut ctx = Ctx {
         a,
         b,
         ids: ids.split_whitespace().map(ToString::to_string).collect(),
         helper,
+        view0: String::new(),
+        disk: Mounted {
+            metadata: m.metadata,
+            disk: m.disk,
+        },
+        accounts: system.root_account.clone(),
     };
+    ctx.view0 = word(&b_status(&ctx), "view").to_string();
     let mut failed: Vec<&str> = Vec::new();
     for &(rule, f) in SECTIONS {
         if f(&ctx) {
@@ -329,7 +349,8 @@ fn b_intact(ctx: &Ctx, after: &str) -> bool {
         && word(&s, "secret") == "intact"
         && word(&s, "pts") == ctx.id("pts")
         && (FUTEX_RELEASED.load(Ordering::Relaxed) || word(&s, "futex") == "waiting")
-        && word(&s, "view") == word(&s, "file");
+        && word(&s, "view") == ctx.view0
+        && word(&s, "file") == ctx.view0;
     if ok {
         println!("ichor: cellaccess: B alive and unchanged after {after}");
     } else {
@@ -341,4 +362,220 @@ fn b_intact(ctx: &Ctx, after: &str) -> bool {
 /// The harness itself: A got B's identifiers and runs; B's helper answers.
 fn smoke(ctx: &Ctx) -> bool {
     in_a(ctx, SMOKE)
+}
+
+/// Prints a harness-side check in the perl checks' format; returns `good`.
+fn report(rule: &str, check: &str, good: bool, detail: &str) -> bool {
+    if good {
+        println!("cellaccess: {rule}: {check}: ok");
+    } else {
+        println!("cellaccess FAILED: {rule}: {check}: {detail}");
+    }
+    good
+}
+
+fn hex(bytes: &[u8]) -> String {
+    let mut s = String::new();
+    for b in bytes {
+        s.push_str(&alloc::format!("{b:02x}"));
+    }
+    s
+}
+
+/// A static ELF that maps page 0-1 of [`SHARED_FILE`] `MAP_PRIVATE`
+/// writable, stores a word at the start of page 1 with an ordinary CPU
+/// store, and reads it back. Exits 0 if the store landed in its copy (1:
+/// it did not read back, 2: the page already held that word).
+fn store_program() -> Vec<u8> {
+    use testprog::{Asm, BLOB_VADDR, Reg, static_elf};
+    let word = u64::from_le_bytes(*b"A-store!");
+    let mut a = Asm::new();
+    let path = a.data(b"/usr/bin/dash\0");
+    let bad = a.label();
+    a.mov_data(Reg::Rdi, path);
+    a.mov_imm(Reg::Rsi, 0);
+    a.sys(2); // open
+    a.mov(Reg::R13, Reg::Rax);
+    a.mov_imm(Reg::Rdi, 0);
+    a.mov_imm(Reg::Rsi, 8192);
+    a.mov_imm(Reg::Rdx, 3); // PROT_READ | PROT_WRITE
+    a.mov_imm(Reg::R10, 2); // MAP_PRIVATE
+    a.mov(Reg::R8, Reg::R13);
+    a.mov_imm(Reg::R9, 0);
+    a.sys(9); // mmap
+    a.mov(Reg::R14, Reg::Rax);
+    a.load(Reg::Rbx, Reg::R14, 4096);
+    a.mov_imm(Reg::R8, word);
+    a.store(Reg::R14, 4096, Reg::R8);
+    a.mov_imm(Reg::R15, 1);
+    a.load(Reg::Rax, Reg::R14, 4096);
+    a.cmp(Reg::Rax, Reg::R8);
+    a.jne(bad);
+    a.mov_imm(Reg::R15, 2);
+    a.cmp(Reg::Rbx, Reg::R8);
+    a.je(bad);
+    a.mov_imm(Reg::R15, 0);
+    a.bind(bad);
+    a.mov(Reg::Rdi, Reg::R15);
+    a.sys(231); // exit_group
+    static_elf(
+        &a.finish(BLOB_VADDR)
+            .unwrap_or_else(|| fail("cellaccess: assembler")),
+    )
+}
+
+/// Section 4: shared page-cache pages.
+fn s4(ctx: &Ctx) -> bool {
+    const RULE: &str = "shared_cache_pages_never_carry_writes_between_cells";
+    let mut ok = true;
+    let b_view = |when: &str| {
+        let s = b_status(ctx);
+        let (v, f) = (word(&s, "view"), word(&s, "file"));
+        report(
+            RULE,
+            &alloc::format!("B's mapping and file are unchanged after {when}"),
+            v == ctx.view0 && f == ctx.view0,
+            &alloc::format!("expected {}, B's mapping {v}, B's file {f}", ctx.view0),
+        )
+    };
+
+    // A CPU store into A's private mapping of the shared page.
+    let p = LinuxProcess::new(ctx.a.cell.clone(), ctx.a.root.clone())
+        .unwrap_or_else(|| fail("cellaccess: no process"));
+    let (code, _) = run_linux(p, &store_program(), None, &["/cellaccess-store"]);
+    ok &= report(
+        RULE,
+        "A's CPU store through MAP_PRIVATE landed in A's own copy",
+        code == 0,
+        &alloc::format!("the store program exited {code}"),
+    );
+    ok &= b_view("A's CPU store");
+
+    // A's futex wake, read() into its mappings, and copy-up (perl).
+    ok &= in_a(ctx, S4_PAGES);
+    ok &= b_view("A's read() into its private mapping and its copy-up write");
+
+    // The cache page itself, as B's root reads it, kept its bytes.
+    let ino = ctx.b.root.lock().resolve(ROOT, SHARED_FILE, true);
+    let page = ino.ok().and_then(|i| ctx.b.root.cached_page(i, 1));
+    let bytes = page.map(|f| {
+        let mut b = [0u8; 16];
+        f.reader().read(&mut b);
+        hex(&b)
+    });
+    ok &= report(
+        RULE,
+        "the shared cache page B's root maps kept its bytes",
+        bytes.as_deref() == Some(ctx.view0.as_str()),
+        &alloc::format!("expected {}, got {bytes:?}", ctx.view0),
+    );
+    // A's file is now in A's upper layer, so A's root no longer maps it.
+    let a_ino = ctx.a.root.lock().resolve(ROOT, SHARED_FILE, true);
+    ok &= report(
+        RULE,
+        "A's write copied the file up into A's own root",
+        a_ino.is_ok_and(|i| ctx.a.root.cached_page(i, 1).is_none()),
+        "A's root still maps the lower file",
+    );
+
+    // B's futex waiter is still waiting; the harness ends the wait with a
+    // signal, and B reports how it ended.
+    let s = b_status(ctx);
+    ok &= report(
+        RULE,
+        "B's futex waiter was not woken by A",
+        word(&s, "futex") == "waiting",
+        &alloc::format!("B's waiter: {}", word(&s, "futex")),
+    );
+    let pid: u64 = ctx.id("futex_pid").parse().unwrap_or(0);
+    let sent = crate::proc::send(ctx.b.cell.id(), pid, 10).is_ok(); // SIGUSR1
+    let deadline = frame::time::now() + Duration::from_secs(30);
+    let ended = loop {
+        let s = b_status(ctx);
+        let f = String::from(word(&s, "futex"));
+        if f != "waiting" || frame::time::now() > deadline {
+            break f;
+        }
+        frame::task::sleep_until(frame::time::now() + Duration::from_millis(50));
+    };
+    FUTEX_RELEASED.store(true, Ordering::Relaxed);
+    ok &= report(
+        RULE,
+        "B's futex wait ended only when the harness signalled it (EINTR)",
+        sent && ended == "EINTR",
+        &alloc::format!("signal sent: {sent}; the wait ended with {ended}"),
+    );
+
+    ok &= opted_out(ctx);
+    ok
+}
+
+/// Section 4, ADR-0004 §4: a cell whose root opted out of page sharing
+/// (B') keeps its private cache pages while A fills the shared cache, and
+/// is charged for them itself.
+fn opted_out(ctx: &Ctx) -> bool {
+    const RULE: &str = "shared_cache_pages_never_carry_writes_between_cells";
+    let cell = Cell::new(&ctx.accounts, CELL_PAGES).unwrap_or_else(|| fail("cellaccess: no cell"));
+    let root = Arc::new(
+        Vfs::mount_disk_private(&ctx.disk, cell.account().clone())
+            .unwrap_or_else(|_| fail("cellaccess: could not mount a private root")),
+    );
+    prepare(&root);
+    let Some(ns) = root.private_ns() else {
+        return report(
+            RULE,
+            "the opted-out root has a private namespace",
+            false,
+            "none",
+        );
+    };
+    let mut ok = perl((&cell, &root), S4_PRIVATE, &[]) == 0;
+    let ino = root
+        .lock()
+        .resolve(ROOT, SHARED_FILE, true)
+        .unwrap_or_else(|_| fail("cellaccess: no shared file"));
+    let phys = |root: &Vfs| -> Vec<u64> {
+        (0..8)
+            .filter_map(|i| root.cached_page(ino, i).map(|f| f.phys().as_u64()))
+            .collect()
+    };
+    let before = phys(&root);
+    let pages = crate::pagecache::private_pages(ns);
+    let used = cell.account().used();
+    ok &= report(
+        RULE,
+        "B' is charged for its own private cache pages",
+        pages > 0 && used == pages as u64,
+        &alloc::format!("{pages} private pages, {used} charged"),
+    );
+    let (_, _, misses0, _, _) = crate::pagecache::stats();
+    ok &= in_a(ctx, S4_FILL);
+    let (_, _, misses1, _, _) = crate::pagecache::stats();
+    ok &= report(
+        RULE,
+        "A's reads went through more pages than the shared cache holds",
+        misses1 - misses0 > 8192,
+        &alloc::format!("{} chunks read", misses1 - misses0),
+    );
+    let after = phys(&root);
+    ok &= report(
+        RULE,
+        "A filling the shared cache evicted none of the opted-out cell's pages",
+        after == before
+            && crate::pagecache::private_pages(ns) == pages
+            && cell.account().used() == pages as u64,
+        &alloc::format!(
+            "pages {before:x?} -> {after:x?}, {pages} -> {} private pages, {} charged",
+            crate::pagecache::private_pages(ns),
+            cell.account().used()
+        ),
+    );
+    drop(root);
+    ok &= report(
+        RULE,
+        "the opted-out cell's private pages were returned with its root",
+        crate::pagecache::private_pages(ns) == 0 && cell.account().used() == 0,
+        &alloc::format!("{} still charged", cell.account().used()),
+    );
+    ok
 }

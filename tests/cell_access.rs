@@ -78,6 +78,25 @@ fn proc_and_sys_show_only_their_cell() {
     ]);
 }
 
+/// Section 4: A and B map the same cache page. A's CPU store, its read()
+/// into a private mapping and its copy-up write leave B's mapping, B's
+/// file and the cache page unchanged; read() into PROT_READ is EFAULT; a
+/// FUTEX_WAKE at B's futex (same page, offset and address) wakes nobody;
+/// an opted-out root keeps and pays for its own pages while A fills the
+/// shared cache.
+#[test]
+fn shared_cache_pages_never_carry_writes_between_cells() {
+    assert_rule("shared_cache_pages_never_carry_writes_between_cells");
+    suite().assert_in_order(&[
+        "B's mapping and file are unchanged after A's CPU store: ok",
+        "FUTEX_WAKE at B's futex wakes nobody: ok",
+        "the shared cache page B's root maps kept its bytes: ok",
+        "B's futex wait ended only when the harness signalled it (EINTR): ok",
+        "evicted none of the opted-out cell's pages: ok",
+        "ichor: cellaccess: shared_cache_pages_never_carry_writes_between_cells passed",
+    ]);
+}
+
 #[test]
 fn cells_clean_up_after_themselves() {
     let out = suite();

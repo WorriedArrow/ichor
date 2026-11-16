@@ -70,7 +70,7 @@ Status: [ ] to do, [x] done and committed.
 - [ ] **3. file_systems_are_scoped_to_their_root** (BLOCKED, see notes): `..` at the root,
   symlinks into B's paths ENOENT, created files invisible both ways, link
   and rename stay in A, B's ptys ENOENT in A (`Vfs::ptys` per root).
-- [ ] **4. shared_cache_pages_never_carry_writes_between_cells**:
+- [x] **4. shared_cache_pages_never_carry_writes_between_cells** (27 checks):
   MAP_PRIVATE store, copy-up, read() into a private mapping, EFAULT into
   PROT_READ, futex wake at B's offset wakes 0, private root not evicted
   and charged to its cell.
