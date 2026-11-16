@@ -1,0 +1,61 @@
+//! Cell access control through the Linux ABI
+//! (`kernel/ichor/src/cellaccess.rs`; `docs/reports/cell-access-tests.md`).
+//!
+//! One boot with `cell_access` runs every section: two cells with their
+//! own roots from the same Debian disk, a helper in B owning one object of
+//! each kind, and checks from A that make the real syscall on B's object
+//! (exact errno) and on A's own (the control). Each test below asserts one
+//! rule's section of that boot, so a failure names the rule; they share
+//! the boot.
+
+use std::sync::OnceLock;
+
+use ichor_tests::{Exit, Outcome};
+
+fn suite() -> &'static Outcome {
+    static OUT: OnceLock<Outcome> = OnceLock::new();
+    OUT.get_or_init(|| ichor_tests::boot("cell-access", "cell_access", 2))
+}
+
+/// Panics unless `rule`'s section passed, quoting its failed checks.
+fn assert_rule(rule: &str) {
+    let out = suite();
+    let failures: Vec<&str> = out
+        .serial
+        .lines()
+        .filter(|l| l.contains("cellaccess FAILED") && l.contains(rule))
+        .collect();
+    let passed = format!("ichor: cellaccess: {rule} passed");
+    assert!(
+        failures.is_empty() && out.serial.contains(&passed),
+        "{rule}: {} failed checks (exit {:?}):\n{}\n--- the section's log ---\n{}",
+        failures.len(),
+        out.exit,
+        failures.join("\n"),
+        out.serial
+            .lines()
+            .filter(|l| l.contains(rule))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
+#[test]
+fn the_harness_gives_a_only_what_b_reports() {
+    assert_rule("harness");
+    suite().assert_in_order(&[
+        "ichor: cellaccess: cell A is cell ",
+        "ichor: cellaccess: cell B is cell ",
+        "ichor: cellaccess: B's helper reports pid=",
+        "ichor: cellaccess: B alive and unchanged after harness",
+    ]);
+}
+
+#[test]
+fn cells_clean_up_after_themselves() {
+    let out = suite();
+    out.assert_in_order(&[
+        "ichor: cellaccess: every section passed; both cells exited and their memory returned",
+    ]);
+    out.assert_exit(Exit::Success);
+}

@@ -14,6 +14,10 @@ name = "boot"
 path = "boot.rs"
 
 [[test]]
+name = "cell_access"
+path = "cell_access.rs"
+
+[[test]]
 name = "control"
 path = "control.rs"
 
