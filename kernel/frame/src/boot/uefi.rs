@@ -12,7 +12,7 @@ use core::ffi::c_void;
 use core::ptr;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use super::{MemoryKind, MemoryRegion, Phase, take_boot_state};
+use super::{MemoryKind, MemoryRegion, Phase, ROOTS_MAX, take_boot_state};
 use crate::mm::{PAGE_SIZE, PhysAddr};
 use crate::power::{self, ExitStatus};
 use crate::{arch, println};
@@ -275,6 +275,8 @@ const fn ucs2<const N: usize>(s: &str) -> [u16; N] {
 
 /// Where the kernel command line lives on the boot volume.
 const CMDLINE_PATH: [u16; 15] = ucs2("\\ichor\\cmdline");
+/// Where the control plane's CA bundle lives.
+const ROOTS_PATH: [u16; 17] = ucs2("\\ichor\\roots.pem");
 
 // ---------------------------------------------------------------------------
 // Firmware: boot services as a typestate. Holding a `Firmware` means boot
@@ -643,6 +645,14 @@ extern "efiapi" fn efi_main(image: Handle, system_table: *const SystemTable) -> 
             println!("ichor: frame: warning: command line is not UTF-8; truncating");
             e.valid_up_to()
         }
+    };
+    state.roots_len = match fw.read_boot_file(&ROOTS_PATH, &mut state.roots) {
+        Ok(n) if n == ROOTS_MAX => {
+            println!(r"ichor: frame: warning: \ichor\roots.pem is larger than {ROOTS_MAX} bytes");
+            0
+        }
+        Ok(n) => n,
+        Err(_) => 0,
     };
     if cmdline::Cmdline::new(state.cmdline()).flag("qemu_debug_exit") {
         power::enable_qemu_debug_exit();

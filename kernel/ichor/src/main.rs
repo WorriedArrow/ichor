@@ -15,6 +15,7 @@ mod bench;
 mod blktest;
 mod busytest;
 mod celltest;
+mod control;
 mod copytest;
 mod cred;
 mod debiantest;
@@ -26,7 +27,9 @@ mod kcell;
 mod linuxabi;
 mod loader;
 mod locks;
+mod native;
 mod nativeabi;
+mod nativetest;
 mod netstack;
 mod nettest;
 mod pagecache;
@@ -149,6 +152,7 @@ fn kmain(info: BootInfo) -> ! {
     nettest::run();
     netstack::accounting_selftest();
     linuxabi::unix::accounting_selftest();
+    nativetest::run();
     blktest::run();
 
     if cmdline.flag("test_stack_overflow") {
@@ -171,6 +175,19 @@ fn kmain(info: BootInfo) -> ! {
     if largest > u32::from(frame::mm::MAX_ORDER) {
         println!("ichor: FAILED: a request exceeded MAX_ORDER");
         shutdown(ExitStatus::Failure);
+    }
+
+    // The control plane (milestone 6): `control=PORT` serves the API there,
+    // published on the uplink; `control_exit` stops (and the machine with
+    // it) once the first API client hangs up, for tests.
+    if let Some(port) = cmdline.get("control").and_then(|v| v.parse().ok()) {
+        let resolver = cmdline.get("dns").unwrap_or("10.0.2.3");
+        let once = cmdline.flag("control_exit");
+        let code = control::run(info.roots(), port, resolver, once);
+        println!("ichor: control: exited with {code:?}");
+        if code != Some(0) {
+            shutdown(ExitStatus::Failure);
+        }
     }
 
     println!("ichor: boot complete; halting");

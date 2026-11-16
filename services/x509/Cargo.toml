@@ -1,0 +1,17 @@
+[package]
+name = "ichor-x509"
+description = "DER, X.509 certificates, PEM bundles and chain verification for the control plane (no_std, host-tested)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "x509"
+
+[dependencies]
+crypto.workspace = true
+civil.workspace = true
+
+[lints]
+workspace = true

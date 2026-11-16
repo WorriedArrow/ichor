@@ -148,3 +148,24 @@ its output and exit code.
   refused.
 - `services/rt` is a second audited `unsafe` crate with its own budget.
 - The kernel image grows by the control plane's size.
+
+## Amendment (2026-11-15): as built
+
+Milestone 6 closed with this design. Where it differs from the text
+above:
+
+- AES-GCM was left out of `services/crypto`: every Docker Hub endpoint
+  (registry, token service, both blob CDNs) negotiates
+  ChaCha20-Poly1305.
+- Native ABI v2 has 28 calls, not about thirty, and no `CELL_SIGNAL`,
+  `CELL_INSPECT` or `CELL_DESTROY` yet; the API has `PullImage`,
+  `CreateCell` and `Run` only. Stdout and stderr share one pipe, so
+  `RunEvent` carries one output stream.
+- An image handed to `IMAGE_CREATE` is copied into pages served to the
+  page cache as a RAM disk (no allocation exceeds `MAX_ORDER`, chunks are
+  verified when read) and is kept for the life of the system.
+- The CA bundle reaches the service as a read-only Blob capability
+  (`BLOB_READ`): frame reads `\ichor\roots.pem` with the command line
+  before boot services exit.
+- The acceptance test pulls `hello-world` and Alpine 3.20.3 by digest
+  from Docker Hub (so it needs the internet) and runs a command in each.

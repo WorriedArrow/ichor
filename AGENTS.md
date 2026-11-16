@@ -15,17 +15,77 @@ a framekernel. The founding brief is the source of truth until an ADR in
 
 ## Status
 
-**Active milestone: 6.** The control plane pulls a real OCI image from a
-registry, verifies it, converts it, and runs it through the gRPC API.
+**Active milestone: 7** (io_uring; postgres, node, python, go and JVM
+workloads pass their own test suites at a tracked pass rate). The design
+is ADR-0013: io_uring rings as cell-charged pages read through `UFrame`s
+(no frame change), inline completion for what is ready and per-ring
+worker tasks for the rest, no SQPOLL; the suites run through the control
+plane on pinned official images (plus pinned source-tree layers), scored
+by `cargo xtask workloads` into `docs/workloads.md`, with floors in
+`workloads.toml`. Order: CPython, Go, PostgreSQL, Node.js (io_uring), JVM.
+Not started.
+
+**Milestone 6 is done** (2026-11-15): the control plane pulls a real OCI
+image from a registry, verifies it, converts it, and runs it through the
+gRPC API. `tests/control.rs` (needs the internet): the host, through
+gRPC on a forwarded port, has the guest pull Docker Hub's `hello-world`
+and Alpine 3.20.3 by digest (TLS 1.3 to the registry, TLS 1.2 to the
+Cloudflare/CloudFront CDNs, roots from the boot volume), make a cell of
+each and run `/hello` and `sh -c ...`, checking output and exit status.
 The design is ADR-0012: `services/control`, a native-ABI service embedded
-in the kernel image and run in the system cell; `services/rt` its only
-`unsafe` crate; native ABI v2 (sockets, waiting, images, cells); our own
-host-tested crates for crypto, X.509, TLS 1.2 + 1.3 (Docker Hub's blob CDN
-is TLS 1.2 only), HTTP/1.1 and HTTP/2, gRPC/protobuf, OCI, layer
-conversion and DNS; Mozilla's CA bundle as boot-volume configuration.
-Order: crypto, X.509, TLS, HTTP + OCI + layer (host-tested against
-recorded traffic), native ABI v2 + `services/rt` + the loader, HTTP/2 +
-gRPC, then the end-to-end pull-and-run test.
+in the kernel image and run in the system cell (`control=PORT`,
+`control_exit`, `dns=`); `services/rt` its only `unsafe` crate; native
+ABI v2; our own host-tested crates for crypto, X.509, TLS 1.2 + 1.3,
+HTTP/1.1 and HTTP/2, gRPC/protobuf, OCI, layer conversion and DNS;
+Mozilla's CA bundle (`xtask::artifact::MOZILLA_ROOTS`, pinned) as
+`\ichor\roots.pem` on the ESP, read by frame at boot and handed to the
+service as a Blob capability. Open from it: `Signal`/`Inspect`/`Destroy`
+calls and cell destruction, image deletion, API TLS and authentication
+(before milestone 8 runs anywhere reachable), signature verification,
+a working directory and user for `Run`, an offline (recorded) variant of
+the acceptance test.
+
+- M6 control plane: `services/control` is one `OBJECT_WAIT` loop over the
+  API listener and connections (`grpc::Server` on `http::h2`), pulls
+  (`oci::Puller` driving `fetch.rs`: DNS over UDP, TCP, TLS or plain
+  HTTP, one request per connection) and runs (process output streamed
+  as `RunEvent`s). `services/http` gained `hpack` (RFC 7541 incl.
+  Huffman, the canonical code built from Appendix B's lengths; RFC C.2-C.4
+  vectors) and `h2` (both ends, flow control, CONTINUATION, PING,
+  RST/GOAWAY); `services/grpc` has protobuf, framing, server and client
+  sides and the `ichor.v1.Control` messages (`docs/abi/control.proto`).
+- M6 host crates (all `no_std`, our own code): `services/crypto`
+  (SHA-2, HMAC/HKDF/TLS PRF, ChaCha20-Poly1305, X25519, RSA and ECDSA
+  P-256/P-384 verification; RFC vectors and OpenSSL-made signatures),
+  `services/x509` (DER, certificates, chain verification; Docker Hub's
+  real chains), `services/tls` (TLS 1.3 + 1.2 client; live sessions with
+  Docker Hub recorded with fixed randomness and replayed offline),
+  `services/http` (HTTP/1.1 client messages), `services/layer` (gzip +
+  tar layers with OCI whiteouts into images; xtask uses it through thin
+  shims), `services/oci` (references, Bearer token flow, index to
+  linux/amd64, digest-verified manifests and blobs, CDN redirects without
+  the token, conversion, image config; a real `hello-world` pull recorded
+  and replayed), `services/dns` (A records, CNAME chains). AES-GCM is left
+  out: every Docker Hub endpoint accepts ChaCha20-Poly1305. Refresh a
+  recording with `cargo test -p ichor-tls -- --ignored record_live` (or
+  `-p ichor-oci`); it needs the internet and the Windows-exported roots in
+  `services/x509/testdata/roots.pem`.
+- M6 native ABI v2 (`docs/abi/native.md`): `kernel/ichor/src/native.rs`
+  runs native processes (a demand-paged `Mm` charged to the cell, the ELF
+  loader, faults) and the v2 calls: LOG, CLOCK, RANDOM, MEM_MAP/UNMAP,
+  OBJECT_WAIT (over `poll::Watchers`), TCP/UDP sockets on the cell's own
+  stack (`socket::native`), PORT_PUBLISH (switch handle), IMAGE_CREATE
+  (pages behind the page cache as a RAM disk, root hash checked),
+  CELL_CREATE, CELL_SPAWN (a Linux process through `exec::exec`, stdout
+  and stderr on one pipe), PROCESS_READ/WAIT, CELL_ADDR. `services/rt`
+  (the only unsafe services crate, budget in `services/rt/audit.toml`):
+  `_start`, syscalls behind slice-taking wrappers, a size-class heap,
+  the panic handler, `rt::main!`. Services build for
+  `x86_64-unknown-none` (static, small code model; `.cargo/config.toml`)
+  and the kernel embeds them (`ICHOR_SERVICES_DIR`, set by xtask). Boot
+  runs `services/nativetest`: clock, CSPRNG, heap, loopback TCP and UDP,
+  refused handles, and Docker's recorded `hello-world` layer converted in
+  the service, made a cell and run.
 
 Roadmap from the founding brief (the brief is not checked in; this is
 its milestone list as an earlier session recorded it):
@@ -398,9 +458,10 @@ are owed as multi-cell scheduling lands in milestone 4. Boot logs which apply.
 Frame budget: ADR-0005 sets the milestone 3 ceiling at 8,500 lines / 380
 sites; ADR-0007 raises it to 9,500 / 420 for milestone 4 (TLB shootdown,
 atomic user ops for futexes, PCID). `audit.toml` is at step 6 (5,800 / 250);
-frame is at 5,611 / 244 (A5 added RDSEED/RDRAND and UEFI GetTime; B
-added XSAVE; C the frames tree and request tracking; ADR-0011 the checked
-user copy).
+frame is at 5,630 / 244 (A5 added RDSEED/RDRAND and UEFI GetTime; B
+added XSAVE; C the frames tree and request tracking; M6 reading
+`\ichor\roots.pem`; ADR-0011 the checked user copy). `services/rt` has
+its own budget (`services/rt/audit.toml`: 500 / 40; at 402 / 29).
 
 The goal set for this effort is milestone 8, whose acceptance test needs
 cloud accounts and bare-metal hardware from the owner.
@@ -428,7 +489,7 @@ cargo xtask run            # boot in QEMU + OVMF, serial on stdio, exits on halt
 cargo xtask run --cmdline "memmap"   # without qemu_debug_exit: halts; Ctrl-C to quit
 cargo xtask test           # host unit tests, then QEMU integration tests (tests/)
 cargo xtask lint           # fmt check, clippy (host + UEFI target), forbid check, frame budget
-cargo xtask frame-audit    # frame line and unsafe-site counts against the budget
+cargo xtask frame-audit    # frame's and services/rt's line and unsafe-site counts against their budgets
 cargo xtask run --cmdline "qemu_debug_exit bench" --smp 4 --release   # benchmarks (use KVM for real numbers)
 cargo xtask bench --accel kvm --smp 4   # Ichor vs Linux, same machine and programs (Markdown table)
 cargo xtask disk-image     # target/ichor-disk.img: bootable GPT disk (ESP + Ichor root) for clouds/bare metal
@@ -471,6 +532,9 @@ comment.
 | `bench` | run the Phase E benchmarks (`bench.rs`) after the root disk's self-tests and print them |
 | `net_echo_port=N` | the kernel's TCP, then a Debian cell through NAT, echo 256 KiB with the host's echo server at 10.0.2.2:N |
 | `net_publish=N` | publish uplink port N to a Debian cell's port 80 and serve one HTTP request from the host (QEMU forwards a host port to N) |
+| `control=PORT` | after the self-tests, run the control plane serving gRPC on PORT, published on the uplink |
+| `control_exit` | with `control`: stop when the first API client hangs up, then shut down (tests) |
+| `dns=A.B.C.D` | the control plane's DNS resolver (default `10.0.2.3`, QEMU's) |
 
 ## Layout
 
@@ -511,6 +575,17 @@ xtask/src/inflate.rs       gzip/DEFLATE decoder; rootfs.rs: tar -> Ichor image
 xtask/src/disk.rs, fat.rs  bootable GPT disk image (FAT32 ESP + Ichor root partition)
 xtask/src/linuxref.rs      Linux reference boot for `cargo xtask bench` (Alpine linux-virt + initramfs)
 kernel/ichor     the kernel binary; frame::main!(kmain); kcell/nativeabi tie it together
+services/crypto  SHA-2, HMAC/HKDF, ChaCha20-Poly1305, X25519, RSA/ECDSA verify (host-tested; ADR-0012)
+services/x509    DER, X.509, PEM root stores, chain verification (host-tested)
+services/tls     sans-I/O TLS 1.3 + 1.2 client (host-tested, recorded sessions)
+services/http    sans-I/O HTTP/1.1 client messages (host-tested)
+services/layer   gzip/DEFLATE + tar layers (OCI whiteouts) into images; xtask uses it (host-tested)
+services/oci     image references, the registry pull protocol, conversion, image config (host-tested)
+services/dns     stub resolver messages (host-tested)
+services/rt      native services' runtime: entry, syscalls, heap, panic (the only unsafe services crate; x86_64-unknown-none)
+services/nativetest  native ABI v2 boot self-test, embedded in the kernel image
+services/control the control plane: gRPC API, registry pulls, cells and runs (native service, embedded)
+services/grpc    protobuf, gRPC over HTTP/2, ichor.v1.Control messages (host-tested)
 xtask/           build/run/test/lint tooling (lib + bin, no dependencies)
 tests/           QEMU integration tests (host crate using xtask's runner)
 docs/adr/        architecture decision records
@@ -552,8 +627,10 @@ vfs,block,net,linux-abi,native-abi}`, `kernel/drivers/*`, `abi/`, `services/`.
 
 ## Toolchain
 
-Pinned stable `1.100.0` (`rust-toolchain.toml`) with target
-`x86_64-unknown-uefi`.
+Pinned stable `1.100.0` (`rust-toolchain.toml`) with targets
+`x86_64-unknown-uefi` (the kernel) and `x86_64-unknown-none` (native
+services, built into `target/services`; xtask's `SERVICE_ONLY` list keeps
+them out of host builds and lints them for that target).
 
 ### Unstable features
 

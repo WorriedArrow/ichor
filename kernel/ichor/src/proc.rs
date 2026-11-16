@@ -575,6 +575,20 @@ pub(crate) fn fork(
     Ok((child, cctx))
 }
 
+/// Drops a process that never ran (its program failed to load), taking it
+/// out of the table.
+pub(crate) fn discard(p: LinuxProcess) {
+    let pid = p.entry.pid;
+    drop(p);
+    forget(pid);
+}
+
+/// Takes a process that never ran, and that nobody waits for, out of the
+/// table.
+pub(crate) fn forget(pid: u64) {
+    TABLE.lock().remove(&pid);
+}
+
 /// Spawns the task that runs a forked child.
 pub(crate) fn start(child: LinuxProcess, ctx: UserContext) -> Result<u64, i64> {
     let pid = child.entry.pid;

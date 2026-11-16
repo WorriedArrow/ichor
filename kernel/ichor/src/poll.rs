@@ -177,6 +177,30 @@ fn changes(fd: &Fd) -> u64 {
     }
 }
 
+/// Sleeps until `check` returns `Some` or the deadline passes (`None`),
+/// woken only by changes to the objects behind `watched` (the native
+/// personality's `OBJECT_WAIT`). `check` runs with interrupts off.
+pub(crate) fn wait_watchers<T>(
+    watched: &[&Watchers],
+    deadline: Option<Duration>,
+    mut check: impl FnMut() -> Option<T>,
+) -> Option<T> {
+    let poller = Arc::new(Poller {
+        queue: WaitQueue::new(),
+    });
+    for w in watched {
+        w.watch(&poller);
+    }
+    let r = match deadline {
+        Some(d) => poller.queue.wait_until_deadline(d, &mut check),
+        None => Some(poller.queue.wait_until(&mut check)),
+    };
+    for w in watched {
+        w.unwatch(&poller);
+    }
+    r
+}
+
 /// Sleeps until `check` returns `Some`, the deadline passes (`Ok(None)`),
 /// or a signal arrives (`EINTR`; posting a signal wakes the task directly).
 /// The task is woken only by changes to the objects behind `fds`.

@@ -1,0 +1,11 @@
+# Size budget for services/rt, the native-ABI services' runtime and the
+# only services crate allowed `unsafe` (ADR-0012 §1). Checked like frame's
+# by `cargo xtask frame-audit` and `cargo xtask lint`; raising it needs an
+# ADR, cited here.
+#
+# code_lines:   non-blank lines in services/rt/src that are not pure comments
+# unsafe_sites: `unsafe` keyword occurrences outside comments and strings
+#
+# Milestone 6, ADR-0012: entry point, syscalls, heap, panic handler.
+max_code_lines = 500
+max_unsafe_sites = 40

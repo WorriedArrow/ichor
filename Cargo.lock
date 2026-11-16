@@ -65,7 +65,32 @@ name = "ichor-cmdline"
 version = "0.0.0"
 
 [[package]]
+name = "ichor-control"
+version = "0.0.0"
+dependencies = [
+ "ichor-dns",
+ "ichor-grpc",
+ "ichor-http",
+ "ichor-image",
+ "ichor-oci",
+ "ichor-rt",
+ "ichor-tls",
+ "ichor-x509",
+]
+
+[[package]]
+name = "ichor-crypto"
+version = "0.0.0"
+dependencies = [
+ "ichor-csprng",
+]
+
+[[package]]
 name = "ichor-csprng"
+version = "0.0.0"
+
+[[package]]
+name = "ichor-dns"
 version = "0.0.0"
 
 [[package]]
@@ -88,10 +113,36 @@ name = "ichor-gpt"
 version = "0.0.0"
 
 [[package]]
+name = "ichor-grpc"
+version = "0.0.0"
+dependencies = [
+ "ichor-http",
+]
+
+[[package]]
+name = "ichor-http"
+version = "0.0.0"
+
+[[package]]
 name = "ichor-image"
 version = "0.0.0"
 dependencies = [
  "ichor-blake3",
+]
+
+[[package]]
+name = "ichor-layer"
+version = "0.0.0"
+dependencies = [
+ "ichor-image",
+]
+
+[[package]]
+name = "ichor-nativetest"
+version = "0.0.0"
+dependencies = [
+ "ichor-layer",
+ "ichor-rt",
 ]
 
 [[package]]
@@ -107,6 +158,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ichor-oci"
+version = "0.0.0"
+dependencies = [
+ "ichor-crypto",
+ "ichor-http",
+ "ichor-image",
+ "ichor-layer",
+ "ichor-tls",
+ "ichor-x509",
+]
+
+[[package]]
 name = "ichor-overlay"
 version = "0.0.0"
 dependencies = [
@@ -116,6 +179,13 @@ dependencies = [
 [[package]]
 name = "ichor-pe"
 version = "0.0.0"
+
+[[package]]
+name = "ichor-rt"
+version = "0.0.0"
+dependencies = [
+ "ichor-abi",
+]
 
 [[package]]
 name = "ichor-sched"
@@ -129,7 +199,16 @@ version = "0.0.0"
 name = "ichor-tests"
 version = "0.0.0"
 dependencies = [
+ "ichor-grpc",
  "xtask",
+]
+
+[[package]]
+name = "ichor-tls"
+version = "0.0.0"
+dependencies = [
+ "ichor-crypto",
+ "ichor-x509",
 ]
 
 [[package]]
@@ -169,10 +248,19 @@ name = "ichor-vma"
 version = "0.0.0"
 
 [[package]]
+name = "ichor-x509"
+version = "0.0.0"
+dependencies = [
+ "ichor-civil",
+ "ichor-crypto",
+]
+
+[[package]]
 name = "xtask"
 version = "0.0.0"
 dependencies = [
  "ichor-gpt",
  "ichor-image",
+ "ichor-layer",
  "ichor-testprog",
 ]

@@ -1,2 +1,13 @@
 [alias]
 xtask = "run --quiet --package xtask --"
+
+# Native-ABI services (ADR-0012): static, non-PIE ELF executables at the
+# linker's default base (0x200000), below the kernel's mmap area. The
+# target's default kernel code model would put code in the top 2 GiB.
+[target.x86_64-unknown-none]
+rustflags = [
+    "-C", "relocation-model=static",
+    "-C", "code-model=small",
+    # They are embedded in the kernel image: keep symbols, drop DWARF.
+    "-C", "strip=debuginfo",
+]

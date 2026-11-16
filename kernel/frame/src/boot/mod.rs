@@ -34,6 +34,8 @@ use crate::{arch, println};
 
 pub(crate) const MAX_REGIONS: usize = 1638;
 pub(crate) const CMDLINE_MAX: usize = 4096;
+/// Room for `\ichor\roots.pem` (Mozilla's bundle is about 200 KiB).
+pub(crate) const ROOTS_MAX: usize = 512 * 1024;
 pub(crate) const VENDOR_MAX: usize = 64;
 
 /// What boot learns from firmware, kept in `.bss` and handed from the
@@ -44,6 +46,9 @@ pub(crate) struct BootState {
     pub(crate) cmdline: [u8; CMDLINE_MAX],
     /// Length of the valid UTF-8 prefix of `cmdline`.
     pub(crate) cmdline_len: usize,
+    /// `\ichor\roots.pem`, the control plane's CA bundle (ADR-0012 §4).
+    pub(crate) roots: [u8; ROOTS_MAX],
+    pub(crate) roots_len: usize,
     pub(crate) vendor: [u8; VENDOR_MAX],
     pub(crate) vendor_len: usize,
     pub(crate) acpi_rsdp: Option<PhysAddr>,
@@ -80,6 +85,8 @@ static BOOT_STATE: BootStateCell = BootStateCell(UnsafeCell::new(BootState {
     region_count: 0,
     cmdline: [0; CMDLINE_MAX],
     cmdline_len: 0,
+    roots: [0; ROOTS_MAX],
+    roots_len: 0,
     vendor: [0; VENDOR_MAX],
     vendor_len: 0,
     acpi_rsdp: None,
@@ -228,6 +235,7 @@ pub(crate) extern "sysv64" fn kernel_space_entry() -> ! {
     );
     enter_kernel(BootInfo {
         cmdline: state.cmdline(),
+        roots: &state.roots[..state.roots_len],
         memory_map: state.regions(),
         acpi_rsdp: state.acpi_rsdp,
         firmware_vendor: core::str::from_utf8(&state.vendor[..state.vendor_len]).unwrap_or(""),
@@ -284,6 +292,7 @@ fn enter_kernel(info: BootInfo) -> ! {
 #[derive(Debug)]
 pub struct BootInfo {
     cmdline: &'static str,
+    roots: &'static [u8],
     memory_map: &'static [MemoryRegion],
     acpi_rsdp: Option<PhysAddr>,
     firmware_vendor: &'static str,
@@ -296,6 +305,12 @@ impl BootInfo {
     /// The kernel command line (contents of `\ichor\cmdline`, or empty).
     pub fn cmdline(&self) -> &'static str {
         self.cmdline
+    }
+
+    /// The contents of `\ichor\roots.pem` on the boot volume (empty if
+    /// there is none): the control plane's CA bundle.
+    pub fn roots(&self) -> &'static [u8] {
+        self.roots
     }
 
     /// The firmware memory map, captured at the moment boot services exited.

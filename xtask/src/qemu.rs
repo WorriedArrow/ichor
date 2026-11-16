@@ -6,6 +6,7 @@
 //! ```text
 //! esp/EFI/BOOT/BOOTX64.EFI   the kernel
 //! esp/ichor/cmdline          the kernel command line
+//! esp/ichor/roots.pem        the control plane's CA bundle (Mozilla's, pinned)
 //! root.img                   the root image, attached as virtio-blk and NVMe disks
 //! ```
 //!
@@ -67,10 +68,12 @@ impl Accel {
         if kvm_usable { Accel::Kvm } else { Accel::Tcg }
     }
 
-    /// The `-accel` value.
+    /// The `-accel` value. TCG's translation buffer is 256 MiB rather than
+    /// QEMU's 1 GiB default: every boot test runs at once, and eleven
+    /// default buffers exhausted a shared machine's commit limit.
     pub fn qemu_name(self) -> &'static str {
         match self {
-            Accel::Auto | Accel::Tcg => "tcg",
+            Accel::Auto | Accel::Tcg => "tcg,tb-size=256",
             Accel::Kvm => "kvm",
             Accel::Whpx => "whpx",
             Accel::Hvf => "hvf",
@@ -356,6 +359,11 @@ fn prepare_run_dir(cfg: &RunConfig, fw: &Firmware) -> Result<PathBuf> {
         .map_err(|e| format!("copying kernel {}: {e}", cfg.kernel.display()))?;
     fs::write(cfg_dir.join("cmdline"), &cfg.cmdline)
         .map_err(|e| format!("writing cmdline: {e}"))?;
+    fs::write(
+        cfg_dir.join("roots.pem"),
+        crate::artifact::MOZILLA_ROOTS.bytes()?,
+    )
+    .map_err(|e| format!("writing roots.pem: {e}"))?;
     fs::write(dir.join("root.img"), root_image()?)
         .map_err(|e| format!("writing root image: {e}"))?;
     fs::write(dir.join("alpine.img"), alpine_image()?)

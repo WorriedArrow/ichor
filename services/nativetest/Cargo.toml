@@ -1,0 +1,20 @@
+[package]
+name = "ichor-nativetest"
+description = "The kernel's native ABI v2 self-test, a native service run at every boot"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "ichor-nativetest"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+rt.workspace = true
+layer.workspace = true
+
+[lints]
+workspace = true

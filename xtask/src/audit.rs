@@ -95,8 +95,13 @@ fn count_unsafe(code: &str) -> usize {
 
 /// Measures the frame crate.
 pub fn frame_metrics() -> Result<FrameMetrics> {
+    metrics_of("kernel/frame/src")
+}
+
+/// Measures the sources under `dir` (workspace-relative).
+fn metrics_of(dir: &str) -> Result<FrameMetrics> {
     let mut files = Vec::new();
-    rust_files(&workspace_root().join("kernel/frame/src"), &mut files)?;
+    rust_files(&workspace_root().join(dir), &mut files)?;
     let mut m = FrameMetrics::default();
     for file in files {
         let text = fs::read_to_string(&file).map_err(|e| format!("{}: {e}", file.display()))?;
@@ -114,7 +119,11 @@ pub fn frame_metrics() -> Result<FrameMetrics> {
 
 /// Reads `kernel/frame/audit.toml` (a flat `key = integer` file).
 pub fn frame_budget() -> Result<FrameBudget> {
-    let path = workspace_root().join("kernel/frame/audit.toml");
+    budget_of("kernel/frame/audit.toml")
+}
+
+fn budget_of(file: &str) -> Result<FrameBudget> {
+    let path = workspace_root().join(file);
     let text = fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
     let get = |key: &str| -> Result<usize> {
         text.lines()
@@ -136,22 +145,32 @@ pub fn frame_budget() -> Result<FrameBudget> {
 
 /// Fails if frame exceeds its budget.
 pub fn check_frame_budget() -> Result<FrameMetrics> {
-    let m = frame_metrics()?;
-    let b = frame_budget()?;
+    check_budget("frame", "kernel/frame/src", "kernel/frame/audit.toml")
+}
+
+/// Fails if `services/rt`, the services' unsafe runtime, exceeds its
+/// budget (ADR-0012 §1).
+pub fn check_rt_budget() -> Result<FrameMetrics> {
+    check_budget("rt", "services/rt/src", "services/rt/audit.toml")
+}
+
+fn check_budget(name: &str, src: &str, budget: &str) -> Result<FrameMetrics> {
+    let m = metrics_of(src)?;
+    let b = budget_of(budget)?;
     println!(
-        "frame: {} code lines (budget {}), {} unsafe sites (budget {})",
+        "{name}: {} code lines (budget {}), {} unsafe sites (budget {})",
         m.code_lines, b.max_code_lines, m.unsafe_sites, b.max_unsafe_sites
     );
     let mut errors = Vec::new();
     if m.code_lines > b.max_code_lines {
         errors.push(format!(
-            "frame has {} code lines, budget is {}",
+            "{name} has {} code lines, budget is {}",
             m.code_lines, b.max_code_lines
         ));
     }
     if m.unsafe_sites > b.max_unsafe_sites {
         errors.push(format!(
-            "frame has {} unsafe sites, budget is {}",
+            "{name} has {} unsafe sites, budget is {}",
             m.unsafe_sites, b.max_unsafe_sites
         ));
     }
@@ -159,7 +178,7 @@ pub fn check_frame_budget() -> Result<FrameMetrics> {
         Ok(m)
     } else {
         Err(format!(
-            "{}\nGrowing frame requires an ADR; update kernel/frame/audit.toml in the same change.",
+            "{}\nGrowing {name} requires an ADR; update {budget} in the same change.",
             errors.join("\n")
         ))
     }
@@ -177,7 +196,8 @@ pub fn check_forbid_unsafe() -> Result<usize> {
     let mut errors = Vec::new();
     for manifest in manifests {
         let dir = manifest.parent().unwrap_or(&root).to_path_buf();
-        if dir == root.join("kernel/frame") {
+        // The two crates allowed `unsafe`, each under a budget.
+        if dir == root.join("kernel/frame") || dir == root.join("services/rt") {
             continue;
         }
         for crate_root in ["src/lib.rs", "src/main.rs"] {

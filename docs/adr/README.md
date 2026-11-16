@@ -18,6 +18,7 @@ brief where they conflict with it.
 | [0010](0010-network-stack-and-cell-switch.md) | Network stack (own, sans-I/O, per cell) and the cell switch | Accepted |
 | [0011](0011-user-copies.md) | Kernel copies to and from user memory: a checked walk under the space lock | Accepted |
 | [0012](0012-control-plane.md) | The control plane: a native-ABI service, native ABI v2, our own TLS/HTTP/OCI crates | Accepted |
+| [0013](0013-workloads-and-io-uring.md) | Milestone 7: io_uring, and real workloads' own test suites through the control plane | Accepted |
 
 ## Planned
 

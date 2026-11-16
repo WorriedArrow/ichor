@@ -70,9 +70,20 @@ pub(super) fn execve(
 ) -> Result<(), i64> {
     let path = user_path(p, path)?;
     let mut total = 0;
-    let mut argv = user_strings(p, argv, &mut total)?;
+    let argv = user_strings(p, argv, &mut total)?;
     let envp = user_strings(p, envp, &mut total)?;
+    exec(p, ctx, path, argv, envp)
+}
 
+/// `execve` with its arguments already in the kernel (also how the native
+/// personality's `CELL_SPAWN` starts a process's first program).
+pub(crate) fn exec(
+    p: &mut LinuxProcess,
+    ctx: &mut UserContext,
+    path: String,
+    mut argv: Vec<String>,
+    envp: Vec<String>,
+) -> Result<(), i64> {
     // `#!` scripts: run the interpreter with the script as an argument, as
     // Linux does (`interp [arg] script argv[1..]`). An interpreter may itself
     // be a script, a few levels deep.

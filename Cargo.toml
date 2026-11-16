@@ -27,6 +27,17 @@ members = [
     "kernel/drivers/virtio-net",
     "kernel/drivers/nvme",
     "kernel/ichor",
+    "services/crypto",
+    "services/x509",
+    "services/tls",
+    "services/layer",
+    "services/http",
+    "services/oci",
+    "services/dns",
+    "services/grpc",
+    "services/rt",
+    "services/nativetest",
+    "services/control",
     "tests",
     "xtask",
 ]
@@ -53,6 +64,14 @@ default-members = [
     "kernel/testprog",
     "kernel/gpt",
     "kernel/net",
+    "services/crypto",
+    "services/x509",
+    "services/tls",
+    "services/layer",
+    "services/http",
+    "services/oci",
+    "services/dns",
+    "services/grpc",
     "tests",
     "xtask",
 ]
@@ -89,6 +108,15 @@ virtio-net = { package = "ichor-virtio-net", path = "kernel/drivers/virtio-net" 
 net = { package = "ichor-net", path = "kernel/net" }
 virtio-blk = { package = "ichor-virtio-blk", path = "kernel/drivers/virtio-blk" }
 nvme = { package = "ichor-nvme", path = "kernel/drivers/nvme" }
+crypto = { package = "ichor-crypto", path = "services/crypto" }
+x509 = { package = "ichor-x509", path = "services/x509" }
+layer = { package = "ichor-layer", path = "services/layer" }
+http = { package = "ichor-http", path = "services/http" }
+tls = { package = "ichor-tls", path = "services/tls" }
+rt = { package = "ichor-rt", path = "services/rt" }
+grpc = { package = "ichor-grpc", path = "services/grpc" }
+oci = { package = "ichor-oci", path = "services/oci" }
+dns = { package = "ichor-dns", path = "services/dns" }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

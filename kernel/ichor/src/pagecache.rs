@@ -35,7 +35,7 @@ use image::{CHUNK_SIZE, ChunkSource, Error, Extent, Hash};
 pub(crate) const CAPACITY: usize = 8192;
 /// Largest image metadata read at mount: one contiguous buffer, so at most
 /// the allocator's largest block (4 MiB, enough for ~80,000 files).
-const MAX_METADATA: usize = 4 << 20;
+pub(crate) const MAX_METADATA: usize = 4 << 20;
 
 struct Entry {
     frame: UFrame,

@@ -63,6 +63,11 @@ jobs:
         with:
           path: target/alpine-kernel
           key: linux-virt-6.6.142-r0
+      - name: Cache the CA bundle (hash-checked by xtask)
+        uses: actions/cache@v4
+        with:
+          path: target/roots
+          key: mozilla-roots-2026-11-05
       - run: cargo xtask test
         env:
           ICHOR_TEST_VERBOSE: "1"

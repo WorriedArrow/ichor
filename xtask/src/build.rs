@@ -30,12 +30,45 @@ pub fn kernel_target_dir() -> PathBuf {
     workspace_root().join("target").join("kernel")
 }
 
+/// The native-ABI services' target (ADR-0012): static ELF executables.
+pub const SERVICES_TARGET: &str = "x86_64-unknown-none";
+
+/// The service binaries the kernel image embeds.
+pub const SERVICES: &[&str] = &["ichor-nativetest", "ichor-control"];
+
+/// Where service builds go (their own directory, like the kernel's).
+pub fn services_target_dir() -> PathBuf {
+    workspace_root().join("target").join("services")
+}
+
+/// Builds the embedded services; returns the directory holding them,
+/// which the kernel build reads as `ICHOR_SERVICES_DIR`.
+pub fn services(profile: Profile) -> Result<PathBuf> {
+    let mut cmd = cargo();
+    cmd.arg("build");
+    for s in SERVICES {
+        cmd.args(["--package", s]);
+    }
+    cmd.args(["--target", SERVICES_TARGET])
+        .arg("--target-dir")
+        .arg(services_target_dir());
+    if profile == Profile::Release {
+        cmd.arg("--release");
+    }
+    run_cmd(&mut cmd)?;
+    Ok(services_target_dir()
+        .join(SERVICES_TARGET)
+        .join(profile.dir()))
+}
+
 /// Builds the kernel and returns the path to `ichor.efi`.
 pub fn kernel(profile: Profile) -> Result<PathBuf> {
+    let services = services(profile)?;
     let mut cmd = cargo();
     cmd.args(["build", "--package", "ichor", "--target", KERNEL_TARGET])
         .arg("--target-dir")
-        .arg(kernel_target_dir());
+        .arg(kernel_target_dir())
+        .env("ICHOR_SERVICES_DIR", &services);
     if profile == Profile::Release {
         cmd.arg("--release");
     }

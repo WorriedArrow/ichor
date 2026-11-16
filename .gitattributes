@@ -1,3 +1,6 @@
 * text=auto eol=lf
 *.fd binary
 *.efi binary
+# Recorded traffic and other test inputs are bytes, not text: CRLFs in
+# HTTP responses must survive.
+services/*/testdata/** binary

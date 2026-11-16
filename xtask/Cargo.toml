@@ -24,6 +24,9 @@ image = { workspace = true, features = ["builder"] }
 testprog.workspace = true
 # Writes the GPT of a bootable disk image (a path crate, no external code).
 gpt = { workspace = true, features = ["builder"] }
+# gzip'd tar layers into images, shared with the control plane (a path
+# crate, no external code).
+layer.workspace = true
 
 [lints]
 workspace = true

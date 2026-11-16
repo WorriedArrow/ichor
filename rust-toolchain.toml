@@ -4,5 +4,6 @@
 [toolchain]
 channel = "1.100.0"
 components = ["rustfmt", "clippy", "rust-src"]
-targets = ["x86_64-unknown-uefi"]
+# x86_64-unknown-none: the native-ABI services (services/rt, ADR-0012).
+targets = ["x86_64-unknown-uefi", "x86_64-unknown-none"]
 profile = "minimal"

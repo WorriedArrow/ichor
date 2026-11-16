@@ -1,0 +1,19 @@
+HTTP/1.1 200 OK
+Content-Type: application/octet-stream
+Content-Length: 577
+Connection: close
+Server: AmazonS3
+Date: Wed, 11 Nov 2026 09:43:12 GMT
+Last-Modified: Mon, 23 Mar 2026 21:34:02 GMT
+ETag: "28decde6c3a76413377e5c337ab30579"
+x-amz-server-side-encryption: AES256
+x-amz-version-id: vdVNHqG2aM.eaSMcTM5_7CC9pd2xQSCV
+Accept-Ranges: bytes
+X-Cache: Hit from cloudfront
+Via: 1.1 851c08a67685da1a5c66610a9f744baa.cloudfront.net (CloudFront)
+X-Amz-Cf-Pop: SFO53-P1
+Alt-Svc: h3=":443"; ma=86400
+X-Amz-Cf-Id: ZPjwZcp5CcweLFndoW-2krjbVn6cuIk1UYQWJcktzQD4MUmV3zcMwg==
+Age: 397537
+
+{"architecture":"amd64","config":{"Env":["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"],"Cmd":["/hello"],"WorkingDir":"/"},"created":"2026-03-23T21:33:59.562202219Z","history":[{"created":"2026-03-23T21:33:59.562202219Z","created_by":"COPY hello / # buildkit","comment":"buildkit.dockerfile.v0"},{"created":"2026-03-23T21:33:59.562202219Z","created_by":"CMD [\"/hello\"]","comment":"buildkit.dockerfile.v0","empty_layer":true}],"os":"linux","rootfs":{"type":"layers","diff_ids":["sha256:897b3f2a7c1bc2f3d02432f7892fe31c6272c521ad4d70257df624504a3238b4"]}}
