@@ -39,6 +39,7 @@ members = [
     "services/rt",
     "services/nativetest",
     "services/control",
+    "fuzz",
     "tests",
     "xtask",
 ]
@@ -74,6 +75,7 @@ default-members = [
     "services/oci",
     "services/dns",
     "services/grpc",
+    "fuzz",
     "tests",
     "xtask",
 ]

@@ -27,6 +27,11 @@ gpt = { workspace = true, features = ["builder"] }
 # gzip'd tar layers into images, shared with the control plane (a path
 # crate, no external code).
 layer.workspace = true
+# Scores certificate path validation against x509-limbo (path crates, no
+# external code).
+x509.workspace = true
+oci.workspace = true
+civil.workspace = true
 
 [lints]
 workspace = true

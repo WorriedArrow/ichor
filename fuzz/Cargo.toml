@@ -1,0 +1,29 @@
+[package]
+name = "ichor-fuzz"
+description = "Mutation fuzzing of every parser that takes untrusted input: TLS, X.509/DER, HPACK, HTTP/2, gRPC/protobuf, HTTP/1.1, OCI JSON, DNS, gzip, tar, Ichor images (host-only)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "fuzz"
+path = "lib.rs"
+
+[[test]]
+name = "fuzz"
+path = "run.rs"
+
+[dependencies]
+crypto.workspace = true
+x509.workspace = true
+tls.workspace = true
+http.workspace = true
+grpc.workspace = true
+oci.workspace = true
+dns.workspace = true
+layer.workspace = true
+image.workspace = true
+
+[lints]
+workspace = true

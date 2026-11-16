@@ -24,6 +24,31 @@ plane on pinned official images (plus pinned source-tree layers), scored
 by `cargo xtask workloads` into `docs/workloads.md`, with floors in
 `workloads.toml`. Order: CPython, Go, PostgreSQL, Node.js (io_uring), JVM.
 
+Owner's order of work for milestone 7 (2026-11-16), all before any
+milestone 8 preparation: (1) fuzz every parser, score certificate
+validation on x509-limbo, write up the gaps [done]; (2) an ADR for
+`services/rt` as the second trusted crate; (3) the control-plane listener
+local unless configured, with a test, then API authentication and
+Signal/Inspect/Destroy before any cloud boot; (4) io_uring completions
+without an enter (epoll on the ring fd, registered eventfd), with a test,
+before the Node.js suite; (5) extra layers in PullImage, each pinned and
+verified by digest, with a refusal test; (6) ADR-0004's owed mitigations
+(VERW, IBPB on cross-cell switches, page-table isolation), logged at
+boot. The cell access-control suite is written in another worktree: do
+not write it; merge its branch when it lands.
+
+- M7 parsers and certificates: `fuzz/` (host-only) mutation-fuzzes every
+  parser of untrusted input (TLS server side, X.509/DER, PEM, HPACK,
+  HTTP/2 both ends + gRPC, protobuf, HTTP/1.1, registry protocol + JSON,
+  DNS, gzip, tar, Ichor images) from real seeds; a panic or a 5 s input
+  fails and is saved to `target/fuzz/`. Every test run fuzzes 300 inputs
+  per target, CI 20,000 (`conformance` job), `cargo xtask fuzz` longer.
+  Not coverage-guided (that needs nightly). `cargo xtask x509-limbo` scores
+  `verify_chain` on x509-limbo (pinned) into `docs/x509-limbo.md` with
+  floors; `docs/tls-and-x509.md` says what is enforced and the deliberate
+  gaps. Verification now builds paths with backtracking and enforces name
+  constraints, leaf serverAuth EKU and not-a-CA, DNS SAN syntax, serial
+  and RSA key rules (98.4% accept / 99.4% refuse agreement).
 - M7 io_uring, first step: `kernel/uring` (host-tested) has the ABI, this
   kernel's ring layout (one mapping for both rings, fields grouped by
   writer) and the ordering rules (`Order`: links, hard links, drains,
@@ -500,6 +525,8 @@ cargo xtask frame-audit    # frame's and services/rt's line and unsafe-site coun
 cargo xtask run --cmdline "qemu_debug_exit bench" --smp 4 --release   # benchmarks (use KVM for real numbers)
 cargo xtask bench --accel kvm --smp 4   # Ichor vs Linux, same machine and programs (Markdown table)
 cargo xtask disk-image     # target/ichor-disk.img: bootable GPT disk (ESP + Ichor root) for clouds/bare metal
+cargo xtask fuzz [TARGET] --iterations N   # mutation-fuzz the parsers (failing inputs: target/fuzz/)
+cargo xtask x509-limbo     # certificate validation vs x509-limbo -> docs/x509-limbo.md (fails below floors)
 cargo deny check           # licenses, advisories, sources
 ```
 
@@ -594,6 +621,7 @@ services/rt      native services' runtime: entry, syscalls, heap, panic (the onl
 services/nativetest  native ABI v2 boot self-test, embedded in the kernel image
 services/control the control plane: gRPC API, registry pulls, cells and runs (native service, embedded)
 services/grpc    protobuf, gRPC over HTTP/2, ichor.v1.Control messages (host-tested)
+fuzz/            mutation fuzzing of every untrusted-input parser (host-only)
 xtask/           build/run/test/lint tooling (lib + bin, no dependencies)
 tests/           QEMU integration tests (host crate using xtask's runner)
 docs/adr/        architecture decision records

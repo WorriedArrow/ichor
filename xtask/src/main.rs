@@ -22,6 +22,11 @@ Commands:
   linux-abi-table  Regenerate docs/linux-abi.md from the Linux syscall table
   bench        Run the benchmarks on Ichor and on a pinned Linux kernel, same
                machine and programs; prints a Markdown table (CI: --smp 4)
+  x509-limbo   Score services/x509 against the pinned x509-limbo suite; writes
+               docs/x509-limbo.md and fails below the recorded floors
+  fuzz [TARGET] [--iterations N]
+               Mutation-fuzz every parser (or one); failing inputs go to
+               target/fuzz/ (replay with ICHOR_FUZZ_REPLAY=FILE)
   disk-image   Write target/ichor-disk.img: a bootable GPT disk (FAT32 ESP with
                ichor.efi, Ichor root partition), for cloud import or bare metal;
                the kernel command line is --cmdline (default: empty);
@@ -332,6 +337,33 @@ fn cmd_test(o: &Opts) -> Result<()> {
     run_cmd(&mut cmd)
 }
 
+/// `cargo xtask fuzz [TARGET] [--iterations N] [--seed S]`: the fuzz
+/// targets, longer than CI's run, with overflow checks (the dev profile).
+fn cmd_fuzz(args: &[String]) -> Result<()> {
+    let mut cmd = cargo();
+    cmd.args(["test", "--package", "ichor-fuzz", "--", "--nocapture"]);
+    let mut it = args.iter();
+    cmd.env("ICHOR_FUZZ_ITERATIONS", "100000");
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--iterations" => {
+                cmd.env(
+                    "ICHOR_FUZZ_ITERATIONS",
+                    it.next().ok_or("--iterations needs a value")?,
+                );
+            }
+            "--seed" => {
+                cmd.env("ICHOR_FUZZ_SEED", it.next().ok_or("--seed needs a value")?);
+            }
+            t if !t.starts_with('-') => {
+                cmd.env("ICHOR_FUZZ_TARGET", t);
+            }
+            other => return Err(format!("fuzz: unknown option {other:?}")),
+        }
+    }
+    run_cmd(&mut cmd)
+}
+
 fn cmd_lint() -> Result<()> {
     run_cmd(cargo().args(["fmt", "--all", "--check"]))?;
     run_cmd(
@@ -381,7 +413,9 @@ fn main() -> ExitCode {
     let (command, rest) = args
         .split_first()
         .map_or(("help", &[][..]), |(c, r)| (c.as_str(), r));
-    let result = parse(rest).and_then(|o| match command {
+    // `fuzz` takes its own arguments.
+    let rest_for_parse = if command == "fuzz" { &[][..] } else { rest };
+    let result = parse(rest_for_parse).and_then(|o| match command {
         "build" => build::kernel(o.profile).map(|p| println!("{}", p.display())),
         "run" => cmd_run(&o),
         "test" => cmd_test(&o),
@@ -391,6 +425,8 @@ fn main() -> ExitCode {
         }
         "linux-abi-table" => linux_abi::write_table(),
         "bench" => cmd_bench(&o),
+        "x509-limbo" => xtask::limbo::run(),
+        "fuzz" => cmd_fuzz(rest),
         "disk-image" => cmd_disk_image(&o, rest),
         "help" | "--help" | "-h" => {
             print!("{HELP}");

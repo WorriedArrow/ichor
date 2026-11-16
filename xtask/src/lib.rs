@@ -16,6 +16,7 @@ pub mod deflate;
 pub mod disk;
 pub mod fat;
 pub mod inflate;
+pub mod limbo;
 pub mod linux_abi;
 pub mod linuxref;
 pub mod qemu;

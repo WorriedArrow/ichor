@@ -43,6 +43,10 @@ pub enum Error {
     WrongHost,
     /// The leaf may not authenticate a TLS server.
     NotServerAuth,
+    /// A CA's name constraints exclude (or do not permit) the leaf's names.
+    NameConstraint,
+    /// Path building gave up (too many candidate issuers).
+    TooComplex,
 }
 
 /// Most certificates in a path, leaf and root included.
@@ -150,48 +154,138 @@ fn may_issue(c: &Certificate<'_>, below: usize) -> Result<(), Error> {
     Ok(())
 }
 
-/// Verifies `chain` (the leaf first, then what the server sent, as DER)
-/// for `host` at Unix time `now`.
+/// Most signature checks one path search may make (a hostile chain could
+/// otherwise make the search exponential).
+const MAX_SIGNATURE_CHECKS: usize = 64;
+
+struct Search<'s, 'a> {
+    leaf: &'s Certificate<'a>,
+    pool: &'s [Certificate<'a>],
+    roots: &'s [Certificate<'a>],
+    now: u64,
+    checks: usize,
+}
+
+impl Search<'_, '_> {
+    /// Whether `issuer` may sign the path below it (`path`: the pool
+    /// members between it and the leaf): a CA for TLS servers, valid now,
+    /// within its path length (self-issued certificates below do not count,
+    /// RFC 5280 6.1.4), its name constraints allowing the leaf's and those
+    /// intermediates' names.
+    fn may_extend(&self, issuer: &Certificate<'_>, path: &[usize]) -> Result<(), Error> {
+        valid_at(issuer, self.now)?;
+        let counted = path
+            .iter()
+            .filter(|&&i| self.pool[i].issuer != self.pool[i].subject)
+            .count();
+        may_issue(issuer, counted)?;
+        if !issuer.may_issue_server() {
+            return Err(Error::NotServerAuth);
+        }
+        issuer.permits(self.leaf)?;
+        for &i in path {
+            issuer.permits(&self.pool[i])?;
+        }
+        Ok(())
+    }
+
+    fn signed(&mut self, c: &Certificate<'_>, by: &Certificate<'_>) -> Result<bool, Error> {
+        if c.issuer != by.subject {
+            return Ok(false);
+        }
+        self.checks += 1;
+        if self.checks > MAX_SIGNATURE_CHECKS {
+            return Err(Error::TooComplex);
+        }
+        Ok(c.signed_by(by))
+    }
+
+    /// Extends the path above `current` (`path`: the pool members already
+    /// in it, nearest the leaf first) to a trusted root, trying every
+    /// candidate issuer in turn. Returns the error of the last failure if
+    /// none works.
+    fn extend(&mut self, current: &Certificate<'_>, path: &mut Vec<usize>) -> Result<(), Error> {
+        if path.len() + 2 > MAX_DEPTH {
+            return Err(Error::PathTooLong);
+        }
+        let mut best = Error::UnknownIssuer;
+        // A trusted root ends the path.
+        for r in self.roots {
+            if !self.signed(current, r)? {
+                if current.issuer == r.subject {
+                    best = Error::BadSignature;
+                }
+                continue;
+            }
+            match self.may_extend(r, path) {
+                Ok(()) => return Ok(()),
+                Err(e) => best = e,
+            }
+        }
+        // Otherwise an intermediate from the pool, then onward.
+        for i in 0..self.pool.len() {
+            if path.contains(&i) {
+                continue;
+            }
+            let issuer = &self.pool[i];
+            if !self.signed(current, issuer)? {
+                if current.issuer == issuer.subject {
+                    best = Error::BadSignature;
+                }
+                continue;
+            }
+            if !issuer.serial_ok {
+                best = Error::Malformed;
+                continue;
+            }
+            if let Err(e) = self.may_extend(issuer, path) {
+                best = e;
+                continue;
+            }
+            path.push(i);
+            let r = self.extend(issuer, path);
+            path.pop();
+            match r {
+                Ok(()) => return Ok(()),
+                Err(Error::TooComplex) => return Err(Error::TooComplex),
+                Err(e) => best = e,
+            }
+        }
+        Err(best)
+    }
+}
+
+/// Verifies `chain` (the leaf first, then what the server sent, as DER, in
+/// any order) for `host` at Unix time `now`: some path from the leaf
+/// through the sent certificates to a trusted root must be valid, each
+/// issuer a CA within its path length, extended key usage and name
+/// constraints.
 pub fn verify_chain(chain: &[&[u8]], roots: &RootStore, host: &str, now: u64) -> Result<(), Error> {
-    let certs: Vec<Certificate<'_>> = chain.iter().map(|d| parse(d)).collect::<Result<_, _>>()?;
-    let leaf = certs.first().ok_or(Error::Malformed)?;
+    let (leaf, rest) = chain.split_first().ok_or(Error::Malformed)?;
+    let leaf = parse(leaf)?;
+    // A sent certificate we cannot parse cannot be on the path; it does
+    // not spoil the others.
+    let pool: Vec<Certificate<'_>> = rest.iter().filter_map(|d| parse(d).ok()).collect();
+    let leaf = &leaf;
     if !leaf.matches_host(host) {
         return Err(Error::WrongHost);
     }
-    if !leaf.server_auth {
+    if !leaf.may_serve() {
         return Err(Error::NotServerAuth);
     }
-    let roots: Vec<Certificate<'_>> = roots.roots.iter().filter_map(|d| parse(d).ok()).collect();
-    let mut current = leaf.clone();
-    let mut used = alloc::vec![false; certs.len()];
-    used[0] = true;
-    for depth in 0..MAX_DEPTH {
-        valid_at(&current, now)?;
-        // A trusted root that signed it ends the path.
-        if let Some(root) = roots.iter().find(|r| current.signed_by(r)) {
-            valid_at(root, now)?;
-            if depth > 0 {
-                may_issue(root, depth)?;
-            } else if !root.ca {
-                return Err(Error::NotCa);
-            }
-            return Ok(());
-        }
-        // Otherwise an intermediate the server sent.
-        let next = certs
-            .iter()
-            .enumerate()
-            .find(|(i, c)| !used[*i] && current.issuer == c.subject)
-            .ok_or(Error::UnknownIssuer)?;
-        let (i, issuer) = next;
-        if !current.signed_by(issuer) {
-            return Err(Error::BadSignature);
-        }
-        may_issue(issuer, depth)?;
-        used[i] = true;
-        current = issuer.clone();
+    if !leaf.serial_ok {
+        return Err(Error::Malformed);
     }
-    Err(Error::PathTooLong)
+    valid_at(leaf, now)?;
+    let roots: Vec<Certificate<'_>> = roots.roots.iter().filter_map(|d| parse(d).ok()).collect();
+    Search {
+        leaf,
+        pool: &pool,
+        roots: &roots,
+        now,
+        checks: 0,
+    }
+    .extend(leaf, &mut Vec::new())
 }
 
 #[cfg(test)]

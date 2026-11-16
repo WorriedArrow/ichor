@@ -110,6 +110,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "ichor-fuzz"
+version = "0.0.0"
+dependencies = [
+ "ichor-crypto",
+ "ichor-dns",
+ "ichor-grpc",
+ "ichor-http",
+ "ichor-image",
+ "ichor-layer",
+ "ichor-oci",
+ "ichor-tls",
+ "ichor-x509",
+]
+
+[[package]]
 name = "ichor-gpt"
 version = "0.0.0"
 
@@ -264,8 +279,11 @@ dependencies = [
 name = "xtask"
 version = "0.0.0"
 dependencies = [
+ "ichor-civil",
  "ichor-gpt",
  "ichor-image",
  "ichor-layer",
+ "ichor-oci",
  "ichor-testprog",
+ "ichor-x509",
 ]

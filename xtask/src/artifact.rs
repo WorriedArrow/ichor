@@ -128,6 +128,17 @@ pub const MOZILLA_ROOTS: Artifact = Artifact {
     token_url: None,
 };
 
+/// The x509-limbo certificate path-validation suite (C2SP), pinned to a
+/// commit: `cargo xtask x509-limbo` scores `services/x509` against it.
+pub const X509_LIMBO: Artifact = Artifact {
+    dir: "x509-limbo",
+    file: "limbo-519f4bcf.json",
+    url: "https://raw.githubusercontent.com/C2SP/x509-limbo/519f4bcf6a31d20e1b7011a0586e233dbbd3e732/limbo.json",
+    sha256: "56799cefd65fc9e0bdb9cb0f97fce6734533b45df3de4fc17fdc7b7b79654fca",
+    env: "ICHOR_X509_LIMBO",
+    token_url: None,
+};
+
 /// The official static busybox 1.35.0 (musl, x86-64) from busybox.net.
 pub const BUSYBOX: Artifact = Artifact {
     dir: "busybox/1.35.0",

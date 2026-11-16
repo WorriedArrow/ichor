@@ -24,8 +24,48 @@ const BASIC_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x13];
 const KEY_USAGE: &[u8] = &[0x55, 0x1d, 0x0f];
 const SUBJECT_ALT_NAME: &[u8] = &[0x55, 0x1d, 0x11];
 const EXT_KEY_USAGE: &[u8] = &[0x55, 0x1d, 0x25];
+const NAME_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x1e];
 const SERVER_AUTH: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x01];
 const ANY_EKU: &[u8] = &[0x55, 0x1d, 0x25, 0x00];
+
+/// GeneralName tags (context-specific, primitive).
+const GN_DNS: u8 = 0x82;
+const GN_IP: u8 = 0x87;
+
+const GN_DIRECTORY: u8 = 0xa4;
+
+/// Name-constraint subtrees: each base's GeneralName tag and contents.
+pub type Subtrees<'a> = Vec<(u8, &'a [u8])>;
+
+/// Smallest RSA modulus accepted, in bits.
+const MIN_RSA_BITS: usize = 2048;
+/// Most subtrees in one name-constraints list.
+const MAX_SUBTREES: usize = 128;
+/// Most name comparisons one CA's constraints may take (a certificate
+/// with thousands of names and constraints is a denial of service).
+const MAX_NC_CHECKS: usize = 1024;
+
+/// A DNS name's syntax (preferred name syntax, RFC 1034 3.5): labels of
+/// letters, digits and hyphens, none empty or starting or ending with a
+/// hyphen, at most 63 bytes each and 253 in all.
+fn valid_dns_name(name: &str) -> bool {
+    let name = name.strip_suffix('.').unwrap_or(name);
+    !name.is_empty()
+        && name.len() <= 253
+        && name.split('.').all(|l| {
+            !l.is_empty()
+                && l.len() <= 63
+                && !l.starts_with('-')
+                && !l.ends_with('-')
+                && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
+}
+
+/// A DNS SAN: a name, or `*.` and a name (a wildcard is the whole
+/// leftmost label).
+fn valid_dns_san(name: &str) -> bool {
+    valid_dns_name(name.strip_prefix("*.").unwrap_or(name))
+}
 
 /// `keyCertSign` in the KeyUsage bit string (bit 5).
 pub const KEY_CERT_SIGN: u16 = 1 << 5;
@@ -78,10 +118,20 @@ pub struct Certificate<'a> {
     pub path_len: Option<u32>,
     /// KeyUsage bits (bit 0 is digitalSignature), if present.
     pub key_usage: Option<u16>,
+    /// Extended key usage, if the certificate has the extension: whether
+    /// it allows TLS server authentication explicitly, and whether it
+    /// carries `anyExtendedKeyUsage`.
+    pub eku: Option<(bool, bool)>,
+    /// The serial number is a positive integer of at most 20 octets.
+    pub serial_ok: bool,
+    /// IP address SANs (4 or 16 bytes).
+    pub ip_names: Vec<&'a [u8]>,
+    /// SANs of other types than DNS and IP.
+    pub other_names: bool,
+    /// Name constraints: permitted and excluded subtrees, `(tag, base)`.
+    pub name_constraints: Option<(Subtrees<'a>, Subtrees<'a>)>,
     /// Subject alternative DNS names.
     pub dns_names: Vec<&'a str>,
-    /// ExtendedKeyUsage allows TLS server authentication (true when absent).
-    pub server_auth: bool,
 }
 
 fn sig_alg(body: &[u8]) -> Result<SigAlg, Error> {
@@ -152,6 +202,12 @@ fn public_key(spki: &[u8]) -> Result<PublicKey<'_>, Error> {
                 .ok_or(Error::Malformed)?;
             let e = der::unsigned(k.expect(der::INTEGER).ok_or(Error::Malformed)?)
                 .ok_or(Error::Malformed)?;
+            // Weak keys, and moduli that are not a whole number of bytes,
+            // are refused (as the Web PKI does).
+            let bits = n.len() * 8 - n.first().map_or(8, |b| b.leading_zeros() as usize);
+            if bits < MIN_RSA_BITS || bits % 8 != 0 {
+                return Err(Error::Unsupported);
+            }
             Ok(PublicKey::Rsa { n, e })
         }
         EC_PUBLIC_KEY => {
@@ -188,7 +244,14 @@ pub fn parse(raw: &[u8]) -> Result<Certificate<'_>, Error> {
     if version != [der::INTEGER, 1, 2] {
         return Err(Error::Unsupported);
     }
-    t.expect(der::INTEGER).ok_or(Error::Malformed)?;
+    // The serial: a positive integer of at most 20 octets (RFC 5280
+    // 4.1.2.2). Checked for certificates a server sends, not for trust
+    // anchors (old roots, Starfield's G2 among them, have serial 0).
+    let serial = t.expect(der::INTEGER).ok_or(Error::Malformed)?;
+    let serial_ok = serial.len() <= 21
+        && serial.first().is_some_and(|b| b & 0x80 == 0)
+        && !serial.iter().all(|&b| b == 0)
+        && (serial.len() < 21 || serial[0] == 0);
     let inner_alg = sig_alg(t.expect(der::SEQUENCE).ok_or(Error::Malformed)?)?;
     if inner_alg != outer_alg {
         return Err(Error::Malformed);
@@ -217,8 +280,12 @@ pub fn parse(raw: &[u8]) -> Result<Certificate<'_>, Error> {
         ca: false,
         path_len: None,
         key_usage: None,
+        eku: None,
+        serial_ok,
+        ip_names: Vec::new(),
+        other_names: false,
+        name_constraints: None,
         dns_names: Vec::new(),
-        server_auth: true,
     };
     if let Some(exts) = t.optional(0xa3) {
         let mut list = Reader::new(
@@ -226,9 +293,15 @@ pub fn parse(raw: &[u8]) -> Result<Certificate<'_>, Error> {
                 .expect(der::SEQUENCE)
                 .ok_or(Error::Malformed)?,
         );
+        let mut seen: Vec<&[u8]> = Vec::new();
         while !list.is_empty() {
             let mut e = Reader::new(list.expect(der::SEQUENCE).ok_or(Error::Malformed)?);
             let oid = e.expect(der::OID).ok_or(Error::Malformed)?;
+            // An extension may appear once (RFC 5280 4.2).
+            if seen.contains(&oid) {
+                return Err(Error::Malformed);
+            }
+            seen.push(oid);
             let critical = e.optional(der::BOOLEAN).is_some_and(|b| b == [0xff]);
             let value = e.expect(der::OCTET_STRING).ok_or(Error::Malformed)?;
             extension(&mut out, oid, critical, value)?;
@@ -285,9 +358,17 @@ fn extension<'a>(
             );
             while !r.is_empty() {
                 let gn = r.read().ok_or(Error::Malformed)?;
-                if gn.tag == 0x82 {
-                    let name = core::str::from_utf8(gn.body).map_err(|_| Error::Malformed)?;
-                    c.dns_names.push(name);
+                match gn.tag {
+                    GN_DNS => {
+                        let name = core::str::from_utf8(gn.body).map_err(|_| Error::Malformed)?;
+                        if !valid_dns_san(name) {
+                            return Err(Error::Malformed);
+                        }
+                        c.dns_names.push(name);
+                    }
+                    GN_IP if gn.body.len() == 4 || gn.body.len() == 16 => c.ip_names.push(gn.body),
+                    GN_IP => return Err(Error::Malformed),
+                    _ => c.other_names = true,
                 }
             }
         }
@@ -297,12 +378,60 @@ fn extension<'a>(
                     .expect(der::SEQUENCE)
                     .ok_or(Error::Malformed)?,
             );
-            let mut ok = false;
+            let (mut server, mut any) = (false, false);
             while !r.is_empty() {
                 let purpose = r.expect(der::OID).ok_or(Error::Malformed)?;
-                ok |= purpose == SERVER_AUTH || purpose == ANY_EKU;
+                server |= purpose == SERVER_AUTH;
+                any |= purpose == ANY_EKU;
             }
-            c.server_auth = ok;
+            c.eku = Some((server, any));
+        }
+        NAME_CONSTRAINTS => {
+            // RFC 5280 4.2.1.10: always critical.
+            if !critical {
+                return Err(Error::Malformed);
+            }
+            let mut r = Reader::new(
+                Reader::new(v)
+                    .expect(der::SEQUENCE)
+                    .ok_or(Error::Malformed)?,
+            );
+            let subtrees = |body: &'a [u8]| -> Result<Vec<(u8, &'a [u8])>, Error> {
+                let mut out = Vec::new();
+                let mut s = Reader::new(body);
+                while !s.is_empty() {
+                    let mut st = Reader::new(s.expect(der::SEQUENCE).ok_or(Error::Malformed)?);
+                    let base = st.read().ok_or(Error::Malformed)?;
+                    // minimum and maximum: RFC 5280 says absent (0, none).
+                    if !st.is_empty() {
+                        return Err(Error::Unsupported);
+                    }
+                    if base.tag == GN_DNS {
+                        let b = core::str::from_utf8(base.body).map_err(|_| Error::Malformed)?;
+                        if !b.is_empty() && !valid_dns_name(b.strip_prefix('.').unwrap_or(b)) {
+                            return Err(Error::Malformed);
+                        }
+                    }
+                    out.push((base.tag, base.body));
+                }
+                // GeneralSubtrees ::= SEQUENCE SIZE (1..MAX)
+                if out.is_empty() || out.len() > MAX_SUBTREES {
+                    return Err(Error::Malformed);
+                }
+                Ok(out)
+            };
+            let permitted = match r.optional(0xa0) {
+                Some(b) => subtrees(b)?,
+                None => Vec::new(),
+            };
+            let excluded = match r.optional(0xa1) {
+                Some(b) => subtrees(b)?,
+                None => Vec::new(),
+            };
+            if !r.is_empty() || (permitted.is_empty() && excluded.is_empty()) {
+                return Err(Error::Malformed);
+            }
+            c.name_constraints = Some((permitted, excluded));
         }
         // An unknown extension may be ignored unless it is critical.
         _ if critical => return Err(Error::UnknownCritical),
@@ -311,7 +440,134 @@ fn extension<'a>(
     Ok(())
 }
 
+/// Whether DNS name `name` lies in the subtree `base` (RFC 5280
+/// 4.2.1.10): `base` itself or a subdomain; with a leading dot, only
+/// subdomains; empty, every name.
+fn dns_within(name: &str, base: &str) -> bool {
+    let name = name.trim_end_matches('.');
+    if base.is_empty() {
+        return true;
+    }
+    let (sub_only, base) = match base.strip_prefix('.') {
+        Some(b) => (true, b),
+        None => (false, base),
+    };
+    let n = name.len();
+    let b = base.len();
+    if !sub_only && name.eq_ignore_ascii_case(base) {
+        return true;
+    }
+    n > b && name.as_bytes()[n - b - 1] == b'.' && name[n - b..].eq_ignore_ascii_case(base)
+}
+
+/// Whether some name a SAN pattern covers lies in `base`. For permitted
+/// subtrees every covered name must (`all`); for excluded, any.
+fn pattern_within(pat: &str, base: &str, all: bool) -> bool {
+    let Some(rest) = pat.strip_prefix("*.") else {
+        return dns_within(pat, base);
+    };
+    // Every `x.rest` ends in `.B` exactly when `rest` is `B` or below it,
+    // whether `base` is `B` or `.B`.
+    let below = dns_within(rest, base.trim_start_matches('.'));
+    if all {
+        below
+    } else {
+        // Some `x.rest` is also `B` itself when `B` is one label below
+        // `rest` (and the base is not subdomains-only).
+        below
+            || !base.starts_with('.')
+                && base.split_once('.').is_some_and(|(label, tail)| {
+                    !label.is_empty() && tail.eq_ignore_ascii_case(rest)
+                })
+    }
+}
+
+fn ip_within(ip: &[u8], base: &[u8]) -> Option<bool> {
+    if base.len() != 2 * ip.len() {
+        return None; // a constraint for the other address family
+    }
+    let (addr, mask) = base.split_at(ip.len());
+    Some(
+        ip.iter()
+            .zip(addr)
+            .zip(mask)
+            .all(|((i, a), m)| i & m == a & m),
+    )
+}
+
 impl Certificate<'_> {
+    /// Whether this CA's name constraints allow `leaf`'s names (DNS and IP
+    /// SANs). A constraint of another type, or a leaf name of another type
+    /// under a CA with constraints, cannot be checked and is refused.
+    pub fn permits(&self, leaf: &Certificate<'_>) -> Result<(), Error> {
+        let Some((permitted, excluded)) = &self.name_constraints else {
+            return Ok(());
+        };
+        // directoryName constraints apply to every subject, which we do not
+        // compare; constraints of other types (email, URI, ...) only to
+        // names of that type, which we cannot compare either.
+        let types = || permitted.iter().chain(excluded).map(|(t, _)| *t);
+        if types().any(|t| t == GN_DIRECTORY)
+            || (leaf.other_names && types().any(|t| t != GN_DNS && t != GN_IP))
+        {
+            return Err(Error::Unsupported);
+        }
+        if (leaf.dns_names.len() + leaf.ip_names.len()) * (permitted.len() + excluded.len())
+            > MAX_NC_CHECKS
+        {
+            return Err(Error::TooComplex);
+        }
+        fn dns(tag: u8, b: &[u8]) -> Option<&str> {
+            (tag == GN_DNS)
+                .then(|| core::str::from_utf8(b).ok())
+                .flatten()
+        }
+        for name in &leaf.dns_names {
+            if excluded
+                .iter()
+                .filter_map(|(t, b)| dns(*t, b))
+                .any(|b| pattern_within(name, b, false))
+            {
+                return Err(Error::NameConstraint);
+            }
+            let mut allowed = permitted.iter().filter_map(|(t, b)| dns(*t, b)).peekable();
+            if allowed.peek().is_some() && !allowed.any(|b| pattern_within(name, b, true)) {
+                return Err(Error::NameConstraint);
+            }
+        }
+        for ip in &leaf.ip_names {
+            let of = |list: &[(u8, &[u8])]| -> Vec<bool> {
+                list.iter()
+                    .filter(|(t, _)| *t == GN_IP)
+                    .filter_map(|(_, b)| ip_within(ip, b))
+                    .collect()
+            };
+            if of(excluded).iter().any(|&m| m) {
+                return Err(Error::NameConstraint);
+            }
+            let p = of(permitted);
+            if !p.is_empty() && !p.iter().any(|&m| m) {
+                return Err(Error::NameConstraint);
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether this certificate may be a TLS server's leaf: not a CA, no
+    /// certificate signing, and an extended key usage naming serverAuth.
+    pub fn may_serve(&self) -> bool {
+        !self.ca
+            && self.key_usage.is_none_or(|ku| ku & KEY_CERT_SIGN == 0)
+            && self.name_constraints.is_none()
+            && self.eku.is_some_and(|(server, _)| server)
+    }
+
+    /// Whether this CA's extended key usage, if it has one, allows issuing
+    /// for TLS servers.
+    pub fn may_issue_server(&self) -> bool {
+        self.eku.is_none_or(|(server, any)| server || any)
+    }
+
     /// Whether `issuer` signed this certificate.
     pub fn signed_by(&self, issuer: &Certificate<'_>) -> bool {
         self.issuer == issuer.subject && issuer.key.verify(self.sig_alg, self.tbs, self.signature)
@@ -330,5 +586,64 @@ impl Certificate<'_> {
                 None => pat.eq_ignore_ascii_case(host),
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dns_subtrees() {
+        assert!(dns_within("example.com", "example.com"));
+        assert!(dns_within("a.b.Example.com", "example.com"));
+        assert!(!dns_within("badexample.com", "example.com"));
+        assert!(!dns_within("example.com", ".example.com"));
+        assert!(dns_within("a.example.com", ".example.com"));
+        assert!(dns_within("anything.test", ""));
+    }
+
+    #[test]
+    fn wildcards_against_subtrees() {
+        // Permitted: every name the wildcard covers must be inside.
+        assert!(pattern_within("*.example.com", "example.com", true));
+        assert!(pattern_within("*.example.com", ".example.com", true));
+        assert!(!pattern_within("*.example.com", "a.example.com", true));
+        // Excluded: any covered name inside is enough.
+        assert!(pattern_within("*.example.com", "a.example.com", false));
+        assert!(!pattern_within("*.example.com", ".a.example.com", false));
+        assert!(!pattern_within("*.example.com", "other.com", false));
+    }
+
+    #[test]
+    fn ip_subtrees() {
+        let base = [10, 0, 0, 0, 255, 0, 0, 0];
+        assert_eq!(ip_within(&[10, 1, 2, 3], &base), Some(true));
+        assert_eq!(ip_within(&[11, 1, 2, 3], &base), Some(false));
+        assert_eq!(ip_within(&[0; 16], &base), None);
+    }
+
+    #[test]
+    fn dns_san_syntax() {
+        for ok in [
+            "example.com",
+            "*.example.com",
+            "a-b.c0.example",
+            "example.com.",
+        ] {
+            assert!(valid_dns_san(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            "a..b",
+            "_x.example.com",
+            "-a.example",
+            "a.*.example",
+            "*",
+            "ex ample.com",
+            "é.example",
+        ] {
+            assert!(!valid_dns_san(bad), "{bad}");
+        }
     }
 }
