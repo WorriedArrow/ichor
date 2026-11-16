@@ -75,6 +75,238 @@ mod sys {
     pub(super) const RECVMSG: u64 = 47;
     pub(super) const SOCKETPAIR: u64 = 53;
     pub(super) const GETSOCKOPT: u64 = 55;
+    pub(super) const IO_URING_SETUP: u64 = 425;
+    pub(super) const IO_URING_ENTER: u64 = 426;
+    pub(super) const IO_URING_REGISTER: u64 = 427;
+}
+
+/// io_uring (ADR-0013 §1) from ring 3: a ring set up and mapped; a write
+/// linked to a read through a pipe, beside a NOP, all completed by one
+/// `io_uring_enter`; a read of an empty pipe armed, then completed by a
+/// forked child's write while the parent waits; a timeout; an unknown
+/// opcode refused; the probe. The exit code is the failing check.
+fn uring_program() -> Vec<u8> {
+    use ::uring::abi;
+    let Ok(l) = ::uring::setup(8, 0, 0) else {
+        fail("uring layout");
+    };
+    let mut a = Asm::new();
+    let bad = a.label();
+    let parent = a.label();
+    let text = a.data(b"uring!");
+    let x = a.data(b"x");
+    let ms50 = a.data(&[0, 0, 0, 0, 0, 0, 0, 0, 0x80, 0xf0, 0xfa, 0x02, 0, 0, 0, 0]);
+    let ms20 = a.data(&[0, 0, 0, 0, 0, 0, 0, 0, 0x00, 0x2d, 0x31, 0x01, 0, 0, 0, 0]);
+    let expect = |a: &mut Asm, n: u64, v: u64| {
+        a.mov_imm(Reg::R15, n);
+        a.mov_imm(Reg::R14, v);
+        a.cmp(Reg::Rax, Reg::R14);
+        a.jne(bad);
+    };
+    // SQE `slot`: (opcode, flags, fd), off, addr, len, user_data.
+    let sqe = |a: &mut Asm,
+               slot: i32,
+               op: u8,
+               flags: u8,
+               fd: i32,
+               off: u64,
+               addr: Option<(Reg, i32)>,
+               len: u32,
+               ud: u64| {
+        let w0 = u64::from(op) | (u64::from(flags) << 8) | (u64::from(fd as u32) << 32);
+        let words = [w0, off, 0, u64::from(len), ud, 0, 0, 0];
+        for (k, w) in words.iter().enumerate() {
+            a.mov_imm(Reg::Rax, *w);
+            a.store(Reg::R13, slot * 64 + 8 * k as i32, Reg::Rax);
+        }
+        if let Some((base, disp)) = addr {
+            a.mov(Reg::Rax, base);
+            a.add_imm(Reg::Rax, disp);
+            a.store(Reg::R13, slot * 64 + 16, Reg::Rax);
+        }
+        // The SQ array names the slot, then the tail moves past it.
+        a.mov_imm(Reg::Rax, slot as u64);
+        a.store32(Reg::R12, l.sq.array as i32 + 4 * slot, Reg::Rax);
+        a.mov_imm(Reg::Rax, slot as u64 + 1);
+        a.store32(Reg::R12, l.sq.tail as i32, Reg::Rax);
+    };
+    let enter = |a: &mut Asm, submit: u64, min: u64, flags: u64| {
+        a.mov_imm(Reg::Rdi, 5);
+        a.mov_imm(Reg::Rsi, submit);
+        a.mov_imm(Reg::Rdx, min);
+        a.mov_imm(Reg::R10, flags);
+        a.mov_imm(Reg::R8, 0);
+        a.mov_imm(Reg::R9, 0);
+        a.sys(sys::IO_URING_ENTER);
+    };
+    let cqe = |a: &mut Asm, n: u64, i: i32, ud: u64, res: i32| {
+        a.load(Reg::Rax, Reg::R12, l.cq.cqes as i32 + 16 * i);
+        expect(a, n, ud);
+        a.load32(Reg::Rax, Reg::R12, l.cq.cqes as i32 + 16 * i + 8);
+        expect(a, n, u64::from(res as u32));
+    };
+    let cq_tail = |a: &mut Asm, n: u64, v: u64| {
+        a.load32(Reg::Rax, Reg::R12, l.cq.tail as i32);
+        expect(a, n, v);
+    };
+    let set_cq_head = |a: &mut Asm, v: u64| {
+        a.mov_imm(Reg::Rax, v);
+        a.store32(Reg::R12, l.cq.head as i32, Reg::Rax);
+    };
+    a.mov(Reg::Rbp, Reg::Rsp);
+    a.sub_imm(Reg::Rbp, 8192);
+    // 1: a pipe (fds 3 and 4).
+    a.mov(Reg::Rdi, Reg::Rbp);
+    a.add_imm(Reg::Rdi, 256);
+    a.mov_imm(Reg::Rsi, 0);
+    a.sys(sys::PIPE2);
+    expect(&mut a, 1, 0);
+    // 2: io_uring_setup(8, zeroed params) is fd 5; the params say 8
+    // entries and our features.
+    a.mov_imm(Reg::Rax, 0);
+    for k in 0..15 {
+        a.store(Reg::Rbp, 8 * k, Reg::Rax);
+    }
+    a.mov_imm(Reg::Rdi, 8);
+    a.mov(Reg::Rsi, Reg::Rbp);
+    a.sys(sys::IO_URING_SETUP);
+    expect(&mut a, 2, 5);
+    a.load32(Reg::Rax, Reg::Rbp, 0);
+    expect(&mut a, 2, 8);
+    a.load32(Reg::Rax, Reg::Rbp, 20);
+    expect(&mut a, 2, u64::from(::uring::FEATURES));
+    // 3: map the rings and the SQEs.
+    for (reg, len, off) in [
+        (Reg::R12, l.ring_bytes, abi::OFF_SQ_RING),
+        (Reg::R13, l.sqes_bytes, abi::OFF_SQES),
+    ] {
+        a.mov_imm(Reg::Rdi, 0);
+        a.mov_imm(Reg::Rsi, len);
+        a.mov_imm(Reg::Rdx, 3); // PROT_READ | PROT_WRITE
+        a.mov_imm(Reg::R10, 1); // MAP_SHARED
+        a.mov_imm(Reg::R8, 5);
+        a.mov_imm(Reg::R9, off);
+        a.sys(sys::MMAP);
+        a.mov_imm(Reg::R15, 3);
+        a.mov_imm(Reg::R14, (-4096i64) as u64);
+        a.cmp(Reg::Rax, Reg::R14);
+        a.ja(bad);
+        a.mov(reg, Reg::Rax);
+    }
+    a.load32(Reg::Rax, Reg::R12, l.sq.ring_entries as i32);
+    expect(&mut a, 3, 8);
+    // 4: WRITE "uring!" to the pipe, linked to a READ of it; a NOP beside.
+    a.mov_imm(Reg::Rax, 0);
+    a.store(Reg::Rbp, 512, Reg::Rax);
+    a.mov_data(Reg::Rbx, text);
+    sqe(
+        &mut a,
+        0,
+        abi::OP_WRITE,
+        abi::SQE_IO_LINK,
+        4,
+        0,
+        Some((Reg::Rbx, 0)),
+        6,
+        1,
+    );
+    sqe(
+        &mut a,
+        1,
+        abi::OP_READ,
+        0,
+        3,
+        0,
+        Some((Reg::Rbp, 512)),
+        6,
+        2,
+    );
+    sqe(&mut a, 2, abi::OP_NOP, 0, -1, 0, None, 0, 3);
+    enter(&mut a, 3, 3, u64::from(abi::ENTER_GETEVENTS));
+    expect(&mut a, 4, 3);
+    // 5: three CQEs: the write, the NOP, then the read it unblocked.
+    cq_tail(&mut a, 5, 3);
+    cqe(&mut a, 5, 0, 1, 6);
+    cqe(&mut a, 6, 1, 3, 0);
+    cqe(&mut a, 7, 2, 2, 6);
+    a.load(Reg::Rax, Reg::Rbp, 512);
+    expect(&mut a, 8, u64::from_le_bytes(*b"uring!\0\0"));
+    set_cq_head(&mut a, 3);
+    // 9: a READ of the empty pipe is armed, not completed.
+    sqe(
+        &mut a,
+        3,
+        abi::OP_READ,
+        0,
+        3,
+        0,
+        Some((Reg::Rbp, 600)),
+        1,
+        4,
+    );
+    enter(&mut a, 1, 0, 0);
+    expect(&mut a, 9, 1);
+    cq_tail(&mut a, 9, 3);
+    // 10: a child writes after 50 ms; the parent's wait completes it.
+    a.sys(sys::FORK);
+    a.cmp_imm(Reg::Rax, 0);
+    a.jne(parent);
+    a.mov_data(Reg::Rdi, ms50);
+    a.mov_imm(Reg::Rsi, 0);
+    a.sys(sys::NANOSLEEP);
+    a.mov_imm(Reg::Rdi, 4);
+    a.mov_data(Reg::Rsi, x);
+    a.mov_imm(Reg::Rdx, 1);
+    a.sys(sys::WRITE);
+    a.mov_imm(Reg::Rdi, 0);
+    a.sys(sys::EXIT_GROUP);
+    a.bind(parent);
+    enter(&mut a, 0, 1, u64::from(abi::ENTER_GETEVENTS));
+    expect(&mut a, 10, 0);
+    cq_tail(&mut a, 10, 4);
+    cqe(&mut a, 11, 3, 4, 1);
+    a.mov_imm(Reg::Rdi, u64::MAX);
+    a.mov_imm(Reg::Rsi, 0);
+    a.mov_imm(Reg::Rdx, 0);
+    a.mov_imm(Reg::R10, 0);
+    a.sys(sys::WAIT4);
+    set_cq_head(&mut a, 4);
+    // 12: a 20 ms TIMEOUT ends with -ETIME.
+    a.mov_data(Reg::Rbx, ms20);
+    sqe(
+        &mut a,
+        4,
+        abi::OP_TIMEOUT,
+        0,
+        -1,
+        0,
+        Some((Reg::Rbx, 0)),
+        1,
+        5,
+    );
+    enter(&mut a, 1, 1, u64::from(abi::ENTER_GETEVENTS));
+    expect(&mut a, 12, 1);
+    cqe(&mut a, 12, 4, 5, -62);
+    // 13: an unknown opcode is -EINVAL.
+    sqe(&mut a, 5, 200, 0, -1, 0, None, 0, 6);
+    enter(&mut a, 1, 1, u64::from(abi::ENTER_GETEVENTS));
+    expect(&mut a, 13, 1);
+    cqe(&mut a, 13, 5, 6, -22);
+    // 14: the probe: last op MKDIRAT (37), 38 ops listed.
+    a.mov_imm(Reg::Rdi, 5);
+    a.mov_imm(Reg::Rsi, u64::from(abi::REGISTER_PROBE));
+    a.mov(Reg::Rdx, Reg::Rbp);
+    a.add_imm(Reg::Rdx, 1024);
+    a.mov_imm(Reg::R10, 64);
+    a.sys(sys::IO_URING_REGISTER);
+    expect(&mut a, 14, 0);
+    a.load(Reg::Rax, Reg::Rbp, 1024);
+    expect(&mut a, 14, 37 | (38 << 8));
+    a.mov_imm(Reg::R15, 0);
+    a.bind(bad);
+    a.mov(Reg::Rdi, Reg::R15);
+    a.sys(sys::EXIT_GROUP);
+    static_elf(&a.finish(BLOB_VADDR).unwrap_or_else(|| fail("assembler")))
 }
 
 const MOTD: &[u8] = b"hello from /etc/motd inside an Ichor image\n";
@@ -1981,6 +2213,15 @@ pub(crate) fn run() {
         fail("polltest");
     }
     println!("ichor: linux: poll timeout and wakeup, epoll, eventfd ok ({syscalls} syscalls)");
+
+    let (status, syscalls) = run_linux(new_process(), &uring_program(), None, &["uringtest"]);
+    if status != 0 {
+        println!("ichor: linux: uringtest failed check {status}");
+        fail("uringtest");
+    }
+    println!(
+        "ichor: linux: io_uring: linked write and read, armed read woken by a child, timeout, probe ok ({syscalls} syscalls)"
+    );
 
     let (status, syscalls) = run_linux(new_process(), &lock_program(), None, &["locktest"]);
     if status != 0 {

@@ -21,6 +21,7 @@ members = [
     "kernel/testprog",
     "kernel/gpt",
     "kernel/net",
+    "kernel/uring",
     "kernel/drivers/virtio-pci",
     "kernel/drivers/virtio-blk",
     "kernel/drivers/virtio-rng",
@@ -64,6 +65,7 @@ default-members = [
     "kernel/testprog",
     "kernel/gpt",
     "kernel/net",
+    "kernel/uring",
     "services/crypto",
     "services/x509",
     "services/tls",
@@ -106,6 +108,7 @@ virtio-pci = { package = "ichor-virtio-pci", path = "kernel/drivers/virtio-pci" 
 virtio-rng = { package = "ichor-virtio-rng", path = "kernel/drivers/virtio-rng" }
 virtio-net = { package = "ichor-virtio-net", path = "kernel/drivers/virtio-net" }
 net = { package = "ichor-net", path = "kernel/net" }
+uring = { package = "ichor-uring", path = "kernel/uring" }
 virtio-blk = { package = "ichor-virtio-blk", path = "kernel/drivers/virtio-blk" }
 nvme = { package = "ichor-nvme", path = "kernel/drivers/nvme" }
 crypto = { package = "ichor-crypto", path = "services/crypto" }

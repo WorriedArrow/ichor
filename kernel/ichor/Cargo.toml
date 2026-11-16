@@ -32,6 +32,7 @@ blake3.workspace = true
 virtio-rng.workspace = true
 virtio-net.workspace = true
 net.workspace = true
+uring.workspace = true
 
 [lints]
 workspace = true

@@ -553,6 +553,37 @@ impl Mm {
         Ok(start)
     }
 
+    /// Maps kernel pages shared with the kernel (an io_uring ring): placed
+    /// as `mmap(MAP_SHARED | MAP_ANONYMOUS)` with `map_flags`' placement
+    /// bits would place them, the pages being `frames` instead of fresh
+    /// ones. They stay shared across `fork`. Charged as one page each while
+    /// mapped.
+    pub(crate) fn map_frames(
+        &mut self,
+        addr: u64,
+        frames: &[UFrame],
+        prot: u64,
+        map_flags: u64,
+    ) -> Result<u64, i64> {
+        use flags::*;
+        let len = frames.len() as u64 * PAGE_SIZE;
+        let place = map_flags & (MAP_FIXED | MAP_FIXED_NOREPLACE);
+        let start = self.mmap(addr, len, prot, MAP_SHARED | MAP_ANONYMOUS | place, None)?;
+        let user = Prot::from_linux(prot).ok_or(EINVAL)?;
+        for (i, f) in frames.iter().enumerate() {
+            let va = start + i as u64 * PAGE_SIZE;
+            let mapped = self.account.charge(1).is_ok() && {
+                self.pages.insert(va, f.clone());
+                !user.accessible() || self.space.map(va, f, user_prot(user)).is_ok()
+            };
+            if !mapped {
+                let _ = self.munmap(start, len);
+                return Err(ENOMEM);
+            }
+        }
+        Ok(start)
+    }
+
     /// `munmap`.
     pub(crate) fn munmap(&mut self, addr: u64, len: u64) -> Result<u64, i64> {
         let len = vma::page_len(len).ok_or(EINVAL)?;

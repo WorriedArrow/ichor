@@ -101,6 +101,10 @@ pub(crate) trait Object: Send + Sync + Debug {
     fn unix(&self) -> Option<&crate::linuxabi::unix::UnixSocket> {
         None
     }
+    /// This object as an io_uring instance.
+    fn uring(&self) -> Option<&crate::linuxabi::uring::Ring> {
+        None
+    }
 }
 
 /// One task sleeping in `poll`/`select`/`epoll_wait`, registered with each
@@ -151,7 +155,7 @@ impl Default for Watchers {
 }
 
 /// The watcher list of what `fd` names, if its readiness can change.
-fn watchers(fd: &Fd) -> Option<&Watchers> {
+pub(crate) fn watchers(fd: &Fd) -> Option<&Watchers> {
     match fd {
         Fd::Console | Fd::File(_) | Fd::Dev(_) => None,
         Fd::Pipe(e) => Some(e.pipe.watchers()),
@@ -204,7 +208,7 @@ pub(crate) fn wait_watchers<T>(
 /// Sleeps until `check` returns `Some`, the deadline passes (`Ok(None)`),
 /// or a signal arrives (`EINTR`; posting a signal wakes the task directly).
 /// The task is woken only by changes to the objects behind `fds`.
-fn wait_ready<'f, T>(
+pub(crate) fn wait_ready<'f, T>(
     p: &LinuxProcess,
     fds: impl Iterator<Item = &'f Fd>,
     deadline: Option<Duration>,
@@ -239,7 +243,7 @@ fn wait_ready<'f, T>(
     }
 }
 
-fn read_timespec(p: &mut LinuxProcess, addr: u64) -> Result<Duration, i64> {
+pub(crate) fn read_timespec(p: &mut LinuxProcess, addr: u64) -> Result<Duration, i64> {
     let mut b = [0u8; 16];
     if p.copy_from_user(addr, &mut b) != 16 {
         return Err(EFAULT);

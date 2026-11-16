@@ -66,8 +66,11 @@ impl Process {
         *self.status.lock()
     }
 
+    /// Readable with output buffered; readable and hung up once the exit
+    /// status is recorded (not merely when the pipe closes, which happens
+    /// just before: the end of the output promises the status).
     fn readiness(&self) -> u32 {
-        let mut r = u32::from(self.output.poll(false));
+        let mut r = u32::from(self.output.poll(false)) & ichor_abi::READABLE;
         if self.exited().is_some() {
             r |= ichor_abi::READABLE | ichor_abi::HANGUP;
         }
@@ -334,6 +337,8 @@ pub(crate) fn call(cell: &Arc<Cell>, mm: &mut Mm, nr: u64, a: [u64; 6]) -> Resul
             let p = process(cell, a[0], rights::READ)?;
             let mut buf = alloc::vec![0u8; io_len(a[2])?];
             match p.output.read(&mut buf, true, &|| false) {
+                // The pipe closed, but the status is not recorded yet.
+                Ok(0) if p.exited().is_none() => Err(Error::WouldBlock),
                 Ok(n) => {
                     write_user(mm, a[1], &buf[..n])?;
                     Ok(n as u64)

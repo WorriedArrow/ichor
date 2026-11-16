@@ -23,7 +23,23 @@ worker tasks for the rest, no SQPOLL; the suites run through the control
 plane on pinned official images (plus pinned source-tree layers), scored
 by `cargo xtask workloads` into `docs/workloads.md`, with floors in
 `workloads.toml`. Order: CPython, Go, PostgreSQL, Node.js (io_uring), JVM.
-Not started.
+
+- M7 io_uring, first step: `kernel/uring` (host-tested) has the ABI, this
+  kernel's ring layout (one mapping for both rings, fields grouped by
+  writer) and the ordering rules (`Order`: links, hard links, drains,
+  chains cut at each submission's end). `linuxabi/uring.rs`: setup,
+  `mmap` of the ring descriptor (`Mm::map_frames`: kernel pages shared
+  with the process, kept across fork), enter (with GETEVENTS waits on
+  armed objects, EXT_ARG timeouts, overflow kept per NODROP) and register
+  (probe, eventfd). SQEs run on the submitting thread through
+  `linuxabi::dispatch` (the synchronous syscalls' code); one on a pipe or
+  socket that is not ready is armed and completes during a later enter.
+  Ops: NOP, READ/WRITE(V) (positional on files), FSYNC, POLL_ADD/REMOVE,
+  SEND/RECV(MSG), ACCEPT, CONNECT, SHUTDOWN, CLOSE, OPENAT, STATX,
+  RENAMEAT/UNLINKAT/MKDIRAT, TIMEOUT/TIMEOUT_REMOVE, ASYNC_CANCEL.
+  `runtest::uring_program` checks it from ring 3 on every boot. Not yet:
+  a kernel worker so armed ops complete without an enter, registered
+  files/buffers, LINK_TIMEOUT, the EXT_ARG signal mask, liburing's tests.
 
 **Milestone 6 is done** (2026-11-15): the control plane pulls a real OCI
 image from a registry, verifies it, converts it, and runs it through the
@@ -560,6 +576,7 @@ kernel/drivers/virtio-blk  safe virtio-blk driver over frame's IoMem/DMA
 kernel/drivers/virtio-rng  safe virtio-rng (entropy) driver
 kernel/drivers/virtio-net  safe virtio-net driver (polled, MAC feature only)
 kernel/net       network protocols, sans-I/O: Ethernet, ARP, IPv4, ICMP, UDP, TCP (host-tested; ADR-0010)
+kernel/uring     io_uring's ABI, ring layout and submission ordering, sans-I/O (host-tested; ADR-0013)
 kernel/drivers/nvme        safe NVMe driver (polled, DMA-trusted)
 xtask/src/artifact.rs      pinned downloads (busybox, Alpine): SHA-256, cache, never committed
 xtask/src/inflate.rs       gzip/DEFLATE decoder; rootfs.rs: tar -> Ichor image

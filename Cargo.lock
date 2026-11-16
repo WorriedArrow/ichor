@@ -22,6 +22,7 @@ dependencies = [
  "ichor-overlay",
  "ichor-sched",
  "ichor-testprog",
+ "ichor-uring",
  "ichor-virtio-blk",
  "ichor-virtio-net",
  "ichor-virtio-rng",
@@ -210,6 +211,10 @@ dependencies = [
  "ichor-crypto",
  "ichor-x509",
 ]
+
+[[package]]
+name = "ichor-uring"
+version = "0.0.0"
 
 [[package]]
 name = "ichor-virtio-blk"

@@ -1,0 +1,13 @@
+[package]
+name = "ichor-uring"
+description = "io_uring's ABI and submission logic (rings, SQEs, CQEs, links, drains), sans-I/O (no_std, host-tested; ADR-0013)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "uring"
+
+[lints]
+workspace = true

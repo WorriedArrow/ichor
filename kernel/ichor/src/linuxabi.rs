@@ -12,6 +12,7 @@ pub(crate) mod exec;
 mod fs;
 pub(crate) mod socket;
 pub(crate) mod unix;
+pub(crate) mod uring;
 
 use core::time::Duration;
 
@@ -187,6 +188,9 @@ mod nr {
     pub(super) const PRLIMIT64: u64 = 302; // partial: own process only; NOFILE and STACK enforced, others stored
     pub(super) const GETRANDOM: u64 = 318; // ChaCha20 seeded from RDSEED/RDRAND and virtio-rng
     pub(super) const RENAMEAT2: u64 = 316; // partial: RENAME_NOREPLACE only
+    pub(super) const IO_URING_SETUP: u64 = 425; // partial: no SQPOLL/IOPOLL rings
+    pub(super) const IO_URING_ENTER: u64 = 426; // partial: armed operations complete only while a thread is in io_uring_enter; the EXT_ARG signal mask is not applied
+    pub(super) const IO_URING_REGISTER: u64 = 427; // partial: probe and eventfd only (no registered files or buffers)
 }
 
 const EPERM: i64 = 1;
@@ -264,6 +268,9 @@ pub(crate) fn dispatch(p: &mut LinuxProcess, ctx: &mut frame::user::UserContext)
         nr::RENAME => fs::rename(p, AT_FDCWD, a[0], AT_FDCWD, a[1], 0),
         nr::RENAMEAT => fs::rename(p, i(a[0]), a[1], i(a[2]), a[3], 0),
         nr::RENAMEAT2 => fs::rename(p, i(a[0]), a[1], i(a[2]), a[3], a[4]),
+        nr::IO_URING_SETUP => uring::setup(p, a[0], a[1]),
+        nr::IO_URING_ENTER => uring::enter(p, &a),
+        nr::IO_URING_REGISTER => uring::register(p, a[0], a[1], a[2], a[3]),
         nr::SYMLINK => fs::symlink(p, a[0], AT_FDCWD, a[1]),
         nr::SYMLINKAT => fs::symlink(p, a[0], i(a[1]), a[2]),
         nr::READLINK => fs::readlink(p, AT_FDCWD, a[0], a[1], a[2]),
@@ -712,8 +719,16 @@ fn mmap(p: &mut LinuxProcess, a: &[u64; 6]) -> Result<u64, i64> {
     if map_flags & umem::flags::MAP_ANONYMOUS != 0 {
         return p.mm().mmap(addr, len, prot, map_flags, None);
     }
-    if !matches!(p.fd(fd).ok_or(EBADF)?, Fd::File(_)) {
-        return Err(ENODEV);
+    match p.fd(fd).ok_or(EBADF)? {
+        Fd::File(_) => {}
+        Fd::Object(o) if o.obj.uring().is_some() => {
+            let obj = o.obj.clone();
+            return match obj.uring() {
+                Some(ring) => uring::mmap(p, ring, a),
+                None => Err(ENODEV),
+            };
+        }
+        _ => return Err(ENODEV),
     }
     if map_flags & umem::flags::MAP_SHARED != 0 && prot & 2 != 0 {
         // A shared writable mapping would need writes to reach the file.
