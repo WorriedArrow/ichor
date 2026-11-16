@@ -205,6 +205,22 @@ pub(crate) fn send_group(
 
 /// Posts `sig` to every live process of group `pgid` in `cell`: what a
 /// terminal sends (INTR, hangup, window change), with no sender to check.
+/// Posts `sig` to every live process of `cell` (the control plane's
+/// `Signal` and `Destroy`); returns how many.
+pub(crate) fn signal_cell(cell: u64, sig: u32) -> u64 {
+    let pids: alloc::vec::Vec<u64> = TABLE
+        .lock()
+        .values()
+        .filter(|e| e.cell == cell && e.pid == e.tgid && e.status.lock().is_none())
+        .map(|e| e.pid)
+        .collect();
+    let n = pids.len() as u64;
+    for pid in pids {
+        let _ = send(cell, pid, sig);
+    }
+    n
+}
+
 pub(crate) fn signal_pgrp(cell: u64, pgid: u64, sig: u32) {
     let pids: alloc::vec::Vec<u64> = TABLE
         .lock()

@@ -31,7 +31,9 @@ validation on x509-limbo, write up the gaps [done]; (2) an ADR for
 fails if frame or rt relaxes an unsafe-code lint]; (3) the control-plane
 listener local unless configured, with a test [done:
 `the_control_api_is_local_unless_configured`], then API authentication and
-Signal/Inspect/Destroy before any cloud boot; (4) io_uring completions
+Signal/Inspect/Destroy before any cloud boot [done: bearer token from
+`\ichor\apitoken`, ADR-0012 amendment; TLS for the API still owed before
+anything internet-reachable]; (4) io_uring completions
 without an enter (epoll on the ring fd, registered eventfd), with a test,
 before the Node.js suite [done]; (5) extra layers in PullImage, each pinned and
 verified by digest, with a refusal test [done: `LayerSource` (url, sha256
@@ -39,7 +41,8 @@ digest, `from`/`to` remap via `layer::Tree::add_tar_at`), fetched after
 the image, checked with `oci::digest_of` before `oci::convert_with`;
 tests/control.rs serves one from the host and refuses a wrong digest]; (6) ADR-0004's owed mitigations
 (VERW, IBPB on cross-cell switches, page-table isolation), logged at
-boot. The cell access-control suite is written in another worktree: do
+boot [VERW and IBPB done; page-table isolation not yet built, logged
+MISSING on Meltdown-affected CPUs]. The cell access-control suite is written in another worktree: do
 not write it; merge its branch when it lands.
 
 - M7 parsers and certificates: `fuzz/` (host-only) mutation-fuzzes every

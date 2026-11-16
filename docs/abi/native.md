@@ -101,6 +101,8 @@ moves at most 256 KiB (`LOG`, `RANDOM`, the socket calls, `PROCESS_READ`).
 | 25 | `CELL_ADDR` | cell or container | the IPv4 address the switch assigned it |
 | 26 | `MEM_UNMAP` | address, length | 0; unmaps memory from `MEM_MAP` |
 | 27 | `BLOB_READ` | blob, offset, buffer | bytes copied from the blob at the offset (0 past its end); needs READ |
+| 28 | `CELL_SIGNAL` | container, signal (1-64) | how many processes it was posted to (every live process of the cell); needs WRITE |
+| 29 | `CELL_INSPECT` | container, buffer (40 bytes) | 40; writes a `CellInfo`: pages used and limit, live processes, threads, switch address; needs INSPECT |
 
 ### `OBJECT_WAIT` items
 

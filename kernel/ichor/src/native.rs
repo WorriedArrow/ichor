@@ -354,6 +354,29 @@ pub(crate) fn call(cell: &Arc<Cell>, mm: &mut Mm, nr: u64, a: [u64; 6]) -> Resul
             .exited()
             .map(u64::from)
             .ok_or(Error::WouldBlock),
+        sys::CELL_SIGNAL => {
+            let c = container(cell, a[0], rights::WRITE)?;
+            let sig = u32::try_from(a[1])
+                .ok()
+                .filter(|s| (1..=64).contains(s))
+                .ok_or(Error::Invalid)?;
+            Ok(crate::proc::signal_cell(c.cell.id(), sig))
+        }
+        sys::CELL_INSPECT => {
+            let c = container(cell, a[0], Rights::INSPECT)?;
+            let (threads, processes, _) = crate::proc::census(c.cell.id());
+            let info = ichor_abi::CellInfo {
+                memory_used: c.cell.account().used(),
+                memory_limit: c.cell.account().limit(),
+                processes: processes as u64,
+                threads: threads as u64,
+                address: crate::netstack::stack_for(&c.cell)
+                    .addr()
+                    .map_or(0, |ip| ip.to_bits()),
+            };
+            write_user(mm, a[1], &info.to_bytes())?;
+            Ok(ichor_abi::CELL_INFO_LEN as u64)
+        }
         sys::BLOB_READ => {
             let Object::Blob(b) = object(cell, a[0], rights::READ)? else {
                 return Err(Error::BadHandle);

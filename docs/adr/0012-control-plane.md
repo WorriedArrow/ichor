@@ -186,6 +186,11 @@ boot:
   anything else gets `UNAUTHENTICATED`. Without a token the service
   refuses to listen beyond loopback or to publish, whatever the command
   line asks.
+- **The missing calls.** `Signal(cell, signal)` posts a signal to every
+  process of a cell (native `CELL_SIGNAL`), `Inspect(cell)` reports its
+  address, image, memory used and limit, processes and threads
+  (`CELL_INSPECT`), and `Destroy(cell)` kills every process and forgets
+  the cell, whose memory and root the kernel frees once they have exited.
 - **Still owed before Ichor runs anywhere reachable from the internet:**
   TLS for the API. The token travels in the clear over h2c, so today it
   protects only on a network the operator controls (a private subnet or

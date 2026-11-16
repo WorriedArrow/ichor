@@ -9,6 +9,127 @@ use crate::proto::{Error, Reader, Writer};
 pub const PULL_IMAGE: &str = "/ichor.v1.Control/PullImage";
 pub const CREATE_CELL: &str = "/ichor.v1.Control/CreateCell";
 pub const RUN: &str = "/ichor.v1.Control/Run";
+pub const SIGNAL: &str = "/ichor.v1.Control/Signal";
+pub const INSPECT: &str = "/ichor.v1.Control/Inspect";
+pub const DESTROY: &str = "/ichor.v1.Control/Destroy";
+
+/// A request naming one cell (`Inspect`, `Destroy`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CellRequest {
+    pub cell_id: String,
+}
+
+impl CellRequest {
+    pub fn encode(&self) -> Vec<u8> {
+        Writer::new().string(1, &self.cell_id).finish()
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Self, Error> {
+        let mut m = Self::default();
+        each(b, |f, v| {
+            if f == 1 {
+                m.cell_id = v.as_string()?;
+            }
+            Ok(())
+        })?;
+        Ok(m)
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SignalRequest {
+    pub cell_id: String,
+    /// A Linux signal number (15: SIGTERM, 9: SIGKILL).
+    pub signal: u32,
+}
+
+impl SignalRequest {
+    pub fn encode(&self) -> Vec<u8> {
+        Writer::new()
+            .string(1, &self.cell_id)
+            .varint(2, u64::from(self.signal))
+            .finish()
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Self, Error> {
+        let mut m = Self::default();
+        each(b, |f, v| {
+            match f {
+                1 => m.cell_id = v.as_string()?,
+                2 => m.signal = u32::try_from(v.as_u64()?).map_err(|_| Error)?,
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(m)
+    }
+}
+
+/// `Signal`'s answer: how many processes it reached.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SignalResponse {
+    pub processes: u64,
+}
+
+impl SignalResponse {
+    pub fn encode(&self) -> Vec<u8> {
+        Writer::new().varint(1, self.processes).finish()
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Self, Error> {
+        let mut m = Self::default();
+        each(b, |f, v| {
+            if f == 1 {
+                m.processes = v.as_u64()?;
+            }
+            Ok(())
+        })?;
+        Ok(m)
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct InspectResponse {
+    pub cell_id: String,
+    pub address: String,
+    pub image_id: String,
+    pub memory_used_bytes: u64,
+    pub memory_limit_bytes: u64,
+    pub processes: u64,
+    pub threads: u64,
+}
+
+impl InspectResponse {
+    pub fn encode(&self) -> Vec<u8> {
+        Writer::new()
+            .string(1, &self.cell_id)
+            .string(2, &self.address)
+            .string(3, &self.image_id)
+            .varint(4, self.memory_used_bytes)
+            .varint(5, self.memory_limit_bytes)
+            .varint(6, self.processes)
+            .varint(7, self.threads)
+            .finish()
+    }
+
+    pub fn decode(b: &[u8]) -> Result<Self, Error> {
+        let mut m = Self::default();
+        each(b, |f, v| {
+            match f {
+                1 => m.cell_id = v.as_string()?,
+                2 => m.address = v.as_string()?,
+                3 => m.image_id = v.as_string()?,
+                4 => m.memory_used_bytes = v.as_u64()?,
+                5 => m.memory_limit_bytes = v.as_u64()?,
+                6 => m.processes = v.as_u64()?,
+                7 => m.threads = v.as_u64()?,
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(m)
+    }
+}
 
 /// Reads every field of `b` with `f`, skipping the ones it does not know.
 fn each<'a>(
@@ -281,6 +402,21 @@ mod tests {
             }],
         };
         assert_eq!(PullImageRequest::decode(&pull.encode()), Ok(pull));
+        let s = SignalRequest {
+            cell_id: "2".into(),
+            signal: 15,
+        };
+        assert_eq!(SignalRequest::decode(&s.encode()), Ok(s));
+        let i = InspectResponse {
+            cell_id: "2".into(),
+            address: "10.88.0.13".into(),
+            image_id: "ab".into(),
+            memory_used_bytes: 1 << 20,
+            memory_limit_bytes: 64 << 20,
+            processes: 1,
+            threads: 1,
+        };
+        assert_eq!(InspectResponse::decode(&i.encode()), Ok(i));
         for e in [
             RunEvent::Output(b"hi\n".to_vec()),
             RunEvent::ExitStatus(0),

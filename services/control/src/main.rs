@@ -517,6 +517,79 @@ impl Control {
                     }
                 }
             }
+            control::SIGNAL => {
+                let Ok(req) = control::SignalRequest::decode(&call.message) else {
+                    return self.fail(conn, stream, status::INVALID_ARGUMENT, "bad SignalRequest");
+                };
+                let Some(cell) = self.cells.get(&req.cell_id) else {
+                    let m = format!("no cell {}", req.cell_id);
+                    return self.fail(conn, stream, status::NOT_FOUND, &m);
+                };
+                match rt::cell_signal(&cell.handle, req.signal) {
+                    Ok(n) => {
+                        rt::log!(
+                            "control: cell {} signal {} to {n} processes",
+                            req.cell_id,
+                            req.signal
+                        );
+                        let m = control::SignalResponse { processes: n };
+                        self.reply(conn, stream, &m.encode());
+                    }
+                    Err(Error::Invalid) => {
+                        let m = format!("bad signal {}", req.signal);
+                        self.fail(conn, stream, status::INVALID_ARGUMENT, &m);
+                    }
+                    Err(e) => {
+                        let m = format!("cell_signal: {e:?}");
+                        self.fail(conn, stream, status::INTERNAL, &m);
+                    }
+                }
+            }
+            control::INSPECT => {
+                let Ok(req) = control::CellRequest::decode(&call.message) else {
+                    return self.fail(conn, stream, status::INVALID_ARGUMENT, "bad CellRequest");
+                };
+                let Some(cell) = self.cells.get(&req.cell_id) else {
+                    let m = format!("no cell {}", req.cell_id);
+                    return self.fail(conn, stream, status::NOT_FOUND, &m);
+                };
+                match rt::cell_inspect(&cell.handle) {
+                    Ok(i) => {
+                        let m = control::InspectResponse {
+                            cell_id: req.cell_id,
+                            address: ip_text(i.address.to_be_bytes()),
+                            image_id: cell.image.clone(),
+                            memory_used_bytes: i.memory_used * 4096,
+                            memory_limit_bytes: i.memory_limit * 4096,
+                            processes: i.processes,
+                            threads: i.threads,
+                        };
+                        self.reply(conn, stream, &m.encode());
+                    }
+                    Err(e) => {
+                        let m = format!("cell_inspect: {e:?}");
+                        self.fail(conn, stream, status::INTERNAL, &m);
+                    }
+                }
+            }
+            control::DESTROY => {
+                let Ok(req) = control::CellRequest::decode(&call.message) else {
+                    return self.fail(conn, stream, status::INVALID_ARGUMENT, "bad CellRequest");
+                };
+                let Some(cell) = self.cells.remove(&req.cell_id) else {
+                    let m = format!("no cell {}", req.cell_id);
+                    return self.fail(conn, stream, status::NOT_FOUND, &m);
+                };
+                // Every process dies; dropping the handle lets the kernel
+                // free the cell and its root once they have.
+                let n = rt::cell_signal(&cell.handle, 9).unwrap_or(0);
+                drop(cell);
+                rt::log!(
+                    "control: cell {} destroyed ({n} processes killed)",
+                    req.cell_id
+                );
+                self.reply(conn, stream, &[]);
+            }
             other => {
                 let m = format!("unknown method {other}");
                 self.fail(conn, stream, status::UNIMPLEMENTED, &m);

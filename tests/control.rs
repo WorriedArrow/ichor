@@ -30,7 +30,11 @@ const API_TOKEN: &str = "test-token-3f9a1c2b7d4e";
 struct Session {
     sock: TcpStream,
     client: Client,
+    /// Responses per call: messages so far, and the status once it ended.
+    pending: std::collections::HashMap<u32, Messages>,
 }
+
+type Messages = (Vec<Vec<u8>>, Option<(u32, String)>);
 
 impl Session {
     /// Connects once the guest serves: QEMU accepts forwarded connections
@@ -51,7 +55,11 @@ impl Session {
                         && n > 0
                         && client.receive(&buf[..n]).is_ok()
                     {
-                        return Ok(Session { sock, client });
+                        return Ok(Session {
+                            sock,
+                            client,
+                            pending: Default::default(),
+                        });
                     }
                 }
             }
@@ -67,14 +75,35 @@ impl Session {
         msg: &[u8],
         timeout: Duration,
     ) -> Result<(Vec<Vec<u8>>, u32, String), String> {
-        let id = self.client.call(path, msg);
+        let id = self.start(path, msg);
+        self.wait(id, timeout)
+    }
+
+    /// Starts a call without waiting for it (several can be in flight).
+    fn start(&mut self, path: &str, msg: &[u8]) -> u32 {
+        self.client.call(path, msg)
+    }
+
+    /// Waits for call `id` to end; returns its messages and final status.
+    /// Other calls' responses are kept for their own `wait`.
+    fn wait(&mut self, id: u32, timeout: Duration) -> Result<(Vec<Vec<u8>>, u32, String), String> {
         let deadline = Instant::now() + timeout;
-        let mut messages = Vec::new();
         self.sock
             .set_read_timeout(Some(Duration::from_secs(1)))
             .unwrap();
         let mut buf = vec![0u8; 64 * 1024];
-        while Instant::now() < deadline {
+        loop {
+            if let Some((_, Some(_))) = self.pending.get(&id) {
+                let (messages, status) = self.pending.remove(&id).unwrap();
+                let (code, message) = status.unwrap();
+                // Flush acknowledgements before the next call.
+                let out = self.client.conn.take_output();
+                let _ = self.sock.write_all(&out);
+                return Ok((messages, code, message));
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
             let out = self.client.conn.take_output();
             if !out.is_empty() {
                 self.sock
@@ -95,22 +124,20 @@ impl Session {
                 .map_err(|e| format!("HTTP/2: {e:?}"))?
             {
                 match r {
-                    Response::Message { stream, message } if stream == id => messages.push(message),
+                    Response::Message { stream, message } => {
+                        self.pending.entry(stream).or_default().0.push(message);
+                    }
                     Response::Status {
                         stream,
                         code,
                         message,
-                    } if stream == id => {
-                        // Flush acknowledgements before the next call.
-                        let out = self.client.conn.take_output();
-                        let _ = self.sock.write_all(&out);
-                        return Ok((messages, code, message));
+                    } => {
+                        self.pending.entry(stream).or_default().1 = Some((code, message));
                     }
-                    _ => {}
                 }
             }
         }
-        Err(format!("{path} timed out"))
+        Err(format!("call {id} timed out"))
     }
 }
 
@@ -283,9 +310,85 @@ fn session(port: u16, layer_port: u16) -> Result<(Ran, Ran), String> {
             "cat /etc/alpine-release; echo \"$((6 * 7)) from $(uname -s)\"; ls /bin/busybox; cat /opt/extra/greeting; exit 3",
         ],
     )?;
+    lifecycle(&mut s, "2")?;
     // Hanging up ends the control plane (`control_exit`) and the boot.
     drop(s);
     Ok((hello, alpine))
+}
+
+/// Signal, Inspect and Destroy on cell `id`: a long `sleep` runs, Inspect
+/// sees it, SIGTERM ends it (its Run ends with that signal), Destroy forgets
+/// the cell.
+fn lifecycle(s: &mut Session, id: &str) -> Result<(), String> {
+    let run = control::RunRequest {
+        cell_id: id.into(),
+        argv: vec!["sleep".into(), "600".into()],
+        env: vec![],
+    };
+    let sleeper = s.start(control::RUN, &run.encode());
+    let inspect = control::CellRequest { cell_id: id.into() }.encode();
+    // Wait until the sleeper is up (it starts asynchronously).
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let info = loop {
+        let (m, code, msg) = s.call(control::INSPECT, &inspect, Duration::from_secs(60))?;
+        if code != 0 {
+            return Err(format!("Inspect failed ({code}): {msg}"));
+        }
+        let info = control::InspectResponse::decode(m.first().ok_or("no Inspect reply")?)
+            .map_err(|_| "bad InspectResponse")?;
+        // Counted once registered, charged once its program is loaded.
+        if (info.processes >= 1 && info.memory_used_bytes > 0) || Instant::now() > deadline {
+            break info;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    if info.processes < 1
+        || !info.address.starts_with("10.88.")
+        || info.memory_used_bytes == 0
+        || info.memory_limit_bytes != 64 << 20
+        || info.image_id.len() != 64
+    {
+        return Err(format!("Inspect saw {info:?}"));
+    }
+    eprintln!("host: inspect: {info:?}");
+    let sig = control::SignalRequest {
+        cell_id: id.into(),
+        signal: 15,
+    };
+    let (m, code, msg) = s.call(control::SIGNAL, &sig.encode(), Duration::from_secs(60))?;
+    let reached = m
+        .first()
+        .and_then(|b| control::SignalResponse::decode(b).ok())
+        .map_or(0, |r| r.processes);
+    if code != 0 || reached < 1 {
+        return Err(format!(
+            "Signal ({code}, {msg}) reached {reached} processes"
+        ));
+    }
+    let (m, code, msg) = s.wait(sleeper, Duration::from_secs(60))?;
+    let exit = m
+        .iter()
+        .filter_map(|e| RunEvent::decode(e).ok())
+        .find_map(|e| match e {
+            RunEvent::ExitStatus(st) => Some(st),
+            RunEvent::Output(_) => None,
+        });
+    if code != 0 || exit != Some(15) {
+        return Err(format!(
+            "the signalled Run ended ({code}, {msg}) with {exit:?}"
+        ));
+    }
+    eprintln!("host: SIGTERM ended the sleeper");
+    let (_, code, msg) = s.call(control::DESTROY, &inspect, Duration::from_secs(60))?;
+    if code != 0 {
+        return Err(format!("Destroy failed ({code}): {msg}"));
+    }
+    let (_, code, _) = s.call(control::INSPECT, &inspect, Duration::from_secs(60))?;
+    if code != grpc::status::NOT_FOUND {
+        return Err(format!("Inspect after Destroy gave status {code}"));
+    }
+    eprintln!("host: cell {id} destroyed");
+    Ok(())
 }
 
 /// The API has no authentication yet, so by default it is local to the
@@ -357,7 +460,13 @@ fn the_control_plane_pulls_and_runs_an_image_from_docker_hub() {
         .unwrap()
         .port();
     let layer_port = serve(extra_layer());
-    let client = std::thread::spawn(move || session(host_port, layer_port));
+    let client = std::thread::spawn(move || {
+        let r = session(host_port, layer_port);
+        if let Err(e) = &r {
+            eprintln!("host: FAILED: {e}");
+        }
+        r
+    });
     // Exposure is explicit: published on the uplink.
     let cmdline = "control=50051 control_publish=50051 control_exit";
     let out = ichor_tests::boot_with("control", cmdline, 2, |c| {
@@ -381,6 +490,9 @@ fn the_control_plane_pulls_and_runs_an_image_from_docker_hub() {
         "control: layer http://10.0.2.2:",
         "verified (",
         "control: cell 2 at 10.88.",
+        "control: cell 2 runs [\"sleep\", \"600\"]",
+        "control: cell 2 signal 15 to 1 processes",
+        "control: cell 2 destroyed (",
         "control: the API client is gone; exiting",
         "ichor: control: exited with Some(0)",
     ]);
