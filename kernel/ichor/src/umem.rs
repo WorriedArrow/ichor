@@ -111,8 +111,17 @@ fn page_up(v: u64) -> Option<u64> {
 /// `account` (the cell's) and released when unmapped or when the `Mm` is
 /// dropped. Drop it only while its space is not active (switch to the
 /// kernel space first).
+///
+/// The space is shared so a copy can run without the `Mm` lock
+/// ([`copy_user`], ADR-0011 as amended): such a copy holds its own
+/// reference for its duration, so the space outlives an `execve` that
+/// replaces this `Mm` mid-copy. That last reference is dropped by the
+/// copying task, which is never bound to the space: `execve` and the last
+/// thread out wait for every other thread of the process to leave first,
+/// and helper threads (the only ones not waited for) run on the kernel
+/// space (`proc::start_helper`).
 pub(crate) struct Mm {
-    space: VmSpace,
+    space: Arc<VmSpace>,
     account: Arc<Account>,
     regions: RegionMap,
     /// Every page the process owns, mapped or not (`PROT_NONE`).
@@ -132,7 +141,7 @@ impl Mm {
     /// An empty address space charging `account`.
     pub(crate) fn new(account: &Arc<Account>) -> Option<Mm> {
         Some(Mm {
-            space: VmSpace::new()?,
+            space: Arc::new(VmSpace::new()?),
             account: account.clone(),
             regions: RegionMap::new(MMAP_LO, MMAP_HI),
             pages: BTreeMap::new(),
@@ -147,6 +156,18 @@ impl Mm {
     /// The address space.
     pub(crate) fn space(&self) -> &VmSpace {
         &self.space
+    }
+
+    /// A reference to the address space for a copy that runs without the
+    /// `Mm` lock ([`copy_user`]).
+    pub(crate) fn shared_space(&self) -> Arc<VmSpace> {
+        self.space.clone()
+    }
+
+    /// Whether `space` is this `Mm`'s address space (not one an `execve`
+    /// has since replaced).
+    pub(crate) fn owns(&self, space: &Arc<VmSpace>) -> bool {
+        Arc::ptr_eq(&self.space, space)
     }
 
     /// A copy-on-write copy of this address space for `fork`: same
@@ -458,55 +479,25 @@ impl Mm {
         self.space.map(va, &f, prot).is_ok()
     }
 
-    /// Copies `data` to user memory at `va` as user stores would: frame
-    /// copies up to the first page not mapped writable, that page is
-    /// faulted as a user write would fault it (demand paging, or breaking
-    /// copy-on-write), and the copy goes on. Stops at the first page the
-    /// process may not write. Returns the bytes copied.
+    /// Copies `data` to user memory at `va` as user stores would (see
+    /// [`copy_user`]), holding this `Mm` throughout: for spaces no other
+    /// thread can reach (the loader's new image, a native process).
+    /// Returns the bytes copied.
     pub(crate) fn copy_to_user(&mut self, va: u64, data: &[u8]) -> usize {
-        self.copy_user(va, data.len(), true, |space, at, done| {
-            space.copy_to_user(at, &data[done..])
+        let space = self.space.clone();
+        copy_user(&space, va, UserBuf::To(data), |at, write| {
+            self.fault(at, write, false).then_some(())
         })
     }
 
-    /// Copies user memory at `va` into `out` as user loads would (unmapped
-    /// pages are faulted in). Stops at the first page the process may not
-    /// read. Returns the bytes copied.
+    /// Copies user memory at `va` into `out` as user loads would (see
+    /// [`copy_user`]), holding this `Mm` throughout. Returns the bytes
+    /// copied.
     pub(crate) fn copy_from_user(&mut self, va: u64, out: &mut [u8]) -> usize {
-        self.copy_user(va, out.len(), false, |space, at, done| {
-            space.copy_from_user(at, &mut out[done..])
+        let space = self.space.clone();
+        copy_user(&space, va, UserBuf::From(out), |at, write| {
+            self.fault(at, write, false).then_some(())
         })
-    }
-
-    /// The fault-and-retry loop behind both copies. `copy(space, at, done)`
-    /// copies from byte `done` (user address `at`) on and returns how far
-    /// it got. A page is faulted at most once in a row, so a fault that
-    /// does not make it accessible can never loop.
-    fn copy_user(
-        &mut self,
-        va: u64,
-        len: usize,
-        write: bool,
-        mut copy: impl FnMut(&VmSpace, u64, usize) -> usize,
-    ) -> usize {
-        let mut done = 0usize;
-        let mut faulted = None;
-        loop {
-            let Some(at) = va.checked_add(done as u64) else {
-                return done;
-            };
-            done += copy(&self.space, at, done);
-            if done >= len {
-                return done;
-            }
-            let Some(at) = va.checked_add(done as u64) else {
-                return done;
-            };
-            if faulted == Some(at) || !self.fault(at, write, false) {
-                return done;
-            }
-            faulted = Some(at);
-        }
     }
 
     /// Faults in `[va, va+len)` ahead of a kernel copy, stopping at the
@@ -880,6 +871,84 @@ impl Mm {
         }
         self.brk = addr;
         addr
+    }
+}
+
+/// The kernel side of a copy between kernel and user memory.
+pub(crate) enum UserBuf<'a> {
+    /// Bytes to store into user memory (`copy_to_user`).
+    To(&'a [u8]),
+    /// Where to load user memory into (`copy_from_user`).
+    From(&'a mut [u8]),
+}
+
+impl UserBuf<'_> {
+    fn len(&self) -> usize {
+        match self {
+            UserBuf::To(d) => d.len(),
+            UserBuf::From(o) => o.len(),
+        }
+    }
+
+    /// Whether the user side is written.
+    fn write(&self) -> bool {
+        matches!(self, UserBuf::To(_))
+    }
+
+    /// Frame's copy of bytes `from..to` at user address `at`, as far as
+    /// the pages are mapped with the access needed.
+    fn copy(&mut self, space: &VmSpace, at: u64, from: usize, to: usize) -> usize {
+        match self {
+            UserBuf::To(d) => space.copy_to_user(at, &d[from..to]),
+            UserBuf::From(o) => space.copy_from_user(at, &mut o[from..to]),
+        }
+    }
+}
+
+/// Copies between `buf` and user memory at `va` in `space` with the
+/// access a user load or store has. Frame copies as far as the pages are
+/// mapped that way (ADR-0011); where it stops, `fault(at, write)` handles
+/// the fault a user access would take there and, if the access is now
+/// allowed, returns a guard (the `Mm` lock) held while that one page is
+/// copied, so nothing can unmap or protect it between the fault and the
+/// copy. Then the guard is dropped and the copy goes on without it.
+///
+/// So the `Mm` lock is held only for faults, never across a copy of
+/// resident pages, and another thread's `mmap`, `munmap`, `mprotect` or
+/// page fault waits for at most one fault and one page copy. A page that
+/// is faulted and still cannot be copied ends the copy, so it never loops;
+/// a page unmapped by another thread before the fault ends it too (the
+/// fault fails). Returns the bytes copied.
+pub(crate) fn copy_user<G>(
+    space: &VmSpace,
+    va: u64,
+    mut buf: UserBuf<'_>,
+    mut fault: impl FnMut(u64, bool) -> Option<G>,
+) -> usize {
+    let len = buf.len();
+    let write = buf.write();
+    let mut done = 0usize;
+    loop {
+        let Some(at) = va.checked_add(done as u64) else {
+            return done;
+        };
+        done += buf.copy(space, at, done, len);
+        if done >= len {
+            return done;
+        }
+        let Some(at) = va.checked_add(done as u64) else {
+            return done;
+        };
+        let Some(guard) = fault(at, write) else {
+            return done;
+        };
+        let page_end = (PAGE_SIZE - (at & (PAGE_SIZE - 1))) as usize;
+        let n = buf.copy(space, at, done, done.saturating_add(page_end).min(len));
+        drop(guard);
+        if n == 0 {
+            return done;
+        }
+        done += n;
     }
 }
 
