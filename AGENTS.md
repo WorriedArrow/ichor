@@ -558,6 +558,9 @@ cargo xtask bench --accel kvm --smp 4   # Ichor vs Linux, same machine and progr
 cargo xtask disk-image     # target/ichor-disk.img: bootable GPT disk (ESP + Ichor root) for clouds/bare metal
 cargo xtask fuzz [TARGET] --iterations N   # mutation-fuzz the parsers (failing inputs: target/fuzz/)
 cargo xtask x509-limbo     # certificate validation vs x509-limbo -> docs/x509-limbo.md (fails below floors)
+cargo xtask workloads python   # CPython's own suite through the control plane -> docs/workloads.md (fails below workloads.toml's floor)
+cargo xtask workloads python --tests "test_os test_json"   # a subset (printed, not recorded)
+cargo xtask workloads python --cmdline trace_errors --cmd "python3 -c ..."   # explore; guest log in target/workloads-python.serial.log
 cargo deny check           # licenses, advisories, sources
 ```
 

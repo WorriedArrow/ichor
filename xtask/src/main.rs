@@ -347,18 +347,21 @@ fn cmd_test(o: &Opts) -> Result<()> {
 }
 
 /// `cargo xtask workloads SUITE [--tests "a b"] [--cmd "shell command"]
-/// [--accel A]`: a runtime's own test suite through the control plane
+/// [--accel A] [--cmdline "kernel options"]`: a runtime's own test suite through the control plane
 /// (ADR-0013 §2); prints the pass rate.
 fn cmd_workloads(args: &[String]) -> Result<()> {
     use xtask::workloads;
     let mut it = args.iter();
     let mut suite = None;
     let (mut tests, mut cmd, mut accel) = (None, None, None);
+    let mut extra = String::new();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--tests" => tests = Some(it.next().ok_or("--tests needs a value")?.clone()),
             "--cmd" => cmd = Some(it.next().ok_or("--cmd needs a value")?.clone()),
             "--accel" => accel = Some(it.next().ok_or("--accel needs a value")?.clone()),
+            // Extra kernel options (`trace_errors`, `trace_pid=N`).
+            "--cmdline" => extra = it.next().ok_or("--cmdline needs a value")?.clone(),
             s if !s.starts_with('-') => {
                 suite = Some(
                     workloads::SUITES
@@ -386,19 +389,57 @@ fn cmd_workloads(args: &[String]) -> Result<()> {
         Some(a) => a.parse().map_err(|e| format!("--accel: {e}"))?,
         None => Accel::Auto,
     };
-    let (out, status) = workloads::run(suite, argv, kernel, |c| c.accel = accel)?;
+    let started = std::time::Instant::now();
+    let (out, status) = workloads::run(suite, argv, kernel, |c| {
+        c.accel = accel;
+        if !extra.is_empty() {
+            c.cmdline = format!("{} {extra}", c.cmdline);
+        }
+    })?;
     print!("{out}");
     println!("workloads: {} exited with status {status:#x}", suite.name);
-    if cmd.is_none() {
-        let s = workloads::parse_python(&out);
-        let total = s.passed.len() + s.failed.len();
-        println!(
-            "workloads: {}: {} of {total} test modules passed ({} skipped); failed: {}",
+    if cmd.is_some() {
+        return Ok(());
+    }
+    let s = workloads::parse_python(&out);
+    let total = s.run();
+    println!(
+        "workloads: {}: {} of {total} test modules passed ({} skipped); failed: {}",
+        suite.name,
+        s.passed.len(),
+        s.skipped.len(),
+        s.failed.join(" ")
+    );
+    // A run that scored nothing did not run the suite (a usage error, a
+    // crash before the summary): that is a failure, not 0 of 0.
+    if total == 0 {
+        return Err(format!(
+            "workloads: {} reported no results (status {status:#x})",
+            suite.name
+        ));
+    }
+    // Only a full run is recorded and held to its floor.
+    if tests.is_some() {
+        return Ok(());
+    }
+    let root = xtask::workspace_root();
+    let floors = std::fs::read_to_string(root.join("workloads.toml")).unwrap_or_default();
+    let floor = workloads::floors(&floors)
+        .into_iter()
+        .find(|(n, _)| n == suite.name)
+        .map_or(0, |(_, f)| f);
+    let doc_path = root.join("docs").join("workloads.md");
+    let old = std::fs::read_to_string(&doc_path).unwrap_or_default();
+    let section = workloads::section(suite, &s, started.elapsed().as_secs(), floor);
+    std::fs::write(&doc_path, workloads::merge_doc(&old, suite.name, &section))
+        .map_err(|e| format!("{}: {e}", doc_path.display()))?;
+    println!("workloads: wrote {}", doc_path.display());
+    if s.per_mille() < floor {
+        return Err(format!(
+            "workloads: {} passed {} per mille, below its floor of {floor}",
             suite.name,
-            s.passed.len(),
-            s.skipped.len(),
-            s.failed.join(" ")
-        );
+            s.per_mille()
+        ));
     }
     Ok(())
 }
