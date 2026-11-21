@@ -259,7 +259,27 @@ pub fn run(
         let cell = s.create_cell(&pulled.image_id, 3 << 30)?;
         let a: Vec<&str> = argv.iter().map(String::as_str).collect();
         eprintln!("workloads: cell {} runs {a:?}", cell.cell_id);
-        let (out, status) = s.run(&cell.cell_id, &a, suite.env, Duration::from_secs(5 * 3600))?;
+        // The output also goes to a file as it comes, so a run that fails
+        // partway keeps what it printed.
+        let path = crate::workspace_root()
+            .join("target")
+            .join(format!("workloads-{}.out", suite.name));
+        let mut file =
+            std::fs::File::create(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        eprintln!("workloads: output in {}", path.display());
+        let mut out = Vec::new();
+        let status = s.run_with(
+            &cell.cell_id,
+            &a,
+            suite.env,
+            Duration::from_secs(5 * 3600),
+            &mut |b| {
+                use std::io::Write;
+                let _ = file.write_all(b);
+                let _ = file.flush();
+                out.extend_from_slice(b);
+            },
+        )?;
         Ok((String::from_utf8_lossy(&out).into_owned(), status))
     });
     let outcome = qemu::run(&cfg)?;

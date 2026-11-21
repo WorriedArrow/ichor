@@ -20,8 +20,13 @@ pub type Endpoint = (Ipv4Addr, u16);
 
 /// Ports the table hands out for outbound connections.
 pub const PORTS: core::ops::RangeInclusive<u16> = 49152..=65535;
-/// How long an idle mapping lives.
+/// How long an idle mapping lives (UDP and anything but open TCP).
 pub const IDLE: Duration = Duration::from_secs(600);
+/// How long an idle open TCP connection's mapping lives: Linux's
+/// `nf_conntrack_tcp_timeout_established` (five days). A connection quiet
+/// for longer than `IDLE` (a long API call streaming nothing) must not
+/// lose its mapping.
+pub const TCP_ESTABLISHED: Duration = Duration::from_secs(5 * 24 * 3600);
 /// How long a TCP mapping lives after both FINs or a RST.
 pub const CLOSING: Duration = Duration::from_secs(60);
 
@@ -36,6 +41,8 @@ struct Mapping {
     remote: Endpoint,
     outside_port: u16,
     last: Duration,
+    /// A TCP mapping (open ones live `TCP_ESTABLISHED`).
+    tcp: bool,
     /// FIN seen from the inside / from the outside.
     fin_in: bool,
     fin_out: bool,
@@ -46,6 +53,8 @@ impl Mapping {
     fn expired(&self, now: Duration) -> bool {
         let life = if self.reset || (self.fin_in && self.fin_out) {
             CLOSING
+        } else if self.tcp {
+            TCP_ESTABLISHED
         } else {
             IDLE
         };
@@ -192,6 +201,7 @@ impl Nat {
                     remote,
                     outside_port: port,
                     last: now,
+                    tcp: proto == PROTO_TCP,
                     fin_in: false,
                     fin_out: false,
                     reset: false,
@@ -236,6 +246,7 @@ impl Nat {
                 remote,
                 outside_port: port,
                 last: now,
+                tcp: proto == PROTO_TCP,
                 fin_in: false,
                 fin_out: false,
                 reset: false,
@@ -400,9 +411,20 @@ mod tests {
         n.expire(t(10) + CLOSING + t(1));
         assert_eq!(n.len(), 1, "the closed mapping went first");
         assert_eq!(n.inbound(PROTO_TCP, (FAR, 80), b.1, ACK, t(80)), None);
+        // A quiet UDP mapping goes after IDLE; an open TCP one does not (a
+        // long call that streams nothing keeps its connection).
+        let u = n
+            .outbound(PROTO_UDP, (CELL, 3), (FAR, 53), 0, t(0))
+            .unwrap();
         n.expire(t(0) + IDLE + t(1));
+        assert_eq!(n.len(), 1, "the open TCP mapping stays");
+        assert_eq!(n.inbound(PROTO_UDP, (FAR, 53), u.1, 0, IDLE + t(2)), None);
+        assert_eq!(
+            n.inbound(PROTO_TCP, (FAR, 80), a.1, ACK, IDLE + t(2)),
+            Some((CELL, 1))
+        );
+        n.expire(IDLE + t(2) + TCP_ESTABLISHED + t(1));
         assert!(n.is_empty());
-        assert_eq!(n.inbound(PROTO_TCP, (FAR, 80), a.1, ACK, IDLE + t(2)), None);
     }
 
     /// A SYN on a finished mapping starts over: to the cell the port is

@@ -74,17 +74,36 @@ impl Session {
     /// Waits for call `id` to end; returns its messages and final status.
     /// Other calls' responses are kept for their own `wait`.
     pub fn wait(&mut self, id: u32, timeout: Duration) -> Result<(Vec<Vec<u8>>, u32, String)> {
+        let mut kept = Vec::new();
+        let (code, message) = self.wait_with(id, timeout, &mut |m| kept.push(m.to_vec()))?;
+        Ok((kept, code, message))
+    }
+
+    /// Waits for call `id` to end, handing each of its messages to `on` as
+    /// it arrives (so a call that fails partway has delivered what came);
+    /// returns its final status.
+    pub fn wait_with(
+        &mut self,
+        id: u32,
+        timeout: Duration,
+        on: &mut dyn FnMut(&[u8]),
+    ) -> Result<(u32, String)> {
         let deadline = Instant::now() + timeout;
         let _ = self.sock.set_read_timeout(Some(Duration::from_secs(1)));
         let mut buf = vec![0u8; 64 * 1024];
         loop {
+            if let Some((messages, _)) = self.pending.get_mut(&id) {
+                for m in messages.drain(..) {
+                    on(&m);
+                }
+            }
             if let Some((_, Some(_))) = self.pending.get(&id)
-                && let Some((messages, Some((code, message)))) = self.pending.remove(&id)
+                && let Some((_, Some((code, message)))) = self.pending.remove(&id)
             {
                 // Flush acknowledgements before the next call.
                 let out = self.client.conn.take_output();
                 let _ = self.sock.write_all(&out);
-                return Ok((messages, code, message));
+                return Ok((code, message));
             }
             if Instant::now() >= deadline {
                 return Err(format!("call {id} timed out"));
@@ -170,23 +189,42 @@ impl Session {
         env: &[&str],
         timeout: Duration,
     ) -> Result<(Vec<u8>, u32)> {
+        let mut output = Vec::new();
+        let status = self.run_with(cell_id, argv, env, timeout, &mut |b| {
+            output.extend_from_slice(b)
+        })?;
+        Ok((output, status))
+    }
+
+    /// `Run` to the end, handing output to `out` as it arrives; returns the
+    /// wait status.
+    pub fn run_with(
+        &mut self,
+        cell_id: &str,
+        argv: &[&str],
+        env: &[&str],
+        timeout: Duration,
+        out: &mut dyn FnMut(&[u8]),
+    ) -> Result<u32> {
         let req = control::RunRequest {
             cell_id: cell_id.into(),
             argv: argv.iter().map(|a| a.to_string()).collect(),
             env: env.iter().map(|a| a.to_string()).collect(),
         };
-        let (m, code, msg) = self.call(control::RUN, &req.encode(), timeout)?;
+        let id = self.start(control::RUN, &req.encode());
+        let mut exit = None;
+        let mut bad = false;
+        let (code, msg) = self.wait_with(id, timeout, &mut |e| match RunEvent::decode(e) {
+            Ok(RunEvent::Output(b)) => out(&b),
+            Ok(RunEvent::ExitStatus(st)) => exit = Some(st),
+            Err(_) => bad = true,
+        })?;
         if code != 0 {
             return Err(format!("Run failed ({code}): {msg}"));
         }
-        let mut output = Vec::new();
-        let mut exit = None;
-        for e in m {
-            match RunEvent::decode(&e).map_err(|_| "bad RunEvent")? {
-                RunEvent::Output(b) => output.extend(b),
-                RunEvent::ExitStatus(st) => exit = Some(st),
-            }
+        if bad {
+            return Err("bad RunEvent".into());
         }
-        Ok((output, exit.ok_or("no exit status")?))
+        exit.ok_or_else(|| "no exit status".into())
     }
 }

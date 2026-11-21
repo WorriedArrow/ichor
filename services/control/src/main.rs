@@ -328,20 +328,25 @@ impl Control {
         if let Some(a) = self.conns[i].as_mut() {
             let mut buf = alloc::vec![0u8; 64 * 1024];
             loop {
+                // Why a connection ends is logged: a long call's client
+                // that vanishes needs telling apart from one that hung up.
                 match rt::recv(&a.sock, &mut buf) {
                     Ok(0) => {
+                        rt::log("control: an API client hung up");
                         gone = true;
                         break;
                     }
                     Ok(n) => match a.server.receive(&buf[..n]) {
                         Ok(c) => calls.extend(c),
-                        Err(_) => {
+                        Err(e) => {
+                            rt::log!("control: an API client broke the protocol: {e:?}");
                             gone = true;
                             break;
                         }
                     },
                     Err(Error::WouldBlock) => break,
-                    Err(_) => {
+                    Err(e) => {
+                        rt::log!("control: an API connection failed: {e:?}");
                         gone = true;
                         break;
                     }
@@ -761,7 +766,8 @@ impl Control {
                     a.out.drain(..n);
                 }
                 Err(Error::WouldBlock) => break,
-                Err(_) => {
+                Err(e) => {
+                    rt::log!("control: sending to an API client failed: {e:?}");
                     self.conns[i] = None;
                     return;
                 }
