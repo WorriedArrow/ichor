@@ -183,6 +183,9 @@ pub(crate) struct Prctl {
     pub(crate) name: Option<alloc::string::String>,
     pub(crate) dumpable: bool,
     pub(crate) no_new_privs: bool,
+    /// The nice value (`setpriority`), -20..=19; kept across fork and
+    /// exec. The scheduler does not use it yet.
+    pub(crate) nice: i32,
 }
 
 impl Default for Prctl {
@@ -191,6 +194,7 @@ impl Default for Prctl {
             name: None,
             dumpable: true,
             no_new_privs: false,
+            nice: 0,
         }
     }
 }
@@ -244,10 +248,10 @@ fn default_limits() -> Limits {
 
 impl Group {
     /// Records the program the process runs (load or `execve`).
-    pub(crate) fn set_exec(&self, path: &str, argv: &[&str]) {
+    pub(crate) fn set_exec<S: AsRef<[u8]>>(&self, path: &str, argv: &[S]) {
         let mut cmd = Vec::new();
         for a in argv {
-            cmd.extend_from_slice(a.as_bytes());
+            cmd.extend_from_slice(a.as_ref());
             cmd.push(0);
         }
         *self.exe.lock() = (alloc::string::String::from(path), cmd);
@@ -738,6 +742,31 @@ impl LinuxProcess {
                     }
                 })
                 .collect()
+        };
+        for s in gone {
+            self.closed(s.desc);
+        }
+    }
+
+    /// `close_range`: closes every open descriptor in `[first, last]`, or
+    /// with `cloexec` marks them close-on-exec instead.
+    pub(crate) fn close_range(&mut self, first: u64, last: u64, cloexec: bool) {
+        let gone: Vec<Slot> = {
+            let mut files = self.group.files.lock();
+            let len = files.fds.len();
+            let end = usize::try_from(last)
+                .map_or(len, |l| l.saturating_add(1))
+                .min(len);
+            let start = usize::try_from(first).map_or(end, |f| f.min(end));
+            let range = &mut files.fds[start..end];
+            if cloexec {
+                for s in range.iter_mut().flatten() {
+                    s.cloexec = true;
+                }
+                Vec::new()
+            } else {
+                range.iter_mut().filter_map(Option::take).collect()
+            }
         };
         for s in gone {
             self.closed(s.desc);

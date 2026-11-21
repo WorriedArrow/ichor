@@ -112,6 +112,18 @@ pub(crate) fn run(vfs: &Arc<Vfs>) {
         println!("ichor: busybox: cloexec test exited {code}");
         fail("close-on-exec");
     }
+    let cell = Cell::new(&system.root_account, CELL_PAGES).unwrap_or_else(|| fail("no cell"));
+    let p = LinuxProcess::new(cell, vfs.clone()).unwrap_or_else(|| fail("no process"));
+    let (code, _) = run_linux(
+        p,
+        &crate::runtest::exec_bytes_program(),
+        None,
+        &["execbytes"],
+    );
+    if code != 0 {
+        println!("ichor: busybox: exec bytes test exited {code}");
+        fail("exec argv/envp as bytes");
+    }
 }
 
 pub(crate) fn read_busybox(vfs: &Arc<Vfs>) -> Vec<u8> {

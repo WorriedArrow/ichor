@@ -57,6 +57,10 @@ mod sys {
     pub(super) const EVENTFD2: u64 = 290;
     pub(super) const EPOLL_CREATE1: u64 = 291;
     pub(super) const PIPE2: u64 = 293;
+    pub(super) const GETPRIORITY: u64 = 140;
+    pub(super) const SETPRIORITY: u64 = 141;
+    pub(super) const FADVISE64: u64 = 221;
+    pub(super) const CLOSE_RANGE: u64 = 436;
     pub(super) const EXIT_GROUP: u64 = 231;
     pub(super) const RT_SIGACTION: u64 = 13;
     pub(super) const RT_SIGRETURN: u64 = 15;
@@ -1174,6 +1178,62 @@ fn direction_program() -> Vec<u8> {
     static_elf(&a.finish(BLOB_VADDR).unwrap_or_else(|| fail("assembler")))
 }
 
+/// What CPython's subprocess and os modules call: `close_range` closes a
+/// pipe's two ends (fds 3 and 4) and nothing below them; `fadvise64` checks
+/// its descriptor; the nice value reads 0 (raw 20), rises to 5 (raw 15),
+/// and cannot be lowered again. Exits 0, or the number of the failed check.
+fn misc_program() -> Vec<u8> {
+    const F_GETFD: u64 = 1;
+    let neg = |e: i64| (-e) as u64;
+    let mut a = Asm::new();
+    let bad = a.label();
+    let check = |a: &mut Asm, n: u64, want: u64| {
+        a.mov_imm(Reg::R14, want);
+        a.mov_imm(Reg::Rdi, n);
+        a.cmp(Reg::Rax, Reg::R14);
+        a.jne(bad);
+    };
+    a.mov(Reg::Rbp, Reg::Rsp);
+    a.sub_imm(Reg::Rbp, 4096);
+    a.mov(Reg::Rdi, Reg::Rbp);
+    a.mov_imm(Reg::Rsi, 0);
+    a.sys(sys::PIPE2);
+    check(&mut a, 1, 0);
+    a.mov_imm(Reg::Rdi, 3);
+    a.mov_imm(Reg::Rsi, u64::from(u32::MAX));
+    a.mov_imm(Reg::Rdx, 0);
+    a.sys(sys::CLOSE_RANGE);
+    check(&mut a, 2, 0);
+    for (n, fd, want) in [(3, 3, neg(9)), (4, 4, neg(9)), (5, 2, 0)] {
+        a.mov_imm(Reg::Rdi, fd);
+        a.mov_imm(Reg::Rsi, F_GETFD);
+        a.sys(sys::FCNTL);
+        check(&mut a, n, want);
+    }
+    a.mov_imm(Reg::Rdi, 3); // closed
+    a.mov_imm(Reg::Rsi, 0);
+    a.mov_imm(Reg::Rdx, 0);
+    a.mov_imm(Reg::R10, 0);
+    a.sys(sys::FADVISE64);
+    check(&mut a, 6, neg(9));
+    for (n, call, value, want) in [
+        (7, sys::GETPRIORITY, 0, 20),
+        (8, sys::SETPRIORITY, 5, 0),
+        (9, sys::GETPRIORITY, 0, 15),
+        (10, sys::SETPRIORITY, 0, neg(13)),
+    ] {
+        a.mov_imm(Reg::Rdi, 0); // PRIO_PROCESS
+        a.mov_imm(Reg::Rsi, 0); // the caller
+        a.mov_imm(Reg::Rdx, value);
+        a.sys(call);
+        check(&mut a, n, want);
+    }
+    a.mov_imm(Reg::Rdi, 0);
+    a.bind(bad);
+    a.sys(sys::EXIT_GROUP);
+    static_elf(&a.finish(BLOB_VADDR).unwrap_or_else(|| fail("assembler")))
+}
+
 /// Readiness: poll on an empty pipe times out at once; a blocking poll
 /// wakes when a forked child writes 50 ms later; epoll reports the pipe
 /// with its registered data; an eventfd counts. Exits 0 if every check
@@ -1328,6 +1388,49 @@ pub(crate) fn cloexec_program() -> Vec<u8> {
     a.mov_data(Reg::Rdi, sh);
     a.mov(Reg::Rsi, Reg::Rbp);
     a.mov_imm(Reg::Rdx, 0);
+    a.sys(sys::EXECVE);
+    // Only reached if execve failed.
+    a.mov_imm(Reg::Rdi, 99);
+    a.sys(sys::EXIT_GROUP);
+    static_elf(&a.finish(BLOB_VADDR).unwrap_or_else(|| fail("assembler")))
+}
+
+/// argv and envp are bytes: execs `/bin/sh` with a 5,000-byte argument
+/// (longer than a path) and `X=\xff\xfe` (not UTF-8) in its environment;
+/// the shell checks both arrived whole. Exits 99 if execve failed. Needs a
+/// root with busybox.
+pub(crate) fn exec_bytes_program() -> Vec<u8> {
+    let mut a = Asm::new();
+    let sh = a.data(b"/bin/sh\0");
+    let arg0 = a.data(b"sh\0");
+    let arg1 = a.data(b"-c\0");
+    let arg2 = a.data(
+        b"[ ${#1} -eq 5000 ] && [ \"$X\" = \"$(printf '\\377\\376')\" ] \
+          && echo sh: exec passed a 5000-byte argument and a non-UTF-8 environment\0",
+    );
+    let arg3 = a.data(b"name\0");
+    let mut long = alloc::vec![b'a'; 5000];
+    long.push(0);
+    let arg4 = a.data(&long);
+    let env0 = a.data(b"X=\xff\xfe\0");
+    a.mov(Reg::Rbp, Reg::Rsp);
+    a.sub_imm(Reg::Rbp, 4096);
+    // argv = { "sh", "-c", script, "name", long, NULL } at rbp;
+    // envp = { "X=\xff\xfe", NULL } at rbp + 64.
+    for (i, d) in [arg0, arg1, arg2, arg3, arg4].into_iter().enumerate() {
+        a.mov_data(Reg::Rax, d);
+        a.store(Reg::Rbp, (i * 8) as i32, Reg::Rax);
+    }
+    a.mov_imm(Reg::Rax, 0);
+    a.store(Reg::Rbp, 40, Reg::Rax);
+    a.mov_data(Reg::Rax, env0);
+    a.store(Reg::Rbp, 64, Reg::Rax);
+    a.mov_imm(Reg::Rax, 0);
+    a.store(Reg::Rbp, 72, Reg::Rax);
+    a.mov_data(Reg::Rdi, sh);
+    a.mov(Reg::Rsi, Reg::Rbp);
+    a.mov(Reg::Rdx, Reg::Rbp);
+    a.add_imm(Reg::Rdx, 64);
     a.sys(sys::EXECVE);
     // Only reached if execve failed.
     a.mov_imm(Reg::Rdi, 99);
@@ -2460,6 +2563,13 @@ pub(crate) fn run() {
     println!(
         "ichor: linux: a backward rep movsq resumed backward across 16 page faults; DF kept across a syscall"
     );
+
+    let (status, _) = run_linux(new_process(), &misc_program(), None, &["misctest"]);
+    if status != 0 {
+        println!("ichor: linux: misctest failed check {status}");
+        fail("close_range, fadvise64, priorities");
+    }
+    println!("ichor: linux: close_range, fadvise64, get/setpriority ok");
 
     let (status, syscalls) = run_linux(new_process(), &poll_program(), None, &["polltest"]);
     if status != 0 {

@@ -260,12 +260,15 @@ struct Aux {
 /// be that file: it is loaded too, and the process starts there, finding
 /// the program through the auxiliary vector (`AT_PHDR`, `AT_ENTRY`,
 /// `AT_BASE`), as on Linux.
-pub(crate) fn load(
+///
+/// argv and envp strings are bytes, as on Linux: nothing requires them to
+/// be UTF-8.
+pub(crate) fn load<S: AsRef<[u8]>>(
     mm: &mut Mm,
     image: &dyn File,
     interp: Option<&dyn File>,
-    argv: &[&str],
-    envp: &[&str],
+    argv: &[S],
+    envp: &[S],
     stack_limit: u64,
 ) -> Result<Loaded, LoadError> {
     let stack_size = stack_limit.clamp(MIN_STACK, MAX_STACK) & !(PAGE_SIZE - 1);
@@ -344,11 +347,11 @@ fn random_bytes() -> [u8; 16] {
 /// rsp -> argc, argv[0..argc], NULL, envp[..], NULL, auxv pairs, AT_NULL
 ///        ... padding, random bytes, strings ... STACK_TOP
 /// ```
-fn build_stack(
+fn build_stack<S: AsRef<[u8]>>(
     mm: &mut Mm,
     plan: &Aux,
-    argv: &[&str],
-    envp: &[&str],
+    argv: &[S],
+    envp: &[S],
     stack_size: u64,
 ) -> Result<u64, LoadError> {
     // Strings and blobs go at the top, laid out downwards in `blob`, which
@@ -364,9 +367,9 @@ fn build_stack(
     };
     let random_at = place(&random_bytes(), false);
     let platform_at = place(b"x86_64", true);
-    let execfn_at = place(argv.first().copied().unwrap_or("").as_bytes(), true);
-    let argv_at: Vec<usize> = argv.iter().map(|a| place(a.as_bytes(), true)).collect();
-    let envp_at: Vec<usize> = envp.iter().map(|e| place(e.as_bytes(), true)).collect();
+    let execfn_at = place(argv.first().map_or(&[][..], AsRef::as_ref), true);
+    let argv_at: Vec<usize> = argv.iter().map(|a| place(a.as_ref(), true)).collect();
+    let envp_at: Vec<usize> = envp.iter().map(|e| place(e.as_ref(), true)).collect();
     if strings.len() > MAX_ARGS {
         return Err(LoadError::ArgsTooLong);
     }

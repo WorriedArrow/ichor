@@ -600,6 +600,8 @@ fn spawn(c: &Container, spec: &[u8]) -> Result<Arc<Process>, Error> {
     });
     let pid = p.entry.pid;
     let record = process.clone();
+    let argv: Vec<Vec<u8>> = argv.into_iter().map(String::into_bytes).collect();
+    let envp: Vec<Vec<u8>> = envp.into_iter().map(String::into_bytes).collect();
     let task = TaskOptions::new(move || {
         let leader = p.group.leader.clone();
         let mut ctx = UserContext::new(0, 0);

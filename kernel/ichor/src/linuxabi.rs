@@ -184,6 +184,10 @@ mod nr {
     pub(super) const EPOLL_CREATE1: u64 = 291;
     pub(super) const DUP3: u64 = 292;
     pub(super) const PIPE2: u64 = 293;
+    pub(super) const GETPRIORITY: u64 = 140; // partial: PRIO_PROCESS of the caller only; the nice value does not affect scheduling
+    pub(super) const SETPRIORITY: u64 = 141; // partial: PRIO_PROCESS of the caller only; the nice value does not affect scheduling
+    pub(super) const FADVISE64: u64 = 221; // partial: advice is checked and ignored
+    pub(super) const CLOSE_RANGE: u64 = 436; // partial: CLOSE_RANGE_UNSHARE is EINVAL
     pub(super) const STATX: u64 = 332;
     pub(super) const PRLIMIT64: u64 = 302; // partial: own process only; NOFILE and STACK enforced, others stored
     pub(super) const GETRANDOM: u64 = 318; // ChaCha20 seeded from RDSEED/RDRAND and virtio-rng
@@ -405,6 +409,32 @@ pub(crate) fn dispatch(p: &mut LinuxProcess, ctx: &mut frame::user::UserContext)
         }
         nr::GETPID => Ok(p.group.tgid),
         nr::PRCTL => prctl(p, a[0], a[1], a[2]),
+        nr::GETPRIORITY => priority(p, i(a[0]), a[1], None),
+        nr::SETPRIORITY => priority(p, i(a[0]), a[1], Some(i(a[2]))),
+        nr::FADVISE64 => {
+            // POSIX_FADV_NORMAL..=POSIX_FADV_NOREUSE on an open descriptor.
+            if p.fd(a[0]).is_none() {
+                Err(EBADF)
+            } else if a[3] > 5 {
+                Err(EINVAL)
+            } else {
+                Ok(0)
+            }
+        }
+        nr::CLOSE_RANGE => {
+            const CLOSE_RANGE_CLOEXEC: u64 = 4;
+            let (first, last, flags) = (a[0] as u32, a[1] as u32, a[2]);
+            if first > last || flags & !CLOSE_RANGE_CLOEXEC != 0 {
+                Err(EINVAL)
+            } else {
+                p.close_range(
+                    u64::from(first),
+                    u64::from(last),
+                    flags & CLOSE_RANGE_CLOEXEC != 0,
+                );
+                Ok(0)
+            }
+        }
         nr::SCHED_GETAFFINITY => sched_getaffinity(p, a[0], a[1], a[2]),
         nr::SYSINFO => sysinfo(p, a[0]),
         nr::GETRUSAGE => getrusage(p, i(a[0]), a[1]),
@@ -939,6 +969,37 @@ fn gettimeofday(p: &mut LinuxProcess, tv: u64) -> Result<u64, i64> {
     }
     let now = crate::vfs::wall_clock();
     put_pair(p, tv, now.as_secs(), u64::from(now.subsec_micros()))
+}
+
+/// `getpriority` (`value` None) and `setpriority`: the caller's nice value.
+/// The raw syscall returns `20 - nice` so that it is never negative. Raising
+/// the nice value is always allowed; lowering it needs CAP_SYS_NICE, which
+/// is outside the cell bounding set, so it is EACCES as for an unprivileged
+/// Linux process.
+fn priority(p: &mut LinuxProcess, which: i64, who: u64, value: Option<i64>) -> Result<u64, i64> {
+    const PRIO_USER: i64 = 2;
+    const ESRCH: i64 = 3;
+    const EACCES: i64 = 13;
+    if !(0..=PRIO_USER).contains(&which) {
+        return Err(EINVAL);
+    }
+    // PRIO_PROCESS names a pid; PRIO_PGRP and PRIO_USER only themselves (0).
+    let me = who == 0 || (which == 0 && who == p.group.tgid);
+    if !me {
+        return Err(ESRCH);
+    }
+    let mut prctl = p.group.prctl.lock();
+    match value {
+        None => Ok((20 - prctl.nice) as u64),
+        Some(v) => {
+            let nice = v.clamp(-20, 19) as i32;
+            if nice < prctl.nice {
+                return Err(EACCES);
+            }
+            prctl.nice = nice;
+            Ok(0)
+        }
+    }
 }
 
 /// `prctl(option, arg2, ...)`: the options libc, apt and service managers

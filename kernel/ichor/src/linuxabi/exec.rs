@@ -34,8 +34,14 @@ const MAX_STRINGS: usize = 4096;
 /// Most bytes of argv plus envp strings.
 const MAX_STRING_BYTES: usize = 128 * 1024;
 
-/// Reads a NULL-terminated array of string pointers (argv, envp).
-fn user_strings(p: &mut LinuxProcess, addr: u64, total: &mut usize) -> Result<Vec<String>, i64> {
+/// Longest single argv or envp string, with its NUL (Linux's
+/// `MAX_ARG_STRLEN`, 32 pages).
+const MAX_ARG_STRLEN: usize = 32 * 4096;
+
+/// Reads a NULL-terminated array of string pointers (argv, envp). The
+/// strings are bytes: Linux requires nothing of them but the NUL, and
+/// programs pass non-UTF-8 (CPython's test runner does on purpose).
+fn user_strings(p: &mut LinuxProcess, addr: u64, total: &mut usize) -> Result<Vec<Vec<u8>>, i64> {
     let mut out = Vec::new();
     if addr == 0 {
         return Ok(out);
@@ -52,13 +58,32 @@ fn user_strings(p: &mut LinuxProcess, addr: u64, total: &mut usize) -> Result<Ve
         if ptr == 0 {
             return Ok(out);
         }
-        let s = user_path(p, ptr).map_err(|e| if e == EFAULT { EFAULT } else { E2BIG })?;
+        let s = user_bytes(p, ptr)?;
         *total += s.len() + 1;
         if *total > MAX_STRING_BYTES {
             return Err(E2BIG);
         }
         out.push(s);
     }
+}
+
+/// One NUL-terminated string from user memory, as bytes: E2BIG past
+/// `MAX_ARG_STRLEN`, EFAULT if it runs into memory the process cannot read.
+fn user_bytes(p: &mut LinuxProcess, addr: u64) -> Result<Vec<u8>, i64> {
+    let mut out = Vec::new();
+    let mut chunk = [0u8; 256];
+    while out.len() < MAX_ARG_STRLEN {
+        let got = p.copy_from_user(addr + out.len() as u64, &mut chunk);
+        if got == 0 {
+            return Err(EFAULT);
+        }
+        if let Some(nul) = chunk[..got].iter().position(|&b| b == 0) {
+            out.extend_from_slice(&chunk[..nul]);
+            return Ok(out);
+        }
+        out.extend_from_slice(&chunk[..got]);
+    }
+    Err(E2BIG)
 }
 
 pub(super) fn execve(
@@ -81,8 +106,8 @@ pub(crate) fn exec(
     p: &mut LinuxProcess,
     ctx: &mut UserContext,
     path: String,
-    mut argv: Vec<String>,
-    envp: Vec<String>,
+    mut argv: Vec<Vec<u8>>,
+    envp: Vec<Vec<u8>>,
 ) -> Result<(), i64> {
     // `#!` scripts: run the interpreter with the script as an argument, as
     // Linux does (`interp [arg] script argv[1..]`). An interpreter may itself
@@ -93,9 +118,9 @@ pub(crate) fn exec(
         let Some((interp, arg)) = shebang(&image) else {
             break;
         };
-        let mut new_argv = alloc::vec![interp.clone()];
-        new_argv.extend(arg);
-        new_argv.push(exe_path.clone());
+        let mut new_argv = alloc::vec![interp.clone().into_bytes()];
+        new_argv.extend(arg.map(String::into_bytes));
+        new_argv.push(exe_path.clone().into_bytes());
         new_argv.extend(argv.iter().skip(1).cloned());
         argv = new_argv;
         exe_path = interp;
@@ -122,14 +147,12 @@ pub(crate) fn exec(
     p.group.wait_threads(1);
 
     let mut mm = Mm::new(p.cell.account()).ok_or(ENOMEM)?;
-    let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-    let envp_refs: Vec<&str> = envp.iter().map(String::as_str).collect();
     let loaded = loader::load(
         &mut mm,
         &image,
         interp.as_ref().map(|f| f as &dyn File),
-        &argv_refs,
-        &envp_refs,
+        &argv,
+        &envp,
         p.group.limits()[crate::process::RLIMIT_STACK].0,
     )
     .map_err(|e| match e {
@@ -151,7 +174,7 @@ pub(crate) fn exec(
         v.release(); // the vfork parent goes on
     }
     p.sig.clear_alt_stack();
-    p.group.set_exec(&exe_path, &argv_refs);
+    p.group.set_exec(&exe_path, &argv);
     crate::signal::sync(p);
     *ctx = UserContext::new(loaded.entry, loaded.stack_pointer);
     Ok(())
