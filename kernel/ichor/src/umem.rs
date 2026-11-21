@@ -48,6 +48,10 @@ const ENODEV: i64 = 19;
 /// Where `mmap` places mappings that do not ask for an address.
 pub(crate) const MMAP_LO: u64 = 0x1000_0000_0000;
 pub(crate) const MMAP_HI: u64 = 0x7fff_0000_0000;
+/// Pages handled per step when a range is walked (free, protect, move):
+/// a list of every page of a big region would be an allocation larger than
+/// the largest contiguous block (MAX_ORDER), and the kernel panics on that.
+const PAGE_BATCH: usize = 4096;
 /// Largest program break, relative to its start.
 const BRK_MAX: u64 = 1 << 30;
 
@@ -518,15 +522,27 @@ impl Mm {
 
     /// Frees every page in `[start, end)` (one TLB shootdown for all).
     fn free_range(&mut self, start: u64, end: u64) {
-        let vas: Vec<u64> = self.pages.range(start..end).map(|(&v, _)| v).collect();
-        if vas.is_empty() {
+        if self.pages.range(start..end).next().is_none() {
             return;
         }
         self.space.unmap_range(start, end);
-        for va in vas {
-            self.pages.remove(&va);
-            self.cow.remove(&va);
-            self.account.release(1);
+        // Forget the pages a batch at a time: a list of every resident
+        // page of a large process would itself be a large allocation.
+        loop {
+            let vas: Vec<u64> = self
+                .pages
+                .range(start..end)
+                .map(|(&v, _)| v)
+                .take(PAGE_BATCH)
+                .collect();
+            if vas.is_empty() {
+                return;
+            }
+            for va in vas {
+                self.pages.remove(&va);
+                self.cow.remove(&va);
+                self.account.release(1);
+            }
         }
     }
 
@@ -748,28 +764,37 @@ impl Mm {
             return Err(ENOMEM);
         }
         let moved = old_len.min(new_len);
-        // Pages move with their frames and copy-on-write state.
-        let vas: Vec<u64> = self
-            .pages
-            .range(old..old + moved)
-            .map(|(&v, _)| v)
-            .collect();
-        for va in vas {
-            let Some(f) = self.pages.remove(&va) else {
-                continue;
+        // Pages move with their frames and copy-on-write state, a batch at
+        // a time (the destination never overlaps the source).
+        let mut from = old;
+        loop {
+            let vas: Vec<u64> = self
+                .pages
+                .range(from..old + moved)
+                .map(|(&v, _)| v)
+                .take(PAGE_BATCH)
+                .collect();
+            let Some(&last) = vas.last() else {
+                break;
             };
-            let to = dst + (va - old);
-            let cow = self.cow.remove(&va);
-            let mapped = self.space.translate(va).map(|(_, p)| p);
-            if cow {
-                self.cow.insert(to);
+            from = last + PAGE_SIZE;
+            for va in vas {
+                let Some(f) = self.pages.remove(&va) else {
+                    continue;
+                };
+                let to = dst + (va - old);
+                let cow = self.cow.remove(&va);
+                let mapped = self.space.translate(va).map(|(_, p)| p);
+                if cow {
+                    self.cow.insert(to);
+                }
+                if let Some(p) = mapped
+                    && self.space.map(to, &f, p).is_err()
+                {
+                    return Err(ENOMEM);
+                }
+                self.pages.insert(to, f);
             }
-            if let Some(p) = mapped
-                && self.space.map(to, &f, p).is_err()
-            {
-                return Err(ENOMEM);
-            }
-            self.pages.insert(to, f);
         }
         self.space.unmap_range(old, old + moved);
         // File and shared ranges follow; a grown tail continues them.
@@ -837,19 +862,32 @@ impl Mm {
         if !self.regions.protect(addr, end, prot) {
             return Err(ENOMEM);
         }
-        let vas: Vec<u64> = self.pages.range(addr..end).map(|(&v, _)| v).collect();
-        for va in vas {
-            if self.space.translate(va).is_none() {
-                continue; // Faulted in with the new protection on next use.
-            }
-            if prot.accessible() {
-                let mapped = self.mapped_prot(va, prot);
-                self.space.protect(va, mapped);
-            } else {
-                self.space.unmap(va); // `pages` keeps the frame.
+        // A batch at a time: a list of every page of a large region would
+        // itself be a large allocation.
+        let mut from = addr;
+        loop {
+            let vas: Vec<u64> = self
+                .pages
+                .range(from..end)
+                .map(|(&v, _)| v)
+                .take(PAGE_BATCH)
+                .collect();
+            let Some(&last) = vas.last() else {
+                return Ok(0);
+            };
+            from = last + PAGE_SIZE;
+            for va in vas {
+                if self.space.translate(va).is_none() {
+                    continue; // Faulted in with the new protection on next use.
+                }
+                if prot.accessible() {
+                    let mapped = self.mapped_prot(va, prot);
+                    self.space.protect(va, mapped);
+                } else {
+                    self.space.unmap(va); // `pages` keeps the frame.
+                }
             }
         }
-        Ok(0)
     }
 
     /// `brk`: returns the new break, or the old one if `addr` is refused.

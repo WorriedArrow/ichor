@@ -86,14 +86,29 @@ impl VmSpace {
         self.unmap_range(va, va.saturating_add(super::PAGE_SIZE));
     }
 
-    /// Removes every mapping in `[start, end)` with one TLB shootdown (of
-    /// that page, or of the whole space for more than one). The pages are
-    /// released only after every CPU running this space has forgotten
-    /// them. Must not be called in atomic mode.
+    /// Removes every mapping in `[start, end)`, in batches of at most
+    /// `UNMAP_BATCH` pages with one TLB shootdown each (of that page, or of
+    /// the whole space for more than one), so the bookkeeping never needs
+    /// a large contiguous allocation (a 2 GiB process would need 8 MiB at
+    /// once). Each batch's pages are released only after every CPU running
+    /// this space has forgotten them. Must not be called in atomic mode.
     pub fn unmap_range(&self, start: u64, end: u64) {
-        let (unmapped, frames) = {
+        const UNMAP_BATCH: usize = 4096;
+        let mut from = start;
+        while from < end {
+            let next = self.unmap_batch(from, end, UNMAP_BATCH);
+            from = next.unwrap_or(end);
+        }
+    }
+
+    /// One batch of `unmap_range` from `start`: where the next one starts,
+    /// or `None` once the range is clear.
+    fn unmap_batch(&self, start: u64, end: u64, max: usize) -> Option<u64> {
+        let (unmapped, frames, next) = {
             let mut inner = self.inner.lock();
-            let vas: Vec<u64> = inner.frames.range(start..end).map(|(&v, _)| v).collect();
+            let mut it = inner.frames.range(start..end).map(|(&v, _)| v);
+            let vas: Vec<u64> = it.by_ref().take(max).collect();
+            let next = it.next();
             let mut unmapped = Vec::with_capacity(vas.len());
             // Keep the `UFrame`s alive until the shootdown is done.
             let mut kept = Vec::with_capacity(vas.len());
@@ -105,7 +120,7 @@ impl VmSpace {
                 }
                 kept.extend(inner.frames.remove(&va));
             }
-            (unmapped, kept)
+            (unmapped, kept, next)
         };
         match unmapped.as_slice() {
             [] => {}
@@ -116,6 +131,7 @@ impl VmSpace {
             frame::drop_untyped(pa);
         }
         drop(frames);
+        next
     }
 
     /// How many pages are mapped.

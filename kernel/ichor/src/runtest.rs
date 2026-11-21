@@ -1415,6 +1415,77 @@ fn misc_program() -> Vec<u8> {
     static_elf(&a.finish(BLOB_VADDR).unwrap_or_else(|| fail("assembler")))
 }
 
+/// Ranges bigger than one batch of page bookkeeping (4096 pages): 4200
+/// touched pages, each holding its index, move with mremap and are all
+/// found at the new address, are made read-only, then unmapped. (Lists of
+/// every page used to be one allocation, which a 2 GiB process could not
+/// get.) Exits 0, or the failed check.
+fn big_range_program() -> Vec<u8> {
+    const PAGES: u64 = 4200;
+    const LEN: u64 = PAGES * 4096;
+    let mut a = Asm::new();
+    let bad = a.label();
+    let fill = a.label();
+    let check = a.label();
+    a.mov_imm(Reg::Rdi, 0);
+    a.mov_imm(Reg::Rsi, LEN);
+    a.mov_imm(Reg::Rdx, 3);
+    a.mov_imm(Reg::R10, 0x22);
+    a.mov_imm(Reg::R8, u64::MAX);
+    a.mov_imm(Reg::R9, 0);
+    a.sys(sys::MMAP);
+    a.mov(Reg::R12, Reg::Rax);
+    // Page i holds i.
+    a.mov_imm(Reg::Rcx, 0);
+    a.mov(Reg::Rdx, Reg::R12);
+    a.bind(fill);
+    a.store(Reg::Rdx, 0, Reg::Rcx);
+    a.add_imm(Reg::Rdx, 4096);
+    a.add_imm(Reg::Rcx, 1);
+    a.cmp_imm(Reg::Rcx, PAGES as i32);
+    a.jne(fill);
+    // mremap(old, LEN, 2 * LEN, MREMAP_MAYMOVE): a bigger region elsewhere.
+    a.mov(Reg::Rdi, Reg::R12);
+    a.mov_imm(Reg::Rsi, LEN);
+    a.mov_imm(Reg::Rdx, 2 * LEN);
+    a.mov_imm(Reg::R10, 1);
+    a.sys(sys::MREMAP);
+    a.mov(Reg::R13, Reg::Rax);
+    a.mov_imm(Reg::Rcx, 0);
+    a.mov(Reg::Rdx, Reg::R13);
+    a.bind(check);
+    a.load(Reg::Rax, Reg::Rdx, 0);
+    a.mov_imm(Reg::Rdi, 1);
+    a.cmp(Reg::Rax, Reg::Rcx);
+    a.jne(bad);
+    a.add_imm(Reg::Rdx, 4096);
+    a.add_imm(Reg::Rcx, 1);
+    a.cmp_imm(Reg::Rcx, PAGES as i32);
+    a.jne(check);
+    a.mov(Reg::Rdi, Reg::R13);
+    a.mov_imm(Reg::Rsi, 2 * LEN);
+    a.mov_imm(Reg::Rdx, 1); // PROT_READ
+    a.sys(sys::MPROTECT);
+    a.mov_imm(Reg::Rdi, 2);
+    a.cmp_imm(Reg::Rax, 0);
+    a.jne(bad);
+    a.load(Reg::Rax, Reg::R13, (4096 * (PAGES - 1)) as i32);
+    a.mov_imm(Reg::R14, PAGES - 1);
+    a.mov_imm(Reg::Rdi, 3);
+    a.cmp(Reg::Rax, Reg::R14);
+    a.jne(bad);
+    a.mov(Reg::Rdi, Reg::R13);
+    a.mov_imm(Reg::Rsi, 2 * LEN);
+    a.sys(sys::MUNMAP);
+    a.mov_imm(Reg::Rdi, 4);
+    a.cmp_imm(Reg::Rax, 0);
+    a.jne(bad);
+    a.mov_imm(Reg::Rdi, 0);
+    a.bind(bad);
+    a.sys(sys::EXIT_GROUP);
+    static_elf(&a.finish(BLOB_VADDR).unwrap_or_else(|| fail("assembler")))
+}
+
 /// More of what CPython's suite calls: waitid reports a child's exit as a
 /// siginfo (CLD_EXITED, status 5); preadv reads at an offset; nothing is
 /// pending for rt_sigpending; SCHED_FIFO's priorities top out at 99; an
@@ -3040,6 +3111,19 @@ pub(crate) fn run() {
     println!(
         "ichor: linux: a backward rep movsq resumed backward across 16 page faults; DF kept across a syscall"
     );
+
+    // Its own system and cell: the test needs more than one batch of
+    // pages (4200 pages, 16 MiB), more than the usual test cells hold.
+    let big = System::new(8192).unwrap_or_else(|| fail("no big system cell"));
+    let big_cell = Cell::new(&big.root_account, 5000).unwrap_or_else(|| fail("no big cell"));
+    let big_process =
+        LinuxProcess::new(big_cell, vfs.clone()).unwrap_or_else(|| fail("no process"));
+    let (status, _) = run_linux(big_process, &big_range_program(), None, &["bigrange"]);
+    if status != 0 {
+        println!("ichor: linux: bigrange failed check {status}");
+        fail("large ranges");
+    }
+    println!("ichor: linux: 4200 pages moved, protected and unmapped in batches");
 
     let (status, _) = run_linux(new_process(), &misc2_program(), None, &["misc2test"]);
     if status != 0 {
