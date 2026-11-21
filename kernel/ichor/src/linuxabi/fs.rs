@@ -574,6 +574,41 @@ pub(super) fn fsync(p: &mut LinuxProcess, fd: u64) -> Result<u64, i64> {
     p.fd(fd).ok_or(EBADF).map(|_| 0)
 }
 
+/// What an extended-attribute call does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Xattr {
+    Set,
+    Get,
+    List,
+    Remove,
+}
+
+/// The `*xattr` family, as a filesystem without extended attributes
+/// answers: the file must exist (or the descriptor be open); lists are
+/// empty, reads and removals ENODATA, writes ENOTSUP. `target` is a path
+/// (`follow` for the non-`l` forms) or, with `fd`, a descriptor.
+pub(super) fn xattr(
+    p: &mut LinuxProcess,
+    op: Xattr,
+    target: u64,
+    fd: bool,
+    follow: bool,
+) -> Result<u64, i64> {
+    const ENODATA: i64 = 61;
+    const ENOTSUP: i64 = 95;
+    if fd {
+        p.fd(target).ok_or(EBADF)?;
+    } else {
+        let (start, path) = path_at(p, AT_FDCWD, target)?;
+        p.fs().resolve(start, &path, follow)?;
+    }
+    match op {
+        Xattr::List => Ok(0),
+        Xattr::Get | Xattr::Remove => Err(ENODATA),
+        Xattr::Set => Err(ENOTSUP),
+    }
+}
+
 /// `sync_file_range`: as `fsync`, nothing to write back; the arguments are
 /// checked as Linux checks them.
 pub(super) fn sync_file_range(

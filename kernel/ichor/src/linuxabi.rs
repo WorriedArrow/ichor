@@ -193,6 +193,18 @@ mod nr {
     pub(super) const FADVISE64: u64 = 221; // partial: advice is checked and ignored
     pub(super) const CLOSE_RANGE: u64 = 436; // partial: CLOSE_RANGE_UNSHARE is EINVAL
     pub(super) const CLOCK_GETRES: u64 = 229;
+    pub(super) const SETXATTR: u64 = 188; // partial: no extended attributes (ENOTSUP)
+    pub(super) const LSETXATTR: u64 = 189; // partial: no extended attributes (ENOTSUP)
+    pub(super) const FSETXATTR: u64 = 190; // partial: no extended attributes (ENOTSUP)
+    pub(super) const GETXATTR: u64 = 191; // partial: no extended attributes (ENODATA)
+    pub(super) const LGETXATTR: u64 = 192; // partial: no extended attributes (ENODATA)
+    pub(super) const FGETXATTR: u64 = 193; // partial: no extended attributes (ENODATA)
+    pub(super) const LISTXATTR: u64 = 194; // partial: no extended attributes (empty list)
+    pub(super) const LLISTXATTR: u64 = 195; // partial: no extended attributes (empty list)
+    pub(super) const FLISTXATTR: u64 = 196; // partial: no extended attributes (empty list)
+    pub(super) const REMOVEXATTR: u64 = 197; // partial: no extended attributes (ENODATA)
+    pub(super) const LREMOVEXATTR: u64 = 198; // partial: no extended attributes (ENODATA)
+    pub(super) const FREMOVEXATTR: u64 = 199; // partial: no extended attributes (ENODATA)
     pub(super) const FALLOCATE: u64 = 285; // partial: mode 0 extends the size (nothing is reserved); KEEP_SIZE is a no-op; holes and ranges are EOPNOTSUPP
     pub(super) const SYNC_FILE_RANGE: u64 = 277; // partial: nothing to write back (the upper layer is memory)
     pub(super) const MEMBARRIER: u64 = 324; // partial: CMD_QUERY reports no commands
@@ -378,6 +390,25 @@ pub(crate) fn dispatch(p: &mut LinuxProcess, ctx: &mut frame::user::UserContext)
         nr::UNAME => uname(p, a[0]),
         nr::CLOCK_GETTIME => clock_gettime(p, a[0], a[1]),
         nr::CLOCK_GETRES => clock_getres(p, a[0], a[1]),
+        nr::SETXATTR
+        | nr::LSETXATTR
+        | nr::FSETXATTR
+        | nr::GETXATTR
+        | nr::LGETXATTR
+        | nr::FGETXATTR
+        | nr::LISTXATTR
+        | nr::LLISTXATTR
+        | nr::FLISTXATTR
+        | nr::REMOVEXATTR
+        | nr::LREMOVEXATTR
+        | nr::FREMOVEXATTR => {
+            use fs::Xattr::*;
+            // Numbered in threes from 188: path, lpath, fd forms of set,
+            // get, list and remove.
+            let op = [Set, Get, List, Remove][((nr - nr::SETXATTR) / 3) as usize];
+            let form = (nr - nr::SETXATTR) % 3;
+            fs::xattr(p, op, a[0], form == 2, form == 0)
+        }
         nr::FALLOCATE => fs::fallocate(p, a[0], a[1], a[2], a[3]),
         nr::SYNC_FILE_RANGE => fs::sync_file_range(p, a[0], a[1], a[2], a[3]),
         nr::MEMBARRIER => {

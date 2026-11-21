@@ -69,6 +69,9 @@ mod sys {
     pub(super) const FALLOCATE: u64 = 285;
     pub(super) const SYNC_FILE_RANGE: u64 = 277;
     pub(super) const MEMBARRIER: u64 = 324;
+    pub(super) const SETXATTR: u64 = 188;
+    pub(super) const GETXATTR: u64 = 191;
+    pub(super) const LISTXATTR: u64 = 194;
     pub(super) const GETTID: u64 = 186;
     pub(super) const SET_ROBUST_LIST: u64 = 273;
     pub(super) const READLINK: u64 = 89;
@@ -1376,6 +1379,29 @@ fn misc_program() -> Vec<u8> {
     a.mov(Reg::Rsi, Reg::Rbp);
     a.sys(sys::STAT);
     check(&mut a, 33, 0);
+    // No extended attributes: an empty list, ENODATA, ENOTSUP; a missing
+    // file is ENOENT.
+    let attr = a.data(b"user.x\0");
+    let nope = a.data(b"/nope\0");
+    for (n, call, path, want) in [
+        (34, sys::LISTXATTR, shm, 0),
+        (35, sys::GETXATTR, shm, neg(61)),
+        (36, sys::SETXATTR, shm, neg(95)),
+        (37, sys::LISTXATTR, nope, neg(2)),
+    ] {
+        a.mov_data(Reg::Rdi, path);
+        if call == sys::LISTXATTR {
+            a.mov_imm(Reg::Rsi, 0);
+            a.mov_imm(Reg::Rdx, 0);
+        } else {
+            a.mov_data(Reg::Rsi, attr);
+            a.mov(Reg::Rdx, Reg::Rbp);
+            a.mov_imm(Reg::R10, 1);
+            a.mov_imm(Reg::R8, 0);
+        }
+        a.sys(call);
+        check(&mut a, n, want);
+    }
     a.mov_imm(Reg::Rdi, 0);
     a.bind(bad);
     a.sys(sys::EXIT_GROUP);

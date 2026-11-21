@@ -193,7 +193,8 @@ fn session(port: u16, layer_port: u16) -> Result<(Ran, Ran), String> {
         &[
             "sh",
             "-c",
-            "cat /etc/alpine-release; echo \"$((6 * 7)) from $(uname -s)\"; ls /bin/busybox; cat /opt/extra/greeting; exit 3",
+            "cat /etc/alpine-release; echo \"$((6 * 7)) from $(uname -s)\"; ls /bin/busybox; cat /opt/extra/greeting; \
+             head -1 /etc/hosts; cat /etc/hostname; exit 3",
         ],
     )?;
     lifecycle(&mut s, "2")?;
@@ -402,7 +403,8 @@ fn the_control_plane_pulls_and_runs_an_image_from_docker_hub() {
     let text = String::from_utf8_lossy(&output);
     assert_eq!(
         text,
-        "3.20.3\n42 from Linux\n/bin/busybox\nhello from an extra layer\n"
+        "3.20.3\n42 from Linux\n/bin/busybox\nhello from an extra layer\n\
+         127.0.0.1\tlocalhost\nichor\n"
     );
     assert_eq!(exit, 3 << 8);
 }
