@@ -81,8 +81,13 @@ const MSR_FMASK: u32 = 0xC000_0084;
 const EFER_SCE: u64 = 1; // syscall enable
 
 // RFLAGS bits the user may hold; everything else is forced safe (IF set,
-// IOPL 0, no DF/TF/AC). Reserved bit 1 is always set.
-const USER_RFLAGS_ALLOWED: u64 = 0x0000_08d5; // CF PF AF ZF SF OF
+// IOPL 0, no TF/AC). Reserved bit 1 is always set. DF is the user's: a
+// backward `rep movs` (memmove) interrupted by a fault or a preemption
+// must resume backward, or it copies the rest forward over the bytes past
+// its buffer. The kernel never runs with it: `syscall` clears it (FMASK)
+// and every trap stub runs `cld`.
+const USER_RFLAGS_ALLOWED: u64 = 0x0000_0cd5; // CF PF AF ZF SF DF OF
+const RFLAGS_DF: u64 = 1 << 10;
 const RFLAGS_IF: u64 = 1 << 9;
 const RFLAGS_RESERVED1: u64 = 1 << 1;
 
@@ -149,6 +154,17 @@ impl UserContext {
     /// (IOPL, IF, ...) are not taken from `value`.
     pub fn set_rflags(&mut self, value: u64) {
         self.rflags = (value & USER_RFLAGS_ALLOWED) | RFLAGS_IF | RFLAGS_RESERVED1;
+    }
+
+    /// Whether the direction flag is set (string instructions run down).
+    pub fn direction_down(&self) -> bool {
+        self.rflags & RFLAGS_DF != 0
+    }
+
+    /// Clears the direction flag, as the ABI requires on entry to a
+    /// function the kernel calls (a signal handler).
+    pub fn clear_direction(&mut self) {
+        self.rflags &= !RFLAGS_DF;
     }
 
     /// The extended register state as a signal frame saves it: the

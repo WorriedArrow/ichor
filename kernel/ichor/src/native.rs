@@ -661,11 +661,21 @@ pub(crate) fn run(cell: &Arc<Cell>, elf: &[u8], argv: &[&str]) -> Option<u64> {
                 error,
                 cr2,
             } if mm.fault(cr2, error & 2 != 0, error & 16 != 0) => {}
-            UserEvent::Exception { vector, cr2, .. } => {
+            UserEvent::Exception { vector, error, cr2 } => {
                 println!(
-                    "ichor: native: cell {} killed: exception {vector} at rip {:#x} (cr2 {cr2:#x})",
+                    "ichor: native: cell {} killed: exception {vector} (error {error:#x}) at rip {:#x} (cr2 {cr2:#x})",
                     cell.id(),
                     ctx.rip
+                );
+                // The registers, so a crash seen once can be read off the
+                // disassembly (a corrupted pointer names what held it).
+                println!(
+                    "ichor: native:   rax {:#x} rbx {:#x} rcx {:#x} rdx {:#x} rsi {:#x} rdi {:#x} rbp {:#x} rsp {:#x}",
+                    ctx.rax, ctx.rbx, ctx.rcx, ctx.rdx, ctx.rsi, ctx.rdi, ctx.rbp, ctx.rsp
+                );
+                println!(
+                    "ichor: native:   r8 {:#x} r9 {:#x} r10 {:#x} r11 {:#x} r12 {:#x} r13 {:#x} r14 {:#x} r15 {:#x}",
+                    ctx.r8, ctx.r9, ctx.r10, ctx.r11, ctx.r12, ctx.r13, ctx.r14, ctx.r15
                 );
                 break None;
             }

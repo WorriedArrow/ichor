@@ -487,7 +487,10 @@ report at the end of each phase. Do not rewrite `main`.
   are already kicked when a task is enqueued on them (`sched.rs`).
   Per-CPU single-page lists are on the local branch `pcp-page-lists`,
   held back: one unexplained user page fault (dpkg's decompressor) in 20
-  one-CPU boots, against 0 in 20 without it. Baseline in `docs/benchmarks.md`; Linux reference
+  one-CPU boots, against 0 in 20 without it (worth retrying: the
+  direction-flag bug fixed on 2026-11-21, `docs/reports/direction-flag-fix.md`,
+  corrupted memory past interrupted backward copies, and decompressors
+  memmove a lot). Baseline in `docs/benchmarks.md`; Linux reference
   numbers come from `cargo xtask bench` (Alpine `linux-virt` booted with
   the same `testprog::bench` programs; CI job summary). Mm lock not held
   across whole user copies: done. Frame's copies check the PTE and copy
@@ -656,7 +659,7 @@ fuzz/            mutation fuzzing of every untrusted-input parser (host-only)
 xtask/           build/run/test/lint tooling (lib + bin, no dependencies)
 tests/           QEMU integration tests (host crate using xtask's runner)
 docs/adr/        architecture decision records
-docs/reports/    write-ups of fixes and investigations (user-copy-fix.md)
+docs/reports/    write-ups of fixes and investigations (user-copy-fix.md, direction-flag-fix.md)
 ```
 
 Planned crates (create as milestones need them): `kernel/{mm,sched,cap,cell,

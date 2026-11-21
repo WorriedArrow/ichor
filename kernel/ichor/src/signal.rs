@@ -570,6 +570,9 @@ fn setup_frame(
     ctx.rax = 0;
     ctx.rsp = sp;
     ctx.rip = act.handler;
+    // The handler starts as a function call does: direction flag clear.
+    // The frame keeps the interrupted code's flag for `rt_sigreturn`.
+    ctx.clear_direction();
     Ok(())
 }
 

@@ -1105,6 +1105,75 @@ fn shootdown_program() -> Vec<u8> {
     static_elf(&a.finish(BLOB_VADDR).unwrap_or_else(|| fail("assembler")))
 }
 
+/// The direction flag belongs to user code: a backward `rep movsq` (what
+/// memmove does for overlapping copies) into 16 untouched pages faults on
+/// each page mid-copy, and must resume backward each time; then DF must
+/// survive a syscall. Exits 0, or 1 if the copy came out wrong, 2 if DF
+/// was lost across the syscall. (Clearing DF dropped it at every return
+/// to ring 3, and memmoves interrupted that way corrupted heaps.)
+fn direction_program() -> Vec<u8> {
+    const QWORDS: i32 = 0x1_0000 / 8;
+    const STD: u8 = 0xfd;
+    const CLD: u8 = 0xfc;
+    let mut a = Asm::new();
+    let fill = a.label();
+    let check = a.label();
+    let bad_copy = a.label();
+    let bad_flag = a.label();
+    // r12 = source, rbx = destination: 64 KiB each, untouched.
+    for dst in [Reg::R12, Reg::Rbx] {
+        a.mov_imm(Reg::Rdi, 0);
+        a.mov_imm(Reg::Rsi, 0x1_0000);
+        a.mov_imm(Reg::Rdx, 3);
+        a.mov_imm(Reg::R10, 0x22);
+        a.mov_imm(Reg::R8, u64::MAX);
+        a.mov_imm(Reg::R9, 0);
+        a.sys(sys::MMAP);
+        a.mov(dst, Reg::Rax);
+    }
+    // Source qword i holds i + 1.
+    a.mov_imm(Reg::Rax, 1);
+    a.mov(Reg::Rdx, Reg::R12);
+    a.bind(fill);
+    a.store(Reg::Rdx, 0, Reg::Rax);
+    a.add_imm(Reg::Rdx, 8);
+    a.add_imm(Reg::Rax, 1);
+    a.cmp_imm(Reg::Rax, QWORDS + 1);
+    a.jne(fill);
+    // Copy from the last qword down.
+    a.mov(Reg::Rsi, Reg::R12);
+    a.add_imm(Reg::Rsi, 0x1_0000 - 8);
+    a.mov(Reg::Rdi, Reg::Rbx);
+    a.add_imm(Reg::Rdi, 0x1_0000 - 8);
+    a.mov_imm(Reg::Rcx, QWORDS as u64);
+    a.raw(&[STD, 0xf3, 0x48, 0xa5, CLD]); // std; rep movsq; cld
+    a.mov_imm(Reg::Rax, 1);
+    a.mov(Reg::Rdx, Reg::Rbx);
+    a.bind(check);
+    a.load(Reg::Rcx, Reg::Rdx, 0);
+    a.cmp(Reg::Rcx, Reg::Rax);
+    a.jne(bad_copy);
+    a.add_imm(Reg::Rdx, 8);
+    a.add_imm(Reg::Rax, 1);
+    a.cmp_imm(Reg::Rax, QWORDS + 1);
+    a.jne(check);
+    // DF across a syscall.
+    a.raw(&[STD]);
+    a.sys(sys::GETPID);
+    a.raw(&[0x9c, 0x58, CLD]); // pushfq; pop rax; cld
+    a.raw(&[0xa9, 0x00, 0x04, 0x00, 0x00]); // test eax, 0x400
+    a.je(bad_flag);
+    a.mov_imm(Reg::Rdi, 0);
+    a.sys(sys::EXIT_GROUP);
+    a.bind(bad_copy);
+    a.mov_imm(Reg::Rdi, 1);
+    a.sys(sys::EXIT_GROUP);
+    a.bind(bad_flag);
+    a.mov_imm(Reg::Rdi, 2);
+    a.sys(sys::EXIT_GROUP);
+    static_elf(&a.finish(BLOB_VADDR).unwrap_or_else(|| fail("assembler")))
+}
+
 /// Readiness: poll on an empty pipe times out at once; a blocking poll
 /// wakes when a forked child writes 50 ms later; epoll reports the pipe
 /// with its registered data; an eventfd counts. Exits 0 if every check
@@ -2382,6 +2451,15 @@ pub(crate) fn run() {
         fail("tlb shootdown");
     }
     println!("ichor: linux: munmap shot down a page another thread was reading (it faulted)");
+
+    let (status, _) = run_linux(new_process(), &direction_program(), None, &["dirtest"]);
+    if status != 0 {
+        println!("ichor: linux: direction flag test failed check {status}");
+        fail("direction flag");
+    }
+    println!(
+        "ichor: linux: a backward rep movsq resumed backward across 16 page faults; DF kept across a syscall"
+    );
 
     let (status, syscalls) = run_linux(new_process(), &poll_program(), None, &["polltest"]);
     if status != 0 {
