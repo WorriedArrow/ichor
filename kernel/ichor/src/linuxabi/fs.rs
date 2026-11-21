@@ -38,7 +38,9 @@ const ENXIO: i64 = 6;
 /// Copy chunk for file I/O.
 const CHUNK: usize = 4096;
 
-/// Copies a NUL-terminated path out of user memory.
+/// Copies a NUL-terminated path out of user memory. Paths are bytes; one
+/// that is not UTF-8 is carried escaped (`overlay::name`), and names going
+/// back out ([`getdents64`], [`readlink`], [`getcwd`]) are unescaped.
 pub(super) fn user_path(p: &mut LinuxProcess, addr: u64) -> Result<String, i64> {
     let mut out = Vec::new();
     let mut chunk = [0u8; 256];
@@ -49,7 +51,7 @@ pub(super) fn user_path(p: &mut LinuxProcess, addr: u64) -> Result<String, i64> 
         }
         if let Some(nul) = chunk[..got].iter().position(|&b| b == 0) {
             out.extend_from_slice(&chunk[..nul]);
-            return String::from_utf8(out).map_err(|_| ENOENT);
+            return Ok(overlay::name::encode(&out));
         }
         out.extend_from_slice(&chunk[..got]);
     }
@@ -871,6 +873,7 @@ pub(super) fn getdents64(
         let Some((ino, dtype, name)) = entry else {
             break;
         };
+        let name = overlay::name::decode(name);
         let reclen = (HEADER + name.len() + 1).next_multiple_of(8);
         if out.len() + reclen > count {
             if out.is_empty() {
@@ -883,7 +886,7 @@ pub(super) fn getdents64(
         out.extend_from_slice(&(index + 1).to_le_bytes()); // d_off
         out.extend_from_slice(&(reclen as u16).to_le_bytes());
         out.push(dtype);
-        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(&name);
         out.resize(start + reclen, 0);
         index += 1;
     }
@@ -1029,8 +1032,9 @@ pub(super) fn readlink(
         let procfs::Node::Link(t) = node? else {
             return Err(EINVAL);
         };
+        let t = overlay::name::decode(&t);
         let n = t.len().min(size as usize);
-        if p.copy_to_user(buf, &t.as_bytes()[..n]) != n {
+        if p.copy_to_user(buf, &t[..n]) != n {
             return Err(EFAULT);
         }
         return Ok(n as u64);
@@ -1038,11 +1042,11 @@ pub(super) fn readlink(
     let target = {
         let mut fs = p.fs();
         let ino = fs.resolve(start, &path, false)?;
-        fs.readlink(ino)?
+        overlay::name::decode(&fs.readlink(ino)?)
     };
     // No NUL terminator, truncated to the buffer (like Linux).
     let n = target.len().min(size as usize);
-    if p.copy_to_user(buf, &target.as_bytes()[..n]) != n {
+    if p.copy_to_user(buf, &target[..n]) != n {
         return Err(EFAULT);
     }
     Ok(n as u64)
@@ -1088,12 +1092,12 @@ pub(super) fn fchdir(p: &mut LinuxProcess, fd: u64) -> Result<u64, i64> {
 
 pub(super) fn getcwd(p: &mut LinuxProcess, buf: u64, size: u64) -> Result<u64, i64> {
     let cwd = p.cwd();
-    let mut path = p.fs().path(cwd)?;
-    path.push('\0');
+    let mut path = overlay::name::decode(&p.fs().path(cwd)?);
+    path.push(0);
     if (size as usize) < path.len() {
         return Err(ERANGE);
     }
-    if p.copy_to_user(buf, path.as_bytes()) != path.len() {
+    if p.copy_to_user(buf, &path) != path.len() {
         return Err(EFAULT);
     }
     Ok(path.len() as u64)

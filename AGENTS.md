@@ -79,6 +79,20 @@ not write it; merge its branch when it lands.
   checks completion while blocked on a registered eventfd and on
   `epoll_wait` of the ring fd. Not yet: registered files/buffers,
   LINK_TIMEOUT, the EXT_ARG signal mask, liburing's tests.
+- M7 CPython (first suite): `cargo xtask workloads python` pulls
+  `python:3.12-slim-bookworm` plus the 3.12.16 source tree's `Lib/test`
+  as a pinned layer and runs `python -m test -j0` in a cell. Fixed on
+  the way: the direction flag was cleared on every return to ring 3,
+  corrupting memory past interrupted backward copies
+  (`docs/reports/direction-flag-fix.md`); `execve` argv/envp are bytes;
+  file names are bytes (`overlay::name`: a reversible escape for
+  non-UTF-8 bytes at the syscall boundary); `close_range`, `fadvise64`,
+  get/setpriority, `memfd_create`, absolute `clock_nanosleep`, named
+  pipes (`mknod`/`mknodat` S_IFIFO, blocking opens), robust futex lists;
+  open TCP NAT mappings live five days (Linux's established timeout), not
+  ten minutes. Known gaps from its runs: `test_math` cosh is 8 ulps off
+  under TCG (check on KVM), O_RDWR FIFOs, rseq/clone3 (ENOSYS, glibc
+  falls back).
 
 **Milestone 6 is done** (2026-11-15): the control plane pulls a real OCI
 image from a registry, verifies it, converts it, and runs it through the

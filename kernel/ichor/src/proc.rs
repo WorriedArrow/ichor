@@ -533,6 +533,8 @@ pub(crate) fn run(mut p: LinuxProcess, mut ctx: UserContext) -> (u32, u32) {
             break status;
         }
     };
+    // Robust futexes the thread still holds are marked owner-dead first.
+    crate::futex::exit_robust_list(&mut p);
     // `CLONE_CHILD_CLEARTID`: zero the word and wake one waiter (this is
     // how `pthread_join` learns the thread is gone).
     if p.clear_tid != 0 {

@@ -378,6 +378,9 @@ pub(crate) struct LinuxProcess {
     /// `CLONE_CHILD_CLEARTID` / `set_tid_address`: zeroed and futex-woken
     /// when the thread exits.
     pub(crate) clear_tid: u64,
+    /// `set_robust_list`: the head of the thread's robust futex list,
+    /// walked when it exits (`futex::exit_robust_list`). Not inherited.
+    pub(crate) robust_list: u64,
 }
 
 impl LinuxProcess {
@@ -423,6 +426,7 @@ impl LinuxProcess {
             vfs,
             sig: Signals::new(),
             clear_tid: 0,
+            robust_list: 0,
         })
     }
 
@@ -472,6 +476,7 @@ impl LinuxProcess {
             vfs: self.vfs.clone(),
             sig: self.sig.clone(),
             clear_tid: 0,
+            robust_list: 0,
         })
     }
 
@@ -494,6 +499,7 @@ impl LinuxProcess {
             vfs: self.vfs.clone(),
             sig,
             clear_tid: 0,
+            robust_list: 0,
         }
     }
 
@@ -520,6 +526,7 @@ impl LinuxProcess {
             vfs: self.vfs.clone(),
             sig,
             clear_tid: 0,
+            robust_list: 0,
         }
     }
 

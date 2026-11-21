@@ -29,6 +29,8 @@ use alloc::vec::Vec;
 
 use image::{ChunkSource, Image, Node};
 
+pub mod name;
+
 /// Linux errno values.
 pub mod errno {
     pub const EPERM: i64 = 1;

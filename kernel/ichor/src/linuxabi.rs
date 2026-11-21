@@ -154,6 +154,8 @@ mod nr {
     pub(super) const EPOLL_CREATE: u64 = 213;
     pub(super) const GETDENTS64: u64 = 217;
     pub(super) const SET_TID_ADDRESS: u64 = 218;
+    pub(super) const SET_ROBUST_LIST: u64 = 273;
+    pub(super) const GET_ROBUST_LIST: u64 = 274; // partial: the caller's own list only (others are EPERM)
     pub(super) const CLOCK_GETTIME: u64 = 228; // partial: CPU-time clocks report time since the process started
     pub(super) const CLOCK_NANOSLEEP: u64 = 230; // partial: CPU-time clocks are ENOTSUP; an absolute realtime sleep does not follow clock steps
     pub(super) const UTIMES: u64 = 235;
@@ -481,6 +483,29 @@ pub(crate) fn dispatch(p: &mut LinuxProcess, ctx: &mut frame::user::UserContext)
         nr::SET_TID_ADDRESS => {
             p.clear_tid = a[0];
             Ok(p.entry.pid)
+        }
+        nr::SET_ROBUST_LIST => {
+            if a[1] != crate::futex::ROBUST_HEAD_LEN {
+                Err(EINVAL)
+            } else {
+                p.robust_list = a[0];
+                Ok(0)
+            }
+        }
+        nr::GET_ROBUST_LIST => {
+            // Another thread's list would need ptrace rights; only the
+            // caller's (pid 0 or its own tid) is answered.
+            if a[0] != 0 && a[0] != p.entry.pid {
+                Err(EPERM)
+            } else {
+                let head = p.robust_list.to_le_bytes();
+                let len = crate::futex::ROBUST_HEAD_LEN.to_le_bytes();
+                if p.copy_to_user(a[1], &head) != 8 || p.copy_to_user(a[2], &len) != 8 {
+                    Err(EFAULT)
+                } else {
+                    Ok(0)
+                }
+            }
         }
         nr::EXIT => return Outcome::Exit(a[0] as i32),
         nr::EXIT_GROUP => {

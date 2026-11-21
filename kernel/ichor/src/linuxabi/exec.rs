@@ -161,6 +161,9 @@ pub(crate) fn exec(
         _ => ENOEXEC,
     })?;
 
+    // Robust futexes held in the old image are released (and the list
+    // forgotten) while that memory is still the process's, as Linux does.
+    crate::futex::exit_robust_list(p);
     // Switch to the new space, then drop the old one (no longer active).
     mm.space().bind_to_current_task();
     drop(p.replace_mm(mm));

@@ -95,6 +95,78 @@ fn with_two<R>(a: &Key, b: &Key, f: impl FnOnce(&mut Table, Option<&mut Table>) 
     }
 }
 
+/// The robust list's head: `{ next, futex_offset, list_op_pending }`.
+pub(crate) const ROBUST_HEAD_LEN: u64 = 24;
+
+/// A dying thread's robust futexes (Linux's `exit_robust_list`): every
+/// lock on its list (and the one it was taking or dropping, per
+/// `list_op_pending`) whose word still names it is marked
+/// FUTEX_OWNER_DIED, and one waiter is woken, so the next locker gets
+/// EOWNERDEAD instead of hanging. A list that cannot be read, or longer
+/// than Linux's 2048 entries, is followed only as far as it goes.
+pub(crate) fn exit_robust_list(p: &mut LinuxProcess) {
+    const LIMIT: usize = 2048;
+    let head = core::mem::take(&mut p.robust_list);
+    if head == 0 {
+        return;
+    }
+    let read = |p: &mut LinuxProcess, a: u64| -> Option<u64> {
+        let mut b = [0u8; 8];
+        (p.copy_from_user(a, &mut b) == 8).then(|| u64::from_le_bytes(b))
+    };
+    let (Some(mut entry), Some(offset), Some(pending)) =
+        (read(p, head), read(p, head + 8), read(p, head + 16))
+    else {
+        return;
+    };
+    let tid = p.entry.pid as u32;
+    // Bit 0 of an entry marks a PI futex; the address is the rest.
+    let pending = pending & !1;
+    for _ in 0..LIMIT {
+        if entry == head || entry == 0 {
+            break;
+        }
+        let next = read(p, entry);
+        if entry & !1 != pending {
+            owner_died(p, (entry & !1).wrapping_add(offset), tid);
+        }
+        match next {
+            Some(n) => entry = n,
+            None => break,
+        }
+    }
+    if pending != 0 {
+        owner_died(p, pending.wrapping_add(offset), tid);
+    }
+}
+
+/// Marks the futex word at `addr` FUTEX_OWNER_DIED if thread `tid` holds it,
+/// waking one waiter if there were any.
+fn owner_died(p: &LinuxProcess, addr: u64, tid: u32) {
+    const FUTEX_WAITERS: u32 = 0x8000_0000;
+    const FUTEX_OWNER_DIED: u32 = 0x4000_0000;
+    const FUTEX_TID_MASK: u32 = 0x3fff_ffff;
+    let waiters = loop {
+        let mm = p.mm();
+        let space = mm.space();
+        let Some(cur) = space.load_u32_atomic(addr) else {
+            return;
+        };
+        if cur & FUTEX_TID_MASK != tid {
+            return;
+        }
+        let new = (cur & FUTEX_WAITERS) | FUTEX_OWNER_DIED;
+        match space.compare_exchange_u32(addr, cur, new) {
+            None => return,
+            Some(Ok(_)) => break cur & FUTEX_WAITERS != 0,
+            Some(Err(_)) => continue,
+        }
+    };
+    if waiters {
+        wake(p, addr, 1, u32::MAX);
+    }
+}
+
 /// Wakes up to `n` waiters on `addr` whose bitset meets `bitset`; returns
 /// how many.
 pub(crate) fn wake(p: &LinuxProcess, addr: u64, n: u32, bitset: u32) -> u64 {

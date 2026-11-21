@@ -64,6 +64,10 @@ mod sys {
     pub(super) const MEMFD_CREATE: u64 = 319;
     pub(super) const CLOCK_GETTIME: u64 = 228;
     pub(super) const MKNOD: u64 = 133;
+    pub(super) const SYMLINK: u64 = 88;
+    pub(super) const GETTID: u64 = 186;
+    pub(super) const SET_ROBUST_LIST: u64 = 273;
+    pub(super) const READLINK: u64 = 89;
     pub(super) const CLOCK_NANOSLEEP: u64 = 230;
     pub(super) const PREAD64: u64 = 17;
     pub(super) const EXIT_GROUP: u64 = 231;
@@ -1301,6 +1305,111 @@ fn misc_program() -> Vec<u8> {
     a.mov_imm(Reg::R10, 0);
     a.sys(sys::CLOCK_NANOSLEEP);
     check(&mut a, 19, neg(95));
+    // Names are bytes: a directory named "x\xff" is made, entered, and
+    // getcwd gives the same bytes back; a symlink's non-UTF-8 target reads
+    // back unchanged.
+    let dir = a.data(b"/x\xff\0");
+    let target = a.data(b"t\xfe\0");
+    let link = a.data(b"/l\0");
+    a.mov_data(Reg::Rdi, dir);
+    a.mov_imm(Reg::Rsi, 0o755);
+    a.sys(sys::MKDIR);
+    check(&mut a, 20, 0);
+    a.mov_data(Reg::Rdi, dir);
+    a.sys(sys::CHDIR);
+    check(&mut a, 21, 0);
+    a.mov(Reg::Rdi, Reg::Rbp);
+    a.mov_imm(Reg::Rsi, 64);
+    a.sys(sys::GETCWD);
+    check(&mut a, 22, 4);
+    a.load32(Reg::Rax, Reg::Rbp, 0);
+    check(&mut a, 23, u64::from(u32::from_le_bytes(*b"/x\xff\0")));
+    a.mov_data(Reg::Rdi, target);
+    a.mov_data(Reg::Rsi, link);
+    a.sys(sys::SYMLINK);
+    check(&mut a, 24, 0);
+    a.mov_data(Reg::Rdi, link);
+    a.mov(Reg::Rsi, Reg::Rbp);
+    a.mov_imm(Reg::Rdx, 64);
+    a.sys(sys::READLINK);
+    check(&mut a, 25, 2);
+    a.load32(Reg::Rax, Reg::Rbp, 0);
+    a.mov_imm(Reg::Rcx, 0xffff);
+    a.raw(&[0x48, 0x21, 0xc8]); // and rax, rcx
+    check(&mut a, 26, u64::from(u16::from_le_bytes(*b"t\xfe")));
+    a.mov_imm(Reg::Rdi, 0);
+    a.bind(bad);
+    a.sys(sys::EXIT_GROUP);
+    static_elf(&a.finish(BLOB_VADDR).unwrap_or_else(|| fail("assembler")))
+}
+
+/// Robust futexes: a forked child registers a robust list (in MAP_SHARED
+/// memory) holding one lock whose word is its tid, and exits holding it;
+/// the parent then finds the word marked FUTEX_OWNER_DIED with the tid
+/// gone. A head length other than 24 is EINVAL. Exits 0, or the failed
+/// check.
+fn robust_program() -> Vec<u8> {
+    const OWNER_DIED: u64 = 0x4000_0000;
+    let mut a = Asm::new();
+    let bad = a.label();
+    let parent = a.label();
+    a.mov(Reg::Rbp, Reg::Rsp);
+    a.sub_imm(Reg::Rbp, 4096);
+    a.mov_imm(Reg::Rdi, 0);
+    a.mov_imm(Reg::Rsi, 4096);
+    a.mov_imm(Reg::Rdx, 3);
+    a.mov_imm(Reg::R10, 0x21); // MAP_SHARED | MAP_ANONYMOUS
+    a.mov_imm(Reg::R8, u64::MAX);
+    a.mov_imm(Reg::R9, 0);
+    a.sys(sys::MMAP);
+    a.mov(Reg::R13, Reg::Rax);
+    a.mov(Reg::Rdi, Reg::R13);
+    a.mov_imm(Reg::Rsi, 23);
+    a.sys(sys::SET_ROBUST_LIST);
+    a.mov_imm(Reg::R14, (-22i64) as u64);
+    a.mov_imm(Reg::Rdi, 1);
+    a.cmp(Reg::Rax, Reg::R14);
+    a.jne(bad);
+    a.sys(sys::FORK);
+    a.mov(Reg::R12, Reg::Rax);
+    a.cmp_imm(Reg::Rax, 0);
+    a.jne(parent);
+    // Child: head at +0 { next = +32, futex_offset = 8, pending = 0 };
+    // the lock's entry at +32 { next = head }, its word at +40 = tid.
+    a.sys(sys::GETTID);
+    a.store32(Reg::R13, 40, Reg::Rax);
+    a.mov(Reg::Rax, Reg::R13);
+    a.add_imm(Reg::Rax, 32);
+    a.store(Reg::R13, 0, Reg::Rax);
+    a.mov_imm(Reg::Rax, 8);
+    a.store(Reg::R13, 8, Reg::Rax);
+    a.mov_imm(Reg::Rax, 0);
+    a.store(Reg::R13, 16, Reg::Rax);
+    a.store(Reg::R13, 32, Reg::R13);
+    a.mov(Reg::Rdi, Reg::R13);
+    a.mov_imm(Reg::Rsi, 24);
+    a.sys(sys::SET_ROBUST_LIST);
+    a.mov(Reg::Rdi, Reg::Rax); // exit status: set_robust_list's result
+    a.sys(sys::EXIT);
+    a.bind(parent);
+    a.mov(Reg::Rdi, Reg::R12);
+    a.mov(Reg::Rsi, Reg::Rbp);
+    a.mov_imm(Reg::Rdx, 0);
+    a.mov_imm(Reg::R10, 0);
+    a.sys(sys::WAIT4);
+    a.mov_imm(Reg::Rdi, 2);
+    a.cmp(Reg::Rax, Reg::R12);
+    a.jne(bad);
+    a.load32(Reg::Rax, Reg::Rbp, 0);
+    a.mov_imm(Reg::R14, 0);
+    a.mov_imm(Reg::Rdi, 3); // the child's set_robust_list failed
+    a.cmp(Reg::Rax, Reg::R14);
+    a.jne(bad);
+    a.load32(Reg::Rax, Reg::R13, 40);
+    a.mov_imm(Reg::R14, OWNER_DIED);
+    a.mov_imm(Reg::Rdi, 4);
+    a.cmp(Reg::Rax, Reg::R14);
+    a.jne(bad);
     a.mov_imm(Reg::Rdi, 0);
     a.bind(bad);
     a.sys(sys::EXIT_GROUP);
@@ -2740,6 +2849,13 @@ pub(crate) fn run() {
         "ichor: linux: a backward rep movsq resumed backward across 16 page faults; DF kept across a syscall"
     );
 
+    let (status, _) = run_linux(new_process(), &robust_program(), None, &["robusttest"]);
+    if status != 0 {
+        println!("ichor: linux: robusttest failed check {status}");
+        fail("robust futexes");
+    }
+    println!("ichor: linux: a robust futex held by an exiting process is marked FUTEX_OWNER_DIED");
+
     let (status, _) = run_linux(new_process(), &fifo_program(), None, &["fifotest"]);
     if status != 0 {
         println!("ichor: linux: fifotest failed check {status}");
@@ -2755,7 +2871,7 @@ pub(crate) fn run() {
         fail("close_range, fadvise64, priorities");
     }
     println!(
-        "ichor: linux: close_range, fadvise64, get/setpriority, memfd_create, absolute clock_nanosleep ok"
+        "ichor: linux: close_range, fadvise64, get/setpriority, memfd_create, absolute clock_nanosleep, non-UTF-8 names ok"
     );
 
     let (status, syscalls) = run_linux(new_process(), &poll_program(), None, &["polltest"]);

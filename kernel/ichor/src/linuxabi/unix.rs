@@ -793,10 +793,9 @@ fn read_sun(p: &mut LinuxProcess, addr: u64, len: u64) -> Result<Target, i64> {
         None => Ok(Target::Unnamed),
         Some(0) => Ok(Target::Abstract(path[1..].to_vec())),
         Some(_) => {
+            // A path name, escaped like every path (`overlay::name`).
             let end = path.iter().position(|&c| c == 0).unwrap_or(path.len());
-            String::from_utf8(path[..end].to_vec())
-                .map(Target::Path)
-                .map_err(|_| crate::vfs::errno::ENOENT)
+            Ok(Target::Path(overlay::name::encode(&path[..end])))
         }
     }
 }
@@ -810,7 +809,7 @@ fn write_sun(p: &mut LinuxProcess, addr: u64, lenp: u64, name: Option<&Name>) ->
     let mut b = (AF_UNIX as u16).to_le_bytes().to_vec();
     match name {
         Some(Name::Path(s, _)) => {
-            b.extend_from_slice(s.as_bytes());
+            b.extend_from_slice(&overlay::name::decode(s));
             b.push(0);
         }
         Some(Name::Abstract(n)) => {
