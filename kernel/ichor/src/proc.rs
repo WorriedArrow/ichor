@@ -66,6 +66,9 @@ pub(crate) struct ProcEntry {
     task: SpinLock<Option<Arc<Task>>>,
     /// Woken when a signal is posted (`pause`, `rt_sigsuspend`).
     signals: WaitQueue,
+    /// CPU time this thread has spent in user code, in nanoseconds (the
+    /// time inside `UserMode::execute`; kernel time is not counted yet).
+    pub(crate) cpu_ns: AtomicU64,
 }
 
 impl ProcEntry {
@@ -281,6 +284,7 @@ pub(crate) fn register(
         ignored: AtomicU64::new(signal::bit(signal::SIGCHLD)),
         task: SpinLock::new(None),
         signals: WaitQueue::new(),
+        cpu_ns: AtomicU64::new(0),
     });
     TABLE.lock().insert(pid, e.clone());
     e
@@ -445,6 +449,7 @@ pub(crate) fn wait(
     caller: &ProcEntry,
     pid: i64,
     nohang: bool,
+    reap: bool,
 ) -> Result<Option<(u64, u32)>, i64> {
     leader.children.wait_until(|| {
         if interrupted(caller) {
@@ -471,7 +476,10 @@ pub(crate) fn wait(
             }
         }
         if let Some((cpid, st)) = found {
-            t.remove(&cpid);
+            // `waitid(WNOWAIT)` leaves the child waitable.
+            if reap {
+                t.remove(&cpid);
+            }
             return Some(Ok(Some((cpid, st))));
         }
         if !any {
@@ -493,7 +501,13 @@ pub(crate) fn run(mut p: LinuxProcess, mut ctx: UserContext) -> (u32, u32) {
     let mut syscalls = 0u32;
     let status = loop {
         let mut restart = None;
-        match UserMode::new(&mut ctx).execute() {
+        let entered = frame::time::now();
+        let event = UserMode::new(&mut ctx).execute();
+        let ran = frame::time::now().saturating_sub(entered);
+        p.entry
+            .cpu_ns
+            .fetch_add(ran.as_nanos() as u64, Ordering::Relaxed);
+        match event {
             UserEvent::Syscall => {
                 syscalls = syscalls.wrapping_add(1);
                 let nr = ctx.rax;

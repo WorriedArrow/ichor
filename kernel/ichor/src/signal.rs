@@ -269,6 +269,18 @@ pub(crate) fn sigprocmask(
     Ok(0)
 }
 
+/// `rt_sigpending`: the signals pending for the thread or its process that
+/// its mask holds back (unblocked ones are delivered before returning to
+/// user code, so they are never seen here).
+pub(crate) fn sigpending(p: &mut LinuxProcess, set: u64, size: u64) -> Result<u64, i64> {
+    if size != 8 {
+        return Err(EINVAL);
+    }
+    let pending = proc::pending(&p.entry) | proc::pending(&p.group.leader);
+    write_u64(p, set, pending & p.sig.mask)?;
+    Ok(0)
+}
+
 /// `rt_sigsuspend`: waits with `mask` in place until a signal is delivered.
 pub(crate) fn sigsuspend(p: &mut LinuxProcess, mask: u64, size: u64) -> Result<u64, i64> {
     if size != 8 {

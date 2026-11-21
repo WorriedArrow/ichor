@@ -175,6 +175,8 @@ pub(crate) struct Group {
     /// `PR_SET_NAME` (per process here; Linux's is per thread), and the
     /// `PR_SET_DUMPABLE` / `PR_SET_NO_NEW_PRIVS` flags.
     pub(crate) prctl: SpinLock<Prctl>,
+    /// User CPU time of threads that have exited (`cpu_ns`).
+    gone_cpu_ns: core::sync::atomic::AtomicU64,
 }
 
 /// State `prctl` sets.
@@ -186,6 +188,9 @@ pub(crate) struct Prctl {
     /// The nice value (`setpriority`), -20..=19; kept across fork and
     /// exec. The scheduler does not use it yet.
     pub(crate) nice: i32,
+    /// `sched_setaffinity`'s CPU mask (bit n: CPU n; `None`: every CPU),
+    /// kept across fork and exec. The scheduler does not apply it yet.
+    pub(crate) affinity: Option<u64>,
 }
 
 impl Default for Prctl {
@@ -195,6 +200,7 @@ impl Default for Prctl {
             dumpable: true,
             no_new_privs: false,
             nice: 0,
+            affinity: None,
         }
     }
 }
@@ -336,8 +342,24 @@ impl Group {
 
     /// Removes `me` from the live threads; returns the group's wait status
     /// if it was the last (its exit status, or `status`, the last thread's).
+    /// The process's user CPU time: its live threads' and those gone.
+    pub(crate) fn cpu_ns(&self) -> u64 {
+        use core::sync::atomic::Ordering::Relaxed;
+        let live: u64 = self
+            .threads
+            .lock()
+            .iter()
+            .map(|e| e.cpu_ns.load(Relaxed))
+            .sum();
+        live + self.gone_cpu_ns.load(Relaxed)
+    }
+
     pub(crate) fn thread_exited(&self, me: &ProcEntry, status: u32) -> Option<u32> {
         let mut t = self.threads.lock();
+        self.gone_cpu_ns.fetch_add(
+            me.cpu_ns.load(core::sync::atomic::Ordering::Relaxed),
+            core::sync::atomic::Ordering::Relaxed,
+        );
         t.retain(|e| e.pid != me.pid);
         let last = t.is_empty();
         drop(t);
@@ -418,6 +440,7 @@ impl LinuxProcess {
             vfork: SpinLock::new(None),
             creds: SpinLock::new(crate::cred::Creds::root()),
             prctl: SpinLock::new(Prctl::default()),
+            gone_cpu_ns: core::sync::atomic::AtomicU64::new(0),
         });
         Some(Self {
             entry,
@@ -466,6 +489,7 @@ impl LinuxProcess {
             vfork: SpinLock::new(None),
             creds: SpinLock::new(self.group.creds()),
             prctl: SpinLock::new(self.group.prctl.lock().clone()),
+            gone_cpu_ns: core::sync::atomic::AtomicU64::new(0),
         });
         let c = group.creds();
         entry.set_uids(c.ruid, c.suid);

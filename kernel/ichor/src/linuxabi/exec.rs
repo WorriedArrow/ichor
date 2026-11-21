@@ -15,7 +15,7 @@ use alloc::vec::Vec;
 use frame::user::UserContext;
 
 use super::EFAULT;
-use super::fs::user_path;
+use super::fs::{AT_FDCWD, user_path};
 use crate::file::{File, VfsFile};
 use crate::loader::{self, LoadError};
 use crate::process::LinuxProcess;
@@ -98,6 +98,54 @@ pub(super) fn execve(
     let argv = user_strings(p, argv, &mut total)?;
     let envp = user_strings(p, envp, &mut total)?;
     exec(p, ctx, path, argv, envp)
+}
+
+/// `execveat(dirfd, path, argv, envp, flags)`: `path` relative to the
+/// directory `dirfd`, or with AT_EMPTY_PATH and an empty path the file
+/// `dirfd` itself is open on (`fexecve`). The file is found again by its
+/// name, so one unlinked since it was opened is ENOENT (partial);
+/// AT_SYMLINK_NOFOLLOW is accepted and not applied.
+pub(super) fn execveat(
+    p: &mut LinuxProcess,
+    ctx: &mut UserContext,
+    dirfd: i64,
+    path: u64,
+    argv: u64,
+    envp: u64,
+    flags: u64,
+) -> Result<(), i64> {
+    const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+    const AT_EMPTY_PATH: u64 = 0x1000;
+    const EBADF: i64 = 9;
+    const EINVAL: i64 = 22;
+    if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+        return Err(EINVAL);
+    }
+    let rel = user_path(p, path)?;
+    let at = |p: &LinuxProcess| -> Result<String, i64> {
+        match p.fd(dirfd as u64).ok_or(EBADF)? {
+            crate::process::Fd::File(f) => p.fs().path(f.ino),
+            _ => Err(EBADF),
+        }
+    };
+    let full = if rel.is_empty() {
+        if flags & AT_EMPTY_PATH == 0 {
+            return Err(ENOENT);
+        }
+        at(p)?
+    } else if rel.starts_with('/') || dirfd == AT_FDCWD {
+        rel
+    } else {
+        let mut d = at(p)?;
+        if !d.ends_with('/') {
+            d.push('/');
+        }
+        d + &rel
+    };
+    let mut total = 0;
+    let argv = user_strings(p, argv, &mut total)?;
+    let envp = user_strings(p, envp, &mut total)?;
+    exec(p, ctx, full, argv, envp)
 }
 
 /// `execve` with its arguments already in the kernel (also how the native

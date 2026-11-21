@@ -110,9 +110,9 @@ mod nr {
     pub(super) const FCHOWN: u64 = 93;
     pub(super) const LCHOWN: u64 = 94;
     pub(super) const UMASK: u64 = 95;
-    pub(super) const GETRUSAGE: u64 = 98; // partial: no CPU-time accounting (times are zero; maxrss is the current rss)
+    pub(super) const GETRUSAGE: u64 = 98; // partial: user CPU time only (system time and children are zero); maxrss is the current rss
     pub(super) const SYSINFO: u64 = 99; // partial: the cell's memory; no load averages or swap
-    pub(super) const TIMES: u64 = 100; // partial: no CPU-time accounting (zeros; returns ticks since boot)
+    pub(super) const TIMES: u64 = 100; // partial: user CPU time only (system and children's times are zero)
     pub(super) const GETTIMEOFDAY: u64 = 96; // firmware clock at boot plus monotonic time (no NTP)
     pub(super) const GETRLIMIT: u64 = 97;
     pub(super) const SETRLIMIT: u64 = 160; // partial: NOFILE and STACK enforced, others stored
@@ -149,14 +149,27 @@ mod nr {
     pub(super) const GETTID: u64 = 186;
     pub(super) const TIME: u64 = 201; // firmware clock at boot plus monotonic time (no NTP)
     pub(super) const TKILL: u64 = 200;
-    pub(super) const SCHED_GETAFFINITY: u64 = 204;
+    pub(super) const SCHED_GETAFFINITY: u64 = 204; // partial: the mask sched_setaffinity recorded
+    pub(super) const SCHED_SETAFFINITY: u64 = 203; // partial: the caller's process only; recorded, not applied by the scheduler
+    pub(super) const SCHED_GET_PRIORITY_MAX: u64 = 146;
+    pub(super) const SCHED_GET_PRIORITY_MIN: u64 = 147;
+    pub(super) const SCHED_RR_GET_INTERVAL: u64 = 148; // partial: always Linux's 100 ms slice
+    pub(super) const RT_SIGPENDING: u64 = 127;
+    pub(super) const EXECVEAT: u64 = 322; // partial: an fd's file is found again by name (ENOENT once unlinked); AT_SYMLINK_NOFOLLOW not applied
+    pub(super) const WAITID: u64 = 247; // partial: exited children only (no stop/continue reports); P_PIDFD is EINVAL
+    pub(super) const PREADV: u64 = 295;
+    pub(super) const PWRITEV: u64 = 296;
+    pub(super) const PREADV2: u64 = 327; // partial: no RWF_* flags (EOPNOTSUPP)
+    pub(super) const PWRITEV2: u64 = 328; // partial: no RWF_* flags (EOPNOTSUPP)
+    pub(super) const CLOCK_SETTIME: u64 = 227; // partial: always EPERM (no CAP_SYS_TIME in cells)
+    pub(super) const SETTIMEOFDAY: u64 = 164; // partial: always EPERM (no CAP_SYS_TIME in cells)
     pub(super) const FUTEX: u64 = 202; // partial: shared only within shared anonymous memory; no PI, no FUTEX_FD
     pub(super) const EPOLL_CREATE: u64 = 213;
     pub(super) const GETDENTS64: u64 = 217;
     pub(super) const SET_TID_ADDRESS: u64 = 218;
     pub(super) const SET_ROBUST_LIST: u64 = 273;
     pub(super) const GET_ROBUST_LIST: u64 = 274; // partial: the caller's own list only (others are EPERM)
-    pub(super) const CLOCK_GETTIME: u64 = 228; // partial: CPU-time clocks report time since the process started
+    pub(super) const CLOCK_GETTIME: u64 = 228; // partial: CPU-time clocks count user time only; other processes' CPU clocks are EINVAL
     pub(super) const CLOCK_NANOSLEEP: u64 = 230; // partial: CPU-time clocks are ENOTSUP; an absolute realtime sleep does not follow clock steps
     pub(super) const UTIMES: u64 = 235;
     pub(super) const EXIT_GROUP: u64 = 231;
@@ -486,6 +499,18 @@ pub(crate) fn dispatch(p: &mut LinuxProcess, ctx: &mut frame::user::UserContext)
             }
         }
         nr::SCHED_GETAFFINITY => sched_getaffinity(p, a[0], a[1], a[2]),
+        nr::SCHED_SETAFFINITY => sched_setaffinity(p, a[0], a[1], a[2]),
+        nr::SCHED_GET_PRIORITY_MAX => sched_priority_bound(a[0], true),
+        nr::SCHED_GET_PRIORITY_MIN => sched_priority_bound(a[0], false),
+        nr::SCHED_RR_GET_INTERVAL => sched_rr_get_interval(p, a[0], a[1]),
+        nr::RT_SIGPENDING => signal::sigpending(p, a[0], a[1]),
+        nr::WAITID => waitid(p, a[0], a[1], a[2], a[3], a[4]),
+        nr::PREADV => fs::vector_at(p, a[0], a[1], a[2] as usize, a[3], 0, false),
+        nr::PWRITEV => fs::vector_at(p, a[0], a[1], a[2] as usize, a[3], 0, true),
+        nr::PREADV2 => fs::vector_at(p, a[0], a[1], a[2] as usize, a[3], a[5], false),
+        nr::PWRITEV2 => fs::vector_at(p, a[0], a[1], a[2] as usize, a[3], a[5], true),
+        // Setting a clock needs CAP_SYS_TIME, outside the cell bounding set.
+        nr::CLOCK_SETTIME | nr::SETTIMEOFDAY => Err(EPERM),
         nr::SYSINFO => sysinfo(p, a[0]),
         nr::GETRUSAGE => getrusage(p, i(a[0]), a[1]),
         nr::TIMES => times(p, a[0]),
@@ -519,6 +544,10 @@ pub(crate) fn dispatch(p: &mut LinuxProcess, ctx: &mut frame::user::UserContext)
         nr::WAIT4 => wait4(p, i(a[0]), a[1], a[2], a[3]),
         nr::EXECVE => match exec::execve(p, ctx, a[0], a[1], a[2]) {
             // The context now starts the new program: no return value.
+            Ok(()) => return Outcome::Continue,
+            Err(e) => Err(e),
+        },
+        nr::EXECVEAT => match exec::execveat(p, ctx, i(a[0]), a[1], a[2], a[3], a[4]) {
             Ok(()) => return Outcome::Continue,
             Err(e) => Err(e),
         },
@@ -740,6 +769,8 @@ fn fcntl(p: &mut LinuxProcess, fd: u64, cmd: u64, arg: u64) -> Result<u64, i64> 
     const F_OFD_SETLK: u64 = 37;
     const F_OFD_SETLKW: u64 = 38;
     const F_DUPFD_CLOEXEC: u64 = 1030;
+    const F_SETPIPE_SZ: u64 = 1031;
+    const F_GETPIPE_SZ: u64 = 1032;
     const F_SETOWN: u64 = 8;
     const F_GETOWN: u64 = 9;
     const FD_CLOEXEC: u64 = 1;
@@ -809,6 +840,12 @@ fn fcntl(p: &mut LinuxProcess, fd: u64, cmd: u64, arg: u64) -> Result<u64, i64> 
         F_GETLK | F_SETLK | F_SETLKW | F_OFD_GETLK | F_OFD_SETLK | F_OFD_SETLKW => {
             fs::record_lock(p, &desc, cmd, arg)
         }
+        // Pipe capacity: Linux answers EBADF for anything but a pipe.
+        F_SETPIPE_SZ | F_GETPIPE_SZ => match &*desc.state() {
+            Fd::Pipe(e) if cmd == F_GETPIPE_SZ => Ok(e.pipe.capacity() as u64),
+            Fd::Pipe(e) => e.pipe.set_capacity(arg).map(|n| n as u64),
+            _ => Err(EBADF),
+        },
         _ => Err(EINVAL),
     }
 }
@@ -958,7 +995,7 @@ fn wait4(
     const WNOHANG: u64 = 1;
     /// `sizeof(struct rusage)` on x86-64.
     const RUSAGE_SIZE: usize = 144;
-    match proc::wait(&p.group.leader, &p.entry, pid, options & WNOHANG != 0)? {
+    match proc::wait(&p.group.leader, &p.entry, pid, options & WNOHANG != 0, true)? {
         None => Ok(0),
         Some((cpid, status)) => {
             if wstatus != 0 && p.copy_to_user(wstatus, &status.to_le_bytes()) != 4 {
@@ -972,6 +1009,76 @@ fn wait4(
             Ok(cpid)
         }
     }
+}
+
+/// `waitid(idtype, id, infop, options, rusage)`: exited children only
+/// (stopped and continued ones are never reported: there is no job-control
+/// stop yet), with WNOHANG and WNOWAIT; the child's state is a siginfo_t.
+fn waitid(
+    p: &mut LinuxProcess,
+    idtype: u64,
+    id: u64,
+    infop: u64,
+    options: u64,
+    rusage: u64,
+) -> Result<u64, i64> {
+    const WNOHANG: u64 = 1;
+    const WSTOPPED: u64 = 2;
+    const WEXITED: u64 = 4;
+    const WCONTINUED: u64 = 8;
+    const WNOWAIT: u64 = 0x0100_0000;
+    const KNOWN: u64 = WNOHANG | WSTOPPED | WEXITED | WCONTINUED | WNOWAIT | 0xe000_0000;
+    const SIGCHLD: u32 = 17;
+    const CLD_EXITED: u32 = 1;
+    const CLD_KILLED: u32 = 2;
+    const CLD_DUMPED: u32 = 3;
+    const ECHILD: i64 = 10;
+    if options & !KNOWN != 0 || options & (WEXITED | WSTOPPED | WCONTINUED) == 0 {
+        return Err(EINVAL);
+    }
+    let pid = match idtype {
+        0 => -1,                                           // P_ALL
+        1 if id > 0 && id <= i32::MAX as u64 => id as i64, // P_PID
+        2 if id <= i32::MAX as u64 => -(id as i64),        // P_PGID (0: the caller's)
+        _ => return Err(EINVAL),
+    };
+    let found = if options & WEXITED == 0 {
+        // Only stops or continues asked for: none ever come.
+        if options & WNOHANG == 0 {
+            return Err(ECHILD);
+        }
+        None
+    } else {
+        proc::wait(
+            &p.group.leader,
+            &p.entry,
+            pid,
+            options & WNOHANG != 0,
+            options & WNOWAIT == 0,
+        )?
+    };
+    // struct siginfo (128 bytes): signo, errno, code, then pid, uid, status.
+    let mut si = [0u8; 128];
+    if let Some((cpid, st)) = found {
+        let (code, status) = if st & 0x7f == 0 {
+            (CLD_EXITED, (st >> 8) & 0xff)
+        } else if st & 0x80 != 0 {
+            (CLD_DUMPED, st & 0x7f)
+        } else {
+            (CLD_KILLED, st & 0x7f)
+        };
+        si[0..4].copy_from_slice(&SIGCHLD.to_le_bytes());
+        si[8..12].copy_from_slice(&code.to_le_bytes());
+        si[16..20].copy_from_slice(&(cpid as u32).to_le_bytes());
+        si[24..28].copy_from_slice(&status.to_le_bytes());
+    }
+    if infop != 0 && p.copy_to_user(infop, &si) != si.len() {
+        return Err(EFAULT);
+    }
+    if rusage != 0 && p.copy_to_user(rusage, &[0u8; 144]) != 144 {
+        return Err(EFAULT);
+    }
+    Ok(0)
 }
 
 // ---------------------------------------------------------------------------
@@ -1027,9 +1134,33 @@ fn clock_gettime(p: &mut LinuxProcess, clock: u64, tp: u64) -> Result<u64, i64> 
     let t = match clock {
         REALTIME | REALTIME_COARSE => crate::vfs::wall_clock(),
         MONOTONIC | MONOTONIC_RAW | MONOTONIC_COARSE | BOOTTIME => frame::time::now(),
-        PROCESS_CPUTIME | THREAD_CPUTIME => {
-            let started = core::time::Duration::from_millis(p.group.leader.started * 10);
-            frame::time::now().saturating_sub(started)
+        PROCESS_CPUTIME => core::time::Duration::from_nanos(p.group.cpu_ns()),
+        THREAD_CPUTIME => core::time::Duration::from_nanos(
+            p.entry.cpu_ns.load(core::sync::atomic::Ordering::Relaxed),
+        ),
+        // A CPU-time clock id for a pid or tid (clock_getcpuclockid,
+        // pthread_getcpuclockid): `~id << 3 | type`, bit 2 for a thread.
+        // The caller's own process and threads are answered.
+        c if (c as i32) < 0 => {
+            let c = c as i32;
+            let id = u64::from((!c >> 3) as u32);
+            if c & 3 == 3 {
+                return Err(EINVAL);
+            }
+            let ns = if c & 4 != 0 {
+                p.group
+                    .threads()
+                    .iter()
+                    .find(|e| e.pid == id || (id == 0 && e.pid == p.entry.pid))
+                    .ok_or(EINVAL)?
+                    .cpu_ns
+                    .load(core::sync::atomic::Ordering::Relaxed)
+            } else if id == 0 || id == p.group.tgid {
+                p.group.cpu_ns()
+            } else {
+                return Err(EINVAL);
+            };
+            core::time::Duration::from_nanos(ns)
         }
         _ => return Err(EINVAL),
     };
@@ -1191,14 +1322,64 @@ fn sched_getaffinity(p: &mut LinuxProcess, pid: u64, len: u64, mask: u64) -> Res
     if (len as usize) < bytes || !len.is_multiple_of(8) {
         return Err(EINVAL);
     }
+    let set = p.group.prctl.lock().affinity;
     let mut v = alloc::vec![0u8; bytes];
     for cpu in 0..n {
-        v[cpu / 8] |= 1 << (cpu % 8);
+        if set.is_none_or(|m| cpu < 64 && m & (1 << cpu) != 0) {
+            v[cpu / 8] |= 1 << (cpu % 8);
+        }
     }
     if p.copy_to_user(mask, &v) != v.len() {
         return Err(EFAULT);
     }
     Ok(bytes as u64)
+}
+
+/// `sched_setaffinity(pid, len, mask)`: the caller's process (pid 0 or
+/// one of its own) records the mask, which must name an online CPU; the
+/// scheduler does not apply it yet (partial). Another process: EPERM, as
+/// for an unprivileged caller without CAP_SYS_NICE.
+fn sched_setaffinity(p: &mut LinuxProcess, pid: u64, len: u64, mask: u64) -> Result<u64, i64> {
+    const ESRCH: i64 = 3;
+    let pid = u64::from(pid as u32);
+    if pid != 0 && pid != p.group.tgid && pid != p.entry.pid {
+        crate::proc::uids_of(p.entry.cell, pid).map_err(|_| ESRCH)?;
+        return Err(EPERM);
+    }
+    let n = frame::cpu::online_count().min(64);
+    let mut b = [0u8; 8];
+    let take = (len as usize).min(8);
+    if p.copy_from_user(mask, &mut b[..take]) != take {
+        return Err(EFAULT);
+    }
+    let online = if n == 64 { u64::MAX } else { (1u64 << n) - 1 };
+    let m = u64::from_le_bytes(b) & online;
+    if m == 0 {
+        return Err(EINVAL);
+    }
+    p.group.prctl.lock().affinity = (m != online).then_some(m);
+    Ok(0)
+}
+
+/// `sched_get_priority_max`/`min`: 1..=99 for the real-time policies
+/// (FIFO, RR, DEADLINE has none), 0 for the others, as on Linux.
+fn sched_priority_bound(policy: u64, max: bool) -> Result<u64, i64> {
+    match policy {
+        1 | 2 => Ok(if max { 99 } else { 1 }), // SCHED_FIFO, SCHED_RR
+        0 | 3 | 5 | 6 => Ok(0),                // OTHER, BATCH, IDLE, DEADLINE
+        _ => Err(EINVAL),
+    }
+}
+
+/// `sched_rr_get_interval`: the round-robin time slice Linux reports
+/// (100 ms); the caller's process only.
+fn sched_rr_get_interval(p: &mut LinuxProcess, pid: u64, tp: u64) -> Result<u64, i64> {
+    const ESRCH: i64 = 3;
+    let pid = u64::from(pid as u32);
+    if pid != 0 && crate::proc::uids_of(p.entry.cell, pid).is_err() {
+        return Err(ESRCH);
+    }
+    put_pair(p, tp, 0, 100_000_000)
 }
 
 /// `sysinfo`: uptime, the cell's memory (its account, as `/proc/meminfo`
@@ -1230,6 +1411,15 @@ fn getrusage(p: &mut LinuxProcess, who: i64, buf: u64) -> Result<u64, i64> {
     let mut b = [0u8; 144];
     match who {
         RUSAGE_SELF | RUSAGE_THREAD => {
+            // ru_utime: user CPU time (a timeval); system time is not
+            // accounted yet.
+            let ns = if who == RUSAGE_SELF {
+                p.group.cpu_ns()
+            } else {
+                p.entry.cpu_ns.load(core::sync::atomic::Ordering::Relaxed)
+            };
+            b[0..8].copy_from_slice(&(ns / 1_000_000_000).to_le_bytes());
+            b[8..16].copy_from_slice(&((ns % 1_000_000_000) / 1000).to_le_bytes());
             let rss_kb = p.mm().resident_pages() as u64 * 4;
             b[32..40].copy_from_slice(&rss_kb.to_le_bytes());
         }
@@ -1242,10 +1432,13 @@ fn getrusage(p: &mut LinuxProcess, who: i64, buf: u64) -> Result<u64, i64> {
     Ok(0)
 }
 
-/// `times(buf)`: no CPU-time accounting yet (all zero); returns clock
-/// ticks (`USER_HZ`, 100/s) since boot.
+/// `times(buf)`: the process's user CPU time in clock ticks (`USER_HZ`,
+/// 100/s); system and children's times are not accounted yet (zero).
+/// Returns clock ticks since boot.
 fn times(p: &mut LinuxProcess, buf: u64) -> Result<u64, i64> {
-    if buf != 0 && p.copy_to_user(buf, &[0u8; 32]) != 32 {
+    let mut t = [0u8; 32];
+    t[0..8].copy_from_slice(&(p.group.cpu_ns() / 10_000_000).to_le_bytes());
+    if buf != 0 && p.copy_to_user(buf, &t) != 32 {
         return Err(EFAULT);
     }
     Ok((frame::time::now().as_millis() / 10) as u64)

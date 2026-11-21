@@ -32,6 +32,8 @@ struct State {
     /// end to be opened, even if it is closed again before the waiter runs).
     reader_opens: u64,
     writer_opens: u64,
+    /// Bytes the pipe holds (`F_SETPIPE_SZ`; CAPACITY to start).
+    capacity: usize,
 }
 
 /// A pipe.
@@ -68,6 +70,7 @@ impl Pipe {
                 writers: n,
                 reader_opens: u64::from(n),
                 writer_opens: u64::from(n),
+                capacity: CAPACITY,
             }),
             readable: WaitQueue::new(),
             writable: WaitQueue::new(),
@@ -97,6 +100,35 @@ impl Pipe {
         self.readable.wake_all();
         self.writable.wake_all();
         self.changed();
+    }
+
+    /// `F_GETPIPE_SZ`: the bytes the pipe holds.
+    pub(crate) fn capacity(&self) -> usize {
+        self.state.lock().capacity
+    }
+
+    /// `F_SETPIPE_SZ`: rounds `size` up to a power-of-two number of pages
+    /// (at least one) and makes that the capacity, as Linux does; above
+    /// Linux's default `pipe-max-size` (1 MiB) is EPERM, and less than what
+    /// is buffered now is EBUSY. Returns the new capacity.
+    pub(crate) fn set_capacity(&self, size: u64) -> Result<usize, i64> {
+        const EPERM: i64 = 1;
+        const EBUSY: i64 = 16;
+        const MAX: usize = 1 << 20;
+        let want = usize::try_from(size).map_err(|_| EPERM)?;
+        if want > MAX {
+            return Err(EPERM);
+        }
+        let n = want.max(4096).next_power_of_two();
+        let mut s = self.state.lock();
+        if n < s.buf.len() {
+            return Err(EBUSY);
+        }
+        s.capacity = n;
+        drop(s);
+        self.writable.wake_all();
+        self.changed();
+        Ok(n)
     }
 
     /// Readers now (a FIFO's non-blocking open for writing needs one).
@@ -168,7 +200,7 @@ impl Pipe {
         if write {
             if s.readers == 0 {
                 POLLERR
-            } else if CAPACITY - s.buf.len() >= PIPE_BUF {
+            } else if s.capacity.saturating_sub(s.buf.len()) >= PIPE_BUF.min(s.capacity) {
                 POLLOUT
             } else {
                 0
@@ -241,7 +273,7 @@ impl Pipe {
                 if s.readers == 0 {
                     return Some(Err(EPIPE));
                 }
-                let room = CAPACITY - s.buf.len();
+                let room = s.capacity.saturating_sub(s.buf.len());
                 if room >= need {
                     let n = room.min(rest.len());
                     s.buf.extend(&rest[..n]);

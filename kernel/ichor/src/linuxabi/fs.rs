@@ -529,11 +529,60 @@ pub(super) fn vector(
     Ok(total)
 }
 
+/// `preadv`/`pwritev` (and the `2` forms with no flags): the vector I/O
+/// above at file offset `offset`, leaving the file position alone; an
+/// offset of -1 (the `2` forms) uses and moves the position instead.
+pub(super) fn vector_at(
+    p: &mut LinuxProcess,
+    fd: u64,
+    iov: u64,
+    iovcnt: usize,
+    offset: u64,
+    flags: u64,
+    is_write: bool,
+) -> Result<u64, i64> {
+    const EOPNOTSUPP: i64 = 95;
+    if flags != 0 {
+        return Err(EOPNOTSUPP); // RWF_HIPRI, RWF_DSYNC, RWF_NOWAIT, ...
+    }
+    if offset == u64::MAX {
+        return vector(p, fd, iov, iovcnt, is_write);
+    }
+    if (offset as i64) < 0 {
+        return Err(EINVAL);
+    }
+    if iovcnt > 1024 {
+        return Err(EINVAL);
+    }
+    p.fd(fd).ok_or(EBADF)?;
+    let mut total = 0u64;
+    for i in 0..iovcnt {
+        let mut hdr = [0u8; 16];
+        if p.copy_from_user(iov + i as u64 * 16, &mut hdr) != 16 {
+            return Err(EFAULT);
+        }
+        let (base, len) = (le_u64(&hdr[0..8]), le_u64(&hdr[8..16]) as usize);
+        let at = offset.checked_add(total).ok_or(EINVAL)?;
+        let n = if is_write {
+            pwrite(p, fd, base, len, at)?
+        } else {
+            pread(p, fd, base, len, at)?
+        };
+        total += n;
+        if (n as usize) < len {
+            break;
+        }
+    }
+    Ok(total)
+}
+
 pub(super) fn lseek(p: &mut LinuxProcess, fd: u64, offset: i64, whence: u64) -> Result<u64, i64> {
     const SEEK_SET: u64 = 0;
     const SEEK_CUR: u64 = 1;
     const SEEK_END: u64 = 2;
-    let f = file(p, fd).map_err(|_| ESPIPE)?;
+    // A closed descriptor is EBADF; an open one that is not a file is
+    // ESPIPE.
+    let f = file(p, fd).map_err(|e| if e == EBADF { EBADF } else { ESPIPE })?;
     let base = match whence {
         SEEK_SET => 0i64,
         SEEK_CUR => f.offset as i64,

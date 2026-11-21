@@ -70,6 +70,13 @@ mod sys {
     pub(super) const SYNC_FILE_RANGE: u64 = 277;
     pub(super) const MEMBARRIER: u64 = 324;
     pub(super) const SETXATTR: u64 = 188;
+    pub(super) const WAITID: u64 = 247;
+    pub(super) const PREADV: u64 = 295;
+    pub(super) const RT_SIGPENDING: u64 = 127;
+    pub(super) const SCHED_GET_PRIORITY_MAX: u64 = 146;
+    pub(super) const SCHED_SETAFFINITY: u64 = 203;
+    pub(super) const SCHED_GETAFFINITY: u64 = 204;
+    pub(super) const CLOCK_SETTIME: u64 = 227;
     pub(super) const GETXATTR: u64 = 191;
     pub(super) const LISTXATTR: u64 = 194;
     pub(super) const GETTID: u64 = 186;
@@ -1402,6 +1409,126 @@ fn misc_program() -> Vec<u8> {
         a.sys(call);
         check(&mut a, n, want);
     }
+    a.mov_imm(Reg::Rdi, 0);
+    a.bind(bad);
+    a.sys(sys::EXIT_GROUP);
+    static_elf(&a.finish(BLOB_VADDR).unwrap_or_else(|| fail("assembler")))
+}
+
+/// More of what CPython's suite calls: waitid reports a child's exit as a
+/// siginfo (CLD_EXITED, status 5); preadv reads at an offset; nothing is
+/// pending for rt_sigpending; SCHED_FIFO's priorities top out at 99; an
+/// affinity mask set is the one read back; a pipe's capacity reads 64 KiB
+/// and can be set to one page; clock_settime is EPERM. Exits 0, or the
+/// failed check.
+fn misc2_program() -> Vec<u8> {
+    const WEXITED: u64 = 4;
+    let neg = |e: i64| (-e) as u64;
+    let mut a = Asm::new();
+    let bad = a.label();
+    let parent = a.label();
+    let check = |a: &mut Asm, n: u64, want: u64| {
+        a.mov_imm(Reg::R14, want);
+        a.mov_imm(Reg::Rdi, n);
+        a.cmp(Reg::Rax, Reg::R14);
+        a.jne(bad);
+    };
+    a.mov(Reg::Rbp, Reg::Rsp);
+    a.sub_imm(Reg::Rbp, 4096);
+    a.sys(sys::FORK);
+    a.mov(Reg::R12, Reg::Rax);
+    a.cmp_imm(Reg::Rax, 0);
+    a.jne(parent);
+    a.mov_imm(Reg::Rdi, 5);
+    a.sys(sys::EXIT_GROUP);
+    a.bind(parent);
+    a.mov_imm(Reg::Rdi, 1); // P_PID
+    a.mov(Reg::Rsi, Reg::R12);
+    a.mov(Reg::Rdx, Reg::Rbp);
+    a.mov_imm(Reg::R10, WEXITED);
+    a.mov_imm(Reg::R8, 0);
+    a.sys(sys::WAITID);
+    check(&mut a, 1, 0);
+    a.load32(Reg::Rax, Reg::Rbp, 8); // si_code
+    check(&mut a, 2, 1);
+    a.load32(Reg::Rax, Reg::Rbp, 24); // si_status
+    check(&mut a, 3, 5);
+    // A pipe: write "abcdef", preadv is ESPIPE on it; its capacity.
+    a.mov(Reg::Rdi, Reg::Rbp);
+    a.add_imm(Reg::Rdi, 256);
+    a.mov_imm(Reg::Rsi, 0);
+    a.sys(sys::PIPE2);
+    check(&mut a, 4, 0);
+    a.load32(Reg::R13, Reg::Rbp, 256); // read end
+    a.mov(Reg::Rdi, Reg::R13);
+    a.mov_imm(Reg::Rsi, 1032); // F_GETPIPE_SZ
+    a.sys(sys::FCNTL);
+    check(&mut a, 5, 64 * 1024);
+    a.mov(Reg::Rdi, Reg::R13);
+    a.mov_imm(Reg::Rsi, 1031); // F_SETPIPE_SZ
+    a.mov_imm(Reg::Rdx, 100);
+    a.sys(sys::FCNTL);
+    check(&mut a, 6, 4096);
+    // preadv on a file at offset 1: "/x" of a fresh file holding "hello".
+    let name = a.data(b"/preadv\0");
+    let text = a.data(b"hello");
+    a.mov_data(Reg::Rdi, name);
+    a.mov_imm(Reg::Rsi, 0o102); // O_RDWR | O_CREAT
+    a.mov_imm(Reg::Rdx, 0o644);
+    a.sys(sys::OPEN);
+    a.mov(Reg::R15, Reg::Rax);
+    a.mov(Reg::Rdi, Reg::R15);
+    a.mov_data(Reg::Rsi, text);
+    a.mov_imm(Reg::Rdx, 5);
+    a.sys(sys::WRITE);
+    check(&mut a, 7, 5);
+    // iovec { rbp + 512, 3 } at rbp + 64.
+    a.mov(Reg::Rax, Reg::Rbp);
+    a.add_imm(Reg::Rax, 512);
+    a.store(Reg::Rbp, 64, Reg::Rax);
+    a.mov_imm(Reg::Rax, 3);
+    a.store(Reg::Rbp, 72, Reg::Rax);
+    a.mov(Reg::Rdi, Reg::R15);
+    a.mov(Reg::Rsi, Reg::Rbp);
+    a.add_imm(Reg::Rsi, 64);
+    a.mov_imm(Reg::Rdx, 1);
+    a.mov_imm(Reg::R10, 1);
+    a.mov_imm(Reg::R8, 0);
+    a.sys(sys::PREADV);
+    check(&mut a, 8, 3);
+    a.load32(Reg::Rax, Reg::Rbp, 512);
+    a.mov_imm(Reg::Rcx, 0xff_ffff);
+    a.raw(&[0x48, 0x21, 0xc8]); // and rax, rcx
+    check(&mut a, 9, u64::from(u32::from_le_bytes(*b"ell\0")));
+    a.mov(Reg::Rdi, Reg::Rbp);
+    a.mov_imm(Reg::Rsi, 8);
+    a.sys(sys::RT_SIGPENDING);
+    check(&mut a, 10, 0);
+    a.load(Reg::Rax, Reg::Rbp, 0);
+    check(&mut a, 11, 0);
+    a.mov_imm(Reg::Rdi, 1); // SCHED_FIFO
+    a.sys(sys::SCHED_GET_PRIORITY_MAX);
+    check(&mut a, 12, 99);
+    a.mov_imm(Reg::Rax, 1); // CPU 0 only
+    a.store(Reg::Rbp, 0, Reg::Rax);
+    a.mov_imm(Reg::Rdi, 0);
+    a.mov_imm(Reg::Rsi, 8);
+    a.mov(Reg::Rdx, Reg::Rbp);
+    a.sys(sys::SCHED_SETAFFINITY);
+    check(&mut a, 13, 0);
+    a.mov_imm(Reg::Rax, 0);
+    a.store(Reg::Rbp, 0, Reg::Rax);
+    a.mov_imm(Reg::Rdi, 0);
+    a.mov_imm(Reg::Rsi, 8);
+    a.mov(Reg::Rdx, Reg::Rbp);
+    a.sys(sys::SCHED_GETAFFINITY);
+    check(&mut a, 14, 8);
+    a.load(Reg::Rax, Reg::Rbp, 0);
+    check(&mut a, 15, 1);
+    a.mov_imm(Reg::Rdi, 0);
+    a.mov(Reg::Rsi, Reg::Rbp);
+    a.sys(sys::CLOCK_SETTIME);
+    check(&mut a, 16, neg(1));
     a.mov_imm(Reg::Rdi, 0);
     a.bind(bad);
     a.sys(sys::EXIT_GROUP);
@@ -2912,6 +3039,15 @@ pub(crate) fn run() {
     }
     println!(
         "ichor: linux: a backward rep movsq resumed backward across 16 page faults; DF kept across a syscall"
+    );
+
+    let (status, _) = run_linux(new_process(), &misc2_program(), None, &["misc2test"]);
+    if status != 0 {
+        println!("ichor: linux: misc2test failed check {status}");
+        fail("waitid, preadv, sigpending, sched_*, pipe size");
+    }
+    println!(
+        "ichor: linux: waitid, preadv, rt_sigpending, sched priorities and affinity, F_SETPIPE_SZ ok"
     );
 
     let (status, _) = run_linux(new_process(), &robust_program(), None, &["robusttest"]);

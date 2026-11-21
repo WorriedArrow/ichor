@@ -386,9 +386,13 @@ pub(super) fn connect(p: &mut LinuxProcess, fd: u64, addr: u64, len: u64) -> Res
         Err(e) => return Err(e),
     }
     if nonblock {
+        // A non-blocking TCP connect is EINPROGRESS even when it is done
+        // already (this stack's loopback completes synchronously): Linux
+        // answers so, and callers wait for writability, then read
+        // SO_ERROR (0 here). An immediate failure is reported as it is.
         return match s.stack.connect_result(id) {
-            Some(r) => r.map(|()| 0),
-            None => Err(netstack::EINPROGRESS),
+            Some(Err(e)) => Err(e),
+            Some(Ok(())) | None => Err(netstack::EINPROGRESS),
         };
     }
     let entry = p.entry.clone();
