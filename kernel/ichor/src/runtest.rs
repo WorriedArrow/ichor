@@ -65,6 +65,10 @@ mod sys {
     pub(super) const CLOCK_GETTIME: u64 = 228;
     pub(super) const MKNOD: u64 = 133;
     pub(super) const SYMLINK: u64 = 88;
+    pub(super) const CLOCK_GETRES: u64 = 229;
+    pub(super) const FALLOCATE: u64 = 285;
+    pub(super) const SYNC_FILE_RANGE: u64 = 277;
+    pub(super) const MEMBARRIER: u64 = 324;
     pub(super) const GETTID: u64 = 186;
     pub(super) const SET_ROBUST_LIST: u64 = 273;
     pub(super) const READLINK: u64 = 89;
@@ -1337,6 +1341,41 @@ fn misc_program() -> Vec<u8> {
     a.mov_imm(Reg::Rcx, 0xffff);
     a.raw(&[0x48, 0x21, 0xc8]); // and rax, rcx
     check(&mut a, 26, u64::from(u16::from_le_bytes(*b"t\xfe")));
+    // clock_getres(CLOCK_MONOTONIC) is 1 ns; fallocate grows the memfd
+    // (fd 3) to 8 KiB; sync_file_range and membarrier's query succeed;
+    // /dev/shm exists.
+    a.mov_imm(Reg::Rdi, 1);
+    a.mov(Reg::Rsi, Reg::Rbp);
+    a.sys(sys::CLOCK_GETRES);
+    check(&mut a, 27, 0);
+    a.load(Reg::Rax, Reg::Rbp, 8);
+    check(&mut a, 28, 1);
+    a.mov_imm(Reg::Rdi, 3);
+    a.mov_imm(Reg::Rsi, 0);
+    a.mov_imm(Reg::Rdx, 0);
+    a.mov_imm(Reg::R10, 8192);
+    a.sys(sys::FALLOCATE);
+    check(&mut a, 29, 0);
+    a.mov_imm(Reg::Rdi, 3);
+    a.mov(Reg::Rsi, Reg::Rbp);
+    a.sys(sys::FSTAT);
+    a.load(Reg::Rax, Reg::Rbp, 48); // st_size
+    check(&mut a, 30, 8192);
+    a.mov_imm(Reg::Rdi, 3);
+    a.mov_imm(Reg::Rsi, 0);
+    a.mov_imm(Reg::Rdx, 0);
+    a.mov_imm(Reg::R10, 0);
+    a.sys(sys::SYNC_FILE_RANGE);
+    check(&mut a, 31, 0);
+    a.mov_imm(Reg::Rdi, 0);
+    a.mov_imm(Reg::Rsi, 0);
+    a.sys(sys::MEMBARRIER);
+    check(&mut a, 32, 0);
+    let shm = a.data(b"/dev/shm\0");
+    a.mov_data(Reg::Rdi, shm);
+    a.mov(Reg::Rsi, Reg::Rbp);
+    a.sys(sys::STAT);
+    check(&mut a, 33, 0);
     a.mov_imm(Reg::Rdi, 0);
     a.bind(bad);
     a.sys(sys::EXIT_GROUP);

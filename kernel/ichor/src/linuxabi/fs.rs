@@ -574,6 +574,58 @@ pub(super) fn fsync(p: &mut LinuxProcess, fd: u64) -> Result<u64, i64> {
     p.fd(fd).ok_or(EBADF).map(|_| 0)
 }
 
+/// `sync_file_range`: as `fsync`, nothing to write back; the arguments are
+/// checked as Linux checks them.
+pub(super) fn sync_file_range(
+    p: &mut LinuxProcess,
+    fd: u64,
+    off: u64,
+    len: u64,
+    flags: u64,
+) -> Result<u64, i64> {
+    const VALID: u64 = 0b111; // WAIT_BEFORE | WRITE | WAIT_AFTER
+    if flags & !VALID != 0 || (off as i64) < 0 || (len as i64) < 0 {
+        return Err(EINVAL);
+    }
+    let _ = file(p, fd)?;
+    Ok(0)
+}
+
+/// `fallocate(fd, mode, offset, len)`: mode 0 makes the file at least
+/// `offset + len` long (the upper layer is sparse, so nothing is reserved
+/// ahead; a later write can still find the byte budget spent), and
+/// FALLOC_FL_KEEP_SIZE alone has nothing to do. Punching holes, collapsing
+/// and zeroing ranges are EOPNOTSUPP.
+pub(super) fn fallocate(
+    p: &mut LinuxProcess,
+    fd: u64,
+    mode: u64,
+    off: u64,
+    len: u64,
+) -> Result<u64, i64> {
+    const KEEP_SIZE: u64 = 1;
+    const EOPNOTSUPP: i64 = 95;
+    if (off as i64) < 0 || (len as i64) <= 0 {
+        return Err(EINVAL);
+    }
+    let f = file(p, fd)?;
+    if f.flags & O_ACCMODE == 0 {
+        return Err(EBADF);
+    }
+    let end = off.checked_add(len).ok_or(EFBIG)?;
+    match mode {
+        0 => {
+            let mut fs = p.fs();
+            if fs.stat(f.ino)?.size < end {
+                fs.truncate(f.ino, end)?;
+            }
+            Ok(0)
+        }
+        KEEP_SIZE => Ok(0),
+        _ => Err(EOPNOTSUPP),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // stat.
 // ---------------------------------------------------------------------------

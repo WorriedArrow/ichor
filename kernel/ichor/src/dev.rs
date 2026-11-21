@@ -66,6 +66,12 @@ pub(crate) fn populate(fs: &mut Overlay<'static>) {
     for &(name, num) in NODES {
         let _ = fs.mknod(dev, name, 0o666, num);
     }
+    // POSIX shared memory and semaphores (`shm_open`, `sem_open`) live in
+    // /dev/shm: a world-writable sticky directory of the root's upper
+    // layer, so its files are the cell's memory, as tmpfs would be.
+    if let Ok(shm) = fs.mkdir(dev, "shm", 0o777) {
+        let _ = fs.chmod(shm, 0o1777);
+    }
     crate::pty::populate(fs, dev);
 }
 

@@ -192,6 +192,10 @@ mod nr {
     pub(super) const SETPRIORITY: u64 = 141; // partial: PRIO_PROCESS of the caller only; the nice value does not affect scheduling
     pub(super) const FADVISE64: u64 = 221; // partial: advice is checked and ignored
     pub(super) const CLOSE_RANGE: u64 = 436; // partial: CLOSE_RANGE_UNSHARE is EINVAL
+    pub(super) const CLOCK_GETRES: u64 = 229;
+    pub(super) const FALLOCATE: u64 = 285; // partial: mode 0 extends the size (nothing is reserved); KEEP_SIZE is a no-op; holes and ranges are EOPNOTSUPP
+    pub(super) const SYNC_FILE_RANGE: u64 = 277; // partial: nothing to write back (the upper layer is memory)
+    pub(super) const MEMBARRIER: u64 = 324; // partial: CMD_QUERY reports no commands
     pub(super) const MEMFD_CREATE: u64 = 319; // partial: no sealing (F_ADD_SEALS); /proc/self/fd shows anon_inode:[file], not /memfd:NAME
     pub(super) const STATX: u64 = 332;
     pub(super) const PRLIMIT64: u64 = 302; // partial: own process only; NOFILE and STACK enforced, others stored
@@ -373,6 +377,14 @@ pub(crate) fn dispatch(p: &mut LinuxProcess, ctx: &mut frame::user::UserContext)
         // Identity, time, limits, signals, threads.
         nr::UNAME => uname(p, a[0]),
         nr::CLOCK_GETTIME => clock_gettime(p, a[0], a[1]),
+        nr::CLOCK_GETRES => clock_getres(p, a[0], a[1]),
+        nr::FALLOCATE => fs::fallocate(p, a[0], a[1], a[2], a[3]),
+        nr::SYNC_FILE_RANGE => fs::sync_file_range(p, a[0], a[1], a[2], a[3]),
+        nr::MEMBARRIER => {
+            // MEMBARRIER_CMD_QUERY: no commands are offered (callers fall
+            // back to their own fences); any other command is EINVAL.
+            if a[0] == 0 { Ok(0) } else { Err(EINVAL) }
+        }
         nr::GETTIMEOFDAY => gettimeofday(p, a[0]),
         nr::TIME => {
             let secs = crate::vfs::wall_clock().as_secs();
@@ -991,6 +1003,18 @@ fn clock_gettime(p: &mut LinuxProcess, clock: u64, tp: u64) -> Result<u64, i64> 
         _ => return Err(EINVAL),
     };
     put_pair(p, tp, t.as_secs(), u64::from(t.subsec_nanos()))
+}
+
+/// `clock_getres`: every clock `clock_gettime` answers reads the TSC-based
+/// time in nanoseconds (the coarse ones too), so the resolution is 1 ns.
+fn clock_getres(p: &mut LinuxProcess, clock: u64, res: u64) -> Result<u64, i64> {
+    if clock > 7 {
+        return Err(EINVAL);
+    }
+    if res == 0 {
+        return Ok(0);
+    }
+    put_pair(p, res, 0, 1)
 }
 
 fn gettimeofday(p: &mut LinuxProcess, tv: u64) -> Result<u64, i64> {
