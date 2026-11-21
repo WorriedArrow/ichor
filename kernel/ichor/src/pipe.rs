@@ -8,8 +8,8 @@
 //! once the last reader is gone. Writes of up to `PIPE_BUF` bytes are
 //! atomic, as POSIX requires; longer blocking writes complete in pieces.
 
-use alloc::collections::VecDeque;
-use alloc::sync::Arc;
+use alloc::collections::{BTreeMap, VecDeque};
+use alloc::sync::{Arc, Weak};
 
 use frame::sync::SpinLock;
 use frame::task::WaitQueue;
@@ -28,6 +28,10 @@ struct State {
     buf: VecDeque<u8>,
     readers: u32,
     writers: u32,
+    /// Opens of each end so far (a FIFO's blocking open waits for the other
+    /// end to be opened, even if it is closed again before the waiter runs).
+    reader_opens: u64,
+    writer_opens: u64,
 }
 
 /// A pipe.
@@ -47,11 +51,23 @@ pub(crate) struct Pipe {
 impl Pipe {
     /// A new pipe with one reader and one writer reference.
     pub(crate) fn new() -> Arc<Pipe> {
+        Self::with_ends(1)
+    }
+
+    /// A named pipe's pipe: no ends until the FIFO is opened
+    /// ([`Pipe::add_end`]).
+    pub(crate) fn new_fifo() -> Arc<Pipe> {
+        Self::with_ends(0)
+    }
+
+    fn with_ends(n: u32) -> Arc<Pipe> {
         Arc::new(Pipe {
             state: SpinLock::new(State {
                 buf: VecDeque::new(),
-                readers: 1,
-                writers: 1,
+                readers: n,
+                writers: n,
+                reader_opens: u64::from(n),
+                writer_opens: u64::from(n),
             }),
             readable: WaitQueue::new(),
             writable: WaitQueue::new(),
@@ -63,6 +79,58 @@ impl Pipe {
     /// The tasks polling this pipe.
     pub(crate) fn watchers(&self) -> &crate::poll::Watchers {
         &self.watchers
+    }
+
+    /// Adds a reference to one end (a FIFO opened for reading or writing),
+    /// waking opens waiting for it.
+    pub(crate) fn add_end(&self, write: bool) {
+        {
+            let mut s = self.state.lock();
+            if write {
+                s.writers += 1;
+                s.writer_opens += 1;
+            } else {
+                s.readers += 1;
+                s.reader_opens += 1;
+            }
+        }
+        self.readable.wake_all();
+        self.writable.wake_all();
+        self.changed();
+    }
+
+    /// Readers now (a FIFO's non-blocking open for writing needs one).
+    pub(crate) fn readers(&self) -> u32 {
+        self.state.lock().readers
+    }
+
+    /// Blocks a FIFO's open of one end until the other end is open, or has
+    /// been opened since this call began.
+    pub(crate) fn wait_peer(&self, write: bool, interrupted: &dyn Fn() -> bool) -> Result<(), i64> {
+        let opens = |s: &State| {
+            if write {
+                s.reader_opens
+            } else {
+                s.writer_opens
+            }
+        };
+        let start = opens(&self.state.lock());
+        let q = if write {
+            &self.writable
+        } else {
+            &self.readable
+        };
+        q.wait_until(|| {
+            let s = self.state.lock();
+            let peers = if write { s.readers } else { s.writers };
+            if peers > 0 || opens(&s) != start {
+                Some(Ok(()))
+            } else if interrupted() {
+                Some(Err(ERESTARTSYS))
+            } else {
+                None
+            }
+        })
     }
 
     /// Drops a reference to one end, waking the other side so it sees EOF
@@ -196,4 +264,21 @@ impl Pipe {
         }
         Ok(done)
     }
+}
+
+/// Named pipes' pipes, by FIFO id (`Overlay::fifo_id`, never reused). A
+/// FIFO's pipe lives while any end of it is open; opened again after that,
+/// it starts empty, as on Linux.
+static FIFOS: SpinLock<BTreeMap<u64, Weak<Pipe>>> = SpinLock::new(BTreeMap::new());
+
+/// The pipe behind FIFO `id`, made on its first open.
+pub(crate) fn fifo(id: u64) -> Arc<Pipe> {
+    let mut m = FIFOS.lock();
+    if let Some(p) = m.get(&id).and_then(Weak::upgrade) {
+        return p;
+    }
+    m.retain(|_, w| w.strong_count() > 0);
+    let p = Pipe::new_fifo();
+    m.insert(id, Arc::downgrade(&p));
+    p
 }

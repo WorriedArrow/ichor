@@ -124,6 +124,8 @@ pub enum Kind {
     /// A socket node (`bind` of an `AF_UNIX` path); the kernel keeps what
     /// listens there.
     Socket,
+    /// A named pipe (`mkfifo`); the kernel keeps the pipe.
+    Fifo,
 }
 
 /// A timestamp (seconds and nanoseconds since the epoch the kernel's
@@ -255,7 +257,14 @@ enum Data<'a> {
     Symlink(String),
     Device(u32),
     Socket,
+    /// A named pipe, by its id ([`Overlay::fifo_id`]).
+    Fifo(u64),
 }
+
+/// Ids of named pipes, unique for the kernel's lifetime: the kernel keys
+/// the pipe behind a FIFO by it, so a reused inode number never reaches an
+/// older FIFO's pipe.
+static NEXT_FIFO: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
 
 #[derive(Debug)]
 struct Inode<'a> {
@@ -295,6 +304,7 @@ impl Inode<'_> {
             Data::Symlink(_) => Kind::Symlink,
             Data::Device(_) => Kind::CharDevice,
             Data::Socket => Kind::Socket,
+            Data::Fifo(_) => Kind::Fifo,
         }
     }
 }
@@ -662,7 +672,7 @@ impl<'a> Overlay<'a> {
             Data::File(f) => f.size,
             Data::Dir(_) => 4096,
             Data::Symlink(t) => t.len() as u64,
-            Data::Device(_) | Data::Socket => 0,
+            Data::Device(_) | Data::Socket | Data::Fifo(_) => 0,
         };
         let rdev = match i.data {
             Data::Device(d) => d,
@@ -693,7 +703,7 @@ impl<'a> Overlay<'a> {
             Data::LowerFile(n) => self.read_lower(n, offset, out),
             Data::File(f) => Ok(f.read(offset, out)),
             Data::Dir(_) => Err(EISDIR),
-            Data::Symlink(_) | Data::Device(_) | Data::Socket => Err(EINVAL),
+            Data::Symlink(_) | Data::Device(_) | Data::Socket | Data::Fifo(_) => Err(EINVAL),
         }
     }
 
@@ -741,7 +751,9 @@ impl<'a> Overlay<'a> {
             Data::LowerFile(n) => *n,
             Data::File(_) => return Ok(()),
             Data::Dir(_) => return Err(EISDIR),
-            Data::Symlink(_) | Data::Device(_) | Data::Socket => return Err(EINVAL),
+            Data::Symlink(_) | Data::Device(_) | Data::Socket | Data::Fifo(_) => {
+                return Err(EINVAL);
+            }
         };
         let size = usize::try_from(node.size()).map_err(|_| EFBIG)?;
         if size > MAX_FILE {
@@ -776,7 +788,8 @@ impl<'a> Overlay<'a> {
             return Err(EFBIG);
         }
         match self.get(ino)?.data {
-            Data::Device(_) => return Ok(()), // `O_TRUNC` on /dev/null and friends
+            // `O_TRUNC` on /dev/null and friends, or on a FIFO.
+            Data::Device(_) | Data::Fifo(_) => return Ok(()),
             Data::Socket => return Err(EINVAL),
             _ => {}
         }
@@ -896,6 +909,24 @@ impl<'a> Overlay<'a> {
         self.add(dir, name, inode)
     }
 
+    /// Creates a file with no name (`memfd_create`), counted as open once:
+    /// it lives until that handle and every later one is closed, and its
+    /// pages count against the byte budget like any upper file's.
+    pub fn create_unnamed(&mut self, mode: u32) -> Ino {
+        let mut inode = Inode::fresh(
+            Data::File(FileData::default()),
+            mode & 0o7777,
+            0,
+            (self.clock)(),
+        );
+        if let Some(c) = &self.cred {
+            inode.uid = c.uid;
+            inode.gid = c.gid;
+        }
+        inode.opens = 1;
+        self.alloc(inode)
+    }
+
     /// Adds the name `ndir/nname` for the existing non-directory `ino` (a
     /// hard link): both names are the same inode, which lives until its
     /// last name is gone and it is closed.
@@ -962,6 +993,22 @@ impl<'a> Overlay<'a> {
     pub fn mknod(&mut self, dir: Ino, name: &str, mode: u32, rdev: u32) -> Result<Ino, i64> {
         let inode = Inode::fresh(Data::Device(rdev), mode & 0o7777, 1, (self.clock)());
         self.add(dir, name, inode)
+    }
+
+    /// Creates a named pipe (`mkfifo`).
+    pub fn mkfifo(&mut self, dir: Ino, name: &str, mode: u32) -> Result<Ino, i64> {
+        let id = NEXT_FIFO.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        let inode = Inode::fresh(Data::Fifo(id), mode & 0o7777, 1, (self.clock)());
+        self.add(dir, name, inode)
+    }
+
+    /// The id of the named pipe `ino`, if it is one: the same for every
+    /// name and open of that FIFO, never reused.
+    pub fn fifo_id(&self, ino: Ino) -> Option<u64> {
+        match self.get(ino).ok()?.data {
+            Data::Fifo(id) => Some(id),
+            _ => None,
+        }
     }
 
     /// Creates a socket node (what `bind` of an `AF_UNIX` path leaves).
@@ -1376,6 +1423,45 @@ mod tests {
         fs.unlink(ROOT, "f").unwrap();
         assert_eq!(read_all(&fs, f), b"data");
         assert_eq!(fs.used_bytes(), PAGE);
+        fs.close(f);
+        assert_eq!(fs.used_bytes(), 0);
+        assert!(fs.stat(f).is_err());
+    }
+
+    #[test]
+    fn fifos_have_their_own_ids() {
+        let mut fs = Overlay::empty(1 << 20);
+        let a = fs.mkfifo(ROOT, "a", 0o644).unwrap();
+        let b = fs.mkfifo(ROOT, "b", 0o600).unwrap();
+        let st = fs.stat(a).unwrap();
+        assert_eq!((st.kind, st.mode, st.size), (Kind::Fifo, 0o644, 0));
+        assert_eq!(fs.readdir(ROOT).unwrap()[0].2, Kind::Fifo);
+        let (ia, ib) = (fs.fifo_id(a).unwrap(), fs.fifo_id(b).unwrap());
+        assert_ne!(ia, ib);
+        fs.link(a, ROOT, "c").unwrap();
+        let c = fs.resolve(ROOT, "/c", true).unwrap();
+        assert_eq!(fs.fifo_id(c), Some(ia));
+        assert_eq!(fs.read(a, 0, &mut [0; 4]), Err(EINVAL));
+        assert_eq!(fs.truncate(a, 0), Ok(()));
+        fs.unlink(ROOT, "a").unwrap();
+        fs.unlink(ROOT, "c").unwrap();
+        let d = fs.mkfifo(ROOT, "d", 0o644).unwrap();
+        assert_ne!(fs.fifo_id(d), Some(ia), "a reused inode gets a new id");
+        assert_eq!(fs.fifo_id(ROOT), None);
+    }
+
+    #[test]
+    fn unnamed_files_live_while_open() {
+        let mut fs = Overlay::empty(1 << 20);
+        let f = fs.create_unnamed(0o600);
+        fs.write(f, 0, b"memfd").unwrap();
+        let st = fs.stat(f).unwrap();
+        assert_eq!((st.kind, st.nlink, st.size), (Kind::File, 0, 5));
+        assert!(names(&mut fs, ROOT).is_empty());
+        assert_eq!(fs.link(f, ROOT, "x"), Err(ENOENT));
+        fs.open(f).unwrap(); // a dup'd description
+        fs.close(f);
+        assert_eq!(read_all(&fs, f), b"memfd");
         fs.close(f);
         assert_eq!(fs.used_bytes(), 0);
         assert!(fs.stat(f).is_err());

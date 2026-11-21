@@ -146,11 +146,18 @@ fn open_path(
         match st.kind {
             Kind::Directory if acc != 0 => return Err(EISDIR),
             Kind::Symlink => return Err(ELOOP), // O_NOFOLLOW on a symlink
-            Kind::File | Kind::CharDevice | Kind::Socket if flags & O_DIRECTORY != 0 => {
+            Kind::File | Kind::CharDevice | Kind::Socket | Kind::Fifo
+                if flags & O_DIRECTORY != 0 =>
+            {
                 return Err(ENOTDIR);
             }
             // A socket node is reached with connect, not open (Linux: ENXIO).
             Kind::Socket => return Err(ENXIO),
+            Kind::Fifo => {
+                let id = fs.fifo_id(ino).ok_or(ENXIO)?;
+                drop(fs);
+                return open_fifo(p, id, flags);
+            }
             Kind::CharDevice => {
                 drop(fs);
                 let fd = crate::dev::open(p, st.rdev, ino, flags)?;
@@ -170,6 +177,66 @@ fn open_path(
         flags: flags & (O_ACCMODE | O_APPEND | O_NONBLOCK),
     };
     p.install_flags(Fd::File(f), flags & O_CLOEXEC != 0)
+        .ok_or(EMFILE)
+}
+
+/// Opens a named pipe: one end of the FIFO's pipe, shared by every open of
+/// it. As on Linux, opening one end blocks until the other is opened
+/// (unless O_NONBLOCK); a non-blocking open for writing with no reader is
+/// ENXIO. O_RDWR (both ends in one description) is not supported: EINVAL.
+fn open_fifo(p: &mut LinuxProcess, id: u64, flags: u64) -> Result<u64, i64> {
+    let write = match flags & O_ACCMODE {
+        0 => false,
+        O_WRONLY => true,
+        _ => return Err(EINVAL),
+    };
+    let nonblock = flags & O_NONBLOCK != 0;
+    let pipe = crate::pipe::fifo(id);
+    if write && nonblock && pipe.readers() == 0 {
+        return Err(ENXIO);
+    }
+    pipe.add_end(write);
+    if !nonblock {
+        let entry = p.entry.clone();
+        if let Err(e) = pipe.wait_peer(write, &|| proc::interrupted(&entry)) {
+            pipe.drop_end(write);
+            return Err(e);
+        }
+    }
+    let end = PipeEnd {
+        pipe,
+        write,
+        nonblock,
+    };
+    // A full table drops the description, which drops the end again.
+    p.install_flags(Fd::Pipe(end), flags & O_CLOEXEC != 0)
+        .ok_or(EMFILE)
+}
+
+/// `memfd_create(name, flags)`: an anonymous read-write file. It is an
+/// unnamed file of the cell's root (its pages count against the root's
+/// byte budget, as tmpfs memory would count against the cell) and lives
+/// until its last descriptor closes. Sealing is not supported: with
+/// MFD_ALLOW_SEALING the file is made, but F_ADD_SEALS is not.
+pub(super) fn memfd_create(p: &mut LinuxProcess, name: u64, flags: u64) -> Result<u64, i64> {
+    const MFD_CLOEXEC: u64 = 1;
+    const MFD_ALLOW_SEALING: u64 = 2;
+    /// Linux's limit: "memfd:" plus the name fits NAME_MAX.
+    const MFD_NAME_MAX: usize = 249;
+    if flags & !(MFD_CLOEXEC | MFD_ALLOW_SEALING) != 0 {
+        return Err(EINVAL); // MFD_HUGETLB and friends
+    }
+    if user_path(p, name)?.len() > MFD_NAME_MAX {
+        return Err(EINVAL);
+    }
+    let ino = p.fs().create_unnamed(0o600);
+    let f = OpenFile {
+        ino,
+        offset: 0,
+        flags: 0o2, // O_RDWR
+    };
+    // A full table drops the description, which closes (frees) the file.
+    p.install_flags(Fd::File(f), flags & MFD_CLOEXEC != 0)
         .ok_or(EMFILE)
 }
 
@@ -546,6 +613,7 @@ fn to_stat(s: &Stat) -> [u8; 144] {
         Kind::Symlink => S_IFLNK,
         Kind::CharDevice => S_IFCHR,
         Kind::Socket => S_IFSOCK,
+        Kind::Fifo => S_IFIFO,
     };
     let mut st = stat_bytes(s.ino, kind | s.mode, s.nlink, s.size);
     st[40..48].copy_from_slice(&u64::from(s.rdev).to_le_bytes()); // st_rdev
@@ -734,6 +802,7 @@ pub(super) fn getdents64(
     buf: u64,
     count: usize,
 ) -> Result<u64, i64> {
+    const DT_FIFO: u8 = 1;
     const DT_CHR: u8 = 2;
     const DT_DIR: u8 = 4;
     const DT_REG: u8 = 8;
@@ -794,6 +863,7 @@ pub(super) fn getdents64(
                     Kind::Symlink => DT_LNK,
                     Kind::CharDevice => DT_CHR,
                     Kind::Socket => DT_SOCK,
+                    Kind::Fifo => DT_FIFO,
                 };
                 (*ino, t, n.as_str())
             }),
@@ -832,6 +902,33 @@ pub(super) fn mkdir(p: &mut LinuxProcess, dirfd: i64, addr: u64, mode: u64) -> R
     let mut fs = p.fs();
     let (dir, name) = fs.resolve_parent(start, &path)?;
     fs.mkdir(dir, &name, mode as u32 & !umask)?;
+    Ok(0)
+}
+
+/// `mknod`/`mknodat`: FIFOs, regular files and socket nodes. Device nodes
+/// need CAP_MKNOD, which is outside the cell bounding set: EPERM, as for an
+/// unprivileged Linux process (a cell's devices are its `/dev`).
+pub(super) fn mknod(
+    p: &mut LinuxProcess,
+    dirfd: i64,
+    addr: u64,
+    mode: u64,
+    _dev: u64,
+) -> Result<u64, i64> {
+    const S_IFMT: u32 = 0o170_000;
+    const S_IFBLK: u32 = 0o060_000;
+    let mode = mode as u32;
+    let (start, path) = path_at(p, dirfd, addr)?;
+    let perm = mode & 0o7777 & !p.umask();
+    let mut fs = p.fs();
+    let (dir, name) = fs.resolve_parent(start, &path)?;
+    match mode & S_IFMT {
+        0 | S_IFREG => fs.create(dir, &name, perm)?,
+        S_IFIFO => fs.mkfifo(dir, &name, perm)?,
+        S_IFSOCK => fs.mksocket(dir, &name, perm)?,
+        S_IFCHR | S_IFBLK => return Err(EPERM),
+        _ => return Err(EINVAL),
+    };
     Ok(0)
 }
 

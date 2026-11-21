@@ -61,6 +61,11 @@ mod sys {
     pub(super) const SETPRIORITY: u64 = 141;
     pub(super) const FADVISE64: u64 = 221;
     pub(super) const CLOSE_RANGE: u64 = 436;
+    pub(super) const MEMFD_CREATE: u64 = 319;
+    pub(super) const CLOCK_GETTIME: u64 = 228;
+    pub(super) const MKNOD: u64 = 133;
+    pub(super) const CLOCK_NANOSLEEP: u64 = 230;
+    pub(super) const PREAD64: u64 = 17;
     pub(super) const EXIT_GROUP: u64 = 231;
     pub(super) const RT_SIGACTION: u64 = 13;
     pub(super) const RT_SIGRETURN: u64 = 15;
@@ -1181,7 +1186,8 @@ fn direction_program() -> Vec<u8> {
 /// What CPython's subprocess and os modules call: `close_range` closes a
 /// pipe's two ends (fds 3 and 4) and nothing below them; `fadvise64` checks
 /// its descriptor; the nice value reads 0 (raw 20), rises to 5 (raw 15),
-/// and cannot be lowered again. Exits 0, or the number of the failed check.
+/// and cannot be lowered again; `memfd_create` gives a close-on-exec file
+/// that keeps what is written. Exits 0, or the number of the failed check.
 fn misc_program() -> Vec<u8> {
     const F_GETFD: u64 = 1;
     let neg = |e: i64| (-e) as u64;
@@ -1228,6 +1234,176 @@ fn misc_program() -> Vec<u8> {
         a.sys(call);
         check(&mut a, n, want);
     }
+    // memfd_create("m", MFD_CLOEXEC) is the lowest free fd (3), close-on-
+    // exec, and holds what is written; MFD_HUGETLB is EINVAL.
+    let name = a.data(b"m\0");
+    let text = a.data(b"memfd");
+    a.mov_data(Reg::Rdi, name);
+    a.mov_imm(Reg::Rsi, 1);
+    a.sys(sys::MEMFD_CREATE);
+    check(&mut a, 11, 3);
+    a.mov_imm(Reg::Rdi, 3);
+    a.mov_imm(Reg::Rsi, F_GETFD);
+    a.sys(sys::FCNTL);
+    check(&mut a, 12, 1);
+    a.mov_imm(Reg::Rdi, 3);
+    a.mov_data(Reg::Rsi, text);
+    a.mov_imm(Reg::Rdx, 5);
+    a.sys(sys::WRITE);
+    check(&mut a, 13, 5);
+    a.mov_imm(Reg::Rdi, 3);
+    a.mov(Reg::Rsi, Reg::Rbp);
+    a.mov_imm(Reg::Rdx, 8);
+    a.mov_imm(Reg::R10, 0);
+    a.sys(sys::PREAD64);
+    check(&mut a, 14, 5);
+    a.load(Reg::Rax, Reg::Rbp, 0);
+    check(
+        &mut a,
+        15,
+        u64::from_le_bytes(*b"memfd\0\0\0") & 0xff_ffff_ffff,
+    );
+    a.mov_data(Reg::Rdi, name);
+    a.mov_imm(Reg::Rsi, 4);
+    a.sys(sys::MEMFD_CREATE);
+    check(&mut a, 16, neg(22));
+    // clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME) until the next whole
+    // second, and the clock is past it afterwards; CPU clocks are ENOTSUP.
+    a.mov_imm(Reg::Rdi, 1);
+    a.mov(Reg::Rsi, Reg::Rbp);
+    a.add_imm(Reg::Rsi, 16);
+    a.sys(sys::CLOCK_GETTIME);
+    a.load(Reg::Rax, Reg::Rbp, 16);
+    a.add_imm(Reg::Rax, 1);
+    a.store(Reg::Rbp, 16, Reg::Rax);
+    a.mov_imm(Reg::Rax, 0);
+    a.store(Reg::Rbp, 24, Reg::Rax);
+    a.mov_imm(Reg::Rdi, 1);
+    a.mov_imm(Reg::Rsi, 1);
+    a.mov(Reg::Rdx, Reg::Rbp);
+    a.add_imm(Reg::Rdx, 16);
+    a.mov_imm(Reg::R10, 0);
+    a.sys(sys::CLOCK_NANOSLEEP);
+    check(&mut a, 17, 0);
+    a.mov_imm(Reg::Rdi, 1);
+    a.mov(Reg::Rsi, Reg::Rbp);
+    a.add_imm(Reg::Rsi, 32);
+    a.sys(sys::CLOCK_GETTIME);
+    a.load(Reg::Rax, Reg::Rbp, 16);
+    a.load(Reg::Rcx, Reg::Rbp, 32);
+    a.mov_imm(Reg::Rdi, 18);
+    a.cmp(Reg::Rax, Reg::Rcx);
+    a.ja(bad); // woke before the deadline's second
+    a.mov_imm(Reg::Rdi, 2);
+    a.mov_imm(Reg::Rsi, 0);
+    a.mov(Reg::Rdx, Reg::Rbp);
+    a.add_imm(Reg::Rdx, 16);
+    a.mov_imm(Reg::R10, 0);
+    a.sys(sys::CLOCK_NANOSLEEP);
+    check(&mut a, 19, neg(95));
+    a.mov_imm(Reg::Rdi, 0);
+    a.bind(bad);
+    a.sys(sys::EXIT_GROUP);
+    static_elf(&a.finish(BLOB_VADDR).unwrap_or_else(|| fail("assembler")))
+}
+
+/// Named pipes: `mknod(S_IFIFO)` makes one that stats as a FIFO; a
+/// non-blocking open for writing with no reader is ENXIO; with a reader
+/// open, bytes pass and the last writer's close is EOF; a blocking reader
+/// open waits for a forked child's blocking writer open (each waits for
+/// the other); device nodes are EPERM. Exits 0, or the failed check.
+fn fifo_program() -> Vec<u8> {
+    const S_IFIFO: u64 = 0o010_000;
+    const O_WRONLY: u64 = 1;
+    const O_NONBLOCK: u64 = 0o4000;
+    let neg = |e: i64| (-e) as u64;
+    let mut a = Asm::new();
+    let bad = a.label();
+    let parent = a.label();
+    let path = a.data(b"/fifo\0");
+    let dev = a.data(b"/dev0\0");
+    let text = a.data(b"abc");
+    let check = |a: &mut Asm, n: u64, want: u64| {
+        a.mov_imm(Reg::R14, want);
+        a.mov_imm(Reg::Rdi, n);
+        a.cmp(Reg::Rax, Reg::R14);
+        a.jne(bad);
+    };
+    let open = |a: &mut Asm, flags: u64| {
+        a.mov_data(Reg::Rdi, path);
+        a.mov_imm(Reg::Rsi, flags);
+        a.mov_imm(Reg::Rdx, 0);
+        a.sys(sys::OPEN);
+    };
+    a.mov(Reg::Rbp, Reg::Rsp);
+    a.sub_imm(Reg::Rbp, 4096);
+    a.mov_data(Reg::Rdi, path);
+    a.mov_imm(Reg::Rsi, S_IFIFO | 0o644);
+    a.mov_imm(Reg::Rdx, 0);
+    a.sys(sys::MKNOD);
+    check(&mut a, 1, 0);
+    a.mov_data(Reg::Rdi, path);
+    a.mov(Reg::Rsi, Reg::Rbp);
+    a.sys(sys::STAT);
+    check(&mut a, 2, 0);
+    a.load32(Reg::Rax, Reg::Rbp, 24); // st_mode
+    check(&mut a, 3, S_IFIFO | 0o644);
+    open(&mut a, O_WRONLY | O_NONBLOCK);
+    check(&mut a, 4, neg(6)); // ENXIO
+    open(&mut a, O_NONBLOCK);
+    check(&mut a, 5, 3);
+    open(&mut a, O_WRONLY | O_NONBLOCK);
+    check(&mut a, 6, 4);
+    a.mov_imm(Reg::Rdi, 4);
+    a.mov_data(Reg::Rsi, text);
+    a.mov_imm(Reg::Rdx, 3);
+    a.sys(sys::WRITE);
+    check(&mut a, 7, 3);
+    a.mov_imm(Reg::Rdi, 4);
+    a.sys(sys::CLOSE);
+    for (n, want) in [(8, 3), (9, 0)] {
+        a.mov_imm(Reg::Rdi, 3);
+        a.mov(Reg::Rsi, Reg::Rbp);
+        a.mov_imm(Reg::Rdx, 16);
+        a.sys(sys::READ);
+        check(&mut a, n, want); // the bytes, then EOF
+    }
+    a.mov_imm(Reg::Rdi, 3);
+    a.sys(sys::CLOSE);
+    // Blocking opens meet across fork.
+    a.sys(sys::FORK);
+    a.mov(Reg::R12, Reg::Rax);
+    a.cmp_imm(Reg::Rax, 0);
+    a.jne(parent);
+    open(&mut a, O_WRONLY);
+    a.mov(Reg::Rdi, Reg::Rax);
+    a.mov_data(Reg::Rsi, text);
+    a.mov_imm(Reg::Rdx, 1);
+    a.sys(sys::WRITE);
+    a.mov_imm(Reg::Rdi, 0);
+    a.sys(sys::EXIT_GROUP);
+    a.bind(parent);
+    open(&mut a, 0);
+    check(&mut a, 10, 3);
+    a.mov_imm(Reg::Rdi, 3);
+    a.mov(Reg::Rsi, Reg::Rbp);
+    a.mov_imm(Reg::Rdx, 16);
+    a.sys(sys::READ);
+    check(&mut a, 11, 1);
+    a.mov(Reg::Rdi, Reg::R12);
+    a.mov(Reg::Rsi, Reg::Rbp);
+    a.add_imm(Reg::Rsi, 64);
+    a.mov_imm(Reg::Rdx, 0);
+    a.mov_imm(Reg::R10, 0);
+    a.sys(sys::WAIT4);
+    a.mov_imm(Reg::Rdi, 12);
+    a.cmp(Reg::Rax, Reg::R12);
+    a.jne(bad);
+    a.mov_data(Reg::Rdi, dev);
+    a.mov_imm(Reg::Rsi, 0o020_000 | 0o644); // S_IFCHR
+    a.mov_imm(Reg::Rdx, 0x103);
+    a.sys(sys::MKNOD);
+    check(&mut a, 13, neg(1));
     a.mov_imm(Reg::Rdi, 0);
     a.bind(bad);
     a.sys(sys::EXIT_GROUP);
@@ -2564,12 +2740,23 @@ pub(crate) fn run() {
         "ichor: linux: a backward rep movsq resumed backward across 16 page faults; DF kept across a syscall"
     );
 
+    let (status, _) = run_linux(new_process(), &fifo_program(), None, &["fifotest"]);
+    if status != 0 {
+        println!("ichor: linux: fifotest failed check {status}");
+        fail("named pipes");
+    }
+    println!(
+        "ichor: linux: mknod FIFO: ENXIO without a reader, EOF after the writer, blocking opens meet"
+    );
+
     let (status, _) = run_linux(new_process(), &misc_program(), None, &["misctest"]);
     if status != 0 {
         println!("ichor: linux: misctest failed check {status}");
         fail("close_range, fadvise64, priorities");
     }
-    println!("ichor: linux: close_range, fadvise64, get/setpriority ok");
+    println!(
+        "ichor: linux: close_range, fadvise64, get/setpriority, memfd_create, absolute clock_nanosleep ok"
+    );
 
     let (status, syscalls) = run_linux(new_process(), &poll_program(), None, &["polltest"]);
     if status != 0 {

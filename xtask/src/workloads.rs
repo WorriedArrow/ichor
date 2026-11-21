@@ -51,7 +51,9 @@ pub const PYTHON: Suite = Suite {
     }],
     // No `-u`: regrtest enables no optional resources (network, cpu-heavy,
     // largefile, ...) by default, which is what a sealed cell can offer.
-    argv: &["python3", "-m", "test", "--timeout", "600"],
+    // `-j0` (ADR-0013): each module in a worker process, so a module that
+    // crashes or hangs its interpreter costs that module, not the run.
+    argv: &["python3", "-m", "test", "-j0", "--timeout", "600"],
     env: &["PYTHONUNBUFFERED=1"],
 };
 

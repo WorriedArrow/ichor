@@ -341,6 +341,51 @@ pub(crate) fn nanosleep(p: &mut LinuxProcess, req: u64, rem: u64) -> Result<u64,
     Err(EINTR)
 }
 
+/// `clock_nanosleep(clock, flags, req, rem)`: relative sleeps as
+/// `nanosleep`; with TIMER_ABSTIME, until `req` on `clock` (CPython's
+/// `time.sleep` sleeps this way on CLOCK_MONOTONIC). A realtime deadline
+/// is converted once to monotonic time, so a clock step during the sleep
+/// is not followed (the wall clock here never steps). An interrupted
+/// absolute sleep is EINTR and leaves `rem` alone, as on Linux.
+pub(crate) fn clock_nanosleep(
+    p: &mut LinuxProcess,
+    clock: u64,
+    flags: u64,
+    req: u64,
+    rem: u64,
+) -> Result<u64, i64> {
+    const REALTIME: u64 = 0;
+    const MONOTONIC: u64 = 1;
+    const BOOTTIME: u64 = 7;
+    const TIMER_ABSTIME: u64 = 1;
+    const ENOTSUP: i64 = 95;
+    match clock {
+        REALTIME | MONOTONIC | BOOTTIME => {}
+        2 | 3 => return Err(ENOTSUP), // CPU-time clocks are not accounted
+        _ => return Err(EINVAL),
+    }
+    if flags & TIMER_ABSTIME == 0 {
+        return nanosleep(p, req, rem);
+    }
+    let sec = read_u64(p, req)?;
+    let nsec = read_u64(p, req + 8)?;
+    if nsec >= 1_000_000_000 || sec > i64::MAX as u64 {
+        return Err(EINVAL);
+    }
+    let target =
+        core::time::Duration::from_secs(sec).saturating_add(core::time::Duration::from_nanos(nsec));
+    let now = frame::time::now();
+    let deadline = if clock == REALTIME {
+        now.saturating_add(target.saturating_sub(crate::vfs::wall_clock()))
+    } else {
+        target
+    };
+    if deadline <= now || !proc::sleep_until(&p.entry, deadline) {
+        return Ok(0);
+    }
+    Err(EINTR)
+}
+
 /// `kill`: process-directed (any thread of the target may take it). `pid`
 /// 0 is the caller's process group, `-pgid` another group, -1 every other
 /// process in the cell. Never crosses the cell.

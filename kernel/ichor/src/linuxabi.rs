@@ -155,7 +155,7 @@ mod nr {
     pub(super) const GETDENTS64: u64 = 217;
     pub(super) const SET_TID_ADDRESS: u64 = 218;
     pub(super) const CLOCK_GETTIME: u64 = 228; // partial: CPU-time clocks report time since the process started
-    pub(super) const CLOCK_NANOSLEEP: u64 = 230; // partial: relative sleeps only
+    pub(super) const CLOCK_NANOSLEEP: u64 = 230; // partial: CPU-time clocks are ENOTSUP; an absolute realtime sleep does not follow clock steps
     pub(super) const UTIMES: u64 = 235;
     pub(super) const EXIT_GROUP: u64 = 231;
     pub(super) const EPOLL_WAIT: u64 = 232; // partial: interest list fixed for the wait; nested epoll never ready
@@ -163,6 +163,8 @@ mod nr {
     pub(super) const TGKILL: u64 = 234;
     pub(super) const OPENAT: u64 = 257;
     pub(super) const MKDIRAT: u64 = 258;
+    pub(super) const MKNOD: u64 = 133; // partial: FIFOs, regular files, sockets; device nodes are EPERM (no CAP_MKNOD in cells)
+    pub(super) const MKNODAT: u64 = 259; // partial: FIFOs, regular files, sockets; device nodes are EPERM (no CAP_MKNOD in cells)
     pub(super) const FCHOWNAT: u64 = 260;
     pub(super) const NEWFSTATAT: u64 = 262;
     pub(super) const UNLINKAT: u64 = 263;
@@ -188,6 +190,7 @@ mod nr {
     pub(super) const SETPRIORITY: u64 = 141; // partial: PRIO_PROCESS of the caller only; the nice value does not affect scheduling
     pub(super) const FADVISE64: u64 = 221; // partial: advice is checked and ignored
     pub(super) const CLOSE_RANGE: u64 = 436; // partial: CLOSE_RANGE_UNSHARE is EINVAL
+    pub(super) const MEMFD_CREATE: u64 = 319; // partial: no sealing (F_ADD_SEALS); /proc/self/fd shows anon_inode:[file], not /memfd:NAME
     pub(super) const STATX: u64 = 332;
     pub(super) const PRLIMIT64: u64 = 302; // partial: own process only; NOFILE and STACK enforced, others stored
     pub(super) const GETRANDOM: u64 = 318; // ChaCha20 seeded from RDSEED/RDRAND and virtio-rng
@@ -264,6 +267,8 @@ pub(crate) fn dispatch(p: &mut LinuxProcess, ctx: &mut frame::user::UserContext)
         nr::GETDENTS64 => fs::getdents64(p, a[0], a[1], a[2] as usize),
         nr::MKDIR => fs::mkdir(p, AT_FDCWD, a[0], a[1]),
         nr::MKDIRAT => fs::mkdir(p, i(a[0]), a[1], a[2]),
+        nr::MKNOD => fs::mknod(p, AT_FDCWD, a[0], a[1], a[2]),
+        nr::MKNODAT => fs::mknod(p, i(a[0]), a[1], a[2], a[3]),
         nr::RMDIR => fs::unlink(p, AT_FDCWD, a[0], 0x200),
         nr::UNLINK => fs::unlink(p, AT_FDCWD, a[0], 0),
         nr::LINK => fs::link(p, AT_FDCWD, a[0], AT_FDCWD, a[1], 0),
@@ -391,8 +396,7 @@ pub(crate) fn dispatch(p: &mut LinuxProcess, ctx: &mut frame::user::UserContext)
         nr::GETITIMER => getitimer(p, a[0], a[1]),
         nr::ALARM => alarm(p, a[0]),
         nr::SETITIMER => setitimer(p, a[0], a[1], a[2]),
-        nr::CLOCK_NANOSLEEP if a[1] == 0 => signal::nanosleep(p, a[2], a[3]),
-        nr::CLOCK_NANOSLEEP => Err(EINVAL), // TIMER_ABSTIME
+        nr::CLOCK_NANOSLEEP => signal::clock_nanosleep(p, a[0], a[1], a[2], a[3]),
         nr::KILL => signal::kill(p, i(a[0]), a[1]),
         nr::TKILL => signal::tkill(p, None, a[0], a[1]),
         nr::TGKILL => signal::tkill(p, Some(a[0]), a[1], a[2]),
@@ -411,6 +415,7 @@ pub(crate) fn dispatch(p: &mut LinuxProcess, ctx: &mut frame::user::UserContext)
         nr::PRCTL => prctl(p, a[0], a[1], a[2]),
         nr::GETPRIORITY => priority(p, i(a[0]), a[1], None),
         nr::SETPRIORITY => priority(p, i(a[0]), a[1], Some(i(a[2]))),
+        nr::MEMFD_CREATE => fs::memfd_create(p, a[0], a[1]),
         nr::FADVISE64 => {
             // POSIX_FADV_NORMAL..=POSIX_FADV_NOREUSE on an open descriptor.
             if p.fd(a[0]).is_none() {
