@@ -17,6 +17,7 @@ dependencies = [
  "ichor-frame",
  "ichor-gpt",
  "ichor-image",
+ "ichor-intel-gbe",
  "ichor-net",
  "ichor-nvme",
  "ichor-overlay",
@@ -146,6 +147,14 @@ name = "ichor-image"
 version = "0.0.0"
 dependencies = [
  "ichor-blake3",
+]
+
+[[package]]
+name = "ichor-intel-gbe"
+version = "0.0.0"
+dependencies = [
+ "ichor-frame",
+ "ichor-net",
 ]
 
 [[package]]

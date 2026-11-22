@@ -803,6 +803,12 @@ print "debian: cells: a datagram crossed the switch and came back\n";
 const NAT_CLIENT: &str = r#"use strict; use warnings; use Socket;
 sub fail { print "debian: nat FAILED: @_\n"; exit 1 }
 my ($host, $port) = @ARGV;
+# What a cloud tells the machine is not for its cells.
+for my $addr ("169.254.169.254", "168.63.129.16") {
+    socket(my $md, AF_INET, SOCK_STREAM, 0) or fail("socket: $!");
+    connect($md, pack_sockaddr_in(80, inet_aton($addr))) and fail("connected to the machine's $addr");
+    $!{ECONNREFUSED} or fail("$addr: $!");
+}
 socket(my $s, AF_INET, SOCK_STREAM, 0) or fail("socket: $!");
 connect($s, pack_sockaddr_in($port, inet_aton($host))) or fail("connect: $!");
 my $n = 256 * 1024;

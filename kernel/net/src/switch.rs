@@ -14,6 +14,16 @@ use core::time::Duration;
 
 use crate::Ipv4Addr;
 
+/// Whether `dst:port` is the machine's own, not its cells': what a cloud
+/// tells and gives a machine at link-local addresses (its credentials among
+/// it, to whoever asks from there) and, on Azure, at 168.63.129.16. Names
+/// are asked for there too, on some clouds: those any cell may ask for.
+pub fn is_machines(dst: Ipv4Addr, port: u16) -> bool {
+    const AZURE: Ipv4Addr = Ipv4Addr::new(168, 63, 129, 16);
+    const DNS: u16 = 53;
+    (dst.is_link_local() || dst == AZURE) && port != DNS
+}
+
 /// A port's identity (the kernel uses the cell id).
 pub type PortId = u64;
 
@@ -282,6 +292,19 @@ mod tests {
         s.detach(1);
         assert_eq!(s.port_of(a), None);
         assert_eq!(s.addr(1), None);
+    }
+
+    #[test]
+    fn the_machines_own_addresses_are_not_its_cells() {
+        let metadata = Ipv4Addr::new(169, 254, 169, 254);
+        let azure = Ipv4Addr::new(168, 63, 129, 16);
+        for (dst, port) in [(metadata, 80), (metadata, 443), (azure, 80), (azure, 32526)] {
+            assert!(is_machines(dst, port), "{dst}:{port}");
+        }
+        // Names, and everyone else.
+        assert!(!is_machines(metadata, 53) && !is_machines(azure, 53));
+        assert!(!is_machines(Ipv4Addr::new(169, 253, 0, 1), 80));
+        assert!(!is_machines(Ipv4Addr::new(168, 63, 129, 17), 80));
     }
 
     #[test]

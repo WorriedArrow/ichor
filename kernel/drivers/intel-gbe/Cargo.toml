@@ -1,0 +1,17 @@
+[package]
+name = "ichor-intel-gbe"
+description = "Intel gigabit Ethernet driver (82574, igb), polled; safe code only"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "intel_gbe"
+
+[dependencies]
+frame.workspace = true
+net.workspace = true
+
+[lints]
+workspace = true

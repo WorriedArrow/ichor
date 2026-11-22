@@ -313,6 +313,7 @@ const KERNEL_ONLY: &[&str] = &[
     "ichor-virtio-blk",
     "ichor-virtio-rng",
     "ichor-virtio-net",
+    "ichor-intel-gbe",
     "ichor-nvme",
     "ichor-virtio-scsi",
 ];

@@ -304,10 +304,62 @@ pub(crate) fn send(from: PortId, pkts: Vec<Packet>) {
                     queue.push_back((id, out));
                 }
             }
-            (Verdict::Uplink, _) => uplink_out(p),
+            (Verdict::Uplink, _) => {
+                let Some(back) = refused(&p) else {
+                    uplink_out(p);
+                    continue;
+                };
+                let stack = with_table(|t| t.stacks.get(&port).and_then(Weak::upgrade));
+                if let (Some(back), Some(stack)) = (back, stack) {
+                    for out in stack.receive(back) {
+                        queue.push_back((port, out));
+                    }
+                }
+            }
             _ => {}
         }
     }
+}
+
+/// If a cell's packet is for what is the machine's alone
+/// ([`net::switch::is_machines`]): what the cell gets back, if anything.
+fn refused(p: &Packet) -> Option<Option<Packet>> {
+    // (What has no ports goes nowhere.)
+    let (_, dp) = ports(p.protocol, &p.payload)?;
+    if !net::switch::is_machines(p.dst, dp) {
+        return None;
+    }
+    if p.protocol != PROTO_TCP {
+        return Some(None);
+    }
+    Some(tcp_refusal(p).map(|payload| Packet {
+        src: p.dst,
+        dst: p.src,
+        protocol: PROTO_TCP,
+        payload,
+    }))
+}
+
+/// What a closed port answers a connection request.
+fn tcp_refusal(p: &Packet) -> Option<Vec<u8>> {
+    let (sp, dp) = ports(p.protocol, &p.payload)?;
+    let f = flags(p.protocol, &p.payload);
+    if f & (tcp::SYN | tcp::ACK | tcp::RST) != tcp::SYN {
+        return None;
+    }
+    let seg = tcp::Segment::parse(&p.payload, p.src, p.dst)?;
+    let ack = seg.seq.wrapping_add(seg.len());
+    let flags = tcp::RST | tcp::ACK;
+    Some(tcp::segment(
+        (p.dst, dp),
+        (p.src, sp),
+        0,
+        ack,
+        flags,
+        0,
+        None,
+        &[],
+    ))
 }
 
 /// Sends a cell's packet out of the uplink, translated.
@@ -378,20 +430,8 @@ pub(crate) fn poll_uplink() -> bool {
                 // A connection request for a port nothing is published
                 // on: refuse it, as a closed port does.
                 if p.protocol == PROTO_TCP
-                    && f & (tcp::SYN | tcp::ACK | tcp::RST) == tcp::SYN
-                    && let Some(seg) = tcp::Segment::parse(&p.payload, p.src, p.dst)
+                    && let Some(rst) = tcp_refusal(&p)
                 {
-                    let ack = seg.seq.wrapping_add(seg.len());
-                    let rst = tcp::segment(
-                        (p.dst, dp),
-                        (p.src, sp),
-                        0,
-                        ack,
-                        tcp::RST | tcp::ACK,
-                        0,
-                        None,
-                        &[],
-                    );
                     u.ifc.send(t, p.src, PROTO_TCP, &rst);
                     st.refused += 1;
                 } else {

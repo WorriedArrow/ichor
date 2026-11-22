@@ -240,6 +240,8 @@ pub struct RunConfig {
     /// Extra options for the user-mode network backend (for example
     /// `hostfwd=tcp:127.0.0.1:8080-:80`).
     pub net_user_opts: String,
+    /// The network device and its properties (`-device`).
+    pub nic: String,
     /// The control plane's API token, written to `\ichor\apitoken`.
     pub api_token: Option<String>,
     /// The API's TLS certificates and key (PEM), written to
@@ -248,7 +250,7 @@ pub struct RunConfig {
 }
 
 impl RunConfig {
-    /// A virtio-net device on QEMU's user-mode network (slirp: the guest
+    /// The network device on QEMU's user-mode network (slirp: the guest
     /// is 10.0.2.15, the gateway 10.0.2.2, which reaches the host's
     /// loopback). No option ROM, so the firmware never tries to network
     /// boot.
@@ -262,7 +264,7 @@ impl RunConfig {
             "-netdev".into(),
             format!("user,id=net0{extra}"),
             "-device".into(),
-            "virtio-net-pci,netdev=net0,disable-legacy=on,romfile=".into(),
+            format!("{},netdev=net0,romfile=", self.nic),
         ]
     }
 
@@ -303,6 +305,7 @@ impl RunConfig {
             machine_props: String::new(),
             smp_topology: String::new(),
             net_user_opts: String::new(),
+            nic: "virtio-net-pci,disable-legacy=on".into(),
             api_token: None,
             api_tls: None,
         }

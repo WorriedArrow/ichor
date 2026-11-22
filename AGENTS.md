@@ -219,6 +219,13 @@ not write it; merge its branch when it lands.
   boot that times out now appends every vCPU's registers, LAPIC and stack
   to its log (`qemu::vcpu_state`): read that first. Both CPUs at the idle
   `hlt` with no timer armed means a lost wake-up, not a lost interrupt.
+- Cells cannot reach what is the machine's alone: link-local addresses and
+  Azure's 168.63.129.16, where clouds answer whoever asks with the machine's
+  credentials (`net::switch::is_machines`: refused with a reset at the
+  uplink, DNS excepted).
+- NICs: `virtio-net`, and `intel-gbe` (82574L and the 82576/I350/I210
+  family; tested on QEMU's `e1000e` and `igb`: `RunConfig::nic`). The first
+  that comes up is the uplink (`nettest::find`).
 - The uplink is any `net::link::Link` (`kernel/net/src/link.rs`:
   `mac`/`transmit`/`receive`): NIC drivers implement it (virtio-net), and
   a software link such as a VPN can wrap one. New NIC drivers (ENA,
@@ -737,7 +744,7 @@ the accelerator).
 
 Plain `cargo build` / `cargo test` at the root only touch host crates
 (`default-members`). Crates that depend on frame (`ichor`, `ichor-frame`,
-`ichor-virtio-pci`, `ichor-virtio-blk`, `ichor-virtio-rng`, `ichor-virtio-net`, `ichor-nvme`) are kernel-only: xtask's `KERNEL_ONLY` list keeps them
+`ichor-virtio-pci`, `ichor-virtio-blk`, `ichor-virtio-rng`, `ichor-virtio-net`, `ichor-intel-gbe`, `ichor-nvme`) are kernel-only: xtask's `KERNEL_ONLY` list keeps them
 out of host clippy and tests and lints them for the UEFI target. The kernel and frame build for `x86_64-unknown-uefi`
 through xtask, into `target/kernel` so they never contend for cargo's build
 lock with the host build.
@@ -803,6 +810,7 @@ kernel/drivers/virtio-pci  modern virtio PCI transport shared by the virtio driv
 kernel/drivers/virtio-blk  safe virtio-blk driver over frame's IoMem/DMA
 kernel/drivers/virtio-rng  safe virtio-rng (entropy) driver
 kernel/drivers/virtio-net  safe virtio-net driver (polled, MAC feature only)
+kernel/drivers/intel-gbe   safe Intel gigabit Ethernet driver (polled, DMA-trusted)
 kernel/net       network protocols, sans-I/O: Ethernet, ARP, IPv4, ICMP, UDP, TCP (host-tested; ADR-0010)
 kernel/uring     io_uring's ABI, ring layout and submission ordering, sans-I/O (host-tested; ADR-0013)
 kernel/drivers/nvme        safe NVMe driver (polled, DMA-trusted)
