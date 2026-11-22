@@ -85,6 +85,9 @@ fn kmain(info: BootInfo) -> ! {
     if let Some(port) = cmdline.get("net_publish").and_then(|v| v.parse().ok()) {
         nettest::set_publish_port(port);
     }
+    if let Some(mtu) = cmdline.get("uplink_mtu").and_then(|v| v.parse().ok()) {
+        nettest::set_mtu(mtu);
+    }
 
     let image = info.kernel_image();
     println!("ichor: image at {} ({} KiB)", image.base, image.len / 1024);

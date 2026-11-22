@@ -305,6 +305,53 @@ pub fn tcp_flags(seg: &[u8]) -> u8 {
     seg.get(13).copied().unwrap_or(0)
 }
 
+/// MSS clamping (what Linux's `TCPMSS --clamp-mss-to-pmtu` does): if `seg`
+/// (a TCP segment from `src` to `dst`, its checksum already right) is a
+/// SYN whose MSS option asks for more than `max`, lowers it to `max` and
+/// fixes the checksum. The uplink clamps every SYN crossing it to its MTU
+/// less 40 (GCP's VPC MTU is 1460), so neither end of a connection sends
+/// segments the link cannot carry. Returns whether it changed anything.
+pub fn clamp_mss(src: Ipv4Addr, dst: Ipv4Addr, seg: &mut [u8], max: u16) -> bool {
+    if seg.len() < 20 || tcp_flags(seg) & SYN == 0 {
+        return false;
+    }
+    let header = usize::from(seg[12] >> 4) * 4;
+    if header < 20 || header > seg.len() {
+        return false;
+    }
+    let mut at = 20;
+    let mut changed = false;
+    while at < header {
+        match seg[at] {
+            0 => break,   // end of options
+            1 => at += 1, // no-op
+            kind => {
+                let Some(&len) = seg.get(at + 1) else {
+                    return false;
+                };
+                let len = usize::from(len);
+                if len < 2 || at + len > header {
+                    return false;
+                }
+                if kind == 2 && len == 4 {
+                    let mss = u16::from_be_bytes([seg[at + 2], seg[at + 3]]);
+                    if mss > max {
+                        seg[at + 2..at + 4].copy_from_slice(&max.to_be_bytes());
+                        changed = true;
+                    }
+                }
+                at += len;
+            }
+        }
+    }
+    if changed {
+        seg[16..18].copy_from_slice(&[0, 0]);
+        let c = fold(sum(pseudo_header(src, dst, PROTO_TCP, seg.len()), seg));
+        seg[16..18].copy_from_slice(&c.to_be_bytes());
+    }
+    changed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -317,6 +364,41 @@ mod tests {
 
     fn t(s: u64) -> Duration {
         Duration::from_secs(s)
+    }
+
+    #[test]
+    fn syns_are_clamped_to_the_link() {
+        let syn = |mss: u16, flags: u8| {
+            tcp::segment(
+                (CELL, 40000),
+                (FAR, 443),
+                1,
+                0,
+                flags,
+                65535,
+                Some((mss, 7)),
+                &[],
+            )
+        };
+        // A SYN asking for 1460 is lowered to 1420 and still checks out.
+        let mut s = syn(1460, SYN);
+        assert!(clamp_mss(CELL, FAR, &mut s, 1420));
+        let seg = Segment::parse(&s, CELL, FAR).expect("checksum fixed");
+        assert_eq!(seg.mss, Some(1420));
+        // Already small enough, or not a SYN: untouched.
+        let mut s = syn(1200, SYN);
+        let before = s.clone();
+        assert!(!clamp_mss(CELL, FAR, &mut s, 1420));
+        assert_eq!(s, before);
+        let mut s = tcp::segment((CELL, 40000), (FAR, 443), 1, 1, ACK, 65535, None, b"x");
+        assert!(!clamp_mss(CELL, FAR, &mut s, 1420));
+        // A SYN-ACK is clamped too; truncated or odd options do no harm.
+        let mut s = syn(1460, SYN | ACK);
+        assert!(clamp_mss(CELL, FAR, &mut s, 1420));
+        for n in 0..s.len() {
+            let mut t = s[..n].to_vec();
+            let _ = clamp_mss(CELL, FAR, &mut t, 1000);
+        }
     }
 
     #[test]

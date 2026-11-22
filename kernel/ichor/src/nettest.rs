@@ -37,6 +37,14 @@ pub(crate) fn set_echo_port(port: u16) {
     ECHO_PORT.store(u32::from(port), Ordering::Relaxed);
 }
 
+/// The uplink's MTU from the command line (0: the DHCP lease's, else 1500).
+static MTU: AtomicU32 = AtomicU32::new(0);
+
+/// Sets the uplink's MTU (`uplink_mtu=N`), over what DHCP says.
+pub(crate) fn set_mtu(mtu: u16) {
+    MTU.store(u32::from(mtu), Ordering::Relaxed);
+}
+
 /// Sets the published-port test's uplink port (`net_publish=N`).
 pub(crate) fn set_publish_port(port: u16) {
     PUBLISH_PORT.store(u32::from(port), Ordering::Relaxed);
@@ -86,7 +94,7 @@ pub(crate) fn run() {
     );
     // The address from the network's DHCP server (a cloud VPC's, QEMU's),
     // else QEMU's user-network defaults.
-    let (addr, prefix, router) = match dhcp(&mut dev, Mac(m)) {
+    let (addr, prefix, router, mtu) = match dhcp(&mut dev, Mac(m)) {
         Some(l) => {
             let dns: Vec<_> = l.dns.iter().map(|d| alloc::format!("{d}")).collect();
             println!(
@@ -105,11 +113,11 @@ pub(crate) fn run() {
                     .map_or("ever".into(), |t| alloc::format!("{} s", t.as_secs())),
             );
             crate::switch::set_uplink_dns(l.dns.clone());
-            (l.addr, l.prefix, l.router)
+            (l.addr, l.prefix, l.router, l.mtu.unwrap_or(1500))
         }
         None => {
             println!("ichor: net: no DHCP answer; using {GUEST}/24 via {GATEWAY}");
-            (GUEST, 24, Some(GATEWAY))
+            (GUEST, 24, Some(GATEWAY), 1500)
         }
     };
     let gateway = router.unwrap_or(GATEWAY);
@@ -162,9 +170,15 @@ pub(crate) fn run() {
     // From here on the device is the cell switch's uplink.
     let link: alloc::boxed::Box<dyn net::link::Link> = alloc::boxed::Box::new(dev);
     let name = alloc::string::String::from(link.name());
-    crate::switch::set_uplink(link, ifc);
+    let mtu = match MTU.load(Ordering::Relaxed) {
+        0 => mtu,
+        forced => forced as u16,
+    };
+    crate::switch::set_uplink(link, ifc, mtu);
     crate::netstack::start();
-    println!("ichor: net: uplink {addr} on {name} is the cell switch's (NAT for 10.88.0.0/16)");
+    println!(
+        "ichor: net: uplink {addr} on {name} is the cell switch's (NAT for 10.88.0.0/16, MTU {mtu})"
+    );
 }
 
 /// Asks the network's DHCP server for an address: up to 8 s, which

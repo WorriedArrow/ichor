@@ -726,7 +726,9 @@ fn a_published_port_serves_the_host_from_a_cell() {
         );
         (got, log)
     });
-    let out = ichor_tests::boot_with("net-publish", "net_publish=8080", 2, |c| {
+    // A 1400-byte uplink MTU: the host's SYNs (MSS 1460) are clamped to
+    // 1360 on the way in, and the cells' replies must still arrive whole.
+    let out = ichor_tests::boot_with("net-publish", "net_publish=8080 uplink_mtu=1400", 2, |c| {
         c.net_user_opts = format!("hostfwd=tcp:127.0.0.1:{host_port}-:8080");
         c.timeout = Some(Duration::from_secs(420)); // two servers wait for the host
     });
@@ -735,7 +737,7 @@ fn a_published_port_serves_the_host_from_a_cell() {
     eprintln!("host client: {log}");
     out.assert_exit(Exit::Success);
     out.assert_in_order(&[
-        "ichor: net: uplink 10.0.2.15 on virtio-net is the cell switch's",
+        "ichor: net: uplink 10.0.2.15 on virtio-net is the cell switch's (NAT for 10.88.0.0/16, MTU 1400)",
         "debian: published: listening on port 80",
         "debian: published: served a request from 10.0.2.2",
     ]);

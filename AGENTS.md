@@ -113,10 +113,16 @@ not write it; merge its branch when it lands.
   about six minutes in when the cell's 3 GiB account filled (under
   investigation). First recorded full run: 403 of 445 modules (90.5%),
   floor 88.0% in `workloads.toml`.
-- Open: one intermittent boot hang (2026-11-21) right after
+- Open: intermittent boot hangs under the full gate's load on TCG (11
+  QEMUs at once), each passing on reruns alone: (2026-11-21) right after
   `proc: native process ran`, i.e. in `copytest::frame_race`, in
-  `cloud_disk_boots_from_gpt_on_nvme` (2 vCPUs) under the full gate's
-  load; it passed on three reruns alone and the gate's rerun.
+  `cloud_disk_boots_from_gpt_on_nvme` (2 vCPUs); and right after
+  `trap: breakpoint handled`, i.e. while the boot CPU waits for its own
+  timer ticks (`selftest::wait_for_ticks`, one-shot LAPIC mode), in
+  `stack_overflow_hits_the_guard_page`. A lost timer interrupt would
+  explain both; `apic::arm`/`program` and `on_timer_interrupt` read
+  correctly, and `start_aps` is bounded. Next step: a stall report (each
+  CPU's deadlines, `frame::time::deadlines`) from a watchdog.
 - The uplink is any `net::link::Link` (`kernel/net/src/link.rs`:
   `mac`/`transmit`/`receive`): NIC drivers implement it (virtio-net), and
   a software link such as a VPN can wrap one. New NIC drivers (ENA,
@@ -656,6 +662,7 @@ comment.
 | `control_publish=PORT` | publish the API on uplink port PORT (without `control_listen`, listens on all addresses); needs an API token in `\ichor\apitoken` (`RunConfig::api_token`, `disk-image --api-token-file`), else the API stays on loopback |
 | `control_exit` | with `control`: stop when the first API client hangs up, then shut down (tests) |
 | `control_exit_after=SECONDS` | with `control`: stop after that long once no client is connected (tests) |
+| `uplink_mtu=N` | the uplink network's MTU, over the DHCP lease's (default: the lease's, else 1500); every TCP SYN crossing the uplink is clamped to MTU - 40 |
 | `dns=A.B.C.D` | the control plane's DNS resolver (default: the uplink's DHCP lease's first DNS server, else `10.0.2.3`, QEMU's) |
 
 ## Layout

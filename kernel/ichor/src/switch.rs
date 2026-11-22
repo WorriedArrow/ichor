@@ -48,6 +48,9 @@ struct Uplink {
     ifc: Interface,
     nat: Nat,
     last_expire: Duration,
+    /// The largest TCP segment the uplink's network carries: its MTU
+    /// less 40 (every SYN crossing the uplink is clamped to it).
+    mss: u16,
 }
 
 static TABLE: SpinLock<Option<Table>> = SpinLock::new(None);
@@ -140,14 +143,16 @@ pub(crate) fn stats(cell: u64) -> Option<(u64, u64, u64)> {
     })
 }
 
-/// Makes `dev`/`ifc` the uplink.
-pub(crate) fn set_uplink(dev: Box<dyn Link>, ifc: Interface) {
+/// Makes `dev`/`ifc` the uplink, on a network whose MTU is `mtu` (GCP's
+/// VPCs: 1460; most others 1500).
+pub(crate) fn set_uplink(dev: Box<dyn Link>, ifc: Interface, mtu: u16) {
     let nat = Nat::new(ifc.addr);
     *UPLINK.lock() = Some(Uplink {
         dev,
         ifc,
         nat,
         last_expire: now(),
+        mss: mtu.clamp(576, 1500) - 40,
     });
 }
 
@@ -244,6 +249,9 @@ fn uplink_out(mut p: Packet) {
     if !nat::rewrite(p.protocol, &mut p.payload, src, (p.dst, dp)) {
         return;
     }
+    if p.protocol == PROTO_TCP {
+        nat::clamp_mss(src.0, p.dst, &mut p.payload, u.mss);
+    }
     u.ifc.send(t, p.dst, p.protocol, &p.payload);
     while let Some(frame) = u.ifc.transmit() {
         u.dev.transmit(&frame);
@@ -309,6 +317,11 @@ pub(crate) fn poll_uplink() -> bool {
             };
             if !nat::rewrite(p.protocol, &mut p.payload, (p.src, sp), inside) {
                 continue;
+            }
+            // A SYN from outside asks for segments the uplink's network
+            // may not carry: clamp it, so the cell answers with small ones.
+            if p.protocol == PROTO_TCP {
+                nat::clamp_mss(p.src, inside.0, &mut p.payload, u.mss);
             }
             p.dst = inside.0;
             let Some(id) = with_table(|tb| {

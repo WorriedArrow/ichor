@@ -66,7 +66,9 @@ drivers, so these are the ones that can network. The uplink takes its
 address, router and DNS server from the VPC's DHCP server (the boot log
 shows `ichor: net: DHCP lease ...`), and the control plane resolves
 through that DNS server unless `dns=` says otherwise. The lease is not
-renewed yet; GCP keeps a VM's internal address for its life.
+renewed yet; GCP keeps a VM's internal address for its life. GCP's VPC
+MTU is 1460 by default: the lease says so, and the uplink clamps every
+TCP SYN crossing it to an MSS of 1420 (`uplink_mtu=N` overrides).
 The newer ones (C3, C4, ...) boot from NVMe and require gVNIC, which
 Ichor does not drive yet: boot-only. Check the machine types' disk
 interfaces and NIC types against current GCP documentation.
