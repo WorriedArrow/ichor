@@ -3,6 +3,7 @@
 pub(crate) mod apic;
 pub mod cpu;
 pub(crate) mod early_console;
+pub(crate) mod entry;
 mod io;
 pub mod paging;
 pub(crate) mod pci;
@@ -110,9 +111,12 @@ pub(crate) fn activate_root(root: u64) {
     // ordered before our page walks (see `mm::tlb`).
     crate::mm::tlb::note_loaded(target);
     if regs::read_cr3() & 0x000f_ffff_ffff_f000 != target {
+        // Under isolation: the roots entry from ring 3 and the way back
+        // load from now on (interrupts are off in every caller).
+        entry::note_root(crate::cpu::this_block(), target);
         // SAFETY: `target` is the kernel PML4 or a user root built by frame,
         // which shares every kernel-half entry, so the running code, stack
-        // and data stay mapped.
+        // and data stay mapped. It names PCID 0 and flushes its entries.
         unsafe { regs::write_cr3(target) };
     }
 }

@@ -45,6 +45,10 @@ pub(crate) fn note_loaded(root: u64) {
 }
 
 fn flush_here(va: u64) {
+    // Under isolation with PCID the user root's entries carry another PCID,
+    // which neither flush below reaches: the next return to ring 3 flushes
+    // them (before any user instruction runs).
+    arch::entry::user_tlb_stale();
     if va == ALL {
         // SAFETY: reloading CR3 with its own value only drops non-global
         // TLB entries; the address space is unchanged.

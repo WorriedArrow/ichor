@@ -272,6 +272,39 @@ pub(crate) fn alloc_stack() -> Option<u64> {
     Some(bottom + STACK_PAGES * PAGE_SIZE)
 }
 
+/// Maps `[pa, pa + len)` at `va` in the entry area (ADR-0004 §2: the one
+/// kernel slot user roots share under page-table isolation). Each caller
+/// owns a fixed, disjoint part of the area, so nothing is mapped twice.
+pub(crate) fn map_entry(va: u64, pa: u64, len: u64, props: Props) -> Option<()> {
+    if paging::slot_of(va) != paging::slot_of(super::ENTRY_BASE) {
+        return None;
+    }
+    let _serial = KSPACE_LOCK.lock();
+    let root = PhysAddr::new(KERNEL_ROOT.load(Ordering::Relaxed));
+    let mut alloc = || {
+        let pa = page_alloc::alloc(0, kind::ALLOCATED)?;
+        // SAFETY: a fresh page from the allocator, reachable via the linear
+        // map, about to become a page table.
+        unsafe { paging::zero_page(pa) };
+        Some(pa)
+    };
+    // SAFETY: `root` is the live kernel PML4 and `alloc` yields zeroed,
+    // owned pages, all reachable through the linear map.
+    let mut m = unsafe { Mapper::new(root, false, &mut alloc) };
+    // SAFETY: the range lies in the entry area, otherwise unused, and each
+    // part is mapped once (above). The pages are frame's own (image text,
+    // its per-CPU tables, stacks and blocks), already reachable through
+    // their usual mapping; an alias of them creates no new Rust reference.
+    unsafe { m.map(va, pa, len, props) }.ok()
+}
+
+/// The physical address of kernel virtual address `va`.
+pub(crate) fn kernel_phys(va: u64) -> Option<u64> {
+    // SAFETY: the kernel root and all its tables are frame-built page
+    // tables, reachable through the linear map; the walk only reads.
+    unsafe { paging::translate(PhysAddr::new(kernel_root()), va) }
+}
+
 /// Base of the kernel MMIO window (ADR-0005).
 const MMIO_BASE: u64 = 0xffff_d000_0000_0000;
 /// Size of the MMIO window (1 TiB).

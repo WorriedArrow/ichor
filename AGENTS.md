@@ -44,9 +44,22 @@ digest, `from`/`to` remap via `layer::Tree::add_tar_at`), fetched after
 the image, checked with `oci::digest_of` before `oci::convert_with`;
 tests/control.rs serves one from the host and refuses a wrong digest]; (6) ADR-0004's owed mitigations
 (VERW, IBPB on cross-cell switches, page-table isolation), logged at
-boot [VERW and IBPB done; page-table isolation not yet built, logged
-MISSING on Meltdown-affected CPUs]. The cell access-control suite is written in another worktree: do
+boot [done: VERW, IBPB, and page-table isolation (ADR-0004's second
+2026-11-16 amendment)]. The cell access-control suite is written in another worktree: do
 not write it; merge its branch when it lands.
+
+- M7 page-table isolation (`kernel/frame/src/arch/x86_64/entry.rs`): the
+  entry area (`mm::ENTRY_BASE`, one PML4 slot) aliases the entry code, the
+  IDT and per CPU its block (GS), GDT/TSS, entry stack (RSP0) and IST
+  stacks; the CPU always enters through the aliases. On Meltdown-affected
+  CPUs, or with `force_pti`, a `VmSpace` root is an 8 KiB pair (full root,
+  then a shadow with only the entry slot plus the shared user slots), ring
+  3 runs on the shadow, every entry loads the full root first, PGE is off,
+  and PCID (0 kernel, 1 user; user flushes owed by root changes and
+  shootdowns) avoids flushes. Every trap from ring 3 now returns through
+  `UserMode::execute` and `ichor_enter_user` (the one way into ring 3).
+  `m2_scheduler_on_eight_cpus` boots with `force_pti`;
+  `frame::user::isolation_selftest` checks the shadow on isolated boots.
 
 - M7 parsers and certificates: `fuzz/` (host-only) mutation-fuzzes every
   parser of untrusted input (TLS server side, X.509/DER, PEM, HPACK,
@@ -533,14 +546,15 @@ Suggested order for milestone 4:
 
 ADR-0004 records the side-channel posture; its per-CPU mitigations (VERW,
 IBPB on cross-cell switch, page-table isolation for Meltdown-affected CPUs)
-are owed as multi-cell scheduling lands in milestone 4. Boot logs which apply.
+are all built. Boot logs which apply.
 
 Frame budget: ADR-0005 sets the milestone 3 ceiling at 8,500 lines / 380
 sites; ADR-0007 raises it to 9,500 / 420 for milestone 4 (TLB shootdown,
-atomic user ops for futexes, PCID). `audit.toml` is at step 6 (5,800 / 250);
-frame is at 5,630 / 244 (A5 added RDSEED/RDRAND and UEFI GetTime; B
-added XSAVE; C the frames tree and request tracking; M6 reading
-`\ichor\roots.pem`; ADR-0011 the checked user copy). `services/rt` has
+atomic user ops for futexes, PCID). `audit.toml` is at step 7 (6,250 / 265,
+ADR-0004's isolation amendment); frame is at 6,169 / 259 (A5 added
+RDSEED/RDRAND and UEFI GetTime; B added XSAVE; C the frames tree and
+request tracking; M6 reading `\ichor\roots.pem`; ADR-0011 the checked user
+copy; ADR-0004 VERW/IBPB and page-table isolation). `services/rt` has
 its own budget (`services/rt/audit.toml`: 500 / 40; at 402 / 29).
 
 The goal set for this effort is milestone 8, whose acceptance test needs
@@ -612,6 +626,8 @@ comment.
 | `memmap` | print the full memory map |
 | `test_panic` | panic after boot (exercises the panic path) |
 | `test_stack_overflow` | recurse until the kernel stack hits its guard page |
+| `force_verw` | VERW before every return to ring 3 on any CPU (ADR-0004; tests) |
+| `force_pti` | page-table isolation on any CPU, Meltdown-affected or not (ADR-0004; tests) |
 | `trace_errors` | log every failing Linux syscall (pid, number, first arguments, errno) |
 | `trace_pid=N` | log every Linux syscall of pid N with its result |
 | `bench` | run the Phase E benchmarks (`bench.rs`) after the root disk's self-tests and print them |

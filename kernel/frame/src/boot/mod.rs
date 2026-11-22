@@ -156,10 +156,10 @@ pub(crate) fn init_cpu(id: CpuId) {
         fatal(e);
     }
     arch::apic::init_timer();
-    // Syscall entry and a fallback ring-3 fault stack for this CPU. Per-task
-    // RSP0 is set on each `UserMode::execute`; this is only a safety net.
-    let fault_stack = crate::mm::kspace::alloc_stack().unwrap_or(0);
-    arch::usermode::init_cpu(fault_stack);
+    // Syscall entry, and the mitigations the boot CPU chose (none yet when
+    // this is the boot CPU: `kernel_space_entry` turns them on after).
+    arch::usermode::init_cpu();
+    arch::usermode::enable_cpu_mitigations();
     crate::task::register_cpu();
     let _ = id;
     crate::cpu::mark_online();
@@ -205,7 +205,9 @@ pub(crate) extern "sysv64" fn kernel_space_entry() -> ! {
     *ACPI_RSDP.lock() = state.acpi_rsdp;
     println!("ichor: frame: running in the higher half");
 
-    arch::trap::init_idt();
+    if arch::trap::init_idt().is_none() {
+        fatal("cannot map the entry area");
+    }
     arch::apic::mask_legacy_pic();
     let Some((hz, source)) = arch::apic::init_tsc() else {
         fatal("cannot determine the TSC frequency (no CPUID leaf, PM timer or PIT)");
@@ -225,7 +227,7 @@ pub(crate) extern "sysv64" fn kernel_space_entry() -> ! {
     let v = arch::cpu::vulnerabilities();
     let yn = |b: bool| if b { "affected" } else { "no" };
     println!(
-        "ichor: frame: cpu0 speculation (ADR-0004): meltdown {}, mds {}, taa {}, bhi {}, gds {}; eibrs {}, ibpb {}, md_clear {}{}",
+        "ichor: frame: cpu0 speculation (ADR-0004): meltdown {}, mds {}, taa {}, bhi {}, gds {}; eibrs {}, ibpb {}, md_clear {}",
         yn(v.meltdown),
         yn(v.mds),
         yn(v.taa),
@@ -234,15 +236,15 @@ pub(crate) extern "sysv64" fn kernel_space_entry() -> ! {
         v.eibrs,
         v.ibpb,
         v.md_clear,
-        if v.meltdown {
-            " -- not safe for untrusted cells until page-table isolation lands"
-        } else {
-            ""
-        },
     );
-    let force_verw = cmdline::Cmdline::new(state.cmdline()).flag("force_verw");
-    let m = arch::usermode::enable_mitigations(&v, force_verw);
+    let cmdline = cmdline::Cmdline::new(state.cmdline());
+    let (force_verw, force_pti) = (cmdline.flag("force_verw"), cmdline.flag("force_pti"));
+    let m = match arch::usermode::enable_mitigations(&v, force_verw, force_pti) {
+        Ok(m) => m,
+        Err(e) => fatal(e),
+    };
     let on = |b: bool| if b { "on" } else { "off (not needed)" };
+    let pcid = if m.pcid { "PCID" } else { "no PCID" };
     println!(
         "ichor: frame: mitigations (ADR-0004): VERW on return to ring 3 {}, IBPB between cells {}, page-table isolation {}",
         if m.verw_missing {
@@ -257,10 +259,12 @@ pub(crate) extern "sysv64" fn kernel_space_entry() -> ! {
         } else {
             "off (IBPB not enumerated)"
         },
-        if v.meltdown {
-            "MISSING (Meltdown-affected CPU)"
+        if !m.pti {
+            "off (not needed)".into()
+        } else if v.meltdown {
+            alloc::format!("on ({pcid})")
         } else {
-            "off (not needed)"
+            alloc::format!("on (forced, {pcid})")
         },
     );
     enter_kernel(BootInfo {
