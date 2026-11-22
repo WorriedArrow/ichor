@@ -7,7 +7,8 @@
 //!
 //! `cargo xtask workloads python [--tests "test_os test_json"]` runs one
 //! suite (all tests, or the named ones); `--cmd "..."` runs a shell command
-//! in the suite's cell instead (exploration).
+//! in the suite's cell instead, and `--follow FILE` then runs each line
+//! added to FILE there until one is `exit` (exploration).
 
 use std::time::{Duration, Instant};
 
@@ -273,11 +274,49 @@ fn layers(suite: &Suite) -> Vec<LayerSource> {
         .collect()
 }
 
-/// Boots Ichor, pulls the suite, runs `argv` in a fresh cell, and returns
-/// its output and wait status.
+/// Runs the lines of `follow` as they are added, each as a shell command in
+/// `cell`, until one is `exit` (a pull takes minutes: exploring should not
+/// need one per command). Output goes to `to`.
+fn follow_commands(
+    s: &mut Session,
+    cell: &str,
+    suite: &Suite,
+    follow: &std::path::Path,
+    to: &mut std::fs::File,
+) -> Result<()> {
+    use std::io::Write;
+    let mut done = 0;
+    loop {
+        let text = std::fs::read_to_string(follow).unwrap_or_default();
+        // Only whole lines: the last may still be being written.
+        let lines: Vec<&str> = text.split_inclusive('\n').collect();
+        let Some(line) = lines.get(done).filter(|l| l.ends_with('\n')) else {
+            std::thread::sleep(Duration::from_millis(500));
+            continue;
+        };
+        done += 1;
+        let line = line.trim();
+        if line == "exit" {
+            return Ok(());
+        }
+        let _ = writeln!(to, "\n$ {line}");
+        let mut out = |b: &[u8]| {
+            let _ = to.write_all(b);
+            let _ = to.flush();
+        };
+        let hour = Duration::from_secs(3600);
+        let status = s.run_with(cell, &["/bin/sh", "-c", line], suite.env, hour, &mut out)?;
+        let _ = writeln!(to, "[status {status:#x}]");
+    }
+}
+
+/// Boots Ichor, pulls the suite, runs `argv` in a fresh cell (then the
+/// commands in `follow`, see [`follow_commands`]), and returns its output
+/// and wait status.
 pub fn run(
     suite: &Suite,
     argv: Vec<String>,
+    follow: Option<std::path::PathBuf>,
     kernel: std::path::PathBuf,
     cfg_tweak: impl FnOnce(&mut RunConfig),
 ) -> Result<(String, u32)> {
@@ -338,6 +377,9 @@ pub fn run(
                 out.extend_from_slice(b);
             },
         )?;
+        if let Some(f) = follow {
+            follow_commands(&mut s, &cell.cell_id, &suite, &f, &mut file)?;
+        }
         Ok((String::from_utf8_lossy(&out).into_owned(), status))
     });
     let outcome = qemu::run(&cfg)?;

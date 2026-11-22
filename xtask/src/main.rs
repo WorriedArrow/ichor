@@ -368,18 +368,20 @@ fn cmd_test(o: &Opts) -> Result<()> {
 }
 
 /// `cargo xtask workloads SUITE [--tests "a b"] [--cmd "shell command"]
-/// [--accel A] [--cmdline "kernel options"]`: a runtime's own test suite through the control plane
+/// [--follow FILE] [--accel A] [--cmdline "kernel options"]`: a runtime's own test suite through the control plane
 /// (ADR-0013 §2); prints the pass rate.
 fn cmd_workloads(args: &[String]) -> Result<()> {
     use xtask::workloads;
     let mut it = args.iter();
     let mut suite = None;
     let (mut tests, mut cmd, mut accel) = (None, None, None);
+    let mut follow = None;
     let mut extra = String::new();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--tests" => tests = Some(it.next().ok_or("--tests needs a value")?.clone()),
             "--cmd" => cmd = Some(it.next().ok_or("--cmd needs a value")?.clone()),
+            "--follow" => follow = Some(it.next().ok_or("--follow needs a value")?.into()),
             "--accel" => accel = Some(it.next().ok_or("--accel needs a value")?.clone()),
             // Extra kernel options (`trace_errors`, `trace_pid=N`).
             "--cmdline" => extra = it.next().ok_or("--cmdline needs a value")?.clone(),
@@ -412,7 +414,7 @@ fn cmd_workloads(args: &[String]) -> Result<()> {
         None => Accel::Auto,
     };
     let started = std::time::Instant::now();
-    let (out, status) = workloads::run(suite, argv, kernel, |c| {
+    let (out, status) = workloads::run(suite, argv, follow, kernel, |c| {
         c.accel = accel;
         if !extra.is_empty() {
             c.cmdline = format!("{} {extra}", c.cmdline);

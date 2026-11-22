@@ -19,6 +19,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use std::{env, fs, thread};
@@ -658,10 +659,19 @@ pub fn run(cfg: &RunConfig) -> Result<Outcome> {
     run_command(command(cfg)?, cfg.capture, cfg.timeout)
 }
 
-/// A loopback port nothing listens on right now.
+/// A loopback port nothing listens on right now, and that nothing else is
+/// likely to take before QEMU does: below the ports systems hand out by
+/// themselves, and never the same twice in this process (parallel tests).
 fn free_port() -> Option<u16> {
-    let l = TcpListener::bind(("127.0.0.1", 0)).ok()?;
-    l.local_addr().ok().map(|a| a.port())
+    static NEXT: AtomicU16 = AtomicU16::new(0);
+    const FIRST: u16 = 20_000;
+    const RANGE: u16 = 10_000;
+    let start = (std::process::id() % 100) as u16 * 100;
+    (0..RANGE).find_map(|_| {
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let port = FIRST + start.wrapping_add(n) % RANGE;
+        TcpListener::bind(("127.0.0.1", port)).ok().map(|_| port)
+    })
 }
 
 /// What QEMU's human monitor on `port` answers to each command (with a
