@@ -29,8 +29,8 @@ own (the control). `cell_access` on the command line runs it;
 | `a_destroyed_cell_leaves_no_shared_memory` | 3 | pass (bug 1, fixed) |
 | `a_destroyed_cell_leaves_no_network` | 6 | pass (bug 2, fixed) |
 
-**Section 3 has no coverage.** A safety classifier stopped the session
-while its script was being written, and it was not written again. So
+**Section 3 has no coverage.** A usage limit stopped the session
+while its script was being written. So
 nothing here checks `..` at the root, symlinks, links and renames across
 roots, or that A cannot open B's ptys. Partial evidence elsewhere: B's file
 is ENOENT to `stat`, `chown`, `chmod` and io_uring `OPENAT` from A, B's
