@@ -172,6 +172,21 @@ fn other_kernel_state_is_per_cell() {
     ]);
 }
 
+/// Section 7: uid 0 in A cannot mount (EPERM), has none of the host
+/// superuser's calls (ENOSYS today, recorded), cannot chown or chmod B's
+/// files (ENOENT) and signals none of B's processes (ESRCH).
+#[test]
+fn uid_0_in_a_cell_has_no_authority_outside_it() {
+    assert_rule("uid_0_in_a_cell_has_no_authority_outside_it");
+    suite().0.assert_in_order(&[
+        "A runs as uid 0: ok",
+        "mount (EPERM): ok",
+        "chown(/b-only/secret) as uid 0 (ENOENT): ok",
+        "ichor: cellaccess: uid_0_in_a_cell_has_no_authority_outside_it passed",
+        "ichor: cellaccess: B alive and unchanged after uid_0_in_a_cell_has_no_authority_outside_it",
+    ]);
+}
+
 #[test]
 fn cells_clean_up_after_themselves() {
     let out = &suite().0;

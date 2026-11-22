@@ -83,7 +83,7 @@ Status: [ ] to do, [x] done and committed.
   SCM_RIGHTS stays in A.
 - [x] **6. other_kernel_state_is_per_cell** (18 checks): SysV IPC (ENOSYS today),
   sethostname (ENOSYS today) and B's uname, io_uring ops on B's names.
-- [ ] **7. uid_0_in_a_cell_has_no_authority_outside_it**: mount/umount2
+- [x] **7. uid_0_in_a_cell_has_no_authority_outside_it** (45 checks): mount/umount2
   EPERM, mknod/reboot/clock_settime/settimeofday/adjtimex (ENOSYS today),
   chown/chmod of B's paths ENOENT, signals ESRCH.
 - [ ] **8. resource_limits_are_per_cell**: A at its memory limit and
