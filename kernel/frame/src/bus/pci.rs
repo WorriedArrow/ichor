@@ -3,13 +3,14 @@
 //! Frame enumerates PCI once at boot and owns configuration space. Drivers
 //! get [`PciDevice`]s: config *reads*, capability iteration, BAR
 //! descriptions, one mediated write ([`PciDevice::enable`]), and
-//! [`PciDevice::map_bar`], which is the only way to obtain an
-//! [`IoMem`](crate::io::IoMem).
+//! [`PciDevice::map_bar`] and [`PciDevice::map_ports`], which are the only
+//! ways to obtain an [`IoMem`](crate::io::IoMem) and
+//! [`IoPorts`](crate::io::IoPorts).
 
 use alloc::vec::Vec;
 
 use crate::arch::pci::{read32, write32};
-use crate::io::IoMem;
+use crate::io::{IoMem, IoPorts};
 use crate::sync::SpinLock;
 
 const COMMAND: u8 = 0x04;
@@ -50,7 +51,7 @@ pub struct PciDevice {
 }
 
 static DEVICES: SpinLock<Vec<PciDevice>> = SpinLock::new(Vec::new());
-/// BARs already handed out as `IoMem`: (bus, device, function, bar).
+/// BARs already handed out: (bus, device, function, bar).
 static CLAIMED: SpinLock<Vec<(u8, u8, u8, usize)>> = SpinLock::new(Vec::new());
 
 impl PciDevice {
@@ -117,14 +118,31 @@ impl PciDevice {
         let Bar::Memory { base, size, .. } = self.bar(index) else {
             return None;
         };
+        self.claim(index, || IoMem::map(base, size))
+    }
+
+    /// The ports of I/O BAR `index`, with port decoding on. Fails for other
+    /// BARs, for a BAR already taken, or for ports that are the platform's.
+    pub fn map_ports(&self, index: usize) -> Option<IoPorts> {
+        let Bar::Io { base, size } = self.bar(index) else {
+            return None;
+        };
+        let ports = self.claim(index, || IoPorts::new(base, size))?;
+        let cmd = self.cfg(COMMAND) & 0xffff;
+        write32(self.bus, self.device, self.function, COMMAND, cmd | CMD_IO);
+        Some(ports)
+    }
+
+    /// What `map` gives for BAR `index`, once.
+    fn claim<T>(&self, index: usize, map: impl FnOnce() -> Option<T>) -> Option<T> {
         let key = (self.bus, self.device, self.function, index);
         let mut claimed = CLAIMED.lock();
         if claimed.contains(&key) {
             return None;
         }
-        let mem = IoMem::map(base, size)?;
+        let mapped = map()?;
         claimed.push(key);
-        Some(mem)
+        Some(mapped)
     }
 }
 

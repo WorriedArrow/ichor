@@ -115,6 +115,20 @@ fn replays_a_hello_world_pull() {
 }
 
 #[test]
+fn an_environment_has_each_name_once() {
+    let mut cfg = ImageConfig::parse(br#"{"config":{"Env":["PATH=/bin","A=1"]}}"#).unwrap();
+    let set = ["A=2".into(), "B=x=y".into(), "AB=3".into()];
+    assert_eq!(
+        cfg.environment(&set),
+        ["PATH=/bin", "HOME=/root", "A=2", "B=x=y", "AB=3"]
+    );
+    cfg.env.clear();
+    let env = cfg.environment(&["HOME=/home/x".into()]);
+    assert!(env[0].starts_with("PATH=/usr/local/sbin:"));
+    assert_eq!(env[1..], ["HOME=/home/x"]);
+}
+
+#[test]
 fn tampered_content_is_refused() {
     // A flipped byte in the last response (the layer blob) breaks its
     // digest; in the platform manifest, the index's pinned digest.

@@ -6,5 +6,5 @@
 //! `kernel/native-abi`) are built on this in safe code.
 
 pub use crate::arch::entry::{isolating, isolation_selftest};
-pub use crate::arch::usermode::ibpb_count;
+pub use crate::arch::usermode::{ibpb_count, ibrs_in_kernel};
 pub use crate::arch::{UserContext, UserEvent, UserMode};

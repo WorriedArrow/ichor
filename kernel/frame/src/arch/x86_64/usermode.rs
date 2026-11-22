@@ -43,10 +43,12 @@ static IBPBS: AtomicU64 = AtomicU64::new(0);
 const MSR_SPEC_CTRL: u32 = 0x48;
 const SPEC_CTRL_IBRS: u64 = 1;
 const SPEC_CTRL_BHI_DIS_S: u64 = 1 << 10;
-/// What every CPU writes to `IA32_SPEC_CTRL` as it comes up (0: nothing).
-/// Set only on CPUs that enumerate enhanced IBRS (ADR-0004 §2: Spectre v2
-/// and BHI in the kernel), where IBRS is set once and left on.
+/// What every CPU writes to `IA32_SPEC_CTRL` as it comes up (0: nothing;
+/// ADR-0004 §2: Spectre v2 and BHI in the kernel). With enhanced IBRS that
+/// is left on; without, it counts only for the mode it was written in, so
+/// the entry code writes it on every entry from ring 3.
 static SPEC_CTRL: AtomicU64 = AtomicU64::new(0);
+static IBRS_ON_ENTRY: AtomicBool = AtomicBool::new(false);
 
 /// What the boot CPU's vulnerabilities call for, switched on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -93,8 +95,9 @@ pub(crate) fn enable_mitigations(
     let eibrs = v.eibrs && v.ibpb;
     let bhi_dis_s = eibrs && v.bhi_ctrl;
     let spec =
-        if eibrs { SPEC_CTRL_IBRS } else { 0 } | if bhi_dis_s { SPEC_CTRL_BHI_DIS_S } else { 0 };
+        if v.ibpb { SPEC_CTRL_IBRS } else { 0 } | if bhi_dis_s { SPEC_CTRL_BHI_DIS_S } else { 0 };
     SPEC_CTRL.store(spec, Relaxed);
+    IBRS_ON_ENTRY.store(v.ibpb && !eibrs, Relaxed);
     enable_cpu_mitigations();
     Ok(Mitigations {
         verw,
@@ -124,7 +127,20 @@ pub(crate) fn enable_cpu_mitigations() {
         // those firmware set, IBRS (with the MSR) and BHI_DIS_S (only with
         // its own CPUID bit). They only restrict speculation on this CPU.
         unsafe { wrmsr(MSR_SPEC_CTRL, firmware | spec) };
+        if IBRS_ON_ENTRY.load(Relaxed) {
+            block.spec_ctrl.store(firmware | spec, Relaxed);
+        }
     }
+}
+
+/// Whether the kernel runs with IBRS on this CPU, if it is to.
+pub fn ibrs_in_kernel() -> Option<bool> {
+    if SPEC_CTRL.load(core::sync::atomic::Ordering::Relaxed) == 0 {
+        return None;
+    }
+    // SAFETY: the MSR exists (as in `enable_cpu_mitigations`); reading it
+    // has no side effects.
+    Some(unsafe { rdmsr(MSR_SPEC_CTRL) } & SPEC_CTRL_IBRS != 0)
 }
 
 /// How many IBPBs cross-cell switches have issued since boot.

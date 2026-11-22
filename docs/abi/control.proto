@@ -104,7 +104,8 @@ message RunRequest {
   string cell_id = 1;
   // Empty: the image's entrypoint and cmd.
   repeated string argv = 2;
-  // Added to the image's environment.
+  // Set over the image's environment (which gets a PATH, and HOME=/root, if
+  // it has none).
   repeated string env = 3;
 }
 

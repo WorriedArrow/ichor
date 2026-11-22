@@ -658,8 +658,10 @@ impl Control {
                 if argv.is_empty() {
                     return self.fail(conn, stream, status::INVALID_ARGUMENT, "nothing to run");
                 }
-                let mut env: Vec<String> = config.map(|c| c.env.clone()).unwrap_or_default();
-                env.extend(req.env.iter().cloned());
+                let env = match config {
+                    Some(c) => c.environment(&req.env),
+                    None => req.env.clone(),
+                };
                 let a: Vec<&str> = argv.iter().map(String::as_str).collect();
                 let e: Vec<&str> = env.iter().map(String::as_str).collect();
                 match rt::cell_spawn(&cell.handle, &a, &e) {

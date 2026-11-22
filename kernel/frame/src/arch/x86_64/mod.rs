@@ -4,7 +4,7 @@ pub(crate) mod apic;
 pub mod cpu;
 pub(crate) mod early_console;
 pub(crate) mod entry;
-mod io;
+pub(crate) mod io;
 pub mod paging;
 pub(crate) mod pci;
 pub(crate) mod qemu;

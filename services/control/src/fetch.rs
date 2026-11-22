@@ -23,6 +23,8 @@ const SPARE: usize = 16 << 20;
 /// trickles bytes must not hold a pull forever).
 const SILENCE_NS: u64 = 120_000_000_000;
 const TIMEOUT_NS: u64 = 3_600_000_000_000;
+/// How often a request whose connection failed is made anew.
+const RETRIES: u32 = 3;
 /// Resend an unanswered DNS query after this long.
 const DNS_RETRY_NS: u64 = 2_000_000_000;
 
@@ -79,6 +81,21 @@ pub(crate) struct Fetch {
     started: u64,
     /// When the server last sent anything.
     heard: u64,
+    /// How often this was started anew.
+    again: u32,
+}
+
+/// Why a try failed.
+enum Fault {
+    /// The connection did: another may do better.
+    Connection(String),
+    Final(String),
+}
+
+impl From<String> for Fault {
+    fn from(text: String) -> Fault {
+        Fault::Final(text)
+    }
 }
 
 impl core::fmt::Debug for Fetch {
@@ -124,6 +141,7 @@ impl Fetch {
             out: Vec::new(),
             started: rt::monotonic(),
             heard: rt::monotonic(),
+            again: 0,
         })
     }
 
@@ -145,11 +163,33 @@ impl Fetch {
         })
     }
 
-    /// Makes what progress it can; the response once it is complete.
+    /// Makes what progress it can; the response once it is complete. What
+    /// a lost connection cut off is asked for again (it is always a GET).
     pub(crate) fn advance(&mut self, net: &mut Net) -> Result<Option<Response>, String> {
+        match self.progress(net) {
+            Ok(r) => Ok(r),
+            Err(Fault::Connection(why)) if self.again < RETRIES => {
+                rt::log!("control: {why}; trying again");
+                net.cache.remove(&self.req.url.host);
+                *self = Fetch {
+                    started: self.started,
+                    again: self.again + 1,
+                    ..Fetch::start(self.req.clone(), net)?
+                };
+                Ok(None)
+            }
+            Err(Fault::Connection(why) | Fault::Final(why)) => Err(why),
+        }
+    }
+
+    fn progress(&mut self, net: &mut Net) -> Result<Option<Response>, Fault> {
         let now = rt::monotonic();
-        if now - self.started > TIMEOUT_NS || now - self.heard > SILENCE_NS {
-            return Err(format!("{} timed out", self.req.url.host));
+        let timed_out = || format!("{} timed out", self.req.url.host);
+        if now - self.started > TIMEOUT_NS {
+            return Err(Fault::Final(timed_out()));
+        }
+        if now - self.heard > SILENCE_NS {
+            return Err(Fault::Connection(timed_out()));
         }
         loop {
             match &mut self.stage {
@@ -169,7 +209,7 @@ impl Fetch {
                                     self.stage = connect(ips[0], self.req.url.port)?;
                                 }
                                 Err(dns::Error::Mismatch) => {}
-                                r => return Err(format!("DNS for {host}: {r:?}")),
+                                r => return Err(format!("DNS for {host}: {r:?}").into()),
                             }
                         }
                         Ok(_) => {}
@@ -178,7 +218,9 @@ impl Fetch {
                                 return Ok(None);
                             }
                             if *tries >= 4 {
-                                return Err(format!("no DNS answer for {}", self.req.url.host));
+                                return Err(
+                                    format!("no DNS answer for {}", self.req.url.host).into()
+                                );
                             }
                             let q = dns::query(*id, &self.req.url.host)
                                 .map_err(|e| format!("{e:?}"))?;
@@ -186,7 +228,7 @@ impl Fetch {
                             (*sent, *tries) = (now, *tries + 1);
                             return Ok(None);
                         }
-                        Err(e) => return Err(format!("DNS receive: {e:?}")),
+                        Err(e) => return Err(format!("DNS receive: {e:?}").into()),
                     }
                 }
                 Stage::Connect { sock } => match rt::sock_error(sock) {
@@ -220,7 +262,8 @@ impl Fetch {
                     }
                     Err(Error::WouldBlock) => return Ok(None),
                     Err(e) => {
-                        return Err(format!("connecting to {}: {e:?}", self.req.url.host));
+                        let why = format!("connecting to {}: {e:?}", self.req.url.host);
+                        return Err(Fault::Connection(why));
                     }
                 },
                 Stage::Tls { .. } | Stage::Plain { .. } => return self.exchange(),
@@ -229,7 +272,7 @@ impl Fetch {
         }
     }
 
-    fn exchange(&mut self) -> Result<Option<Response>, String> {
+    fn exchange(&mut self) -> Result<Option<Response>, Fault> {
         let (sock, mut tls) = match &mut self.stage {
             Stage::Tls { sock, tls } => (&*sock, Some(tls)),
             Stage::Plain { sock } => (&*sock, None),
@@ -245,7 +288,9 @@ impl Fetch {
                         self.out.drain(..n);
                     }
                     Err(Error::WouldBlock) => break,
-                    Err(e) => return Err(format!("sending to {host}: {e:?}")),
+                    Err(e) => {
+                        return Err(Fault::Connection(format!("sending to {host}: {e:?}")));
+                    }
                 }
             }
             let (data, eof) = match rt::recv(sock, &mut buf) {
@@ -255,7 +300,7 @@ impl Fetch {
                     (buf[..n].to_vec(), false)
                 }
                 Err(Error::WouldBlock) => return Ok(None),
-                Err(e) => return Err(format!("receiving from {host}: {e:?}")),
+                Err(e) => return Err(Fault::Connection(format!("receiving from {host}: {e:?}"))),
             };
             let mut closed = eof;
             let plain = match tls.as_mut() {
@@ -263,7 +308,7 @@ impl Fetch {
                     match t.feed(&data) {
                         Ok(()) => {}
                         Err(tls::Error::Closed) => closed = true,
-                        Err(e) => return Err(format!("TLS with {host}: {e:?}")),
+                        Err(e) => return Err(format!("TLS with {host}: {e:?}").into()),
                     }
                     self.out.extend(t.take_output());
                     t.read()
@@ -283,14 +328,15 @@ impl Fetch {
                 return Err(format!(
                     "a response of {host} ({} KiB more) does not fit in memory",
                     wants / 1024
-                ));
+                )
+                .into());
             }
             if closed {
                 return self
                     .parser
                     .eof()
                     .map(Some)
-                    .map_err(|e| format!("{host} closed early: {e:?}"));
+                    .map_err(|e| Fault::Connection(format!("{host} closed early: {e:?}")));
             }
         }
     }

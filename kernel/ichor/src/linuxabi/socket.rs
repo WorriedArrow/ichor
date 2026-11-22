@@ -69,6 +69,10 @@ const IPPROTO_IP: u64 = 0;
 const IP_TOS: u64 = 1;
 const IP_TTL: u64 = 2;
 const IP_MTU_DISCOVER: u64 = 10;
+/// Errors to the socket's error queue too. (It is always empty: the one
+/// error there is, ECONNREFUSED, is the socket's. But glibc's resolver
+/// gives up if it may not set this.)
+const IP_RECVERR: u64 = 11;
 const IP_FREEBIND: u64 = 15;
 const IP_BIND_ADDRESS_NO_PORT: u64 = 24;
 const IP_MULTICAST_IF: u64 = 32;
@@ -94,6 +98,7 @@ const TCP_FASTOPEN: u64 = 23;
 const MSG_PEEK: u64 = 0x2;
 const MSG_DONTWAIT: u64 = 0x40;
 const MSG_WAITALL: u64 = 0x100;
+const MSG_ERRQUEUE: u64 = 0x2000;
 const MSG_NOSIGNAL: u64 = 0x4000;
 const MSG_WAITFORONE: u64 = 0x10000;
 const MSG_CMSG_CLOEXEC: u64 = 0x4000_0000;
@@ -636,6 +641,7 @@ fn known_option(s: &Socket, level: u64, name: u64) -> bool {
             IP_TOS
                 | IP_TTL
                 | IP_MTU_DISCOVER
+                | IP_RECVERR
                 | IP_FREEBIND
                 | IP_BIND_ADDRESS_NO_PORT
                 | IP_MULTICAST_IF
@@ -913,6 +919,10 @@ fn recv_bytes(p: &mut LinuxProcess, fd: u64, max: usize, flags: u64) -> Result<R
     }
     let (o, nonblock) = sock_of(p, fd)?;
     let s = o.socket().ok_or(ENOTSOCK)?;
+    // The error queue, which is never waited for (see `IP_RECVERR`).
+    if flags & MSG_ERRQUEUE != 0 {
+        return Err(EAGAIN);
+    }
     let nonblock = nonblock || flags & MSG_DONTWAIT != 0;
     if s.dgram {
         let (from, mut data) = s.recv_datagram(nonblock, peek, &interrupted)?;

@@ -156,10 +156,14 @@ not write it; merge its branch when it lands.
   which TCG cannot keep up with), `net-boundsocket` (wants port 1 refused;
   any user may bind any port in a cell, as in Docker), and `watch-mode`.
 - M7 JVM (fifth suite): `cargo xtask workloads jvm` (jtreg, OpenJDK 21's
-  tier 1). Not scored: under TCG about one JVM in twenty dies, since QEMU
-  fetches an instruction in pieces while the JVM patches it (an `hs_err`
-  whose fault address decodes from the old first bytes and the new last
-  ones; memory is right). Score it on KVM (`workloads.yml`). A sample of
+  tier 1). On KVM (`workloads.yml`): 2283 of 2376 (2026-11-22, 34 min).
+  Of the 93, by their names: about 50 need native test libraries, which are
+  not built (`java/foreign`, JNI), about ten the Unicode data files (not in
+  a layer), and many of the rest may have met a full cell (the kernel log
+  has processes killed at its 5 GiB; four tests run at once). Not under TCG, where about one JVM in
+  twenty dies, since QEMU fetches an instruction in pieces while the JVM
+  patches it (an `hs_err` whose fault address decodes from the old first
+  bytes and the new last ones; memory is right). A sample of
   other directories passed 247 of 274; of its failures, `ProcessHandle`,
   `PortUnreachable` and four more pass since. Left to work on: multicast,
   urgent data, extended attributes (`CheckPermissions`, `FileAttributes`),
@@ -670,19 +674,22 @@ Suggested order for milestone 4:
    sockets or a file-backed mirror, more `/proc`, and glibc's `ld-linux`).
 
 ADR-0004 records the side-channel posture. Built: VERW, IBPB on cross-cell
-switch, page-table isolation for Meltdown-affected CPUs, and enhanced IBRS
+switch, page-table isolation for Meltdown-affected CPUs, IBRS on every
+entry from ring 3 for CPUs without enhanced IBRS (`ichor_spec_ctrl` in
+`entry.rs`), and enhanced IBRS
 with BHI_DIS_S where enumerated (not yet run on hardware that has it: no
-test machine reports it). Owed: BHB clearing, IBRS on entry without eIBRS,
-RSB filling, masked indices, AMD's measures. Boot logs which apply.
+test machine reports it). Owed: BHB clearing, RSB filling, masked indices,
+AMD's measures. Boot logs which apply.
 
 Frame budget: ADR-0005 sets the milestone 3 ceiling at 8,500 lines / 380
 sites; ADR-0007 raises it to 9,500 / 420 for milestone 4 (TLB shootdown,
-atomic user ops for futexes, PCID). `audit.toml` is at step 7 (6,250 / 265,
-ADR-0004's isolation amendment); frame is at 6,236 / 261 (A5 added
+atomic user ops for futexes, PCID). `audit.toml` is at step 8 (6,350 / 265,
+ADR-0005's amendment); frame is at 6,329 / 260 (A5 added
 RDSEED/RDRAND and UEFI GetTime; B added XSAVE; C the frames tree and
 request tracking; M6 reading `\ichor\roots.pem`; ADR-0011 the checked user
-copy; ADR-0004 VERW/IBPB, page-table isolation and eIBRS). `services/rt` has
-its own budget (`services/rt/audit.toml`: 500 / 40; at 402 / 29).
+copy; ADR-0004 VERW/IBPB, page-table isolation and eIBRS; `IoPorts`).
+`services/rt` has its own budget (`services/rt/audit.toml`: 500 / 40; at
+417 / 30).
 
 The goal set for this effort is milestone 8, whose acceptance test needs
 cloud accounts and bare-metal hardware from the owner.
@@ -707,9 +714,13 @@ QEMU's slirp hands out 10.0.2.15, so the tests see the same address),
 and the control plane resolves through the lease's DNS server unless
 `dns=` is given. The uplink renews the lease at half its time, and moves
 address if the server says so (published ports stay, connections are
-cut); unrenewed past its end, it keeps the address and asks on. Not yet:
-AWS ENA and GCP gVNIC, Hyper-V VMBus for Azure, Secure Boot; nothing has
-run on a real cloud or a real machine.
+cut); unrenewed past its end, it keeps the address and asks on.
+**Google Cloud is done** (2026-11-22, an E2 machine: boots, pulls and runs
+containers through the API over the internet; `docs/cloud.md`). Its virtio
+devices are legacy (I/O ports: `frame::io::IoPorts`, ADR-0005's amendment;
+virtio-pci speaks both transports). Not yet: AWS ENA and GCP gVNIC, Hyper-V
+VMBus for Azure, Secure Boot; nothing has run on AWS, Azure or a real
+machine.
 
 ## Commands
 
@@ -723,6 +734,7 @@ cargo xtask frame-audit    # frame's and services/rt's line and unsafe-site coun
 cargo xtask run --cmdline "qemu_debug_exit bench" --smp 4 --release   # benchmarks (use KVM for real numbers)
 cargo xtask bench --accel kvm --smp 4   # Ichor vs Linux, same machine and programs (Markdown table)
 cargo xtask disk-image     # target/ichor-disk.img: bootable GPT disk (ESP + Ichor root) for clouds/bare metal
+cargo xtask api HOST:50051 --name NAME --ca ca.pem --token-file F IMAGE -- CMD   # pull and run on a running machine (docs/cloud.md)
 cargo xtask fuzz [TARGET] --iterations N   # mutation-fuzz the parsers (failing inputs: target/fuzz/)
 cargo xtask x509-limbo     # certificate validation vs x509-limbo -> docs/x509-limbo.md (fails below floors)
 cargo xtask workloads python   # CPython's own suite through the control plane -> docs/workloads.md (fails below workloads.toml's floor)

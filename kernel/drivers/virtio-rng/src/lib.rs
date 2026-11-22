@@ -1,5 +1,4 @@
-//! virtio-rng: entropy from the host, over the modern PCI transport,
-//! polled. One queue; each request is a device-writable buffer the device
+//! virtio-rng: entropy from the host, polled. One queue; each request is a device-writable buffer the device
 //! fills with random bytes.
 //!
 //! Safe code only (see `virtio-pci`).

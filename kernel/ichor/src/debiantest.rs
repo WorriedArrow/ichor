@@ -226,6 +226,33 @@ $!{ECONNREFUSED} or fail("a closed udp port: $!");
 unpack("i", getsockopt($u5, SOL_SOCKET, SO_ERROR)) == 0 or fail("the error stayed");
 send($u3, "anyone?", 0, $dead) == 7 or fail("udp send to a closed port: $!");
 unpack("i", getsockopt($u3, SOL_SOCKET, SO_ERROR)) == 0 or fail("an unconnected socket got an error");
+# The error queue (IP_RECVERR) can be had, and is empty.
+setsockopt($u3, 0, 11, 1) or fail("IP_RECVERR: $!");
+defined(recv($u3, $m, 100, 0x2000)) and fail("an error in the error queue");
+$!{EAGAIN} or fail("the error queue: $!");
+# glibc's resolver, asking a name server here: one that knows one address.
+open(my $rc, ">", "/etc/resolv.conf") or fail("resolv.conf: $!");
+print $rc "nameserver 127.0.0.1\n";
+close $rc;
+my $dns = udp();
+bind($dns, pack_sockaddr_in(53, $lo)) or fail("bind to port 53: $!");
+my $server = fork() // fail("fork: $!");
+if ($server == 0) {
+    while (defined(my $who = recv($dns, my $q, 512, 0))) {
+        my ($name, $type) = unpack("x12 Z* n", $q);
+        my $end = 12 + length($name) + 5;
+        my $a = $type == 1 ? pack("n n n N n C4", 0xc00c, 1, 1, 60, 4, 192, 0, 2, 7) : "";
+        my $r = substr($q, 0, 2) . pack("n5", 0x8180, 1, $a ne "" ? 1 : 0, 0, 0);
+        send($dns, $r . substr($q, 12, $end - 12) . $a, 0, $who);
+    }
+    POSIX::_exit(1);
+}
+my $named = gethostbyname("ichor.test") or fail("gethostbyname: $?");
+inet_ntoa($named) eq "192.0.2.7" or fail("gethostbyname: " . inet_ntoa($named));
+my ($gai, @found) = Socket::getaddrinfo("ichor.test", "80", { socktype => SOCK_STREAM });
+$gai and fail("getaddrinfo: $gai");
+@found == 1 && (unpack_sockaddr_in($found[0]{addr}))[0] == 80 or fail("getaddrinfo: " . @found);
+kill(9, $server); waitpid($server, 0);
 print "debian: udp: datagrams keep boundaries and sources, truncate, connect filters, ports are per protocol\n";
 "#;
 

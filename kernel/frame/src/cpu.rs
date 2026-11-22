@@ -126,6 +126,9 @@ pub(crate) struct CpuBlock {
     pub(crate) verw: AtomicU64,
     /// 160: VERW's operand, a writable data selector.
     pub(crate) verw_sel: AtomicU64,
+    /// 168: what `IA32_SPEC_CTRL` holds in the kernel, if that is written on
+    /// every entry from ring 3 (ring 3 has it without IBRS); else 0.
+    pub(crate) spec_ctrl: AtomicU64,
 }
 
 impl CpuBlock {
@@ -152,6 +155,7 @@ impl CpuBlock {
             pti: AtomicU64::new(0),
             verw: AtomicU64::new(0),
             verw_sel: AtomicU64::new(0),
+            spec_ctrl: AtomicU64::new(0),
         }
     }
 }

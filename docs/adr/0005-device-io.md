@@ -97,3 +97,27 @@ supersedes ADR-0003's milestone 2 ceiling. Expected additions:
   device-owned rings through `DmaAddr::as_u64()`. Those drivers stay on the
   DMA-trusted list until an IOMMU or a frame-owned ring format covers them.
 - Frame grows by roughly 900 lines for device I/O.
+
+## Amendment (2026-11-22): a device's I/O ports
+
+The first boot on Google Cloud (an E2 machine) found that its virtio
+devices, the disk's controller and the network among them, are legacy ones
+(virtio 0.9.5): their registers are I/O ports behind BAR 0, and they have
+none of the capabilities the modern transport is found by. Reaching them
+takes what ADR-0001 §4.6 called `IoPort`.
+
+- `frame::io::IoPorts` comes only from `PciDevice::map_ports`, for an I/O
+  BAR, once for each. Its accessors are bounds-checked, aligned, and never
+  panic, as `IoMem`'s are. Frame turns port decoding on for the device.
+- The ports below 0x1000 are refused whatever a BAR says: frame drives the
+  interrupt controllers, timers, the console and PCI configuration there.
+  As drivers cannot write configuration space, a BAR is where the firmware
+  put it, and no driver can move one over another device's ports.
+- A legacy device takes a queue as one piece, its used ring aligned to a
+  page, of a size the device alone chooses (Google's are in the thousands):
+  `VirtQueue::new` takes the alignment, and any power of two as the size.
+  The descriptors remain frame's, so a legacy device is no more
+  DMA-trusted than a modern one.
+
+Frame's audit step 8 is 6,350 lines / 265 sites, within ADR-0007's ceiling
+(6,298 / 259 at this change: the port instructions became one macro).

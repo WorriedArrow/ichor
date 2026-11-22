@@ -124,8 +124,10 @@ fn sha256(b: &[u8]) -> String {
 /// Serves `body` to every HTTP request on 127.0.0.1 (the guest's
 /// 10.0.2.2), by a redirect under `/moved/`, until the process ends;
 /// returns the port, and how often it was asked. `/huge` is
-/// [`huge_layer`], and not counted.
+/// [`huge_layer`], and not counted. The first answer with a body stops
+/// halfway.
 fn serve(body: Vec<u8>) -> (u16, Arc<AtomicU32>) {
+    let mut cut = true;
     let huge = huge_layer();
     let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = l.local_addr().unwrap().port();
@@ -154,7 +156,9 @@ fn serve(body: Vec<u8>) -> (u16, Arc<AtomicU32>) {
                 body.len()
             );
             let _ = s.write_all(head.as_bytes());
-            let _ = s.write_all(body);
+            let part = if cut { body.len() / 2 } else { body.len() };
+            let _ = s.write_all(&body[..part]);
+            cut = false;
         }
     });
     (port, asked)
@@ -586,6 +590,7 @@ fn the_control_plane_pulls_and_runs_an_image_from_docker_hub() {
          nameserver 10.0.2.3\na name was found\n"
     );
     assert_eq!(exit, 3 << 8);
-    // Once refused, once for both layers, each after a redirect.
-    assert_eq!(asked.load(Ordering::SeqCst), 4);
+    // Once refused (and again, its first answer having been cut short),
+    // once for both layers, each after a redirect.
+    assert_eq!(asked.load(Ordering::SeqCst), 5);
 }
