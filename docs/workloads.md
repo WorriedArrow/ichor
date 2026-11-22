@@ -23,24 +23,13 @@ Failed:
 
 - Image: `docker.io/library/golang@sha256:4fa7c968ba93f1635670522dbb01a2c78150443e1385746924566079f36570ea`
 - Command: `go test -short -vet=off -timeout 30m std`
-- Result: 254 of 262 packages passed (96.9%), 121 skipped; floor 94.0%
+- Result: 260 of 262 packages passed (99.2%), 121 skipped; floor 94.0%
 - Run time: 78 min (tcg, 4 vCPUs, the cell given 6 GiB)
-- Known causes among the failures: `crypto/sha1` is QEMU's (TCG reads 32
-  bytes for VINSERTI128's 16-byte operand), as `math` was (its FMA, which
-  the emulated CPU no longer has); `syscall` wants ptrace; `time` ran out of
-  its minute under TCG. Fixed since the run: what `net`, `os` and
-  `path/filepath` failed on.
 
 Failed:
 
 - `crypto/sha1`
-- `math`
-- `net`
-- `os`
-- `path/filepath`
-- `runtime`
 - `syscall`
-- `time`
 
 ## postgres
 
@@ -55,44 +44,42 @@ Failed:
 - Image: `docker.io/library/node@sha256:9d266751ca3d7fdbe651c878ffd5ad0a42fed49a18c283509267c97f025b7496`
 - Layer: `https://nodejs.org/dist/v24.22.3/node-v24.22.3.tar.gz` (sha256:4690edccae352134bbe31d844b37898f2a28b2c3d67901d0112fb6c4996d556a), `node-v24.22.3/test/` at `/usr/src/node/test/`
 - Layer: `https://nodejs.org/dist/v24.22.3/node-v24.22.3.tar.gz` (sha256:4690edccae352134bbe31d844b37898f2a28b2c3d67901d0112fb6c4996d556a), `node-v24.22.3/tools/` at `/usr/src/node/tools/`
-- Command: `sh -c cd /usr/src/node && [ $# -gt 0 ] || set -- parallel sequential; exec python3 tools/test.py -J --shell=/usr/local/bin/node -p tap --timeout 600 "$@" node`
-- Result: 4365 of 4400 tests passed (99.2%), 342 skipped; floor 98.0%
-- Run time: 130 min (tcg, 4 vCPUs, the cell given 4 GiB)
+- Layer: `https://nodejs.org/dist/v24.22.3/node-v24.22.3.tar.gz` (sha256:4690edccae352134bbe31d844b37898f2a28b2c3d67901d0112fb6c4996d556a), `node-v24.22.3/CHANGELOG.md` at `/usr/src/node/CHANGELOG.md`
+- Layer: `https://nodejs.org/dist/v24.22.3/node-v24.22.3.tar.gz` (sha256:4690edccae352134bbe31d844b37898f2a28b2c3d67901d0112fb6c4996d556a), `node-v24.22.3/benchmark/` at `/usr/src/node/benchmark/`
+- Layer: `https://nodejs.org/dist/v24.22.3/node-v24.22.3.tar.gz` (sha256:4690edccae352134bbe31d844b37898f2a28b2c3d67901d0112fb6c4996d556a), `node-v24.22.3/doc/` at `/usr/src/node/doc/`
+- Layer: `https://nodejs.org/dist/v24.22.3/node-v24.22.3.tar.gz` (sha256:4690edccae352134bbe31d844b37898f2a28b2c3d67901d0112fb6c4996d556a), `node-v24.22.3/lib/` at `/usr/src/node/lib/`
+- Layer: `https://nodejs.org/dist/v24.22.3/node-v24.22.3.tar.gz` (sha256:4690edccae352134bbe31d844b37898f2a28b2c3d67901d0112fb6c4996d556a), `node-v24.22.3/src/` at `/usr/src/node/src/`
+- Layer: `https://nodejs.org/dist/v24.22.3/node-v24.22.3.tar.gz` (sha256:4690edccae352134bbe31d844b37898f2a28b2c3d67901d0112fb6c4996d556a), `node-v24.22.3/deps/acorn/` at `/usr/src/node/deps/acorn/`
+- Layer: `https://nodejs.org/dist/v24.22.3/node-v24.22.3.tar.gz` (sha256:4690edccae352134bbe31d844b37898f2a28b2c3d67901d0112fb6c4996d556a), `node-v24.22.3/deps/corepack/` at `/usr/src/node/deps/corepack/`
+- Layer: `https://nodejs.org/dist/v24.22.3/node-v24.22.3.tar.gz` (sha256:4690edccae352134bbe31d844b37898f2a28b2c3d67901d0112fb6c4996d556a), `node-v24.22.3/deps/npm/` at `/usr/src/node/deps/npm/`
+- Layer: `https://nodejs.org/dist/v24.22.3/node-v24.22.3.tar.gz` (sha256:4690edccae352134bbe31d844b37898f2a28b2c3d67901d0112fb6c4996d556a), `node-v24.22.3/deps/undici/` at `/usr/src/node/deps/undici/`
+- Layer: `https://nodejs.org/dist/v24.22.3/node-v24.22.3.tar.gz` (sha256:4690edccae352134bbe31d844b37898f2a28b2c3d67901d0112fb6c4996d556a), `node-v24.22.3/deps/v8/src/objects/` at `/usr/src/node/deps/v8/src/objects/`
+- Command: `sh -c chown -R node /usr/src/node && cd /usr/src/node && { [ $# -gt 0 ] || set -- parallel sequential; } && exec su node -c 'exec python3 tools/test.py -J --shell=/usr/local/bin/node -p tap --timeout 600 "$@"' -- "$0" "$@" node`
+- Result: 4398 of 4404 tests passed (99.8%), 338 skipped; floor 98.0%
+- Run time: 98 min (tcg, 4 vCPUs, the cell given 4 GiB)
 
 Failed:
 
-- `parallel/test-benchmark-cli`
-- `parallel/test-benchmark-compare`
-- `parallel/test-child-process-dgram-reuseport`
-- `parallel/test-child-process-net-reuseport`
-- `parallel/test-cli-node-cli-manpage-env-vars`
-- `parallel/test-cli-node-cli-manpage-options`
-- `parallel/test-cli-node-options-docs`
-- `parallel/test-cluster-dgram-reuseport`
-- `parallel/test-cluster-dgram-reuse`
-- `parallel/test-cluster-listen-pipe-readable-writable`
-- `parallel/test-cluster-net-reuseport`
-- `parallel/test-corepack-version`
-- `parallel/test-dgram-multicast-set-interface`
-- `parallel/test-dgram-reuseport`
-- `parallel/test-fs-mkdir`
-- `parallel/test-fs-realpath-pipe`
-- `parallel/test-fs-rmSync-special-char-additional-error`
-- `parallel/test-fs-write-sigxfsz`
-- `parallel/test-http-pipeline-requests-connection-leak`
-- `parallel/test-icu-minimum-version`
 - `parallel/test-net-boundsocket`
-- `parallel/test-net-reuseport`
-- `parallel/test-net-server-listen-path`
-- `parallel/test-npm-install`
-- `parallel/test-npm-version`
-- `parallel/test-process-env-allowed-flags-are-documented`
-- `parallel/test-process-load-env-file`
-- `parallel/test-process-versions`
-- `parallel/test-release-changelog`
-- `parallel/test-release-npm`
-- `parallel/test-repl-history-navigation`
-- `parallel/test-setproctitle`
 - `sequential/test-cpu-prof-dir-worker`
-- `sequential/test-cpu-prof-worker-argv`
+- `sequential/test-cpu-prof-drained`
+- `sequential/test-cpu-prof-name`
+- `sequential/test-diagnostic-dir-cpu-prof`
 - `sequential/test-watch-mode`
+
+## uring
+
+- Image: `docker.io/library/buildpack-deps@sha256:f53cd4c58cdb96a467b98696cd510a949ef4ccd7d23e07b75107de754773007a`
+- Layer: `https://brick.kernel.dk/snaps/liburing-2.5.tar.gz` (sha256:0100cfbf68943dfa869e02c99f8724c69182b09f7a90f1955e709bc914c7ebf9), `liburing-2.5/` at `/usr/src/liburing/`
+- Command: `sh -c cp -r /usr/src/liburing /root/liburing; cd /root/liburing; { ./configure && make -j4 -C src && make -j4 -C test; } >../make.log 2>&1 || { tail -40 ../make.log; exit 1; }; echo built; cd test; [ $# -gt 0 ] || set -- $(ls *.t); n=0; bad=0; for t in "$@"; do t=${t%.t}; n=$((n+1)); timeout -s INT -k 10 120 ./$t.t >/tmp/out 2>&1 </dev/null; s=$?; case $s in 0) echo "ok $n $t";; 77) echo "ok $n $t # skip";; *) echo "not ok $n $t ($s)"; tail -20 /tmp/out | sed 's/^/# /'; bad=1;; esac; done; exit $bad uring`
+- Result: 150 of 156 tests passed (96.1%), 6 skipped; floor 0.0%
+- Run time: 12 min (tcg, 4 vCPUs, the cell given 3 GiB)
+
+Failed:
+
+- `read-write`
+- `recv-multishot`
+- `send-zerocopy`
+- `socket-io-cmd`
+- `timeout`
+- `wq-aff`

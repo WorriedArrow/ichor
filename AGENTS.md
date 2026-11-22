@@ -165,7 +165,10 @@ not write it; merge its branch when it lands.
   Leave NIO's large-file tests out of a 5 GiB cell.
 - M7 liburing (sixth suite): `cargo xtask workloads uring` builds
   liburing 2.5 (of Linux 6.6's time) in `buildpack-deps` and runs its
-  tests one by one. It found the `execve` race (`/proc/<pid>/cmdline` read
+  tests one by one: 150 of 156 (2026-11-22; `timeout` is fixed since, the
+  other five want IPv6, `CAP_SYS_RESOURCE`, which containers lack,
+  `IP_RECVORIGDSTADDR`, URING_CMD on sockets, and Linux's own worker
+  threads). It found the `execve` race (`/proc/<pid>/cmdline` read
   the old arguments' address in the new memory) and that a TCP socket whose
   connect was refused could not connect again.
 - Known weakness: a pull whose image does not fit in memory kills the

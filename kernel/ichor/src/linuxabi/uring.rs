@@ -1965,5 +1965,9 @@ fn wait(
         }
     };
     crate::signal::end_wait_mask(p, &r);
+    // Too few completions are not none: the program looks at them first.
+    if ring.cq_ready() > 0 {
+        return Ok(());
+    }
     r.map(|_| ())
 }
