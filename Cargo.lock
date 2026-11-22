@@ -120,6 +120,7 @@ dependencies = [
  "ichor-http",
  "ichor-image",
  "ichor-layer",
+ "ichor-net",
  "ichor-oci",
  "ichor-tls",
  "ichor-x509",

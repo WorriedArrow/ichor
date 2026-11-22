@@ -550,6 +550,77 @@ fn dns_run(input: &[u8]) {
     let _ = dns::parse_a(input, 7, "registry-1.docker.io");
 }
 
+const FUZZ_MAC: net::Mac = net::Mac([0x52, 0x54, 0, 0x12, 0x34, 0x56]);
+
+/// A DHCP reply of `kind` (2 OFFER, 5 ACK) to transaction 7 for
+/// `FUZZ_MAC`, in a broadcast frame from QEMU's DHCP server.
+fn dhcp_reply(kind: u8) -> Vec<u8> {
+    use net::Ipv4Addr;
+    let server = Ipv4Addr::new(10, 0, 2, 2);
+    let mut m = vec![0u8; 236];
+    m[0] = 2;
+    m[1] = 1;
+    m[2] = 6;
+    m[4..8].copy_from_slice(&7u32.to_be_bytes());
+    m[16..20].copy_from_slice(&[10, 0, 2, 15]);
+    m[28..34].copy_from_slice(&FUZZ_MAC.0);
+    m.extend_from_slice(&[99, 130, 83, 99, 53, 1, kind, 54, 4, 10, 0, 2, 2]);
+    m.extend_from_slice(&[1, 4, 255, 255, 255, 0, 3, 4, 10, 0, 2, 2]);
+    m.extend_from_slice(&[6, 4, 10, 0, 2, 3, 51, 4, 0, 1, 81, 128, 26, 2, 5, 220, 255]);
+    let udp = net::wire::udp(server, 67, Ipv4Addr::BROADCAST, 68, &m);
+    let ip = net::wire::ipv4(server, Ipv4Addr::BROADCAST, net::wire::PROTO_UDP, 1, &udp);
+    net::wire::ethernet(
+        net::Mac::BROADCAST,
+        net::Mac([2, 0, 0, 0, 0, 2]),
+        net::wire::ETHERTYPE_IPV4,
+        &ip,
+    )
+}
+
+/// Ethernet frames off the wire (the uplink's NIC): DHCP replies, ARP,
+/// IPv4, ICMP, UDP and TCP segments.
+fn ethernet_seeds() -> Vec<Vec<u8>> {
+    let arp = net::wire::Arp {
+        op: net::wire::ARP_REPLY,
+        sender_mac: net::Mac([2, 0, 0, 0, 0, 2]),
+        sender_ip: net::Ipv4Addr::new(10, 0, 2, 2),
+        target_mac: FUZZ_MAC,
+        target_ip: net::Ipv4Addr::new(10, 0, 2, 15),
+    };
+    let arp = net::wire::ethernet(
+        FUZZ_MAC,
+        net::Mac([2, 0, 0, 0, 0, 2]),
+        net::wire::ETHERTYPE_ARP,
+        &arp.emit(),
+    );
+    vec![dhcp_reply(2), dhcp_reply(5), arp]
+}
+
+fn ethernet_run(input: &[u8]) {
+    let t = std::time::Duration::from_secs(1);
+    // A DHCP client waiting for an offer, and one waiting for its ACK.
+    let mut c = net::dhcp::Client::new(FUZZ_MAC, 7);
+    let _ = c.poll(t);
+    let _ = c.receive(t, input);
+    let mut c = net::dhcp::Client::new(FUZZ_MAC, 7);
+    let _ = c.poll(t);
+    let _ = c.receive(t, &dhcp_reply(2));
+    let _ = c.poll(t);
+    if let Some(l) = c.receive(t, input) {
+        // A lease that bound must make sense.
+        assert!(l.prefix <= 32);
+    }
+    // The uplink's interface.
+    let mut ifc = net::iface::Interface::new(
+        FUZZ_MAC,
+        net::Ipv4Addr::new(10, 0, 2, 15),
+        24,
+        Some(net::Ipv4Addr::new(10, 0, 2, 2)),
+    );
+    let _ = ifc.receive(t, input);
+    while ifc.transmit().is_some() {}
+}
+
 fn gzip_run(input: &[u8]) {
     let _ = layer::gunzip(input);
     let _ = layer::inflate::inflate(input);
@@ -642,6 +713,11 @@ pub const TARGETS: &[Target] = &[
         name: "dns",
         seeds: dns_seeds,
         run: dns_run,
+    },
+    Target {
+        name: "ethernet",
+        seeds: ethernet_seeds,
+        run: ethernet_run,
     },
     Target {
         name: "gzip",
