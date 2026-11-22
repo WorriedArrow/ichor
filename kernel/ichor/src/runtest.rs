@@ -1415,6 +1415,72 @@ fn misc_program() -> Vec<u8> {
     static_elf(&a.finish(BLOB_VADDR).unwrap_or_else(|| fail("assembler")))
 }
 
+/// A fork costs what it copies: in a 128-page cell, a process with 80
+/// touched pages forks (charging the child for all of them again would
+/// need 160 pages and fail), and the child copies one page by writing it.
+/// Exits 0; 1 if fork failed; 2 if the child did not exit 0.
+fn fork_charge_program() -> Vec<u8> {
+    const PAGES: u64 = 80;
+    let mut a = Asm::new();
+    let bad = a.label();
+    let parent = a.label();
+    let fill = a.label();
+    a.mov(Reg::Rbp, Reg::Rsp);
+    a.sub_imm(Reg::Rbp, 4096);
+    a.mov_imm(Reg::Rdi, 0);
+    a.mov_imm(Reg::Rsi, PAGES * 4096);
+    a.mov_imm(Reg::Rdx, 3);
+    a.mov_imm(Reg::R10, 0x22);
+    a.mov_imm(Reg::R8, u64::MAX);
+    a.mov_imm(Reg::R9, 0);
+    a.sys(sys::MMAP);
+    a.mov(Reg::R12, Reg::Rax);
+    a.mov_imm(Reg::Rcx, 0);
+    a.mov(Reg::Rdx, Reg::R12);
+    a.bind(fill);
+    a.store(Reg::Rdx, 0, Reg::Rcx);
+    a.add_imm(Reg::Rdx, 4096);
+    a.add_imm(Reg::Rcx, 1);
+    a.cmp_imm(Reg::Rcx, PAGES as i32);
+    a.jne(fill);
+    a.sys(sys::FORK);
+    a.mov_imm(Reg::Rdi, 1);
+    a.mov_imm(Reg::R14, (-4096i64) as u64);
+    a.cmp(Reg::Rax, Reg::R14);
+    a.ja(bad); // -errno
+    a.mov(Reg::R13, Reg::Rax);
+    a.cmp_imm(Reg::Rax, 0);
+    a.jne(parent);
+    // Child: write one page (its copy), check it, exit 0.
+    a.mov_imm(Reg::Rax, 0x77);
+    a.store(Reg::R12, 0, Reg::Rax);
+    a.load(Reg::Rcx, Reg::R12, 0);
+    a.mov_imm(Reg::Rdi, 9);
+    a.cmp(Reg::Rcx, Reg::Rax);
+    a.jne(bad);
+    a.mov_imm(Reg::Rdi, 0);
+    a.sys(sys::EXIT_GROUP);
+    a.bind(parent);
+    a.mov(Reg::Rdi, Reg::R13);
+    a.mov(Reg::Rsi, Reg::Rbp);
+    a.mov_imm(Reg::Rdx, 0);
+    a.mov_imm(Reg::R10, 0);
+    a.sys(sys::WAIT4);
+    a.load32(Reg::Rax, Reg::Rbp, 0);
+    a.mov_imm(Reg::Rdi, 2);
+    a.cmp_imm(Reg::Rax, 0);
+    a.jne(bad);
+    // The parent's page 0 still holds 0: the child's write was its own.
+    a.load(Reg::Rax, Reg::R12, 0);
+    a.mov_imm(Reg::Rdi, 3);
+    a.cmp_imm(Reg::Rax, 0);
+    a.jne(bad);
+    a.mov_imm(Reg::Rdi, 0);
+    a.bind(bad);
+    a.sys(sys::EXIT_GROUP);
+    static_elf(&a.finish(BLOB_VADDR).unwrap_or_else(|| fail("assembler")))
+}
+
 /// Ranges bigger than one batch of page bookkeeping (4096 pages): 4200
 /// touched pages, each holding its index, move with mremap and are all
 /// found at the new address, are made read-only, then unmapped. (Lists of
@@ -3111,6 +3177,13 @@ pub(crate) fn run() {
     println!(
         "ichor: linux: a backward rep movsq resumed backward across 16 page faults; DF kept across a syscall"
     );
+
+    let (status, _) = run_linux(new_process(), &fork_charge_program(), None, &["forkcharge"]);
+    if status != 0 {
+        println!("ichor: linux: forkcharge failed check {status}");
+        fail("fork accounting");
+    }
+    println!("ichor: linux: fork charges only what is copied (80 shared pages in a 128-page cell)");
 
     // Its own system and cell: the test needs more than one batch of
     // pages (4200 pages, 16 MiB), more than the usual test cells hold.

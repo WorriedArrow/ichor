@@ -26,9 +26,12 @@
 //!
 //! `fork` is copy-on-write: parent and child map the same pages read-only
 //! and mark them shared; the first write on either side (a fault, or a
-//! kernel copy into user memory) gives that side its own copy. The child
-//! is charged for every page up front, so breaking a share never fails on
-//! the account.
+//! kernel copy into user memory) gives that side its own copy. A page is
+//! charged to the cell once, however many address spaces hold it (it is
+//! a shared `Charged` handle), and the copy a write makes is charged when
+//! it is made: so a forked child costs what it copies, as on Linux, and a
+//! write that breaks a share can fail on a full account (the fault then
+//! kills the writer, as Linux's OOM handling would).
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
@@ -111,10 +114,45 @@ fn page_up(v: u64) -> Option<u64> {
     Some(v.checked_add(PAGE_SIZE - 1)? & !(PAGE_SIZE - 1))
 }
 
+/// A resident page with its one charge to the account it was made under.
+/// Address spaces share it (after `fork`, or in a shared mapping), and the
+/// charge is released when the last of them lets go: a page counts once
+/// however many processes of the cell map it, as on Linux, where a forked
+/// child costs only the pages it copies.
+#[derive(Debug)]
+struct Charged {
+    frame: UFrame,
+    account: Arc<Account>,
+}
+
+impl Drop for Charged {
+    fn drop(&mut self) {
+        self.account.release(1);
+    }
+}
+
+impl core::ops::Deref for Charged {
+    type Target = UFrame;
+    fn deref(&self) -> &UFrame {
+        &self.frame
+    }
+}
+
+type Page = Arc<Charged>;
+
+/// Charges `account` for `frame`, or `None` if it is full.
+fn charged(account: &Arc<Account>, frame: UFrame) -> Option<Page> {
+    account.charge(1).ok()?;
+    Some(Arc::new(Charged {
+        frame,
+        account: account.clone(),
+    }))
+}
+
 /// A process's address space and its bookkeeping. Pages are charged to
-/// `account` (the cell's) and released when unmapped or when the `Mm` is
-/// dropped. Drop it only while its space is not active (switch to the
-/// kernel space first).
+/// `account` (the cell's) once each (`Charged`), and released when no
+/// address space holds them any more. Drop it only while its space is not
+/// active (switch to the kernel space first).
 ///
 /// The space is shared so a copy can run without the `Mm` lock
 /// ([`copy_user`], ADR-0011 as amended): such a copy holds its own
@@ -128,8 +166,8 @@ pub(crate) struct Mm {
     space: Arc<VmSpace>,
     account: Arc<Account>,
     regions: RegionMap,
-    /// Every page the process owns, mapped or not (`PROT_NONE`).
-    pages: BTreeMap<u64, UFrame>,
+    /// Every page the process holds, mapped or not (`PROT_NONE`).
+    pages: BTreeMap<u64, Page>,
     /// Pages possibly shared with another process after `fork`: mapped
     /// read-only, copied on the first write.
     cow: BTreeSet<u64>,
@@ -192,7 +230,8 @@ impl Mm {
         child.shared = self.shared.clone();
         child.brk_start = self.brk_start;
         child.brk = self.brk;
-        self.account.charge(self.pages.len() as u64).ok()?;
+        // The child shares every page (no new charge): what either side
+        // copies on write is charged then.
         for (&va, f) in &self.pages {
             child.pages.insert(va, f.clone());
             if self.is_shared(va) {
@@ -246,10 +285,13 @@ impl Mm {
     /// Maps `frame` (a page cache page) at `va`, copy-on-write: read-only
     /// until written. Charged as one page.
     pub(crate) fn map_cow(&mut self, va: u64, frame: UFrame, prot: Prot) -> bool {
-        if self.pages.contains_key(&va) || self.account.charge(1).is_err() {
+        if self.pages.contains_key(&va) {
             return false;
         }
-        self.pages.insert(va, frame.clone());
+        let Some(page) = charged(&self.account, frame.clone()) else {
+            return false;
+        };
+        self.pages.insert(va, page);
         self.cow.insert(va);
         let p = self.mapped_prot(va, prot);
         !prot.accessible() || self.space.map(va, &frame, p).is_ok()
@@ -261,7 +303,9 @@ impl Mm {
         let Some(shared) = self.pages.get(&va).cloned() else {
             return false;
         };
-        let Some(copy) = UFrame::alloc_zeroed() else {
+        // The copy is charged; the shared page's charge goes with its last
+        // holder (this one, if the other side already copied or left).
+        let Some(copy) = UFrame::alloc_zeroed().and_then(|f| charged(&self.account, f)) else {
             return false;
         };
         let mut buf = alloc::vec![0u8; PAGE_SIZE as usize];
@@ -368,9 +412,8 @@ impl Mm {
     /// map it.
     pub(crate) fn frame(&mut self, va: u64) -> Option<UFrame> {
         if let Some(f) = self.pages.get(&va) {
-            return Some(f.clone());
+            return Some(f.frame.clone());
         }
-        self.account.charge(1).ok()?;
         let file = self.files.iter().find(|r| r.start <= va && va < r.end);
         let at = file.map(|r| r.offset + (va - r.base));
         // A cache page needs no fresh frame (or zeroing one to throw away).
@@ -378,20 +421,19 @@ impl Mm {
             && let Some(cached) = r.file.cached_page(at / PAGE_SIZE)
         {
             // Shared with the cache: read-only until written.
-            self.pages.insert(va, cached.clone());
+            self.pages
+                .insert(va, charged(&self.account, cached.clone())?);
             self.cow.insert(va);
             return Some(cached);
         }
-        let Some(f) = UFrame::alloc_zeroed() else {
-            self.account.release(1);
-            return None;
-        };
+        let page = charged(&self.account, UFrame::alloc_zeroed()?)?;
         if let (Some(r), Some(at)) = (self.files.iter().find(|r| r.start <= va && va < r.end), at) {
-            let mut page = alloc::vec![0u8; PAGE_SIZE as usize];
-            let n = r.file.read_at(at, &mut page);
-            f.writer().write(&page[..n]);
+            let mut buf = alloc::vec![0u8; PAGE_SIZE as usize];
+            let n = r.file.read_at(at, &mut buf);
+            page.writer().write(&buf[..n]);
         }
-        self.pages.insert(va, f.clone());
+        let f = page.frame.clone();
+        self.pages.insert(va, page);
         Some(f)
     }
 
@@ -539,9 +581,9 @@ impl Mm {
                 return;
             }
             for va in vas {
+                // The charge goes with the page's last holder.
                 self.pages.remove(&va);
                 self.cow.remove(&va);
-                self.account.release(1);
             }
         }
     }
@@ -634,10 +676,10 @@ impl Mm {
         let user = Prot::from_linux(prot).ok_or(EINVAL)?;
         for (i, f) in frames.iter().enumerate() {
             let va = start + i as u64 * PAGE_SIZE;
-            let mapped = self.account.charge(1).is_ok() && {
-                self.pages.insert(va, f.clone());
+            let mapped = charged(&self.account, f.clone()).is_some_and(|page| {
+                self.pages.insert(va, page);
                 !user.accessible() || self.space.map(va, f, user_prot(user)).is_ok()
-            };
+            });
             if !mapped {
                 let _ = self.munmap(start, len);
                 return Err(ENOMEM);
@@ -993,9 +1035,5 @@ pub(crate) fn copy_user<G>(
 /// One past the highest user address.
 pub(crate) const USER_TOP: u64 = 0x0000_7fff_ffff_f000;
 
-impl Drop for Mm {
-    fn drop(&mut self) {
-        // The pages themselves are freed with `pages` and `space`.
-        self.account.release(self.pages.len() as u64);
-    }
-}
+// Dropping an `Mm` drops `pages` (each page's charge goes with its last
+// holder) and `space` (which clears the mappings).
