@@ -26,7 +26,7 @@ own (the control). `cell_access` on the command line runs it;
 | 7 `uid_0_in_a_cell_has_no_authority_outside_it` | 51 | pass |
 | 8 `resource_limits_are_per_cell` | 6 | pass |
 | 9 `cells_clean_up_after_themselves` | B after each section, memory | pass |
-| `a_destroyed_cell_leaves_no_shared_memory` | 3 | **fails: bug 1** |
+| `a_destroyed_cell_leaves_no_shared_memory` | 3 | pass (bug 1, fixed) |
 
 **Section 3 has no coverage.** A safety classifier stopped the session
 while its script was being written, and it was not written again. So
@@ -36,19 +36,33 @@ is ENOENT to `stat`, `chown`, `chmod` and io_uring `OPENAT` from A, B's
 socket path is ENOENT, and B's own file and ptys are unchanged after every
 section. The owner decides how that section gets written.
 
-## Bug 1: a destroyed cell's System V segments are never freed
+## Bug 1 (fixed): a destroyed cell's System V segments were never freed
 
 `linuxabi/shm.rs` keeps segments in a global table keyed by (cell id, id).
-Only `IPC_RMID` removes one. Nothing does when a cell is destroyed, so its
-pages stay allocated and charged to the dead cell's account and every
+Only `IPC_RMID` removed one. Nothing did when a cell was destroyed, so its
+pages stayed allocated and charged to the dead cell's account and every
 account above it, up to the system's. ADR-0002 §7: after `cell_destroy`,
 "nothing the cell created survives". A tenant that creates segments and is
-destroyed, repeatedly, uses up the node's memory budget for good.
+destroyed, repeatedly, used up the node's memory budget for good.
 
-The check makes a 64-page segment in a cell, lets the program exit, drops
-the root and the last reference to the cell, and finds 64 pages still
-charged. The control (a program that removes its segment) ends at zero.
-Not fixed here, as the task requires; the check stays failing.
+The suite was committed with this check failing (d17ae02); the owner then
+asked for the fix. `Cell` now frees its segments when its last reference
+drops (`shm::free_cell`). Every process holds its cell, so nothing can make
+another segment by then, and an attachment holds its segment, so pages
+still mapped go when it does.
+
+The check makes a 64-page segment in a cell, attaches it, lets the program
+exit, drops the root and the last reference to the cell, and expects
+nothing charged; the control removes its segment first. With the call to
+`free_cell` disabled it finds 64 pages. B's own segment is intact after it.
+
+## Bug 2 (open, found by reading): a destroyed cell's network stack stays
+
+`netstack::STACKS` holds every cell's `Stack` and nothing removes one;
+`net::switch`'s `detach` is never called by the kernel. So a destroyed
+cell keeps its stack, its switch port and its 10.88.0.0/16 address (which
+runs out), and ports published for it stay published. No check covers it
+yet.
 
 Two smaller observations, not failing checks:
 
@@ -151,7 +165,7 @@ done.
 - ADR-0009 §3 puts MKNOD and SYS_CHROOT in the cell's bounding set. Device
   `mknod` is EPERM ("no CAP_MKNOD in cells") and `chroot` is ENOSYS. The
   task asks for `mknod` to fail, so EPERM is asserted.
-- Bug 1 is against ADR-0002 §7.
+- Bug 1 was, and bug 2 is, against ADR-0002 §7.
 - ADR-0009 says `settimeofday`, `reboot` and module loading are "already
   EPERM or absent", so ENOSYS there agrees with it. Section 7's commit
   message says otherwise and is wrong.
@@ -186,7 +200,7 @@ done.
 
 ## Running it
 
-`cargo xtask test` runs it, with `--no-fail-fast` so bug 1's failing test
-does not hide the test files after it. On a host short of memory QEMU may
+`cargo xtask test` runs it, with `--no-fail-fast` so a failing check does
+not hide the test files after it. On a host short of memory QEMU may
 not start all the boots at once; `cargo test -p ichor-tests --test boot --
 --test-threads=2` with `ICHOR_KERNEL` set runs them two at a time.

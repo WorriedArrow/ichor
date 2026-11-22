@@ -864,15 +864,13 @@ fn segments_go(ctx: &Ctx) -> bool {
         RULE,
         "a destroyed cell's System V segments are freed",
         left == 0,
-        &alloc::format!(
-            "BUG (linuxabi/shm.rs SEGMENTS): {left} pages of a destroyed cell are still charged; nothing removes its segments"
-        ),
+        &alloc::format!("{left} pages of a destroyed cell are still charged"),
     );
     ok
 }
 
-/// A static ELF: `shmget(IPC_PRIVATE, pages)`, then `IPC_RMID` if `remove`;
-/// exits 0 if both worked.
+/// A static ELF: `shmget(IPC_PRIVATE, pages)`, `shmat`, then `IPC_RMID` if
+/// `remove`; exits, still attached, with 0 if they all worked.
 fn segment_program(pages: u64, remove: bool) -> Vec<u8> {
     use testprog::{Asm, BLOB_VADDR, Reg, static_elf};
     let mut a = Asm::new();
@@ -884,12 +882,21 @@ fn segment_program(pages: u64, remove: bool) -> Vec<u8> {
     a.mov_imm(Reg::R15, 1);
     a.cmp_imm(Reg::Rax, 0x7fff_ffff);
     a.ja(bad);
+    a.mov(Reg::Rbx, Reg::Rax);
+    a.mov(Reg::Rdi, Reg::Rbx);
+    a.mov_imm(Reg::Rsi, 0);
+    a.mov_imm(Reg::Rdx, 0);
+    a.sys(30); // shmat
+    a.mov_imm(Reg::R15, 2);
+    a.mov_imm(Reg::R8, 0x7fff_ffff_ffff); // the top of user addresses
+    a.cmp(Reg::Rax, Reg::R8);
+    a.ja(bad); // an errno
     if remove {
-        a.mov(Reg::Rdi, Reg::Rax);
+        a.mov(Reg::Rdi, Reg::Rbx);
         a.mov_imm(Reg::Rsi, 0); // IPC_RMID
         a.mov_imm(Reg::Rdx, 0);
         a.sys(31); // shmctl
-        a.mov_imm(Reg::R15, 2);
+        a.mov_imm(Reg::R15, 3);
         a.cmp_imm(Reg::Rax, 0);
         a.jne(bad);
     }

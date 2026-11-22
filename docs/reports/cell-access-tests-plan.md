@@ -91,13 +91,14 @@ Status: [ ] to do, [x] done and committed.
   signal: at a full account perl cannot run and no file can be made.)
 - [x] **9. cells_clean_up_after_themselves**: B alive and correct after
   each section; memory returned for every run. Plus
-  `a_destroyed_cell_leaves_no_shared_memory`, which **fails**: a
-  documented bug (see notes).
+  `a_destroyed_cell_leaves_no_shared_memory`, which failed until bug 1
+  (see notes) was fixed.
 - [x] **Scoping removal** (sections 1, 2, futex in 4; not 3): each edit,
   the failure seen, the restore checked with `git diff` (never
   committed). Results in `cell-access-tests.md`.
-- [x] **Review, report, AGENTS.md, push.** Open: section 3, and bug 1's
-  check, which fails until the kernel is fixed.
+- [x] **Review, report, AGENTS.md, push.** Bug 1 is fixed (the owner
+  asked); open: section 3, and bug 2 (a destroyed cell's network stack),
+  which has no check.
 
 ## Notes as they come up
 

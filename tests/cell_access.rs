@@ -10,7 +10,7 @@
 
 use std::sync::OnceLock;
 
-use ichor_tests::Outcome;
+use ichor_tests::{Exit, Outcome};
 
 /// Sections the kernel runs (`SECTIONS` in cellaccess.rs).
 const SECTIONS: usize = 9;
@@ -234,13 +234,20 @@ fn cells_clean_up_after_themselves() {
         .matches("ichor: cellaccess: B alive and unchanged after ")
         .count();
     assert_eq!(alive, SECTIONS, "sections after which B was alive");
-    out.assert_in_order(&["ichor: cellaccess: both cells exited and their memory returned"]);
+    out.assert_in_order(&[
+        "ichor: cellaccess: both cells exited and their memory returned",
+        "ichor: cellaccess: every section passed",
+    ]);
+    out.assert_exit(Exit::Success);
 }
 
-/// A destroyed cell's System V segments go with it (ADR-0002 §7). Fails
-/// until `linuxabi/shm.rs` frees them: a documented bug
-/// (`docs/reports/cell-access-tests.md`).
+/// A destroyed cell's System V segments go with it (ADR-0002 §7), and no
+/// other cell's do (B's is intact afterwards).
 #[test]
 fn a_destroyed_cell_leaves_no_shared_memory() {
     assert_rule("a_destroyed_cell_leaves_no_shared_memory");
+    suite().0.assert_in_order(&[
+        "a destroyed cell's System V segments are freed: ok",
+        "ichor: cellaccess: B alive and unchanged after a_destroyed_cell_leaves_no_shared_memory",
+    ]);
 }

@@ -1,9 +1,9 @@
 //! System V shared memory: `shmget`, `shmat`, `shmdt`, `shmctl`. Segments
 //! belong to a cell (its IPC namespace) and are its memory: every page is
 //! made, and charged, when the segment is. A segment goes with its last
-//! attachment once it was removed, and counts attachments exactly
-//! (PostgreSQL finds a dead postmaster's leftovers by `shm_nattch`), over
-//! `fork`, `execve` and whatever way a process ends.
+//! attachment once it was removed, or with its cell, and counts
+//! attachments exactly (PostgreSQL finds a dead postmaster's leftovers by
+//! `shm_nattch`), over `fork`, `execve` and whatever way a process ends.
 //!
 //! Partial: no `SHM_HUGETLB`, `SHM_REMAP`, `SHM_LOCK`; a partly unmapped
 //! attachment still counts. Semaphores and message queues are not here.
@@ -125,6 +125,21 @@ impl Segment {
     fn owned_by(&self, c: &Creds) -> bool {
         c.euid == 0 || c.euid == self.creator.0 || c.euid == self.status.lock().uid
     }
+}
+
+/// Removes the segments of `cell`, which is being destroyed. Their pages
+/// and charge go with them (or with an attachment that is still on its
+/// way out, which holds its segment).
+pub(crate) fn free_cell(cell: u64) {
+    let gone: Vec<Arc<Segment>> = {
+        let mut all = SEGMENTS.lock();
+        let keys: Vec<(u64, i32)> = all
+            .range((cell, 0)..=(cell, i32::MAX))
+            .map(|(k, _)| *k)
+            .collect();
+        keys.iter().filter_map(|k| all.remove(k)).collect()
+    };
+    drop(gone); // pages are freed outside the lock
 }
 
 fn segment(p: &LinuxProcess, id: u64) -> Result<Arc<Segment>, i64> {
