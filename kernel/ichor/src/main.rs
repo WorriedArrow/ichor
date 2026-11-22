@@ -32,6 +32,7 @@ mod nativeabi;
 mod nativetest;
 mod netstack;
 mod nettest;
+mod page;
 mod pagecache;
 mod partition;
 mod pipe;

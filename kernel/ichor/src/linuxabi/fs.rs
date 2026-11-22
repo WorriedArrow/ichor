@@ -17,8 +17,9 @@ const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
 const AT_REMOVEDIR: u64 = 0x200;
 const AT_EMPTY_PATH: u64 = 0x1000;
 
-const O_ACCMODE: u64 = 0o3;
-const O_WRONLY: u64 = 0o1;
+pub(super) const O_ACCMODE: u64 = 0o3;
+pub(super) const O_WRONLY: u64 = 0o1;
+pub(super) const O_RDWR: u64 = 0o2;
 const O_CREAT: u64 = 0o100;
 const O_EXCL: u64 = 0o200;
 const O_TRUNC: u64 = 0o1000;
@@ -374,9 +375,9 @@ fn write_file(
             break;
         }
         let r = if append {
-            p.fs().append(f.ino, &chunk[..got]).map(|end| {
+            p.fs().append(f.ino, &chunk[..got]).map(|(end, n)| {
                 pos = end;
-                got
+                n
             })
         } else {
             p.vfs

@@ -136,11 +136,7 @@ fn mount_image(name: &str, disk: impl BlockDevice + Send + 'static) -> Option<Mo
             fail("mounting the root disk")
         }
     };
-    let image = Image::mount(m.metadata).unwrap_or_else(|e| {
-        println!("ichor: blk: {name}: image rejected: {e:?}");
-        fail("root disk image rejected")
-    });
-    let h = image.root_hash();
+    let h = m.image.root_hash();
     println!(
         "ichor: blk: {name} disk, {} KiB; root hash {:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.. verified over {} KiB of metadata; data paged in on demand",
         bytes / 1024,
@@ -152,7 +148,7 @@ fn mount_image(name: &str, disk: impl BlockDevice + Send + 'static) -> Option<Mo
         h[5],
         h[6],
         h[7],
-        m.metadata.len() / 1024
+        m.image.metadata_len() / 1024
     );
     Some(m)
 }
@@ -170,6 +166,7 @@ fn exercise(name: &str, m: &Mounted, vfs: Arc<Vfs>) {
         // Before anything else reads the disk, so the opted-out root can
         // be the first to read a chunk.
         opt_out(m);
+        root_charges(m);
     }
     check_pattern(name, m);
     println!("ichor: blk: mounted the root image from the {name} disk");
@@ -296,6 +293,46 @@ fn opt_out(m: &Mounted) {
     );
 }
 
+/// What a cell writes to its root is charged to the cell: a page at a time,
+/// up to its limit (a write that only partly fits is short, the next is
+/// ENOSPC), and returned as files go, down to nothing with the root.
+fn root_charges(m: &Mounted) {
+    const PAGE: usize = 4096;
+    let system = System::new(4096).unwrap_or_else(|| fail("no system cell"));
+    let cell = Cell::new(&system.root_account, 16).unwrap_or_else(|| fail("root: no cell"));
+    let vfs = Vfs::mount_disk_for(m, cell.account()).unwrap_or_else(|_| fail("root: mount"));
+    let used = || cell.account().used();
+    if used() != 0 {
+        fail("root: a fresh root is charged");
+    }
+    let mut fs = vfs.lock();
+    let f = fs
+        .create(crate::vfs::ROOT, "big", 0o644)
+        .unwrap_or_else(|_| fail("root: create"));
+    let data = alloc::vec![7u8; 10 * PAGE];
+    if fs.write(f, 100, &data) != Ok(data.len()) || used() != 11 {
+        fail("root: ten pages across eleven were not charged as eleven");
+    }
+    if fs.write(f, 11 * PAGE as u64, &data) != Ok(5 * PAGE) || used() != 16 {
+        fail("root: a write past the limit was not short");
+    }
+    if fs.write(f, 16 * PAGE as u64, &data) != Err(crate::vfs::errno::ENOSPC) {
+        fail("root: a write in a full cell was not ENOSPC");
+    }
+    if fs.truncate(f, PAGE as u64) != Ok(()) || used() != 1 {
+        fail("root: truncating did not return the charge");
+    }
+    drop(fs);
+    if vfs.space() != (16 * PAGE, PAGE) {
+        fail("root: statfs does not show the cell's account");
+    }
+    drop(vfs);
+    if used() != 0 {
+        fail("root: file pages outlived their root");
+    }
+    println!("ichor: vfs: a root's written pages are charged to its cell, up to its limit");
+}
+
 /// A disk in memory, for the tampering checks.
 struct MemDisk(alloc::vec::Vec<u8>);
 
@@ -322,7 +359,7 @@ fn tampering() {
     };
     let mut meta_bad = padded(good.to_vec());
     meta_bad[200] ^= 1;
-    if pagecache::mount_disk(MemDisk(meta_bad)).is_ok_and(|m| Image::mount(m.metadata).is_ok()) {
+    if pagecache::mount_disk(MemDisk(meta_bad)).is_ok() {
         fail("tampered metadata mounted");
     }
     let image = Image::mount(good).unwrap_or_else(|_| fail("root image"));
@@ -355,7 +392,7 @@ fn pattern_byte(i: usize) -> u8 {
 /// Checks every byte of `/usr/share/pattern`, which spans many chunks, so
 /// a misordered or short read shows up (and each chunk is hash-verified).
 fn check_pattern(name: &str, m: &Mounted) {
-    let img = Image::mount(m.metadata).unwrap_or_else(|_| fail("root disk is not an Ichor image"));
+    let img = m.image;
     let src: &dyn ChunkSource = m.disk;
     let node = img
         .lookup("/usr/share/pattern")

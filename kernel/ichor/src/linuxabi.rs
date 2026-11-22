@@ -37,7 +37,7 @@ mod nr {
     pub(super) const LSTAT: u64 = 6;
     pub(super) const POLL: u64 = 7;
     pub(super) const LSEEK: u64 = 8;
-    pub(super) const MMAP: u64 = 9; // partial: shared file mappings are read-only and see a page as of its first touch
+    pub(super) const MMAP: u64 = 9; // partial: a shared file mapping does not see later writes to an image page it has touched, or to a page truncated away; touching past the end of the file is SIGSEGV, not SIGBUS
     pub(super) const MPROTECT: u64 = 10;
     pub(super) const MUNMAP: u64 = 11;
     pub(super) const BRK: u64 = 12;
@@ -54,6 +54,7 @@ mod nr {
     pub(super) const SELECT: u64 = 23;
     pub(super) const SCHED_YIELD: u64 = 24;
     pub(super) const MREMAP: u64 = 25; // partial: no MREMAP_DONTUNMAP; old_len 0 is EINVAL
+    pub(super) const MSYNC: u64 = 26;
     pub(super) const MADVISE: u64 = 28; // partial: DONTNEED on the loaded image's own segments zero-fills
     pub(super) const PAUSE: u64 = 34;
     pub(super) const NANOSLEEP: u64 = 35;
@@ -397,6 +398,7 @@ pub(crate) fn dispatch(p: &mut LinuxProcess, ctx: &mut frame::user::UserContext)
         nr::MPROTECT => p.mm().mprotect(a[0], a[1], a[2]),
         nr::MUNMAP => p.mm().munmap(a[0], a[1]),
         nr::BRK => Ok(p.mm().brk(a[0])),
+        nr::MSYNC => p.mm().msync(a[0], a[1], a[2]),
         nr::MADVISE => p.mm().madvise(a[0], a[1], a[2]),
         nr::MREMAP => p.mm().mremap(a[0], a[1], a[2], a[3], a[4]),
         // Identity, time, limits, signals, threads.
@@ -870,22 +872,25 @@ fn mmap(p: &mut LinuxProcess, a: &[u64; 6]) -> Result<u64, i64> {
         }
         _ => return Err(ENODEV),
     }
-    if map_flags & umem::flags::MAP_SHARED != 0 && prot & 2 != 0 {
-        // A shared writable mapping would need writes to reach the file.
-        return Err(EACCES);
-    }
-    let _ = len;
-    let ino = match p.fd(fd).ok_or(EBADF)? {
-        Fd::File(f) => f.ino,
+    let (ino, mode) = match p.fd(fd).ok_or(EBADF)? {
+        Fd::File(f) => (f.ino, f.flags & fs::O_ACCMODE),
         _ => return Err(ENODEV),
     };
     if p.vfs.lock().stat(ino)?.kind != crate::vfs::Kind::File {
         return Err(ENODEV);
     }
+    // Reading through the mapping needs a descriptor that can read; writing
+    // the file through it, one that can do both.
+    let writable = mode == fs::O_RDWR;
+    let shared = map_flags & umem::flags::MAP_SHARED != 0;
+    if mode == fs::O_WRONLY || (shared && prot & 2 != 0 && !writable) {
+        return Err(EACCES);
+    }
     let file = crate::file::VfsFile::open(&p.vfs, ino)?;
     let src = umem::FileSource {
         file: alloc::sync::Arc::new(file),
         offset,
+        writable,
     };
     p.mm().mmap(addr, len, prot, map_flags, Some(src))
 }

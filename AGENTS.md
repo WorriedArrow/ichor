@@ -108,11 +108,15 @@ not write it; merge its branch when it lands.
   open TCP NAT mappings live five days (Linux's established timeout), not
   ten minutes. Known gaps from its runs: `test_math` cosh is 8 ulps off
   under TCG (check on KVM), O_RDWR FIFOs, rseq/clone3 (ENOSYS, glibc
-  falls back), writable shared file mappings (`test_mmap`; the overlay's
-  upper pages are heap buffers, not frames), and worker processes killed
-  about six minutes in when the cell's 3 GiB account filled (under
-  investigation). First recorded full run: 403 of 445 modules (90.5%),
-  floor 88.0% in `workloads.toml`.
+  falls back). Latest recorded full run: 409 of 445 modules (91.9%),
+  before shared file mappings; floor 88.0% in `workloads.toml`.
+- M7 storage (ADR-0006's 2026-11-21 amendment): a cell's root writes are
+  frames charged to its account (`page.rs`: one charged-page type for
+  process memory and file pages; `overlay::Pages` is where the overlay
+  gets them), so `MAP_SHARED` file mappings map the file's own pages
+  (`umem::fault_shared`, `runtest::shared_file_program`,
+  `blktest::root_charges`), and images with megabytes of metadata mount
+  (format v4: 64 KiB segments, `Image::mount_segments`).
 - Boot hangs under the full gate's load (2026-11-21), found by booting 30
   VMs at a time until one stuck (1 in 60) and by reading. Fixed: a
   blocking FIFO open missed a peer that opened, wrote and closed between

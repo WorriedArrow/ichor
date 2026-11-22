@@ -21,8 +21,15 @@
 //! across `fork`: before the copy, every page of them is made resident,
 //! and parent and child then map the same frames writable, never
 //! copy-on-write. Their contents survive `MADV_DONTNEED`, as shmem's do.
-//! (Making a large shared mapping resident at fork is eager; a page cache
-//! will let it stay lazy.)
+//! (Making a large shared mapping resident at fork is eager.)
+//!
+//! Shared file mappings map the file's own pages, the ones `read` and
+//! `write` copy from and to ([`crate::page`]), so everyone mapping,
+//! reading or writing the file sees one copy. A file of the image nobody
+//! has written yet is mapped from the page cache, read-only; the first
+//! write through a mapping copies the file up. Partial: a mapping that has
+//! touched such a page, or a page since truncated away, does not see what
+//! others write to the file afterwards until it touches the page anew.
 //!
 //! `fork` is copy-on-write: parent and child map the same pages read-only
 //! and mark them shared; the first write on either side (a fault, or a
@@ -40,11 +47,13 @@ use alloc::vec::Vec;
 use cell::Account;
 
 use crate::file::File;
+use crate::page::{Page, charged};
 use frame::mm::{PAGE_SIZE, UFrame, UserProt, VmSpace};
 use vma::{Prot, RegionMap};
 
 const EINVAL: i64 = 22;
 const ENOMEM: i64 = 12;
+const EACCES: i64 = 13;
 const EEXIST: i64 = 17;
 const ENODEV: i64 = 19;
 
@@ -72,6 +81,8 @@ pub(crate) mod flags {
 pub(crate) struct FileSource {
     pub(crate) file: Arc<dyn File>,
     pub(crate) offset: u64,
+    /// The descriptor it was mapped through allows writing.
+    pub(crate) writable: bool,
 }
 
 /// `[start, end)` of the address space shows `file` from `offset` (at
@@ -83,6 +94,20 @@ struct FileRange {
     base: u64,
     offset: u64,
     file: Arc<dyn File>,
+    /// `MAP_SHARED`: the mapping shows the file's own pages.
+    shared: bool,
+    /// A shared mapping may be (made) writable.
+    writable: bool,
+}
+
+impl FileRange {
+    fn has(&self, va: u64) -> bool {
+        self.start <= va && va < self.end
+    }
+
+    fn overlaps(&self, start: u64, end: u64) -> bool {
+        self.start < end && start < self.end
+    }
 }
 
 /// Linux `madvise` advice values.
@@ -112,41 +137,6 @@ fn page_down(v: u64) -> u64 {
 
 fn page_up(v: u64) -> Option<u64> {
     Some(v.checked_add(PAGE_SIZE - 1)? & !(PAGE_SIZE - 1))
-}
-
-/// A resident page with its one charge to the account it was made under.
-/// Address spaces share it (after `fork`, or in a shared mapping), and the
-/// charge is released when the last of them lets go: a page counts once
-/// however many processes of the cell map it, as on Linux, where a forked
-/// child costs only the pages it copies.
-#[derive(Debug)]
-struct Charged {
-    frame: UFrame,
-    account: Arc<Account>,
-}
-
-impl Drop for Charged {
-    fn drop(&mut self) {
-        self.account.release(1);
-    }
-}
-
-impl core::ops::Deref for Charged {
-    type Target = UFrame;
-    fn deref(&self) -> &UFrame {
-        &self.frame
-    }
-}
-
-type Page = Arc<Charged>;
-
-/// Charges `account` for `frame`, or `None` if it is full.
-fn charged(account: &Arc<Account>, frame: UFrame) -> Option<Page> {
-    account.charge(1).ok()?;
-    Some(Arc::new(Charged {
-        frame,
-        account: account.clone(),
-    }))
 }
 
 /// A process's address space and its bookkeeping. Pages are charged to
@@ -235,9 +225,14 @@ impl Mm {
         for (&va, f) in &self.pages {
             child.pages.insert(va, f.clone());
             if self.is_shared(va) {
+                // An image page in a shared mapping stays read-only until
+                // a write copies the file up.
+                if self.cow.contains(&va) {
+                    child.cow.insert(va);
+                }
                 let prot = self.regions.find(va).map(|r| r.prot);
                 if let Some(prot) = prot.filter(|p| p.accessible())
-                    && child.space.map(va, f, user_prot(prot)).is_err()
+                    && child.space.map(va, f, self.mapped_prot(va, prot)).is_err()
                 {
                     return None;
                 }
@@ -263,9 +258,10 @@ impl Mm {
         Some(child)
     }
 
-    /// Whether `va` lies in a shared anonymous mapping.
+    /// Whether `va` lies in a shared mapping.
     fn is_shared(&self, va: u64) -> bool {
         self.shared.iter().any(|&(s, e)| s <= va && va < e)
+            || self.files.iter().any(|r| r.shared && r.has(va))
     }
 
     /// The physical address behind `addr` if it lies in shared memory (so a
@@ -403,6 +399,8 @@ impl Mm {
             base: start,
             offset,
             file,
+            shared: false,
+            writable: false,
         });
         true
     }
@@ -412,7 +410,7 @@ impl Mm {
     /// map it.
     pub(crate) fn frame(&mut self, va: u64) -> Option<UFrame> {
         if let Some(f) = self.pages.get(&va) {
-            return Some(f.frame.clone());
+            return Some((***f).clone());
         }
         let file = self.files.iter().find(|r| r.start <= va && va < r.end);
         let at = file.map(|r| r.offset + (va - r.base));
@@ -432,9 +430,46 @@ impl Mm {
             let n = r.file.read_at(at, &mut buf);
             page.writer().write(&buf[..n]);
         }
-        let f = page.frame.clone();
+        let f = (**page).clone();
         self.pages.insert(va, page);
         Some(f)
+    }
+
+    /// A fault in a shared file mapping: maps the file's own page. A hole
+    /// is given one; past the end of the file there is none (the fault
+    /// fails; Linux sends SIGBUS).
+    fn fault_shared(&mut self, va: u64, prot: Prot, write: bool, exec: bool) -> bool {
+        if let Some((_, p)) = self.space.translate(va)
+            && (!write || p.write)
+            && (!exec || p.exec)
+        {
+            return true; // another thread took this fault first
+        }
+        let Some(r) = self.files.iter().find(|r| r.shared && r.has(va)) else {
+            return false;
+        };
+        let index = (r.offset + (va - r.base)) / PAGE_SIZE;
+        match r.file.shared_page(index, write) {
+            Ok(Some(page)) => {
+                // Takes the place of the image's page, if that was mapped.
+                self.space.unmap(va);
+                self.cow.remove(&va);
+                let mapped = self.space.map(va, &page, user_prot(prot)).is_ok();
+                self.pages.insert(va, page);
+                mapped
+            }
+            // Nobody has written this file: the image's page will do, until
+            // somebody writes it through here.
+            Ok(None) if !write => {
+                let Some(f) = self.frame(va) else {
+                    return false;
+                };
+                self.cow.insert(va);
+                let p = self.mapped_prot(va, prot);
+                self.space.map(va, &f, p).is_ok()
+            }
+            _ => false,
+        }
     }
 
     /// Forgets the shared anonymous ranges over `[start, end)`.
@@ -502,6 +537,9 @@ impl Mm {
         };
         if !region.prot.permits(write, exec) {
             return false;
+        }
+        if self.files.iter().any(|r| r.shared && r.has(va)) {
+            return self.fault_shared(va, region.prot, write, exec);
         }
         if write && self.cow.contains(&va) {
             return self.break_cow(va, region.prot);
@@ -639,10 +677,7 @@ impl Mm {
         if !self.regions.insert(start, start + len, prot) {
             return Err(ENOMEM);
         }
-        // A file mapping fills pages from the file as they are touched. A
-        // shared mapping is only allowed read-only, so it cannot miss a
-        // write to the file it would have made; it can miss later writes by
-        // others (partial).
+        // A file mapping takes its pages from the file as they are touched.
         match file {
             Some(f) => self.files.push(FileRange {
                 start,
@@ -650,6 +685,8 @@ impl Mm {
                 base: start,
                 offset: f.offset,
                 file: f.file,
+                shared: map_flags & MAP_SHARED != 0,
+                writable: f.writable,
             }),
             None if map_flags & MAP_SHARED != 0 => self.shared.push((start, start + len)),
             None => {}
@@ -901,6 +938,11 @@ impl Mm {
         }
         let len = vma::page_len(len).ok_or(ENOMEM)?;
         let end = addr.checked_add(len).ok_or(ENOMEM)?;
+        // A shared mapping of a file opened for reading stays that.
+        let denied = |r: &FileRange| r.shared && !r.writable && r.overlaps(addr, end);
+        if prot.write && self.files.iter().any(denied) {
+            return Err(EACCES);
+        }
         if !self.regions.protect(addr, end, prot) {
             return Err(ENOMEM);
         }
@@ -929,6 +971,27 @@ impl Mm {
                     self.space.unmap(va); // `pages` keeps the frame.
                 }
             }
+        }
+    }
+
+    /// `msync`: what a shared mapping writes is in the file already, and
+    /// nothing is behind the file to write it back to.
+    pub(crate) fn msync(&self, addr: u64, len: u64, flags: u64) -> Result<u64, i64> {
+        const ASYNC: u64 = 1;
+        const INVALIDATE: u64 = 2;
+        const SYNC: u64 = 4;
+        if !addr.is_multiple_of(PAGE_SIZE)
+            || flags & !(ASYNC | INVALIDATE | SYNC) != 0
+            || flags & (ASYNC | SYNC) == (ASYNC | SYNC)
+        {
+            return Err(EINVAL);
+        }
+        let len = vma::page_len(len).unwrap_or(0);
+        let end = addr.checked_add(len).ok_or(ENOMEM)?;
+        if len == 0 || self.regions.covered(addr, end) {
+            Ok(0)
+        } else {
+            Err(ENOMEM)
         }
     }
 

@@ -87,6 +87,8 @@ mod sys {
     pub(super) const READLINK: u64 = 89;
     pub(super) const CLOCK_NANOSLEEP: u64 = 230;
     pub(super) const PREAD64: u64 = 17;
+    pub(super) const PWRITE64: u64 = 18;
+    pub(super) const MSYNC: u64 = 26;
     pub(super) const EXIT_GROUP: u64 = 231;
     pub(super) const RT_SIGACTION: u64 = 13;
     pub(super) const RT_SIGRETURN: u64 = 15;
@@ -2650,6 +2652,153 @@ fn shared_program() -> Vec<u8> {
     static_elf(&a.finish(BLOB_VADDR).unwrap_or_else(|| fail("assembler")))
 }
 
+/// Shared file mappings are the file: what is stored through one, `pread`,
+/// another mapping and a forked child see, and the other way round; a
+/// write through a mapping of an image file copies it up; a private mapping
+/// keeps its stores; a descriptor opened for reading cannot be mapped (or
+/// made) writable. Exits 0, or the failed check.
+fn shared_file_program() -> Vec<u8> {
+    const RW: u64 = 3;
+    const SHARED: u64 = 1;
+    const PRIVATE: u64 = 2;
+    const EACCES: i32 = -13;
+    let mut a = Asm::new();
+    let bad = a.label();
+    let parent = a.label();
+    let path = a.data(b"/shfile\0");
+    let motd = a.data(b"/usr/share/motd\0");
+    let expect = |a: &mut Asm, n: u64, v: i32| {
+        a.mov_imm(Reg::R15, n);
+        a.cmp_imm(Reg::Rax, v);
+        a.jne(bad);
+    };
+    let open = |a: &mut Asm, path, flags: u64, n: u64, want: i32| {
+        a.mov_data(Reg::Rdi, path);
+        a.mov_imm(Reg::Rsi, flags);
+        a.mov_imm(Reg::Rdx, 0o644);
+        a.sys(sys::OPEN);
+        expect(a, n, want);
+    };
+    let map = |a: &mut Asm, len: u64, prot: u64, flags: u64, fd: u64| {
+        a.mov_imm(Reg::Rdi, 0);
+        a.mov_imm(Reg::Rsi, len);
+        a.mov_imm(Reg::Rdx, prot);
+        a.mov_imm(Reg::R10, flags);
+        a.mov_imm(Reg::R8, fd);
+        a.mov_imm(Reg::R9, 0);
+        a.sys(sys::MMAP);
+    };
+    // pread64/pwrite64(fd, rbp, 8, at), then the 8 bytes in rax.
+    let io = |a: &mut Asm, nr: u64, fd: u64, at: u64, n: u64| {
+        a.mov_imm(Reg::Rdi, fd);
+        a.mov(Reg::Rsi, Reg::Rbp);
+        a.mov_imm(Reg::Rdx, 8);
+        a.mov_imm(Reg::R10, at);
+        a.sys(nr);
+        expect(a, n, 8);
+        a.load(Reg::Rax, Reg::Rbp, 0);
+    };
+    let put = |a: &mut Asm, base: Reg, at: i32, v: u64| {
+        a.mov_imm(Reg::Rax, v);
+        a.store(base, at, Reg::Rax);
+    };
+    a.mov(Reg::Rbp, Reg::Rsp);
+    a.sub_imm(Reg::Rbp, 4096);
+    open(&mut a, path, 0o102, 1, 3); // O_RDWR | O_CREAT
+    a.mov_imm(Reg::Rdi, 3);
+    a.mov_imm(Reg::Rsi, 12288);
+    a.sys(sys::FTRUNCATE);
+    expect(&mut a, 1, 0);
+    map(&mut a, 12288, RW, SHARED, 3);
+    a.mov(Reg::R12, Reg::Rax);
+    // 2: a store is in the file (a hole was given a page).
+    put(&mut a, Reg::R12, 4104, 0x41);
+    io(&mut a, sys::PREAD64, 3, 4104, 2);
+    expect(&mut a, 2, 0x41);
+    // 3: a write is in the mapping.
+    put(&mut a, Reg::Rbp, 0, 0x42);
+    io(&mut a, sys::PWRITE64, 3, 16, 3);
+    a.load(Reg::Rax, Reg::R12, 16);
+    expect(&mut a, 3, 0x42);
+    // 4: a forked child's store (to a page nobody had touched) is ours.
+    a.sys(sys::FORK);
+    a.mov(Reg::Rbx, Reg::Rax);
+    a.cmp_imm(Reg::Rax, 0);
+    a.jne(parent);
+    put(&mut a, Reg::R12, 8192, 0x43);
+    put(&mut a, Reg::R12, 16, 0x46);
+    a.mov_imm(Reg::Rdi, 0);
+    a.sys(sys::EXIT_GROUP);
+    a.bind(parent);
+    a.mov(Reg::Rdi, Reg::Rbx);
+    a.mov_imm(Reg::Rsi, 0);
+    a.mov_imm(Reg::Rdx, 0);
+    a.mov_imm(Reg::R10, 0);
+    a.sys(sys::WAIT4);
+    a.load(Reg::Rax, Reg::R12, 8192);
+    expect(&mut a, 4, 0x43);
+    a.load(Reg::Rax, Reg::R12, 16);
+    expect(&mut a, 4, 0x46);
+    // 5, 6: so it is in another mapping, both ways.
+    map(&mut a, 12288, RW, SHARED, 3);
+    a.mov(Reg::R13, Reg::Rax);
+    a.load(Reg::Rax, Reg::R13, 8192);
+    expect(&mut a, 5, 0x43);
+    put(&mut a, Reg::R13, 0, 0x44);
+    a.load(Reg::Rax, Reg::R12, 0);
+    expect(&mut a, 6, 0x44);
+    // 7: msync of it, and of what is not mapped (ENOMEM).
+    a.mov(Reg::Rdi, Reg::R12);
+    a.mov_imm(Reg::Rsi, 12288);
+    a.mov_imm(Reg::Rdx, 4); // MS_SYNC
+    a.sys(sys::MSYNC);
+    expect(&mut a, 7, 0);
+    a.mov_imm(Reg::Rdi, 4096);
+    a.mov_imm(Reg::Rsi, 4096);
+    a.mov_imm(Reg::Rdx, 4);
+    a.sys(sys::MSYNC);
+    expect(&mut a, 7, -12);
+    // 8, 9: opened for reading, it cannot be written.
+    open(&mut a, path, 0, 8, 4);
+    map(&mut a, 4096, RW, SHARED, 4);
+    expect(&mut a, 8, EACCES);
+    map(&mut a, 4096, 1, SHARED, 4);
+    a.mov(Reg::R14, Reg::Rax);
+    a.mov(Reg::Rdi, Reg::R14);
+    a.mov_imm(Reg::Rsi, 4096);
+    a.mov_imm(Reg::Rdx, RW);
+    a.sys(sys::MPROTECT);
+    expect(&mut a, 9, EACCES);
+    a.load(Reg::Rax, Reg::R14, 0);
+    expect(&mut a, 9, 0x44);
+    // 10: an image file: read first, then written, copied up under us.
+    open(&mut a, motd, 2, 10, 5); // O_RDWR
+    map(&mut a, 4096, RW, SHARED, 5);
+    a.mov(Reg::R14, Reg::Rax);
+    io(&mut a, sys::PREAD64, 5, 0, 10);
+    a.mov(Reg::Rbx, Reg::Rax);
+    a.load(Reg::Rax, Reg::R14, 0);
+    a.mov_imm(Reg::R15, 10);
+    a.cmp(Reg::Rax, Reg::Rbx);
+    a.jne(bad);
+    put(&mut a, Reg::R14, 0, 0x45);
+    io(&mut a, sys::PREAD64, 5, 0, 10);
+    expect(&mut a, 10, 0x45);
+    // 11: a private mapping sees the file and keeps its stores.
+    map(&mut a, 4096, RW, PRIVATE, 3);
+    a.mov(Reg::R13, Reg::Rax);
+    a.load(Reg::Rax, Reg::R13, 0);
+    expect(&mut a, 11, 0x44);
+    put(&mut a, Reg::R13, 0, 0x47);
+    io(&mut a, sys::PREAD64, 3, 0, 11);
+    expect(&mut a, 11, 0x44);
+    a.mov_imm(Reg::R15, 0);
+    a.bind(bad);
+    a.mov(Reg::Rdi, Reg::R15);
+    a.sys(sys::EXIT_GROUP);
+    static_elf(&a.finish(BLOB_VADDR).unwrap_or_else(|| fail("assembler")))
+}
+
 /// Waits done right. An `EPOLLET` pipe entry reports a write once, stays
 /// quiet while the data sits unread, and reports the next write. With
 /// SIGUSR1 blocked and pending, `ppoll` and `epoll_pwait` given an empty
@@ -3389,6 +3538,15 @@ pub(crate) fn run() {
     }
     println!(
         "ichor: linux: MAP_SHARED anonymous memory and its futex are shared across fork ({syscalls} syscalls)"
+    );
+
+    let (status, syscalls) = run_linux(new_process(), &shared_file_program(), None, &["shfile"]);
+    if status != 0 {
+        println!("ichor: linux: shfile failed check {status}");
+        fail("shared file mappings");
+    }
+    println!(
+        "ichor: linux: shared file mappings are the file, across fork, read, write and copy-up ({syscalls} syscalls)"
     );
 
     let (status, syscalls) = run_linux(new_process(), &mremap_program(), None, &["mremaptest"]);

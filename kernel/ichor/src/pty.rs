@@ -463,13 +463,13 @@ impl Drop for End {
     }
 }
 
-fn pts_dir(fs: &mut overlay::Overlay<'static>) -> Result<Ino, i64> {
+fn pts_dir(fs: &mut crate::vfs::Tree) -> Result<Ino, i64> {
     let dev = fs.lookup(ROOT, "dev")?;
     fs.lookup(dev, "pts")
 }
 
 /// Creates `/dev/pts` in a freshly mounted root.
-pub(crate) fn populate(fs: &mut overlay::Overlay<'static>, dev: Ino) {
+pub(crate) fn populate(fs: &mut crate::vfs::Tree, dev: Ino) {
     if fs.lookup(dev, "pts").is_err() {
         let _ = fs.mkdir(dev, "pts", 0o755);
     }

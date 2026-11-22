@@ -26,6 +26,7 @@ use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
+use core::cell::RefCell;
 
 use image::{ChunkSource, Image, Node};
 
@@ -172,15 +173,64 @@ struct Dir<'a> {
     parent: Ino,
 }
 
-/// An upper-layer file's bytes: pages by index, absent pages read as zero
-/// (files are sparse). The layer's budget counts allocated pages.
-#[derive(Debug, Default)]
-struct FileData {
-    size: u64,
-    pages: BTreeMap<u64, Box<[u8; PAGE]>>,
+/// A page of an upper-layer file, zeroed when made. Writing takes `&self`:
+/// the kernel's pages are frames that processes may have mapped as well
+/// (shared file mappings), so nothing holds one exclusively.
+pub trait Page: core::fmt::Debug {
+    /// Copies out bytes from `at` on (`at + out.len() <= 4096`).
+    fn read(&self, at: usize, out: &mut [u8]);
+    /// Copies `data` in at `at` (`at + data.len() <= 4096`).
+    fn write(&self, at: usize, data: &[u8]);
 }
 
-impl FileData {
+/// Where upper-layer pages come from (the kernel's charge them to a cell).
+pub trait Pages: core::fmt::Debug {
+    type Page: Page;
+    /// A zeroed page, or `None` if there is no memory (or no charge) left.
+    fn alloc(&self) -> Option<Self::Page>;
+}
+
+/// Pages on the heap (tests, and file systems nothing maps).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Heap;
+
+/// A [`Heap`] page.
+#[derive(Debug)]
+pub struct HeapPage(RefCell<Box<[u8; PAGE]>>);
+
+impl Page for HeapPage {
+    fn read(&self, at: usize, out: &mut [u8]) {
+        out.copy_from_slice(&self.0.borrow()[at..at + out.len()]);
+    }
+
+    fn write(&self, at: usize, data: &[u8]) {
+        self.0.borrow_mut()[at..at + data.len()].copy_from_slice(data);
+    }
+}
+
+impl Pages for Heap {
+    type Page = HeapPage;
+    fn alloc(&self) -> Option<HeapPage> {
+        Some(HeapPage(RefCell::new(Box::new([0u8; PAGE]))))
+    }
+}
+
+/// An upper-layer file's bytes: pages by index, absent pages read as zero
+/// (files are sparse). The layer's budget counts allocated pages.
+#[derive(Debug)]
+struct FileData<P> {
+    size: u64,
+    pages: BTreeMap<u64, P>,
+}
+
+impl<P: Page> FileData<P> {
+    fn empty() -> FileData<P> {
+        FileData {
+            size: 0,
+            pages: BTreeMap::new(),
+        }
+    }
+
     /// Bytes of memory the file holds.
     fn bytes(&self) -> usize {
         self.pages.len() * PAGE
@@ -197,7 +247,7 @@ impl FileData {
             let n = ((end - pos) as usize).min(PAGE - at);
             let dst = &mut out[(pos - offset) as usize..(pos - offset) as usize + n];
             match self.pages.get(&idx) {
-                Some(p) => dst.copy_from_slice(&p[at..at + n]),
+                Some(p) => p.read(at, dst),
                 None => dst.fill(0),
             }
             pos += n as u64;
@@ -205,33 +255,49 @@ impl FileData {
         (end - offset) as usize
     }
 
-    /// Pages a write of `len` bytes at `offset` would add.
-    fn new_pages(&self, offset: u64, len: usize) -> usize {
-        if len == 0 {
-            return 0;
+    /// Page `index`, made from `from` if it is absent and `room` (bytes
+    /// the layer may still grow by) has a page left.
+    fn page(&mut self, index: u64, from: &impl Pages<Page = P>, room: &mut usize) -> Option<&P> {
+        use alloc::collections::btree_map::Entry;
+        match self.pages.entry(index) {
+            Entry::Occupied(e) => Some(e.into_mut()),
+            Entry::Vacant(e) => {
+                *room = room.checked_sub(PAGE)?;
+                match from.alloc() {
+                    Some(p) => Some(e.insert(p)),
+                    None => {
+                        *room += PAGE;
+                        None
+                    }
+                }
+            }
         }
-        let first = offset / PAGE as u64;
-        let last = (offset + len as u64 - 1) / PAGE as u64;
-        (first..=last)
-            .filter(|i| !self.pages.contains_key(i))
-            .count()
     }
 
-    fn write(&mut self, offset: u64, data: &[u8]) {
-        let mut pos = offset;
-        let end = offset + data.len() as u64;
-        while pos < end {
+    /// Writes as much of `data` at `offset` as there are pages for;
+    /// returns how much.
+    fn write(
+        &mut self,
+        offset: u64,
+        data: &[u8],
+        from: &impl Pages<Page = P>,
+        room: &mut usize,
+    ) -> usize {
+        let mut done = 0;
+        while done < data.len() {
+            let pos = offset + done as u64;
             let (idx, at) = (pos / PAGE as u64, (pos % PAGE as u64) as usize);
-            let n = ((end - pos) as usize).min(PAGE - at);
-            let page = self
-                .pages
-                .entry(idx)
-                .or_insert_with(|| Box::new([0u8; PAGE]));
-            let src = (pos - offset) as usize;
-            page[at..at + n].copy_from_slice(&data[src..src + n]);
-            pos += n as u64;
+            let n = (data.len() - done).min(PAGE - at);
+            let Some(page) = self.page(idx, from, room) else {
+                break;
+            };
+            page.write(at, &data[done..done + n]);
+            done += n;
         }
-        self.size = self.size.max(end);
+        if done > 0 {
+            self.size = self.size.max(offset + done as u64);
+        }
+        done
     }
 
     /// Sets the length; pages past it are freed and the tail of the last
@@ -242,9 +308,9 @@ impl FileData {
             self.pages.retain(|&i, _| i < keep);
             let at = (len % PAGE as u64) as usize;
             if at != 0
-                && let Some(p) = self.pages.get_mut(&(len / PAGE as u64))
+                && let Some(p) = self.pages.get(&(len / PAGE as u64))
             {
-                p[at..].fill(0);
+                p.write(at, &[0u8; PAGE][at..]);
             }
         }
         self.size = len;
@@ -252,9 +318,9 @@ impl FileData {
 }
 
 #[derive(Debug)]
-enum Data<'a> {
+enum Data<'a, P> {
     LowerFile(Node<'a>),
-    File(FileData),
+    File(FileData<P>),
     Dir(Dir<'a>),
     Symlink(String),
     Device(u32),
@@ -269,8 +335,8 @@ enum Data<'a> {
 static NEXT_FIFO: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
 
 #[derive(Debug)]
-struct Inode<'a> {
-    data: Data<'a>,
+struct Inode<'a, P> {
+    data: Data<'a, P>,
     mode: u32,
     nlink: u32,
     opens: u32,
@@ -281,9 +347,9 @@ struct Inode<'a> {
     ctime: Time,
 }
 
-impl<'a> Inode<'a> {
+impl<'a, P> Inode<'a, P> {
     /// A new upper-layer inode, owned by root, all times `now`.
-    fn fresh(data: Data<'a>, mode: u32, nlink: u32, now: Time) -> Inode<'a> {
+    fn fresh(data: Data<'a, P>, mode: u32, nlink: u32, now: Time) -> Inode<'a, P> {
         Inode {
             data,
             mode,
@@ -298,7 +364,7 @@ impl<'a> Inode<'a> {
     }
 }
 
-impl Inode<'_> {
+impl<P> Inode<'_, P> {
     fn kind(&self) -> Kind {
         match self.data {
             Data::LowerFile(_) | Data::File(_) => Kind::File,
@@ -327,10 +393,13 @@ impl LowerReader<'_> {
     }
 }
 
-/// An image with a copy-on-write upper layer.
+/// An image with a copy-on-write upper layer, whose file pages come from
+/// `A`.
 #[derive(Debug)]
-pub struct Overlay<'a> {
-    inodes: Vec<Option<Inode<'a>>>,
+pub struct Overlay<'a, A: Pages = Heap> {
+    /// Boxed, so a root with many files needs no large table.
+    inodes: Vec<Option<Box<Inode<'a, A::Page>>>>,
+    pages: A,
     /// Where the lower layer's file data comes from (verified chunks).
     src: Option<&'a (dyn ChunkSource + Sync)>,
     /// The credentials operations are checked against; `None` (the
@@ -343,7 +412,7 @@ pub struct Overlay<'a> {
     max_bytes: usize,
 }
 
-fn upper_dir<'a>(parent: Ino, lower: Option<Node<'a>>) -> Data<'a> {
+fn upper_dir<'a, P>(parent: Ino, lower: Option<Node<'a>>) -> Data<'a, P> {
     Data::Dir(Dir {
         complete: lower.is_none(),
         lower,
@@ -352,7 +421,7 @@ fn upper_dir<'a>(parent: Ino, lower: Option<Node<'a>>) -> Data<'a> {
     })
 }
 
-fn from_lower<'a>(node: Node<'a>, parent: Ino) -> Inode<'a> {
+fn from_lower<'a, P>(node: Node<'a>, parent: Ino) -> Inode<'a, P> {
     let data = match node.kind() {
         image::Kind::File => Data::LowerFile(node),
         image::Kind::Directory => upper_dir(parent, Some(node)),
@@ -387,14 +456,32 @@ fn components(path: &str) -> impl Iterator<Item = String> + '_ {
 
 impl<'a> Overlay<'a> {
     /// An overlay over `lower`, whose file data `src` provides, with an
-    /// upper layer that may hold `max_bytes`.
+    /// upper layer on the heap that may hold `max_bytes`.
     pub fn new(
         lower: &Image<'a>,
         src: &'a (dyn ChunkSource + Sync),
         max_bytes: usize,
     ) -> Result<Overlay<'a>, image::Error> {
+        Overlay::with_pages(lower, src, Heap, max_bytes)
+    }
+
+    /// An overlay on the heap with no lower layer (a `tmpfs`).
+    pub fn empty(max_bytes: usize) -> Overlay<'a> {
+        Overlay::bare(Heap, max_bytes)
+    }
+}
+
+impl<'a, A: Pages> Overlay<'a, A> {
+    /// An overlay over `lower`, whose file data `src` provides, with an
+    /// upper layer of at most `max_bytes` in pages from `pages`.
+    pub fn with_pages(
+        lower: &Image<'a>,
+        src: &'a (dyn ChunkSource + Sync),
+        pages: A,
+        max_bytes: usize,
+    ) -> Result<Overlay<'a, A>, image::Error> {
         let root = lower.root()?;
-        let mut fs = Overlay::empty(max_bytes);
+        let mut fs = Overlay::bare(pages, max_bytes);
         fs.src = Some(src);
         if let Some(Some(r)) = fs.inodes.get_mut(ROOT) {
             r.data = upper_dir(ROOT, Some(root));
@@ -403,15 +490,15 @@ impl<'a> Overlay<'a> {
         Ok(fs)
     }
 
-    /// An overlay with no lower layer (a `tmpfs`).
-    pub fn empty(max_bytes: usize) -> Overlay<'a> {
+    fn bare(pages: A, max_bytes: usize) -> Overlay<'a, A> {
         Overlay {
-            inodes: alloc::vec![Some(Inode::fresh(
+            inodes: alloc::vec![Some(Box::new(Inode::fresh(
                 upper_dir(ROOT, None),
                 0o755,
                 2,
                 Time::default()
-            ))],
+            )))],
+            pages,
             src: None,
             cred: None,
             free: Vec::new(),
@@ -568,14 +655,17 @@ impl<'a> Overlay<'a> {
         self.used_bytes
     }
 
-    fn get(&self, ino: Ino) -> Result<&Inode<'a>, i64> {
-        self.inodes.get(ino).and_then(Option::as_ref).ok_or(ENOENT)
+    fn get(&self, ino: Ino) -> Result<&Inode<'a, A::Page>, i64> {
+        self.inodes
+            .get(ino)
+            .and_then(Option::as_deref)
+            .ok_or(ENOENT)
     }
 
-    fn get_mut(&mut self, ino: Ino) -> Result<&mut Inode<'a>, i64> {
+    fn get_mut(&mut self, ino: Ino) -> Result<&mut Inode<'a, A::Page>, i64> {
         self.inodes
             .get_mut(ino)
-            .and_then(Option::as_mut)
+            .and_then(Option::as_deref_mut)
             .ok_or(ENOENT)
     }
 
@@ -593,7 +683,8 @@ impl<'a> Overlay<'a> {
         }
     }
 
-    fn alloc(&mut self, inode: Inode<'a>) -> Ino {
+    fn alloc(&mut self, inode: Inode<'a, A::Page>) -> Ino {
+        let inode = Box::new(inode);
         if let Some(i) = self.free.pop()
             && let Some(slot) = self.inodes.get_mut(i)
         {
@@ -613,10 +704,8 @@ impl<'a> Overlay<'a> {
             return;
         }
         if let Some(slot) = self.inodes.get_mut(ino)
-            && let Some(Inode {
-                data: Data::File(f),
-                ..
-            }) = slot.take()
+            && let Some(inode) = slot.take()
+            && let Data::File(f) = &inode.data
         {
             self.used_bytes -= f.bytes();
         }
@@ -766,7 +855,8 @@ impl<'a> Overlay<'a> {
             return Err(ENOSPC);
         }
         // Page by page: no buffer the size of the file.
-        let mut f = FileData::default();
+        let mut f = FileData::empty();
+        let mut room = need;
         let mut page = [0u8; PAGE];
         let mut at = 0u64;
         while at < size as u64 {
@@ -774,7 +864,9 @@ impl<'a> Overlay<'a> {
             if n == 0 {
                 break;
             }
-            f.write(at, &page[..n]);
+            if f.write(at, &page[..n], &self.pages, &mut room) < n {
+                return Err(ENOSPC);
+            }
             at += n as u64;
         }
         f.size = at;
@@ -797,7 +889,7 @@ impl<'a> Overlay<'a> {
         }
         if len == 0 && matches!(self.get(ino)?.data, Data::LowerFile(_)) {
             // No need to copy bytes that are about to be dropped.
-            self.get_mut(ino)?.data = Data::File(FileData::default());
+            self.get_mut(ino)?.data = Data::File(FileData::empty());
             self.touch(ino);
             return Ok(());
         }
@@ -814,7 +906,9 @@ impl<'a> Overlay<'a> {
         Ok(())
     }
 
-    /// Writes `data` at `offset` (zero-filling any gap); returns its length.
+    /// Writes `data` at `offset` (zero-filling any gap); returns how much
+    /// was written: less than all of it when the layer fills up part way
+    /// (ENOSPC if nothing fits).
     pub fn write(&mut self, ino: Ino, offset: u64, data: &[u8]) -> Result<usize, i64> {
         self.copy_up(ino)?;
         // A write by someone without CAP_FSETID drops set-id bits.
@@ -829,27 +923,60 @@ impl<'a> Overlay<'a> {
         if end > MAX_FILE {
             return Err(EFBIG);
         }
-        let used = self.used_bytes;
-        let max = self.max_bytes;
-        let Data::File(f) = &mut self.get_mut(ino)?.data else {
+        let before = self.max_bytes.saturating_sub(self.used_bytes);
+        let mut room = before;
+        // The inode and the page source are separate fields.
+        let Some(Some(inode)) = self.inodes.get_mut(ino) else {
+            return Err(ENOENT);
+        };
+        let Data::File(f) = &mut inode.data else {
             return Err(EINVAL);
         };
-        let grow = f.new_pages(off as u64, data.len()) * PAGE;
-        if used + grow > max {
+        let n = f.write(off as u64, data, &self.pages, &mut room);
+        self.used_bytes += before - room;
+        if n == 0 && !data.is_empty() {
             return Err(ENOSPC);
         }
-        f.write(off as u64, data);
-        self.used_bytes = used + grow;
         self.touch(ino);
-        Ok(data.len())
+        Ok(n)
     }
 
     /// Appends `data` at the current end of the file in one step (so two
-    /// `O_APPEND` writers never overwrite each other); returns the new end.
-    pub fn append(&mut self, ino: Ino, data: &[u8]) -> Result<u64, i64> {
+    /// `O_APPEND` writers never overwrite each other); returns the new end
+    /// and how much was written (as [`Self::write`]).
+    pub fn append(&mut self, ino: Ino, data: &[u8]) -> Result<(u64, usize), i64> {
         let end = self.stat(ino)?.size;
-        self.write(ino, end, data)?;
-        Ok(end + data.len() as u64)
+        let n = self.write(ino, end, data)?;
+        Ok((end + n as u64, n))
+    }
+
+    /// Page `index` of the file `ino`, for a shared mapping to map: every
+    /// mapper, reader and writer of the file sees that one page. A hole is
+    /// given a page. `None` for a lower file nothing has written yet, unless
+    /// `write`, which copies it up first. EINVAL past the end of the file.
+    pub fn page(&mut self, ino: Ino, index: u64, write: bool) -> Result<Option<A::Page>, i64>
+    where
+        A::Page: Clone,
+    {
+        if index * PAGE as u64 >= self.stat(ino)?.size {
+            return Err(EINVAL);
+        }
+        if write {
+            self.copy_up(ino)?;
+            self.touch(ino);
+        }
+        let before = self.max_bytes.saturating_sub(self.used_bytes);
+        let mut room = before;
+        let Some(Some(inode)) = self.inodes.get_mut(ino) else {
+            return Err(ENOENT);
+        };
+        let page = match &mut inode.data {
+            Data::File(f) => f.page(index, &self.pages, &mut room).cloned(),
+            Data::LowerFile(_) => return Ok(None),
+            _ => return Err(EINVAL),
+        };
+        self.used_bytes += before - room;
+        page.map(Some).ok_or(ENOSPC)
     }
 
     /// Changes permission bits.
@@ -872,7 +999,7 @@ impl<'a> Overlay<'a> {
         Ok(())
     }
 
-    fn add(&mut self, dir: Ino, name: &str, mut inode: Inode<'a>) -> Result<Ino, i64> {
+    fn add(&mut self, dir: Ino, name: &str, mut inode: Inode<'a, A::Page>) -> Result<Ino, i64> {
         check_name(name)?;
         self.dir(dir)?;
         if self.find(dir, name)?.is_some() {
@@ -903,7 +1030,7 @@ impl<'a> Overlay<'a> {
     /// Creates an empty file.
     pub fn create(&mut self, dir: Ino, name: &str, mode: u32) -> Result<Ino, i64> {
         let inode = Inode::fresh(
-            Data::File(FileData::default()),
+            Data::File(FileData::empty()),
             mode & 0o7777,
             1,
             (self.clock)(),
@@ -916,7 +1043,7 @@ impl<'a> Overlay<'a> {
     /// pages count against the byte budget like any upper file's.
     pub fn create_unnamed(&mut self, mode: u32) -> Ino {
         let mut inode = Inode::fresh(
-            Data::File(FileData::default()),
+            Data::File(FileData::empty()),
             mode & 0o7777,
             0,
             (self.clock)(),
@@ -1642,13 +1769,83 @@ mod tests {
         fs.truncate(f, PAGE as u64 + 10).unwrap();
         assert_eq!(fs.read(f, PAGE as u64 - 2, &mut buf[..4]).unwrap(), 4);
         assert_eq!(&buf[..4], b"a\0\0\0");
-        // The budget counts pages.
+        // The budget counts pages; what fits is written.
         assert_eq!(
-            fs.write(f, 100 * PAGE as u64, &[0u8; 64 * PAGE]),
-            Err(ENOSPC)
+            fs.write(f, 100 * PAGE as u64, &[1u8; 64 * PAGE]),
+            Ok(63 * PAGE)
         );
+        assert_eq!(fs.stat(f).unwrap().size, 163 * PAGE as u64);
+        assert_eq!(fs.write(f, 163 * PAGE as u64, b"x"), Err(ENOSPC));
+        assert_eq!(fs.stat(f).unwrap().size, 163 * PAGE as u64);
         fs.unlink(ROOT, "f").unwrap();
         assert_eq!(fs.used_bytes(), 0);
+    }
+
+    /// Pages that are shared handles, as the kernel's are, from a source
+    /// that can run out.
+    #[derive(Debug)]
+    struct Few(core::cell::Cell<usize>);
+    #[derive(Clone, Debug)]
+    struct Shared(std::rc::Rc<HeapPage>);
+    impl Page for Shared {
+        fn read(&self, at: usize, out: &mut [u8]) {
+            self.0.read(at, out);
+        }
+        fn write(&self, at: usize, data: &[u8]) {
+            self.0.write(at, data);
+        }
+    }
+    impl Pages for Few {
+        type Page = Shared;
+        fn alloc(&self) -> Option<Shared> {
+            self.0.set(self.0.get().checked_sub(1)?);
+            Heap.alloc().map(|p| Shared(std::rc::Rc::new(p)))
+        }
+    }
+
+    #[test]
+    fn a_files_pages_can_be_shared() {
+        let img = lower_image();
+        let image = Image::mount(&img).unwrap();
+        let src = image::SliceSource(&img);
+        let few = Few(core::cell::Cell::new(3));
+        let mut fs = Overlay::with_pages(&image, &src, few, 1 << 20).unwrap();
+        let f = fs.create(ROOT, "f", 0o644).unwrap();
+        fs.write(f, 0, b"hello").unwrap(); // one page
+        fs.truncate(f, 3 * PAGE as u64).unwrap();
+        // What a mapper writes, readers see, and the other way round.
+        let p = fs.page(f, 0, true).unwrap().unwrap();
+        p.write(0, b"J");
+        let mut buf = [0u8; 5];
+        fs.read(f, 0, &mut buf).unwrap();
+        assert_eq!(&buf, b"Jello");
+        fs.write(f, 4, b"y").unwrap();
+        p.read(0, &mut buf);
+        assert_eq!(&buf, b"Jelly");
+        // A hole is given a page; past the end there is none.
+        let hole = fs.page(f, 2, false).unwrap().unwrap();
+        hole.write(7, b"z");
+        fs.read(f, 2 * PAGE as u64 + 7, &mut buf[..1]).unwrap();
+        assert_eq!(&buf[..1], b"z");
+        assert_eq!(fs.used_bytes(), 2 * PAGE);
+        assert!(matches!(fs.page(f, 3, true), Err(EINVAL)));
+        // A lower file is shared only once it is to be written (the last
+        // page goes to its copy).
+        let h = fs.resolve(ROOT, "/etc/motd", true).unwrap();
+        assert!(fs.page(h, 0, false).unwrap().is_none());
+        let up = fs.page(h, 0, true).unwrap().unwrap();
+        up.write(0, b"I");
+        fs.read(h, 0, &mut buf).unwrap();
+        assert_eq!(buf[0], b'I');
+        assert!(fs.page(h, 0, false).unwrap().is_some());
+        // No pages left: the hole stays one.
+        assert!(matches!(fs.page(f, 1, true), Err(ENOSPC)));
+        assert_eq!(fs.write(f, PAGE as u64, b"x"), Err(ENOSPC));
+        // Truncated away, a mapper keeps its page but the file has none.
+        fs.truncate(f, 1).unwrap();
+        assert_eq!(fs.used_bytes(), 2 * PAGE);
+        p.read(1, &mut buf);
+        assert_eq!(buf, [0; 5], "the tail of the kept page is zeroed");
     }
 
     #[test]

@@ -86,11 +86,15 @@ impl Drop for Process {
 }
 
 /// An image handed in by `IMAGE_CREATE`, held in pages: the block device
-/// the page cache reads (and verifies) its chunks from.
+/// the page cache reads (and verifies) its chunks from. The pages are in
+/// groups, so a large image needs no large table.
 struct PageDisk {
-    pages: Vec<UFrame>,
+    pages: Vec<Vec<UFrame>>,
     len: u64,
 }
+
+/// Pages in a [`PageDisk`] group.
+const GROUP: u64 = 4096;
 
 impl block::BlockDevice for PageDisk {
     fn sector_count(&self) -> u64 {
@@ -102,11 +106,13 @@ impl block::BlockDevice for PageDisk {
         let mut at = sector * block::SECTOR_SIZE as u64;
         let mut done = 0;
         while done < buf.len() {
-            let page = (at / PAGE_SIZE) as usize;
+            let page = at / PAGE_SIZE;
+            let page = (self.pages.get((page / GROUP) as usize))
+                .and_then(|g| g.get((page % GROUP) as usize));
             let off = (at % PAGE_SIZE) as usize;
             let n = (PAGE_SIZE as usize - off).min(buf.len() - done);
             let out = &mut buf[done..done + n];
-            match self.pages.get(page) {
+            match page {
                 Some(f) => {
                     let mut r = f.reader();
                     r.skip(off);
@@ -458,18 +464,24 @@ fn object_wait(cell: &Cell, mm: &mut Mm, ptr: u64, n: u64, timeout: u64) -> Resu
 }
 
 /// `IMAGE_CREATE`: copies the image into pages charged to the caller's
-/// cell, checks its metadata and root hash, and keeps it as a disk for
-/// the life of the system (its chunks are verified as they are read).
+/// cell (as is the copy of its metadata the kernel keeps), checks its
+/// metadata and root hash, and keeps it as a disk for the life of the
+/// system (its chunks are verified as they are read).
 fn image_create(cell: &Cell, mm: &mut Mm, ptr: u64, len: u64) -> Result<u64, Error> {
     if !(image::HEADER_LEN as u64..=MAX_IMAGE).contains(&len) {
         return Err(Error::Invalid);
     }
-    let npages = len.div_ceil(PAGE_SIZE);
+    let head = read_user(mm, ptr, image::HEADER_LEN)?;
+    let meta_len = image::metadata_len(&head).map_err(|_| Error::Failed)? as u64;
+    if meta_len > len {
+        return Err(Error::Failed);
+    }
+    let npages = len.div_ceil(PAGE_SIZE) + meta_len.div_ceil(PAGE_SIZE);
     cell.account().charge(npages).map_err(|_| Error::NoMemory)?;
     let copied = (|| {
-        let mut pages = Vec::new();
+        let mut pages: Vec<Vec<UFrame>> = Vec::new();
         let mut buf = alloc::vec![0u8; PAGE_SIZE as usize];
-        for i in 0..npages {
+        for i in 0..len.div_ceil(PAGE_SIZE) {
             let at = i * PAGE_SIZE;
             let n = (len - at).min(PAGE_SIZE) as usize;
             if mm.copy_from_user(ptr + at, &mut buf[..n]) != n {
@@ -478,22 +490,18 @@ fn image_create(cell: &Cell, mm: &mut Mm, ptr: u64, len: u64) -> Result<u64, Err
             buf[n..].fill(0);
             let f = UFrame::alloc_zeroed().ok_or(Error::NoMemory)?;
             f.writer().write(&buf);
-            pages.push(f);
+            match pages.last_mut() {
+                Some(g) if g.len() < GROUP as usize => g.push(f),
+                _ => pages.push(alloc::vec![f]),
+            }
         }
-        let mut disk = PageDisk { pages, len };
-        // Check the metadata (and its root hash) before keeping anything.
-        let mut head = alloc::vec![0u8; image::HEADER_LEN.next_multiple_of(block::SECTOR_SIZE)];
-        block::BlockDevice::read(&mut disk, 0, &mut head[..]).map_err(|_| Error::Invalid)?;
-        let meta_len = image::metadata_len(&head).map_err(|_| Error::Failed)?;
-        if meta_len as u64 > len || meta_len > crate::pagecache::MAX_METADATA {
+        // Checks the metadata and its root hash (the process may have
+        // changed its copy since the charge: a longer metadata fails too).
+        let m = crate::pagecache::mount_disk(PageDisk { pages, len }).map_err(|_| Error::Failed)?;
+        if m.image.metadata_len() as u64 > meta_len {
             return Err(Error::Failed);
         }
-        let mut meta = alloc::vec![0u8; meta_len.next_multiple_of(block::SECTOR_SIZE)];
-        block::BlockDevice::read(&mut disk, 0, &mut meta).map_err(|_| Error::Failed)?;
-        meta.truncate(meta_len);
-        image::Image::mount(&meta).map_err(|_| Error::Failed)?;
-        drop(meta);
-        crate::pagecache::mount_disk(disk).map_err(|_| Error::Failed)
+        Ok(m)
     })();
     match copied {
         Ok(m) => {
@@ -511,8 +519,6 @@ fn image_create(cell: &Cell, mm: &mut Mm, ptr: u64, len: u64) -> Result<u64, Err
     }
 }
 
-/// `CELL_CREATE`: a cell under `parent` with `pages` of memory, rooted at
-/// the image, attached to the switch.
 /// A cell's host name (what `uname` reports as the node name).
 const HOSTNAME: &str = "ichor";
 
@@ -536,6 +542,9 @@ fn write_etc(vfs: &crate::vfs::Vfs, name: &str, data: &[u8]) {
     }
 }
 
+/// `CELL_CREATE`: a cell under `parent` with `pages` of memory (what its
+/// processes use and what it writes to its root), rooted at the image,
+/// attached to the switch.
 fn cell_create(cell: &Cell, parent: u64, image: u64, pages: u64) -> Result<u64, Error> {
     let Object::Cell(parent) = object(cell, parent, rights::CREATE_CELL)? else {
         return Err(Error::BadHandle);
@@ -546,8 +555,9 @@ fn cell_create(cell: &Cell, parent: u64, image: u64, pages: u64) -> Result<u64, 
     if pages < 64 {
         return Err(Error::Invalid);
     }
-    let vfs = Arc::new(crate::vfs::Vfs::mount_disk(m).map_err(|_| Error::Failed)?);
     let new = Cell::new(parent.account(), pages).ok_or(Error::NoMemory)?;
+    let vfs = Vfs::mount_disk_for(m, new.account()).map_err(|_| Error::Failed)?;
+    let vfs = Arc::new(vfs);
     let addr = crate::netstack::stack_for(&new).addr();
     if addr.is_none() {
         println!("ichor: native: cell {} has no switch address", new.id());

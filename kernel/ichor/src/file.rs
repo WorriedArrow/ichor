@@ -7,6 +7,7 @@ use alloc::sync::Arc;
 
 use frame::mm::UFrame;
 
+use crate::page::Page;
 use crate::vfs::{Ino, Vfs};
 
 /// A file's bytes.
@@ -20,6 +21,13 @@ pub(crate) trait File: Send + Sync {
     /// never written; callers map it read-only and copy on write.
     fn cached_page(&self, _index: u64) -> Option<UFrame> {
         None
+    }
+    /// The file's own page `index`, for a shared mapping (`write`: to be
+    /// written through it). `None`: the file is the image's and unwritten,
+    /// or cannot be shared at all. `Err`: there is no such page (past the
+    /// end of the file), or no memory for it.
+    fn shared_page(&self, _index: u64, _write: bool) -> Result<Option<Page>, i64> {
+        Ok(None)
     }
     /// A reference to this file that a mapping can keep for as long as it
     /// lives, so its pages can be filled on demand (`None`: the caller must
@@ -82,6 +90,11 @@ impl File for VfsFile {
 
     fn cached_page(&self, index: u64) -> Option<UFrame> {
         self.vfs.cached_page(self.ino, index)
+    }
+
+    fn shared_page(&self, index: u64, write: bool) -> Result<Option<Page>, i64> {
+        let page = self.vfs.lock().page(self.ino, index, write)?;
+        Ok(page.map(|p| p.0))
     }
 
     fn mappable(&self) -> Option<Arc<dyn File>> {

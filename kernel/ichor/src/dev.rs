@@ -9,10 +9,10 @@
 //! ([`crate::random`]), as `getrandom` does. `ptmx`, the `pts/` nodes and
 //! `tty` (with a controlling terminal) are pseudo-terminals ([`crate::pty`]).
 
-use overlay::{Overlay, ROOT};
+use overlay::ROOT;
 
 use crate::process::{Fd, LinuxProcess};
-use crate::vfs::Ino;
+use crate::vfs::{Ino, Tree};
 
 const ENOSPC: i64 = 28;
 const ENXIO: i64 = 6;
@@ -55,7 +55,7 @@ pub(crate) enum Device {
 
 /// Creates `/dev` and its nodes in a freshly mounted root (keeping any the
 /// image already has).
-pub(crate) fn populate(fs: &mut Overlay<'static>) {
+pub(crate) fn populate(fs: &mut Tree) {
     let dev = match fs.lookup(ROOT, "dev") {
         Ok(d) => d,
         Err(_) => match fs.mkdir(ROOT, "dev", 0o755) {
