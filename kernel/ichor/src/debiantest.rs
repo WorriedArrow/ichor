@@ -555,7 +555,28 @@ sysopen(my $both, "/tmp/both", O_RDWR) or fail("O_RDWR FIFO: $!");
 (fcntl($both, F_GETFL, 0) & 3) == O_RDWR or fail("F_GETFL of an O_RDWR FIFO");
 syswrite($both, "round") == 5 && sysread($both, $m, 10) == 5 && $m eq "round" or fail("through an O_RDWR FIFO: $!");
 sysopen(my $one, "/tmp/both", O_WRONLY | O_NONBLOCK) or fail("a writer beside it: $!");
+(stat $both)[0] == (stat "/tmp/both")[0] && (stat _)[1] == (stat $both)[1] or fail("an open FIFO is not the FIFO");
 close $both;
+# A descriptor that only names a file, a symlink itself included.
+unlink "/tmp/named"; symlink("both", "/tmp/named") or fail("symlink: $!");
+sysopen(my $named, "/tmp/named", 010000000 | 0400000) or fail("O_PATH of a symlink: $!");
+((stat $named)[2] & 0170000) == 0120000 or fail("O_PATH followed the symlink");
+defined(sysread($named, $m, 1)) and fail("read through O_PATH");
+$!{EBADF} or fail("read through O_PATH: $!");
+sysopen(my $null, "/dev/null", O_RDWR) or fail("/dev/null: $!");
+sysseek($null, 100, 0) or fail("seek in /dev/null: $!");
+open(my $perl, "<", "/usr/bin/perl") or fail("open: $!");
+my $before = pack("q", -1);
+syscall(40, $wf, fileno $perl, $before, 10) == -1 && $!{EINVAL} or fail("sendfile from before the start: $!");
+sysopen(my $pdir, "/proc/$$", O_RDONLY) or fail("/proc/<pid>: $!");
+syscall(424, fileno $pdir, 0, 0, 0) == 0 or fail("a signal by /proc/<pid>: $!");
+syscall(424, $wf, 0, 0, 0) == -1 && $!{EBADF} or fail("a signal by a pipe: $!");
+# A futex waits until a time of the wall clock, not for ever.
+for my $when (time + 1, time - 100) {
+    my ($word, $ts) = (pack("L", 5), pack("qq", $when, 0));
+    syscall(202, $word, 9 | 256, 5, $ts, 0, 0xffffffff) == -1 && $!{ETIMEDOUT} or fail("a wall-clock futex wait: $!");
+    time - $when < 30 or $when < time - 50 or fail("a wall-clock futex wait was late");
+}
 { local $SIG{PIPE} = "IGNORE"; defined(syswrite($one, "x")) and fail("a write with no reader left"); $!{EPIPE} or fail("no reader: $!") }
 # A title written over argv is what /proc shows; many arguments, long ones.
 $0 = "a title";

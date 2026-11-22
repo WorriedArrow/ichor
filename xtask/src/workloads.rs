@@ -65,7 +65,8 @@ pub const PYTHON: Suite = Suite {
     // crashes or hangs its interpreter costs that module, not the run.
     argv: &["python3", "-m", "test", "-j0", "--timeout", "600"],
     all: &[],
-    env: &["PYTHONUNBUFFERED=1"],
+    // (No PYTHONUNBUFFERED: test_cmd_line checks what Python does by itself.)
+    env: &[],
     unit: "modules",
     memory_mib: 6144,
     cell_bytes: 3 << 30,

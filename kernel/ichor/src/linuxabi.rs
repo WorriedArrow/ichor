@@ -1024,6 +1024,7 @@ fn mmap(p: &mut LinuxProcess, a: &[u64; 6]) -> Result<u64, i64> {
         _ => return Err(ENODEV),
     }
     let (ino, mode) = match p.fd(fd).ok_or(EBADF)? {
+        Fd::File(f) if f.flags & fs::O_PATH != 0 => return Err(EBADF),
         Fd::File(f) => (f.ino, f.flags & fs::O_ACCMODE),
         _ => return Err(ENODEV),
     };

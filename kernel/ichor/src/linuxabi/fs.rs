@@ -28,6 +28,9 @@ const O_DIRECTORY: u64 = 0o200_000;
 const O_NOFOLLOW: u64 = 0o400_000;
 /// With O_DIRECTORY, which it includes.
 const O_TMPFILE: u64 = 0o20_200_000;
+/// A descriptor that names a file without opening it: for `fstat`, `*at`
+/// calls and `/proc/self/fd`, not for what is in the file.
+pub(super) const O_PATH: u64 = 0o10_000_000;
 pub(super) const O_NONBLOCK: u64 = 0o4000;
 pub(super) const O_CLOEXEC: u64 = 0o2_000_000;
 
@@ -126,6 +129,11 @@ fn open_path(
     mode: u64,
     hops: u32,
 ) -> Result<u64, i64> {
+    let flags = match flags & O_PATH {
+        0 => flags,
+        // Everything else is ignored.
+        _ => flags & (O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC),
+    };
     let acc = flags & O_ACCMODE;
     if acc == O_ACCMODE {
         return Err(EINVAL);
@@ -176,6 +184,21 @@ fn open_path(
         }
         let ino = found?;
         let st = fs.stat(ino)?;
+        if flags & O_PATH != 0 {
+            if flags & O_DIRECTORY != 0 && st.kind != Kind::Directory {
+                return Err(ENOTDIR);
+            }
+            fs.open(ino)?;
+            drop(fs);
+            let f = OpenFile {
+                ino,
+                offset: 0,
+                flags: O_PATH,
+            };
+            return p
+                .install_flags(Fd::File(f), flags & O_CLOEXEC != 0)
+                .ok_or(EMFILE);
+        }
         if flags & O_TMPFILE == O_TMPFILE {
             // A file with no name, in the file system of this directory.
             if st.kind != Kind::Directory {
@@ -220,8 +243,9 @@ fn open_path(
             Kind::Socket => return Err(ENXIO),
             Kind::Fifo => {
                 let id = fs.fifo_id(ino).ok_or(ENXIO)?;
+                fs.open(ino)?;
                 drop(fs);
-                return open_fifo(p, id, flags);
+                return open_fifo(p, id, ino, flags);
             }
             Kind::CharDevice => {
                 drop(fs);
@@ -260,13 +284,45 @@ fn reopen(p: &mut LinuxProcess, fd: u64, flags: u64) -> Result<u64, i64> {
                 O_WRONLY => overlay::MAY_WRITE,
                 _ => overlay::MAY_READ | overlay::MAY_WRITE,
             };
-            fs.permission(of.ino, want)?;
-            let kind = fs.stat(of.ino)?.kind;
+            let st = fs.stat(of.ino)?;
+            if flags & O_PATH == 0 && st.kind != Kind::Symlink {
+                fs.permission(of.ino, want)?;
+            }
+            let kind = st.kind;
             if kind == Kind::Directory && acc != 0 {
                 return Err(EISDIR);
             }
             if kind != Kind::Directory && flags & O_DIRECTORY != 0 {
                 return Err(ENOTDIR);
+            }
+            // What an O_PATH descriptor may name besides files.
+            match kind {
+                _ if flags & O_PATH != 0 => {
+                    fs.open(of.ino)?;
+                    drop(fs);
+                    let f = OpenFile {
+                        offset: 0,
+                        flags: O_PATH,
+                        ..of
+                    };
+                    return p
+                        .install_flags(Fd::File(f), flags & O_CLOEXEC != 0)
+                        .ok_or(EMFILE);
+                }
+                Kind::File | Kind::Directory => {}
+                Kind::Symlink => return Err(ELOOP),
+                Kind::Socket => return Err(ENXIO),
+                Kind::Fifo => {
+                    let id = fs.fifo_id(of.ino).ok_or(ENXIO)?;
+                    fs.open(of.ino)?;
+                    drop(fs);
+                    return open_fifo(p, id, of.ino, flags);
+                }
+                Kind::CharDevice => {
+                    drop(fs);
+                    let fd = crate::dev::open(p, st.rdev, of.ino, flags)?;
+                    return p.install_flags(fd, flags & O_CLOEXEC != 0).ok_or(EMFILE);
+                }
             }
             if flags & O_TRUNC != 0 && acc != 0 {
                 fs.truncate(of.ino, 0)?;
@@ -278,7 +334,14 @@ fn reopen(p: &mut LinuxProcess, fd: u64, flags: u64) -> Result<u64, i64> {
                 flags: flags & (O_ACCMODE | O_APPEND | O_NONBLOCK),
             })
         }
-        Fd::Pipe(e) => Fd::Pipe(PipeEnd::open(e.pipe, acc, nonblock)),
+        Fd::Pipe(e) => {
+            if let Some(ino) = e.fifo {
+                p.vfs.lock().open(ino)?;
+            }
+            let mut end = PipeEnd::open(e.pipe, acc, nonblock);
+            end.fifo = e.fifo;
+            Fd::Pipe(end)
+        }
         Fd::Object(o) if o.obj.tty().is_some() => Fd::Object(crate::process::ObjectEnd {
             obj: o.obj,
             nonblock,
@@ -292,19 +355,29 @@ fn reopen(p: &mut LinuxProcess, fd: u64, flags: u64) -> Result<u64, i64> {
 /// Opens a named pipe: one end of the FIFO's pipe, shared by every open of
 /// it. As on Linux, opening one end blocks until the other is opened
 /// (unless O_NONBLOCK); a non-blocking open for writing with no reader is
-/// ENXIO. O_RDWR opens both, and so never waits.
-fn open_fifo(p: &mut LinuxProcess, id: u64, flags: u64) -> Result<u64, i64> {
+/// ENXIO. O_RDWR opens both, and so never waits. `ino` is the FIFO itself,
+/// counted as open.
+fn open_fifo(p: &mut LinuxProcess, id: u64, ino: Ino, flags: u64) -> Result<u64, i64> {
+    let mut end = match fifo_end(p, id, flags) {
+        Ok(end) => end,
+        Err(e) => {
+            p.vfs.lock().close(ino);
+            return Err(e);
+        }
+    };
+    end.fifo = Some(ino);
+    // A full table drops the description, which drops the end again.
+    p.install_flags(Fd::Pipe(end), flags & O_CLOEXEC != 0)
+        .ok_or(EMFILE)
+}
+
+fn fifo_end(p: &LinuxProcess, id: u64, flags: u64) -> Result<PipeEnd, i64> {
     let nonblock = flags & O_NONBLOCK != 0;
     let pipe = crate::pipe::fifo(id, p.cell.account());
     let write = match flags & O_ACCMODE {
         0 => false,
         O_WRONLY => true,
-        acc => {
-            let both = PipeEnd::open(pipe, acc, nonblock);
-            return p
-                .install_flags(Fd::Pipe(both), flags & O_CLOEXEC != 0)
-                .ok_or(EMFILE);
-        }
+        acc => return Ok(PipeEnd::open(pipe, acc, nonblock)),
     };
     if write && nonblock && pipe.readers() == 0 {
         return Err(ENXIO);
@@ -317,10 +390,7 @@ fn open_fifo(p: &mut LinuxProcess, id: u64, flags: u64) -> Result<u64, i64> {
             return Err(e);
         }
     }
-    let end = PipeEnd::one(pipe, write, nonblock);
-    // A full table drops the description, which drops the end again.
-    p.install_flags(Fd::Pipe(end), flags & O_CLOEXEC != 0)
-        .ok_or(EMFILE)
+    Ok(PipeEnd::one(pipe, write, nonblock))
 }
 
 /// `memfd_create(name, flags)`: an anonymous read-write file. It is an
@@ -502,7 +572,7 @@ fn read_file(
     buf: u64,
     count: usize,
 ) -> Result<u64, i64> {
-    if f.flags & O_ACCMODE == O_WRONLY {
+    if f.flags & O_ACCMODE == O_WRONLY || f.flags & O_PATH != 0 {
         return Err(EBADF);
     }
     let mut chunk = alloc::vec![0u8; CHUNK.min(count.max(1))];
@@ -932,8 +1002,11 @@ pub(super) fn lseek(p: &mut LinuxProcess, fd: u64, offset: i64, whence: u64) -> 
     const SEEK_END: u64 = 2;
     // A closed descriptor is EBADF; an open one that has no position is
     // ESPIPE.
-    if let Some(Fd::Object(o)) = p.fd(fd) {
-        return o.obj.seek(offset, whence);
+    match p.fd(fd) {
+        Some(Fd::Object(o)) => return o.obj.seek(offset, whence),
+        // `/dev/null` and its like are at 0 wherever they are told to go.
+        Some(Fd::Dev(_)) if whence <= SEEK_END => return Ok(0),
+        _ => {}
     }
     let f = file(p, fd).map_err(|e| if e == EBADF { EBADF } else { ESPIPE })?;
     let base = match whence {
@@ -1135,6 +1208,9 @@ fn fstat_raw(p: &mut LinuxProcess, fd: u64) -> Result<[u8; 144], i64> {
     let f = p.fd(fd).ok_or(EBADF)?;
     Ok(match &f {
         Fd::Console => stat_bytes(0, S_IFCHR | 0o620, 1, 0),
+        Fd::Pipe(PipeEnd {
+            fifo: Some(ino), ..
+        }) => to_stat(&p.fs().stat(*ino)?),
         Fd::Pipe(e) => {
             let ino = alloc::sync::Arc::as_ptr(&e.pipe) as u64;
             apart(DEV_PIPE, ino, S_IFIFO | 0o600, 1, 0)
@@ -1612,14 +1688,18 @@ pub(super) fn fchmodat2(
 }
 
 pub(super) fn fchmod(p: &mut LinuxProcess, fd: u64, mode: u64) -> Result<u64, i64> {
-    let f = match p.fd(fd).ok_or(EBADF)? {
-        Fd::File(f) => f,
+    let ino = match p.fd(fd).ok_or(EBADF)? {
+        Fd::File(f) if f.flags & O_PATH != 0 => return Err(EBADF),
+        Fd::File(f) => f.ino,
+        Fd::Pipe(PipeEnd {
+            fifo: Some(ino), ..
+        }) => ino,
         // An inode nobody else opens by its mode (a bound socket's name is
         // another one): nothing keeps it.
         Fd::Pipe(_) | Fd::Object(_) => return Ok(0),
         Fd::Console | Fd::Dev(_) => return Err(EPERM),
     };
-    p.fs().chmod(f.ino, mode as u32)?;
+    p.fs().chmod(ino, mode as u32)?;
     Ok(0)
 }
 
@@ -1674,6 +1754,7 @@ pub(super) fn sendfile(
     count: usize,
 ) -> Result<u64, i64> {
     let src = match p.fd(in_fd).ok_or(EBADF)? {
+        Fd::File(f) if f.flags & O_PATH != 0 => return Err(EBADF),
         Fd::File(f) => f,
         Fd::Pipe(_) | Fd::Object(_) if offp != 0 => return Err(ESPIPE),
         // Not something to read pages of (callers read and write instead).
@@ -1694,6 +1775,9 @@ pub(super) fn sendfile(
     } else {
         src.offset
     };
+    if i64::try_from(offset).is_err() {
+        return Err(EINVAL);
+    }
     let mut buf = alloc::vec![0u8; CHUNK];
     let mut done = 0usize;
     // What counts is what was written, not what was read: a socket or a

@@ -55,6 +55,8 @@ pub(crate) struct PipeEnd {
     pub(crate) read: bool,
     pub(crate) write: bool,
     pub(crate) nonblock: bool,
+    /// The FIFO it was opened through (counted as open).
+    pub(crate) fifo: Option<Ino>,
 }
 
 impl PipeEnd {
@@ -65,6 +67,7 @@ impl PipeEnd {
             read: !write,
             write,
             nonblock,
+            fifo: None,
         }
     }
 
@@ -81,6 +84,7 @@ impl PipeEnd {
             read,
             write,
             nonblock,
+            fifo: None,
         }
     }
 
@@ -174,7 +178,12 @@ impl Drop for Description {
                 crate::linuxabi::inotify::note_close(&self.vfs, of.ino, write);
                 self.vfs.lock().close(of.ino)
             }
-            Fd::Pipe(e) => e.close(),
+            Fd::Pipe(e) => {
+                e.close();
+                if let Some(ino) = e.fifo {
+                    self.vfs.lock().close(ino);
+                }
+            }
         }
     }
 }

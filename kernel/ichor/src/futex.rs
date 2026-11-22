@@ -1,11 +1,10 @@
 //! Futexes: user-space locks' kernel half.
 //!
-//! Waiters are kept per (process, address), except in shared anonymous
-//! memory, where they are kept per physical address so that processes
-//! sharing the page meet on the same futex (with or without
-//! `FUTEX_PRIVATE_FLAG`: a wake that Linux would confine to one process
-//! may reach another, which futex users must tolerate as a spurious
-//! wakeup). There are no shared file mappings yet.
+//! Waiters are kept per (process, address), except in shared memory, where
+//! they are kept per physical address so that processes sharing the page
+//! meet on the same futex (with or without `FUTEX_PRIVATE_FLAG`: a wake
+//! that Linux would confine to one process may reach another, which futex
+//! users must tolerate as a spurious wakeup).
 //!
 //! Waiters live in [`BUCKETS`] hashed buckets, each with its own lock, so
 //! unrelated futexes (other processes, other addresses) do not contend.
@@ -419,12 +418,16 @@ pub(crate) fn futex(p: &mut LinuxProcess, a: &[u64; 6]) -> Result<u64, i64> {
             wait(p, addr, val, deadline, u32::MAX)
         }
         FUTEX_WAIT_BITSET => {
-            // Absolute timeout (every clock counts from boot here).
-            let deadline = if arg4 == 0 {
-                None
-            } else {
-                Some(read_timespec(p, arg4)?)
+            // Absolute timeout: of the monotonic clock, which counts from
+            // boot as ours does, or of the wall clock.
+            let deadline = match arg4 {
+                0 => None,
+                at => Some(read_timespec(p, at)?),
             };
+            let deadline = deadline.map(|at| match op & FUTEX_CLOCK_REALTIME {
+                0 => at,
+                _ => frame::time::now().saturating_add(at.saturating_sub(crate::vfs::wall_clock())),
+            });
             wait(p, addr, val, deadline, val3)
         }
         FUTEX_WAKE => Ok(wake(p, addr, val, u32::MAX)),
