@@ -240,7 +240,8 @@ protects the mode it was last written in:
   itself). Two MSR writes for each system call, fault or interrupt from
   ring 3. Firmware's bits are kept.
 - The boot log says `IBRS on entry`; the boot fails if the kernel finds
-  itself without IBRS.
+  itself without IBRS. Verified on that machine, where it costs Redis about
+  a tenth and PostgreSQL a twentieth (`docs/cloud.md`).
 - Not covered: an NMI between IBRS going off and the user's page tables
   (Ichor takes none), and what IBRS does not do (BHI, the RSB across VM
   exits).

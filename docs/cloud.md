@@ -12,17 +12,24 @@ cloud yet. This page is the runbook.
 enhanced IBRS) in us-central1-a, from the image of
 `disk-image --release --size-gib 1 --gcp --cmdline "metadata=gcp
 control=50051 control_publish=50051"` with a token and a certificate. It
-boots in seconds; every self-test passes; page-table isolation, VERW and
-IBPB are on (kernel Spectre v2 was not mitigated in that boot; IBRS on
-entry, ADR-0004's amendment, came after it). The uplink is GCP's virtio-net with a /32 DHCP lease and
-its 1460 MTU, the metadata service gave the instance's `ichor` attribute,
-and the root partition was found, verified and read on the virtio-scsi
-persistent disk. Over the API, from outside: Alpine 3.20 pulled from Docker
-Hub in 1.5 s (the 122 MiB `python:3.12-slim` in 9.9 s) and run; nginx
-served; redis-benchmark made 220,000 pipelined SETs a second. The boot
-found two bugs: GCP's virtio devices are legacy ones, which the drivers did
-not speak (ADR-0005's amendment; tested in QEMU since), and glibc's resolver
-gave up in cells (it insists on `IP_RECVERR`).
+boots in seconds; every self-test passes; page-table isolation, VERW, IBPB
+and IBRS on entry are on. The uplink is GCP's virtio-net with a /32 DHCP
+lease (renewed after half an hour) and its 1460 MTU, the metadata service
+gave the instance's `ichor` attribute, and the root partition was found,
+verified and read on the virtio-scsi persistent disk. Over the API, from
+outside: Alpine 3.20 pulled from Docker Hub in 1.5 s (the 122 MiB
+`python:3.12-slim` in 9.9 s) and run; Python fetched over HTTPS, nginx
+served, Go compiled and ran a program, and (without and with IBRS on entry)
+redis-benchmark made 226,000 and 203,000 pipelined SETs a second and
+pgbench 4,656 and 4,423 transactions (8 clients, files in memory).
+
+What it found: GCP's virtio devices are legacy ones, which the drivers did
+not speak (ADR-0005's amendment; tested in QEMU since); glibc's resolver
+gave up in cells (it insists on `IP_RECVERR`); and kernel Spectre v2 was not
+mitigated on such a CPU (IBRS on entry, ADR-0004's amendment, since). Still
+open: stopping or deleting the machine takes GCP about two minutes, since
+Ichor does not hear the ACPI power button, and a recreated machine may have
+another external address (look before connecting).
 
 ## What a first boot shows
 
