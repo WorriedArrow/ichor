@@ -160,8 +160,10 @@ not write it; merge its branch when it lands.
   fetches an instruction in pieces while the JVM patches it (an `hs_err`
   whose fault address decodes from the old first bytes and the new last
   ones; memory is right). Score it on KVM (`workloads.yml`). A sample of
-  other directories passed 247 of 274; its failures are the list to work
-  on: `ProcessHandle` (`/proc`), multicast, urgent data, NIO on files.
+  other directories passed 247 of 274; of its failures, `ProcessHandle`,
+  `PortUnreachable` and four more pass since. Left to work on: multicast,
+  urgent data, extended attributes (`CheckPermissions`, `FileAttributes`),
+  `CopyProcFile`, `TracePinnedThreads`.
   Leave NIO's large-file tests out of a 5 GiB cell.
 - M7 liburing (sixth suite): `cargo xtask workloads uring` builds
   liburing 2.5 (of Linux 6.6's time) in `buildpack-deps` and runs its
