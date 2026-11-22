@@ -35,8 +35,7 @@ nothing here checks `..` at the root, symlinks, links and renames across
 roots, or that A cannot open B's ptys. Partial evidence elsewhere: B's file
 is ENOENT to `stat`, `chown`, `chmod` and io_uring `OPENAT` from A, B's
 socket path is ENOENT, and B's own file and ptys are unchanged after every
-section. A person has to write it; `cell-access-tests-section-3.md` says
-what is needed and where it goes.
+section. It is still to be written.
 
 ## Bug 1 (fixed): a destroyed cell's System V segments were never freed
 
