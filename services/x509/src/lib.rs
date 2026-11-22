@@ -328,7 +328,7 @@ mod tests {
     #[test]
     fn docker_hub_chains_verify() {
         let roots = RootStore::from_pem(ROOTS);
-        assert_eq!(roots.len(), 3);
+        assert_eq!(roots.len(), 4);
         // RSA, ending in a cross-signed Amazon root under Starfield G2.
         assert_eq!(check(REGISTRY, "registry-1.docker.io", NOW), Ok(()));
         // ECDSA P-256 and P-384 under ISRG Root X2.

@@ -236,3 +236,21 @@ boot:
   for a `Run` whose caller had left).
 - **Not done:** rotating the certificate without a reboot, client
   certificates, rate limiting of failed tokens.
+
+## Amendment (2026-11-22): AES-128-GCM and P-256
+
+The client could not reach servers without ChaCha20-Poly1305 or X25519:
+Amazon ECR and Microsoft's registry take P-256 and AES, Quay AES, and the
+server with OpenJDK's test tools TLS 1.2 with AES-GCM. It now offers
+AES-128-GCM after ChaCha20-Poly1305, and P-256 after X25519, in TLS 1.3
+and 1.2, with SHA-256 only. The ClientHello carries a key share for both
+groups, so a server has no reason for a HelloRetryRequest, which we still
+do not follow; that costs a P-256 key generation per connection.
+
+Both handle secrets and are constant-time as the rest of `services/crypto`
+is: AES is bitsliced (Boyar and Peralta's S-box circuit, four blocks at a
+time; no AES-NI, since services hold no `unsafe`), GHASH multiplies without
+tables, and P-256 uses complete addition formulas with every scalar bit the
+same work (`p256.rs`; the verifier's variable-time arithmetic is not used).
+The control API's server is unchanged. Layers may now name one archive
+several times: it is fetched and unpacked once.

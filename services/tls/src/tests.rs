@@ -10,11 +10,11 @@ use crypto::sha2::Digest;
 use std::string::ToString;
 
 const ROOTS: &str = include_str!("../../x509/testdata/roots.pem");
-/// The clock of every recorded session (2026-11-15).
-const NOW: u64 = 1_794_786_687;
+/// The clock of every recorded session (2026-11-22).
+const NOW: u64 = 1_795_343_900;
 
 /// Recorded sessions: (name, host, request).
-const SESSIONS: [(&str, &str, &str); 2] = [
+const SESSIONS: [(&str, &str, &str); 4] = [
     (
         "registry",
         "registry-1.docker.io",
@@ -25,12 +25,24 @@ const SESSIONS: [(&str, &str, &str); 2] = [
         "production.cloudflare.docker.com",
         "GET / HTTP/1.1\r\nHost: production.cloudflare.docker.com\r\nUser-Agent: ichor-tls-test\r\nConnection: close\r\n\r\n",
     ),
+    // Servers without ChaCha20, the second of which takes P-256 over X25519
+    // (as Amazon's and Azure's registries do).
+    (
+        "adoptium",
+        "ci.adoptium.net",
+        "HEAD / HTTP/1.1\r\nHost: ci.adoptium.net\r\nUser-Agent: ichor-tls-test\r\nConnection: close\r\n\r\n",
+    ),
+    (
+        "mcr",
+        "mcr.microsoft.com",
+        "GET /v2/ HTTP/1.1\r\nHost: mcr.microsoft.com\r\nUser-Agent: ichor-tls-test\r\nConnection: close\r\n\r\n",
+    ),
 ];
 
 fn config(host: &str, seed: &str) -> Config {
-    let mut random = [0u8; 96];
+    let mut random = [0u8; 128];
     random[..64].copy_from_slice(&crypto::sha2::Sha512::digest(seed.as_bytes()));
-    random[64..].copy_from_slice(&Sha256::hash(host.as_bytes()));
+    random[64..].copy_from_slice(&crypto::sha2::Sha512::digest(host.as_bytes()));
     Config {
         host: host.to_string(),
         roots: Arc::new(x509::RootStore::from_pem(ROOTS)),
@@ -86,6 +98,33 @@ fn replays_tls12_with_docker_hubs_blob_cdn() {
     assert_eq!(c.version(), Some(0x0303));
     let resp = String::from_utf8_lossy(&c.read()).into_owned();
     assert!(resp.starts_with("HTTP/1.1 "), "{resp}");
+}
+
+#[test]
+fn replays_aes_gcm_and_p256() {
+    let (name, host, req) = SESSIONS[2];
+    let (mut c, _) = replay(name, host, req);
+    assert_eq!(c.version(), Some(0x0303));
+    assert_eq!((c.cipher, c.server_group), (Cipher::Aes128, X25519));
+    let resp = String::from_utf8_lossy(&c.read()).into_owned();
+    assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+    let (name, host, req) = SESSIONS[3];
+    let (mut c, _) = replay(name, host, req);
+    assert_eq!(c.version(), Some(0x0304));
+    assert_eq!((c.cipher, c.server_group), (Cipher::Aes128, SECP256R1));
+    let resp = String::from_utf8_lossy(&c.read()).into_owned();
+    assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+    // Tampered with, at the end and before it.
+    for (name, host, req) in [SESSIONS[2], SESSIONS[3]] {
+        let server = std::fs::read(testdata(&std::format!("{name}.server"))).unwrap();
+        for at in [server.len() - 2, server.len() - 60] {
+            let mut bad = server.clone();
+            bad[at] ^= 0x01;
+            let mut c = Client::new(config(host, name));
+            c.write(req.as_bytes());
+            assert_eq!(c.feed(&bad), Err(Error::BadRecordMac), "{name} at {at}");
+        }
+    }
 }
 
 #[test]

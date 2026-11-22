@@ -5,11 +5,13 @@
 //! - [`hmac`]: HMAC (RFC 2104), HKDF (RFC 5869) and the TLS 1.2 PRF
 //!   (RFC 5246 §5);
 //! - [`aead`]: ChaCha20-Poly1305 (RFC 8439);
+//! - [`gcm`]: AES-128-GCM (FIPS 197, SP 800-38D);
 //! - [`x25519`]: X25519 key agreement (RFC 7748);
+//! - [`p256`]: key agreement on P-256 (SEC 1);
 //! - [`ed25519`]: Ed25519 signatures (RFC 8032);
 //! - [`ecdsa`], [`rsa`]: verification only (public values).
 //!
-//! Secrets (keys, the X25519 scalar) only flow through code whose timing
+//! Secrets (keys, the key agreements' scalars) only flow through code whose timing
 //! does not depend on them: no secret-indexed tables, no secret branches.
 //! Tag comparison is constant-time ([`ct_eq`]).
 
@@ -19,11 +21,14 @@
 extern crate alloc;
 
 pub mod aead;
+mod aes;
 pub mod bignum;
 pub mod ecdsa;
 pub mod ed25519;
 mod field;
+pub mod gcm;
 pub mod hmac;
+pub mod p256;
 pub mod rsa;
 pub mod sha2;
 pub mod x25519;

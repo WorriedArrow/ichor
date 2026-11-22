@@ -233,17 +233,19 @@ fn layer_gz() -> Vec<u8> {
 }
 
 /// A recorded TLS session: its client config, and the server's bytes.
-const SESSIONS: [(&str, &str); 2] = [
+const SESSIONS: [(&str, &str); 4] = [
     ("registry", "registry-1.docker.io"),
     ("cloudflare", "production.cloudflare.docker.com"),
+    ("adoptium", "ci.adoptium.net"),
+    ("mcr", "mcr.microsoft.com"),
 ];
-const NOW: u64 = 1_794_786_687;
+const NOW: u64 = 1_795_343_900;
 
 fn tls_config(name: &str, host: &str) -> tls::Config {
     use crypto::sha2::Digest;
-    let mut random = [0u8; 96];
+    let mut random = [0u8; 128];
     random[..64].copy_from_slice(&crypto::sha2::Sha512::digest(name.as_bytes()));
-    random[64..].copy_from_slice(&crypto::sha2::Sha256::hash(host.as_bytes()));
+    random[64..].copy_from_slice(&crypto::sha2::Sha512::digest(host.as_bytes()));
     static ROOTS: std::sync::OnceLock<Arc<x509::RootStore>> = std::sync::OnceLock::new();
     let roots = ROOTS
         .get_or_init(|| {
@@ -304,16 +306,16 @@ fn tls_seeds() -> Vec<Vec<u8>> {
 /// The server's side of a TLS session: records, handshake messages, the
 /// certificate chain (in TLS 1.2 in the clear), key exchange, records.
 fn tls_run(input: &[u8]) {
-    // Which recording's client to pair it with: the TLS 1.2 one if the
-    // input looks like it, so mutations reach past the ServerHello.
-    let (name, host) = if input.len() > 10
-        && input[9..11] == [3, 3]
-        && input.windows(2).any(|w| w == [0xcc, 0xa9])
-    {
-        SESSIONS[1]
-    } else {
-        SESSIONS[0]
-    };
+    // Which recording's client to pair it with: the one whose server's
+    // random it starts with, so mutations reach past the ServerHello.
+    static SEEDS: std::sync::OnceLock<Vec<Vec<u8>>> = std::sync::OnceLock::new();
+    let seeds = SEEDS.get_or_init(tls_seeds);
+    let random = |b: &[u8]| b.get(11..19).map(<[u8]>::to_vec);
+    let (name, host) = SESSIONS
+        .into_iter()
+        .zip(seeds)
+        .find(|(_, seed)| random(seed) == random(input))
+        .map_or(SESSIONS[0], |(s, _)| s);
     for cfg in [
         tls_config(name, host),
         tls_config(SESSIONS[1].0, SESSIONS[1].1),
@@ -357,7 +359,7 @@ fn tls_server_seeds() -> Vec<Vec<u8>> {
         host: "ichor-api.test".into(),
         roots: Arc::new(x509::RootStore::from_pem(&ca)),
         now: 1_795_400_000,
-        random: [0x17; 96],
+        random: [0x17; 128],
         ed25519: true,
         alpn: Some(b"h2"),
     });

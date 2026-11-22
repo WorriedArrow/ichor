@@ -160,7 +160,7 @@ fn record_live() {
             Step::Fetch(r) => r,
         };
         std::println!("GET https://{}{}", req.url.host, req.url.path);
-        let mut random = [0u8; 96];
+        let mut random = [0u8; 128];
         random[..64].copy_from_slice(&<crypto::sha2::Sha512 as crypto::sha2::Digest>::digest(
             format!("{now}-{i}").as_bytes(),
         ));

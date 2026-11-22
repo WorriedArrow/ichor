@@ -198,7 +198,7 @@ impl Fetch {
                         };
                         let request = self.req.encode();
                         if self.req.url.is_https() {
-                            let mut random = [0u8; 96];
+                            let mut random = [0u8; 128];
                             rt::random(&mut random);
                             let mut tls = Box::new(tls::Client::new(tls::Config {
                                 host: self.req.url.host.clone(),

@@ -235,10 +235,12 @@ the acceptance test.
   shims), `services/oci` (references, Bearer token flow, index to
   linux/amd64, digest-verified manifests and blobs, CDN redirects without
   the token, conversion, image config; a real `hello-world` pull recorded
-  and replayed), `services/dns` (A records, CNAME chains). AES-GCM is left
-  out: every Docker Hub endpoint accepts ChaCha20-Poly1305. Refresh a
-  recording with `cargo test -p ichor-tls -- --ignored record_live` (or
-  `-p ichor-oci`); it needs the internet and the Windows-exported roots in
+  and replayed), `services/dns` (A records, CNAME chains). The TLS client
+  also speaks AES-128-GCM (bitsliced) and P-256 (constant-time) since
+  2026-11-22: Amazon's, Microsoft's and Quay's registries want them. Refresh
+  a recording with `cargo test -p ichor-tls -- --ignored record_live` (or
+  `-p ichor-oci`), and the clocks beside `SESSIONS` (there and in `fuzz`);
+  it needs the internet and the roots in
   `services/x509/testdata/roots.pem`.
 - M6 native ABI v2 (`docs/abi/native.md`): `kernel/ichor/src/native.rs`
   runs native processes (a demand-paged `Mm` charged to the cell, the ELF

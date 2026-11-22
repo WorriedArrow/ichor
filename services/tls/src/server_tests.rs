@@ -237,7 +237,7 @@ fn a_client_key_update_is_followed() {
     let w = c.write.as_mut().unwrap();
     let rec = w.seal(CT_HANDSHAKE, &handshake_msg(HS_KEY_UPDATE, &[1]));
     c.c_ap = expand_label(&c.c_ap, "traffic upd", &[], 32);
-    c.write = traffic(&c.c_ap, true);
+    c.write = traffic(Cipher::ChaCha, &c.c_ap);
     s.feed(&rec).unwrap();
     c.write(b"after");
     s.write(b"also after");

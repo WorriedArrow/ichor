@@ -20,10 +20,10 @@ use crypto::sha2::Sha256;
 use crypto::x25519;
 
 use crate::{
-    CT_ALERT, CT_APP, CT_CCS, CT_HANDSHAKE, ED25519, Error, HS_CERTIFICATE, HS_CERTIFICATE_VERIFY,
-    HS_CLIENT_HELLO, HS_ENCRYPTED_EXTENSIONS, HS_FINISHED, HS_KEY_UPDATE, HS_SERVER_HELLO,
-    MAX_RECORD, Protect, TLS13_CHACHA, X25519, expand_label, ext, handshake_msg, plain_record,
-    put_vec, traffic, u16_at, u24_at, vec_at,
+    CT_ALERT, CT_APP, CT_CCS, CT_HANDSHAKE, Cipher, ED25519, Error, HS_CERTIFICATE,
+    HS_CERTIFICATE_VERIFY, HS_CLIENT_HELLO, HS_ENCRYPTED_EXTENSIONS, HS_FINISHED, HS_KEY_UPDATE,
+    HS_SERVER_HELLO, MAX_RECORD, Protect, TLS13_CHACHA, X25519, expand_label, ext, handshake_msg,
+    plain_record, put_vec, traffic, u16_at, u24_at, vec_at,
 };
 
 /// Most bytes in one handshake message from a client (a ClientHello with a
@@ -406,7 +406,7 @@ impl Server {
                 if !crypto::ct_eq(&want, body) {
                     return Err(Error::BadFinished);
                 }
-                self.read = traffic(&self.c_ap, true);
+                self.read = traffic(Cipher::ChaCha, &self.c_ap);
                 self.stage = Stage::Connected;
                 self.transcript = Vec::new();
                 self.c_hs = Vec::new();
@@ -419,11 +419,11 @@ impl Server {
                     return Err(Error::Decode);
                 }
                 self.c_ap = expand_label(&self.c_ap, "traffic upd", &[], 32);
-                self.read = traffic(&self.c_ap, true);
+                self.read = traffic(Cipher::ChaCha, &self.c_ap);
                 if body == [1] && self.write.is_some() {
                     self.send(CT_HANDSHAKE, &handshake_msg(HS_KEY_UPDATE, &[0]));
                     self.s_ap = expand_label(&self.s_ap, "traffic upd", &[], 32);
-                    self.write = traffic(&self.s_ap, true);
+                    self.write = traffic(Cipher::ChaCha, &self.s_ap);
                 }
                 Ok(())
             }
@@ -472,8 +472,8 @@ impl Server {
         let th = Sha256::hash(&self.transcript);
         self.c_hs = expand_label(&hs, "c hs traffic", &th, 32);
         let s_hs = expand_label(&hs, "s hs traffic", &th, 32);
-        self.read = traffic(&self.c_hs, true);
-        self.write = traffic(&s_hs, true);
+        self.read = traffic(Cipher::ChaCha, &self.c_hs);
+        self.write = traffic(Cipher::ChaCha, &s_hs);
 
         let mut exts = Vec::new();
         if h.alpn {
@@ -513,7 +513,7 @@ impl Server {
         let th = Sha256::hash(&self.transcript);
         self.c_ap = expand_label(&master, "c ap traffic", &th, 32);
         self.s_ap = expand_label(&master, "s ap traffic", &th, 32);
-        self.write = traffic(&self.s_ap, true);
+        self.write = traffic(Cipher::ChaCha, &self.s_ap);
         self.stage = Stage::Finished;
         Ok(())
     }

@@ -88,6 +88,6 @@ amendment.
 | No certificate policies processing | Not used by the Web PKI for path validation. |
 | ML-DSA (RFC 9881) and RSA-PSS certificate signatures are not accepted | Not used by any registry we pull from; TLS 1.3 handshake signatures do use RSA-PSS (supported there). |
 | The TLS server takes only Ed25519 certificates, TLS 1.3, ChaCha20-Poly1305 and X25519, and no HelloRetryRequest | One constant-time path through a long-lived key (ADR-0012's 2026-11-21 amendment). |
-| TLS: AES-GCM is not offered | Every Docker Hub endpoint negotiates ChaCha20-Poly1305 (ADR-0012 amendment). Some registries may need it; adding it is a `services/crypto` change. |
+| TLS: AES-128-GCM, not AES-256-GCM; SHA-256 suites only; X25519 and P-256 only | ChaCha20-Poly1305 is offered first; AES-128-GCM (bitsliced, constant-time) is for registries without it (Amazon ECR, Microsoft's, Quay). No registry tried needs the others. |
 | TLS: no session resumption, 0-RTT, renegotiation, client certificates or record-size limits negotiation | Simplicity; none is needed for pulls. |
 | TLS 1.2: only ECDHE with AEAD suites and extended master secret | The suites without forward secrecy or with CBC are not offered. |
