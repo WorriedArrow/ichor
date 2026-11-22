@@ -23,6 +23,12 @@ open(my $sf, ">", "/b-only/secret") or die "secret: $!";
 print $sf "B's secret\n";
 close $sf;
 symlink("/b-only/secret", "/b-only/link") or die "symlink: $!";
+# What section 3's links, renames and removals aim at.
+for my $n (1 .. 6) {
+    open(my $f, ">", "/b-only/v$n") or die "v$n: $!";
+    close $f;
+}
+mkdir("/b-only/vd1") && mkdir("/b-only/vd2") or die "mkdir: $!";
 
 # A plain child (a second pid in B), pausing forever.
 my $child = fork() // die "fork: $!";
@@ -205,6 +211,27 @@ while (1) {
     if (defined(my $v = poll_in("look"))) {
         # Paths A made in its root: none may exist here.
         put("look", join(" ", map { "$_=" . (-e $_ || -l $_ ? "exists" : "absent") } split ' ', $v));
+    }
+    if (defined(my $v = poll_in("list"))) {
+        # What a directory of B's lists.
+        opendir(my $d, $v) or die "cellaccess: opendir $v: $!\n";
+        put("list", join(" ", sort grep { !/^\.\.?$/ } readdir($d)));
+        closedir $d;
+    }
+    if (defined(my $v = poll_in("ptys"))) {
+        # Each pty's size, and whether anything was written to its slave:
+        # nobody has opened either.
+        my @s;
+        for (@pts) {
+            my ($m, $n) = @$_;
+            my $size = "\0" x 8;
+            ioctl($m, 0x5413, $size) or die "cellaccess: TIOCGWINSZ: $!\n";
+            my $rin = "";
+            vec($rin, fileno($m), 1) = 1;
+            my $heard = select(my $rout = $rin, undef, undef, 0) > 0 ? "something" : "nothing";
+            push @s, "$n=" . join("x", (unpack("S4", $size))[0, 1]) . ",$heard";
+        }
+        put("ptys", join(" ", @s));
     }
     last if defined poll_in("exit");
 }

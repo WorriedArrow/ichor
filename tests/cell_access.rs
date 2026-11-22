@@ -13,7 +13,7 @@ use std::sync::OnceLock;
 use ichor_tests::{Exit, Outcome};
 
 /// Sections the kernel runs (`SECTIONS` in cellaccess.rs).
-const SECTIONS: usize = 10;
+const SECTIONS: usize = 11;
 /// B's uplink-facing port inside the guest (`B_UPLINK_PORT` in
 /// cellaccess.rs).
 const B_UPLINK_PORT: u16 = 7300;
@@ -116,6 +116,48 @@ fn proc_and_sys_show_only_their_cell() {
         "cellaccess: global: /proc/loadavg: ",
         "ichor: cellaccess: proc_and_sys_show_only_their_cell passed",
         "ichor: cellaccess: B alive and unchanged after proc_and_sys_show_only_their_cell",
+    ]);
+}
+
+/// Section 3: `..` at A's root is A's root (chdir, directory descriptors,
+/// chains of 1300, moved and removed directories); symlinks to what only
+/// B's root has, and B's files themselves, are ENOENT; links and renames
+/// end inside A's root; B's ptys have no node in A, whose own pty 0 is
+/// another one; and B sees none of what A made, changed or removed.
+#[test]
+fn file_systems_are_scoped_to_their_root() {
+    assert_rule("file_systems_are_scoped_to_their_root");
+    suite().0.assert_in_order(&[
+        "A's devpts is empty while B has ptys: ok",
+        "open /dev/pts/0 (B's) (ENOENT): ok",
+        "chdir(..) at the root: it is A's root: ok",
+        "chdir of 1300 x .. from /var/lib/dpkg: it is A's root: ok",
+        "openat(/usr/bin, 64 x ..) is A's root: ok",
+        "openat(a removed directory, ../../..) is A's root: ok",
+        "open a symlink (absolute) (ENOENT): ok",
+        "open a symlink (absolute): control: ok",
+        "open a symlink (through a directory) (ENOENT): ok",
+        "connect through a symlink to B's socket (ENOENT): ok",
+        "open B's file (ENOENT): ok",
+        "link(B's file, A's name) (ENOENT): ok",
+        "link(A's file, B's directory) (ENOENT): ok",
+        "rename(B's file, A's name) (ENOENT): ok",
+        "rename(A's file, B's directory) (ENOENT): ok",
+        "the link above the root is in A's root: ok",
+        "the rename above the root is in A's root: ok",
+        "A's file under B's name is A's: ok",
+        "A's devpts lists only A's pty: ok",
+        "A's master hears A's slave: ok",
+        "open a node of A's old pty (EIO): ok",
+        "what A made is in A's root while B looks: control: ok",
+        "B finds nothing A made: ok",
+        "B still has the image's files A removed and moved: ok",
+        "A's write to an image file is not in B's file: ok",
+        "B's root lists B's directory and nothing A made: ok",
+        "B's directory holds what B made, no more and no less: ok",
+        "B's ptys heard nothing and kept their size: ok",
+        "ichor: cellaccess: file_systems_are_scoped_to_their_root passed",
+        "ichor: cellaccess: B alive and unchanged after file_systems_are_scoped_to_their_root",
     ]);
 }
 

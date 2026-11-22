@@ -47,6 +47,7 @@ const B_HELPER: &str = include_str!("cellaccess/b_helper.pl");
 const SMOKE: &str = include_str!("cellaccess/smoke.pl");
 const S1_PROCESS: &str = include_str!("cellaccess/s1_process.pl");
 const S2_PROC: &str = include_str!("cellaccess/s2_proc.pl");
+const S3_FILES: &str = include_str!("cellaccess/s3_files.pl");
 const S4_PAGES: &str = include_str!("cellaccess/s4_pages.pl");
 const S4_FILL: &str = include_str!("cellaccess/s4_fill.pl");
 const S4_PRIVATE: &str = include_str!("cellaccess/s4_private.pl");
@@ -94,6 +95,7 @@ const SECTIONS: &[Section] = &[
         in_a(c, S1_PROCESS)
     }),
     ("proc_and_sys_show_only_their_cell", |c| in_a(c, S2_PROC)),
+    ("file_systems_are_scoped_to_their_root", s3),
     ("shared_cache_pages_never_carry_writes_between_cells", s4),
     ("networks_are_scoped_to_their_cell", s5),
     ("other_kernel_state_is_per_cell", |c| in_a(c, S6_STATE)),
@@ -513,6 +515,107 @@ fn cache_bytes(root: &Vfs, path: &str) -> Option<String> {
     let mut b = [0u8; 16];
     page.reader().read(&mut b);
     Some(hex(&b))
+}
+
+/// Section 3: file systems. The perl part runs in A and leaves what it made;
+/// then B looks for it, and for the image's files A changed.
+fn s3(ctx: &Ctx) -> bool {
+    const RULE: &str = "file_systems_are_scoped_to_their_root";
+    /// What A made, of every kind and in every way (`s3_files.pl`).
+    const MADE: &[&str] = &[
+        "/a-only",
+        "/a-only/secret",
+        "/a-only/link",
+        "/a-only/sock",
+        "/a-only/fifo",
+        "/a-only/hard",
+        "/a-only/renamed",
+        "/a-only/skel/.bashrc",
+        "/a-moved-dir",
+        "/a-linked",
+        "/a-renamed",
+        "/a-symlink",
+        "/a-dir2",
+    ];
+    /// Files of the image A removed or moved away.
+    const REMOVED: &[&str] = &["/etc/issue.net", "/etc/skel", "/etc/skel/.bashrc"];
+    const WRITTEN: &str = "/etc/issue";
+    let ask = |request: &str, text: &str| {
+        put(&ctx.b.root, request, text);
+        take(&ctx.b.root, request, &ctx.helper)
+    };
+    let in_a_root = |path: &&str| ctx.a.root.lock().resolve(ROOT, path, false).is_ok();
+    let image = read(&ctx.b.root, WRITTEN);
+    let was_there = REMOVED.iter().all(in_a_root);
+
+    let mut ok = in_a(ctx, S3_FILES);
+
+    let made = MADE.iter().all(in_a_root);
+    ok &= report(
+        RULE,
+        "what A made is in A's root while B looks: control",
+        made,
+        "a path A made is missing in A's root",
+    );
+    let want: Vec<String> = MADE.iter().map(|p| alloc::format!("{p}=absent")).collect();
+    let seen = ask("look", &MADE.join(" "));
+    ok &= report(
+        RULE,
+        "B finds nothing A made",
+        seen == want.join(" "),
+        &alloc::format!("B looked: {seen}"),
+    );
+    let gone = !REMOVED.iter().any(in_a_root);
+    ok &= report(
+        RULE,
+        "A removed and moved the image's files in its own root: control",
+        was_there && gone,
+        &alloc::format!("there before: {was_there}, gone after: {gone}"),
+    );
+    let want: Vec<String> = REMOVED
+        .iter()
+        .map(|p| alloc::format!("{p}=exists"))
+        .collect();
+    let seen = ask("look", &REMOVED.join(" "));
+    ok &= report(
+        RULE,
+        "B still has the image's files A removed and moved",
+        seen == want.join(" "),
+        &alloc::format!("B looked: {seen}"),
+    );
+    let (a, b) = (read(&ctx.a.root, WRITTEN), read(&ctx.b.root, WRITTEN));
+    ok &= report(
+        RULE,
+        "A's write to an image file is not in B's file",
+        image.is_some() && b == image && a != image && a.is_some(),
+        &alloc::format!(
+            "B's file changed: {}, A's file changed: {}",
+            b != image,
+            a != image
+        ),
+    );
+    let seen = ask("list", "/");
+    ok &= report(
+        RULE,
+        "B's root lists B's directory and nothing A made",
+        seen.split(' ').any(|n| n == "b-only") && !seen.split(' ').any(|n| n.starts_with("a-")),
+        &alloc::format!("B's root lists: {seen}"),
+    );
+    let seen = ask("list", "/b-only");
+    ok &= report(
+        RULE,
+        "B's directory holds what B made, no more and no less",
+        seen == "link secret v1 v2 v3 v4 v5 v6 vd1 vd2",
+        &alloc::format!("B's directory lists: {seen}"),
+    );
+    let seen = ask("ptys", "");
+    ok &= report(
+        RULE,
+        "B's ptys heard nothing and kept their size",
+        seen == "0=0x0,nothing 1=0x0,nothing",
+        &alloc::format!("B's ptys: {seen}"),
+    );
+    ok
 }
 
 /// Section 4: shared page-cache pages.
