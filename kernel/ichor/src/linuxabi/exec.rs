@@ -31,9 +31,7 @@ const ENOENT: i64 = 2;
 const ELOOP: i64 = 40;
 
 /// Most argv or envp entries.
-const MAX_STRINGS: usize = 4096;
-/// Most bytes of argv plus envp strings.
-const MAX_STRING_BYTES: usize = 128 * 1024;
+const MAX_STRINGS: usize = 1 << 17;
 
 /// Longest single argv or envp string, with its NUL (Linux's
 /// `MAX_ARG_STRLEN`, 32 pages).
@@ -60,8 +58,8 @@ fn user_strings(p: &mut LinuxProcess, addr: u64, total: &mut usize) -> Result<Ve
             return Ok(out);
         }
         let s = user_bytes(p, ptr)?;
-        *total += s.len() + 1;
-        if *total > MAX_STRING_BYTES {
+        *total += s.len() + 1 + 8;
+        if *total > loader::MAX_ARGS {
             return Err(E2BIG);
         }
         out.push(s);
@@ -184,6 +182,7 @@ pub(crate) fn exec(
     };
 
     let mut mm = Mm::new(p.cell.account()).ok_or(ENOMEM)?;
+    let c = p.group.creds();
     let loaded = loader::load(
         &mut mm,
         &image,
@@ -191,6 +190,7 @@ pub(crate) fn exec(
         &argv,
         &envp,
         p.group.limits()[crate::process::RLIMIT_STACK].0,
+        [c.ruid, c.euid, c.rgid, c.egid],
     )
     .map_err(|e| match e {
         LoadError::OutOfMemory => ENOMEM,
@@ -222,7 +222,7 @@ pub(crate) fn exec(
     // `/proc/self/exe` is the file's own path; the name is the one given.
     let real = image.path().unwrap_or_else(|| exe_path.clone());
     let name = path.rsplit('/').next().unwrap_or("");
-    p.group.set_exec(&real, name, &argv);
+    p.group.set_exec(&real, name, loaded.args);
     crate::signal::sync(p);
     *ctx = UserContext::new(loaded.entry, loaded.stack_pointer);
     Ok(())

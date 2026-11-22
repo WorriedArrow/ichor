@@ -11,3 +11,6 @@ go = 940
 
 # 2026-11-21: 224 of 224 tests under TCG on 4 vCPUs.
 postgres = 980
+
+# 2026-11-22: 4365 of 4400 tests (99.2%) under TCG on 4 vCPUs.
+node = 980

@@ -20,6 +20,7 @@ use frame::mm::VmSpace;
 use frame::sync::{Mutex, MutexGuard, SpinLock};
 
 use crate::kcell::Cell;
+use crate::loader::Args;
 use crate::page::Reserved;
 use crate::pipe::Pipe;
 use crate::proc::{self, ProcEntry};
@@ -46,13 +47,59 @@ pub(crate) struct OpenFile {
     pub(crate) flags: u64,
 }
 
-/// One end of a pipe, as a descriptor holds it.
+/// One end of a pipe, as a descriptor holds it, or (a FIFO opened O_RDWR)
+/// both.
 #[derive(Clone, Debug)]
 pub(crate) struct PipeEnd {
     pub(crate) pipe: Arc<Pipe>,
-    /// The write end (otherwise the read end).
+    pub(crate) read: bool,
     pub(crate) write: bool,
     pub(crate) nonblock: bool,
+}
+
+impl PipeEnd {
+    /// The read end, or the write end.
+    pub(crate) fn one(pipe: Arc<Pipe>, write: bool, nonblock: bool) -> PipeEnd {
+        PipeEnd {
+            pipe,
+            read: !write,
+            write,
+            nonblock,
+        }
+    }
+
+    /// The ends an open with access mode `acc` gives, opened.
+    pub(crate) fn open(pipe: Arc<Pipe>, acc: u64, nonblock: bool) -> PipeEnd {
+        let (read, write) = (acc != 1, acc != 0);
+        for (opens, end) in [(read, false), (write, true)] {
+            if opens {
+                pipe.add_end(end);
+            }
+        }
+        PipeEnd {
+            pipe,
+            read,
+            write,
+            nonblock,
+        }
+    }
+
+    /// Lets go of what it holds.
+    fn close(&self) {
+        for (held, end) in [(self.read, false), (self.write, true)] {
+            if held {
+                self.pipe.drop_end(end);
+            }
+        }
+    }
+
+    /// Readiness, as `poll` reports it.
+    pub(crate) fn poll(&self) -> u16 {
+        [(self.read, false), (self.write, true)]
+            .into_iter()
+            .filter(|&(held, _)| held)
+            .fold(0, |r, (_, end)| r | self.pipe.poll(end))
+    }
 }
 
 /// What a descriptor refers to.
@@ -127,7 +174,7 @@ impl Drop for Description {
                 crate::linuxabi::inotify::note_close(&self.vfs, of.ino, write);
                 self.vfs.lock().close(of.ino)
             }
-            Fd::Pipe(e) => e.pipe.drop_end(e.write),
+            Fd::Pipe(e) => e.close(),
         }
     }
 }
@@ -171,8 +218,8 @@ pub(crate) struct Group {
     exit: SpinLock<Option<u32>>,
     /// The thread ending the others for its `execve`.
     execing: SpinLock<Option<u64>>,
-    /// The program's path and argv (NUL-separated), for `/proc`.
-    exe: SpinLock<(alloc::string::String, Vec<u8>)>,
+    /// The program's path, and where its argv is, for `/proc`.
+    exe: SpinLock<(alloc::string::String, Args)>,
     /// Resource limits (soft, hard), by `RLIMIT_*`.
     limits: SpinLock<Limits>,
     /// Set in a `vfork` child: released when it execs or exits.
@@ -263,16 +310,14 @@ fn default_limits() -> Limits {
     l
 }
 
+/// Most of a command line that `/proc` shows.
+const CMDLINE_MAX: u64 = 1 << 20;
+
 impl Group {
     /// Records the program the process runs (load or `execve`).
     /// `name` is what the process is called (`comm`).
-    pub(crate) fn set_exec<S: AsRef<[u8]>>(&self, path: &str, name: &str, argv: &[S]) {
-        let mut cmd = Vec::new();
-        for a in argv {
-            cmd.extend_from_slice(a.as_ref());
-            cmd.push(0);
-        }
-        *self.exe.lock() = (alloc::string::String::from(path), cmd);
+    pub(crate) fn set_exec(&self, path: &str, name: &str, args: Args) {
+        *self.exe.lock() = (alloc::string::String::from(path), args);
         self.prctl.lock().name = Some(name.chars().take(15).collect());
     }
 
@@ -281,9 +326,27 @@ impl Group {
         self.exe.lock().0.clone()
     }
 
-    /// The program's argv, NUL-separated (`/proc/<pid>/cmdline`).
+    /// The program's argv, NUL-separated (`/proc/<pid>/cmdline`): what is
+    /// in its memory now, as a program may write a title for itself there.
+    /// A title that is longer (it took the last NUL) ends at the next.
     pub(crate) fn cmdline(&self) -> Vec<u8> {
-        self.exe.lock().1.clone()
+        let args = self.exe.lock().1;
+        let mut mm = self.mm();
+        let mut read = |from: u64, to: u64| {
+            let mut b = alloc::vec![0u8; to.saturating_sub(from).min(CMDLINE_MAX) as usize];
+            let n = mm.copy_from_user(from, &mut b);
+            b.truncate(n);
+            b
+        };
+        let cmd = read(args.start, args.end);
+        if cmd.last().is_none_or(|&b| b == 0) {
+            return cmd;
+        }
+        let mut title = read(args.start, args.env_end);
+        if let Some(end) = title.iter().position(|&b| b == 0) {
+            title.truncate(end);
+        }
+        title
     }
 
     /// The address space (locked).

@@ -420,23 +420,35 @@ impl Mm {
                 return (s, Some(r.start));
             }
             let share = if r.backing.shared() { 's' } else { 'p' };
-            let offset = match &r.backing {
-                Backing::File(f) => f.at(r.start),
-                _ => 0,
-            };
-            let label = match r.backing {
-                Backing::Named(name) => name,
-                _ => "",
-            };
-            let _ = writeln!(
+            let (mut offset, mut dev, mut ino) = (0, 0, 0);
+            let mut label = alloc::string::String::new();
+            match &r.backing {
+                Backing::File(f) => {
+                    offset = f.at(r.start);
+                    if let Some((n, path)) = f.file.identity() {
+                        (dev, ino) = (1, n); // as `fstat` has it
+                        label = path.unwrap_or_else(|| "(deleted)".into());
+                    }
+                }
+                Backing::Named(name) => label.push_str(name),
+                Backing::Private | Backing::Shared => {}
+            }
+            let line = s.len();
+            let _ = write!(
                 s,
-                "{:08x}-{:08x} {}{}{}{share} {offset:08x} 00:00 0 {label}",
+                "{:08x}-{:08x} {}{}{}{share} {offset:08x} 00:{dev:02x} {ino} ",
                 r.start,
                 r.end,
                 if r.prot.read { 'r' } else { '-' },
                 if r.prot.write { 'w' } else { '-' },
                 if r.prot.exec { 'x' } else { '-' },
             );
+            if !label.is_empty() {
+                // Names line up, as on Linux.
+                let pad = 73usize.saturating_sub(s.len() - line);
+                let _ = write!(s, "{:pad$}{label}", "");
+            }
+            s.push('\n');
         }
         (s, None)
     }

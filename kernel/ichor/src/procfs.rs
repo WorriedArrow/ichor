@@ -17,6 +17,7 @@ use alloc::vec::Vec;
 
 use frame::sync::{Mutex, SpinLock};
 
+use crate::page::Reserved;
 use crate::poll::Object;
 use crate::proc::{self, ProcEntry};
 use crate::process::{Fd, Group, LinuxProcess};
@@ -509,6 +510,8 @@ fn stat_process(g: &Group, t: &ProcEntry) -> Vec<u8> {
 pub(crate) struct ProcFile {
     state: Mutex<Text>,
     maps: Option<Weak<Group>>,
+    /// What the snapshot costs its opener's cell.
+    _kept: Option<Reserved>,
 }
 
 #[derive(Debug, Default)]
@@ -528,14 +531,17 @@ pub(crate) struct ProcDir {
 }
 
 impl ProcFile {
-    pub(crate) fn new(data: Vec<u8>) -> ProcFile {
-        ProcFile {
+    /// A snapshot, which `p`'s cell pays for; `None` if it cannot.
+    pub(crate) fn new(data: Vec<u8>, p: &LinuxProcess) -> Option<ProcFile> {
+        let pages = data.len().div_ceil(4096) as u64;
+        Some(ProcFile {
             state: Mutex::new(Text {
                 data,
                 ..Text::default()
             }),
             maps: None,
-        }
+            _kept: Some(Reserved::new(p.cell.account(), pages)?),
+        })
     }
 
     pub(crate) fn maps(of: Weak<Group>) -> ProcFile {
@@ -545,6 +551,7 @@ impl ProcFile {
                 ..Text::default()
             }),
             maps: Some(of),
+            _kept: None,
         }
     }
 }

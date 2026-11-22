@@ -241,7 +241,7 @@ pub(crate) fn watchers(fd: &Fd) -> Option<&Watchers> {
 pub(crate) fn readiness(fd: &Fd) -> u16 {
     match fd {
         Fd::Console | Fd::File(_) | Fd::Dev(_) => POLLIN | POLLOUT,
-        Fd::Pipe(e) => e.pipe.poll(e.write),
+        Fd::Pipe(e) => e.poll(),
         Fd::Object(o) => o.obj.poll(),
     }
 }

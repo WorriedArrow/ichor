@@ -278,20 +278,7 @@ fn reopen(p: &mut LinuxProcess, fd: u64, flags: u64) -> Result<u64, i64> {
                 flags: flags & (O_ACCMODE | O_APPEND | O_NONBLOCK),
             })
         }
-        Fd::Pipe(e) => {
-            // Both ends at once cannot be held in one: the end it is of.
-            let write = match acc {
-                0 => false,
-                O_WRONLY => true,
-                _ => e.write,
-            };
-            e.pipe.add_end(write);
-            Fd::Pipe(PipeEnd {
-                pipe: e.pipe,
-                write,
-                nonblock,
-            })
-        }
+        Fd::Pipe(e) => Fd::Pipe(PipeEnd::open(e.pipe, acc, nonblock)),
         Fd::Object(o) if o.obj.tty().is_some() => Fd::Object(crate::process::ObjectEnd {
             obj: o.obj,
             nonblock,
@@ -305,15 +292,20 @@ fn reopen(p: &mut LinuxProcess, fd: u64, flags: u64) -> Result<u64, i64> {
 /// Opens a named pipe: one end of the FIFO's pipe, shared by every open of
 /// it. As on Linux, opening one end blocks until the other is opened
 /// (unless O_NONBLOCK); a non-blocking open for writing with no reader is
-/// ENXIO. O_RDWR (both ends in one description) is not supported: EINVAL.
+/// ENXIO. O_RDWR opens both, and so never waits.
 fn open_fifo(p: &mut LinuxProcess, id: u64, flags: u64) -> Result<u64, i64> {
+    let nonblock = flags & O_NONBLOCK != 0;
+    let pipe = crate::pipe::fifo(id, p.cell.account());
     let write = match flags & O_ACCMODE {
         0 => false,
         O_WRONLY => true,
-        _ => return Err(EINVAL),
+        acc => {
+            let both = PipeEnd::open(pipe, acc, nonblock);
+            return p
+                .install_flags(Fd::Pipe(both), flags & O_CLOEXEC != 0)
+                .ok_or(EMFILE);
+        }
     };
-    let nonblock = flags & O_NONBLOCK != 0;
-    let pipe = crate::pipe::fifo(id, p.cell.account());
     if write && nonblock && pipe.readers() == 0 {
         return Err(ENXIO);
     }
@@ -325,11 +317,7 @@ fn open_fifo(p: &mut LinuxProcess, id: u64, flags: u64) -> Result<u64, i64> {
             return Err(e);
         }
     }
-    let end = PipeEnd {
-        pipe,
-        write,
-        nonblock,
-    };
+    let end = PipeEnd::one(pipe, write, nonblock);
     // A full table drops the description, which drops the end again.
     p.install_flags(Fd::Pipe(end), flags & O_CLOEXEC != 0)
         .ok_or(EMFILE)
@@ -392,7 +380,10 @@ fn open_proc(
         procfs::Node::Dir(e) => alloc::sync::Arc::new(procfs::ProcDir::new(path, e)),
         _ if flags & O_DIRECTORY != 0 => return Err(ENOTDIR),
         _ if flags & O_ACCMODE != 0 => return Err(EACCES),
-        procfs::Node::File(d) => alloc::sync::Arc::new(procfs::ProcFile::new(d)),
+        procfs::Node::File(d) => {
+            let file = procfs::ProcFile::new(d, p).ok_or(crate::vfs::errno::ENOMEM)?;
+            alloc::sync::Arc::new(file)
+        }
         procfs::Node::Maps(g) => alloc::sync::Arc::new(procfs::ProcFile::maps(g)),
     };
     p.install_flags(
@@ -648,7 +639,7 @@ pub(super) fn stream_read(
             chunk.truncate(n);
             Ok(chunk)
         }
-        Fd::Pipe(e) if e.write => Err(EBADF),
+        Fd::Pipe(e) if !e.read => Err(EBADF),
         Fd::Pipe(e) => e.pipe.take(max, e.nonblock || nonblock, &interrupted),
         Fd::File(_) => Err(EINVAL),
     }
@@ -1765,13 +1756,7 @@ pub(super) fn pipe2(p: &mut LinuxProcess, fds: u64, flags: u64) -> Result<u64, i
     }
     let pipe = Pipe::new(p.cell.account());
     let nonblock = flags & O_NONBLOCK != 0;
-    let end = |write| {
-        Fd::Pipe(PipeEnd {
-            pipe: pipe.clone(),
-            write,
-            nonblock,
-        })
-    };
+    let end = |write| Fd::Pipe(PipeEnd::one(pipe.clone(), write, nonblock));
     let cloexec = flags & O_CLOEXEC != 0;
     let r = p.install_flags(end(false), cloexec).ok_or(EMFILE)?;
     let w = match p.install_flags(end(true), cloexec) {

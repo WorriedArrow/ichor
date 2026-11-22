@@ -87,3 +87,50 @@ Failed:
 - Command: `sh -c set -e; useradd -m pg; cp -r /usr/src/postgresql /home/pg/src; chown -R pg /home/pg/src; exec su pg -c 'set -e; cd ~/src; ./configure --prefix=/home/pg/inst --without-icu --without-readline --without-zlib CFLAGS=-O1 >../configure.log 2>&1 || { tail ../configure.log; exit 1; }; make -s -j4 >../make.log 2>&1 || { tail ../make.log; exit 1; }; echo built; cd src/test/regress; if [ $# -gt 0 ]; then make -s check-tests TESTS="test_setup $*"; else make -s check; fi; s=$?; cat regression.diffs 2>/dev/null | head -c 2000000; exit $s' -- "$0" "$@" postgres`
 - Result: 224 of 224 tests passed (100.0%), 0 skipped; floor 98.0%
 - Run time: 39 min
+
+## node
+
+- Image: `docker.io/library/node@sha256:9d266751ca3d7fdbe651c878ffd5ad0a42fed49a18c283509267c97f025b7496`
+- Layer: `https://nodejs.org/dist/v24.22.3/node-v24.22.3.tar.gz` (sha256:4690edccae352134bbe31d844b37898f2a28b2c3d67901d0112fb6c4996d556a), `node-v24.22.3/test/` at `/usr/src/node/test/`
+- Layer: `https://nodejs.org/dist/v24.22.3/node-v24.22.3.tar.gz` (sha256:4690edccae352134bbe31d844b37898f2a28b2c3d67901d0112fb6c4996d556a), `node-v24.22.3/tools/` at `/usr/src/node/tools/`
+- Command: `sh -c cd /usr/src/node && [ $# -gt 0 ] || set -- parallel sequential; exec python3 tools/test.py -J --shell=/usr/local/bin/node -p tap --timeout 600 "$@" node`
+- Result: 4365 of 4400 tests passed (99.2%), 342 skipped; floor 98.0%
+- Run time: 130 min (tcg, 4 vCPUs, the cell given 4 GiB)
+
+Failed:
+
+- `parallel/test-benchmark-cli`
+- `parallel/test-benchmark-compare`
+- `parallel/test-child-process-dgram-reuseport`
+- `parallel/test-child-process-net-reuseport`
+- `parallel/test-cli-node-cli-manpage-env-vars`
+- `parallel/test-cli-node-cli-manpage-options`
+- `parallel/test-cli-node-options-docs`
+- `parallel/test-cluster-dgram-reuseport`
+- `parallel/test-cluster-dgram-reuse`
+- `parallel/test-cluster-listen-pipe-readable-writable`
+- `parallel/test-cluster-net-reuseport`
+- `parallel/test-corepack-version`
+- `parallel/test-dgram-multicast-set-interface`
+- `parallel/test-dgram-reuseport`
+- `parallel/test-fs-mkdir`
+- `parallel/test-fs-realpath-pipe`
+- `parallel/test-fs-rmSync-special-char-additional-error`
+- `parallel/test-fs-write-sigxfsz`
+- `parallel/test-http-pipeline-requests-connection-leak`
+- `parallel/test-icu-minimum-version`
+- `parallel/test-net-boundsocket`
+- `parallel/test-net-reuseport`
+- `parallel/test-net-server-listen-path`
+- `parallel/test-npm-install`
+- `parallel/test-npm-version`
+- `parallel/test-process-env-allowed-flags-are-documented`
+- `parallel/test-process-load-env-file`
+- `parallel/test-process-versions`
+- `parallel/test-release-changelog`
+- `parallel/test-release-npm`
+- `parallel/test-repl-history-navigation`
+- `parallel/test-setproctitle`
+- `sequential/test-cpu-prof-dir-worker`
+- `sequential/test-cpu-prof-worker-argv`
+- `sequential/test-watch-mode`

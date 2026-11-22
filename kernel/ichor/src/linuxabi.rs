@@ -940,7 +940,13 @@ fn fcntl(p: &mut LinuxProcess, fd: u64, cmd: u64, arg: u64) -> Result<u64, i64> 
         F_GETFL => Ok(match &*desc.state() {
             Fd::Console | Fd::Dev(_) => O_RDWR,
             Fd::File(of) => of.flags,
-            Fd::Pipe(e) => u64::from(e.write) | if e.nonblock { fs::O_NONBLOCK } else { 0 },
+            Fd::Pipe(e) => {
+                let acc = match (e.read, e.write) {
+                    (true, true) => O_RDWR,
+                    (_, write) => u64::from(write),
+                };
+                acc | if e.nonblock { fs::O_NONBLOCK } else { 0 }
+            }
             Fd::Object(o) => {
                 let asy = o.obj.unix().is_some_and(|u| u.is_async());
                 O_RDWR | if o.nonblock { fs::O_NONBLOCK } else { 0 } | if asy { O_ASYNC } else { 0 }

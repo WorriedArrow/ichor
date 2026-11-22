@@ -545,6 +545,7 @@ pub(crate) fn run_linux(
         argv,
         ENVP,
         8 << 20,
+        [0; 4],
     ) {
         Ok(l) => l,
         Err(e) => {
@@ -554,7 +555,7 @@ pub(crate) fn run_linux(
     };
     let path = argv.first().copied().unwrap_or("");
     let name = path.rsplit('/').next().unwrap_or("");
-    p.group.set_exec(path, name, argv);
+    p.group.set_exec(path, name, loaded.args);
     let cell = p.cell.clone();
     // What the root holds is not the process's to give back.
     let vfs = p.vfs.clone();

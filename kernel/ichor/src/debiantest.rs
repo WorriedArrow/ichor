@@ -533,6 +533,28 @@ shmctl($id, 0, 0) or fail("IPC_RMID: $!");
 attached() == 1 or fail("a removed segment went with an attachment left");
 syscall(67, $at) == 0 or fail("shmdt: $!");
 attached() == -1 && $!{EINVAL} or fail("a removed segment outlived its attachments");
+# A FIFO opened for both: no peer needed, and it is its own.
+require POSIX;
+unlink "/tmp/both"; POSIX::mkfifo("/tmp/both", 0600) or fail("mkfifo: $!");
+sysopen(my $both, "/tmp/both", O_RDWR) or fail("O_RDWR FIFO: $!");
+(fcntl($both, F_GETFL, 0) & 3) == O_RDWR or fail("F_GETFL of an O_RDWR FIFO");
+syswrite($both, "round") == 5 && sysread($both, $m, 10) == 5 && $m eq "round" or fail("through an O_RDWR FIFO: $!");
+sysopen(my $one, "/tmp/both", O_WRONLY | O_NONBLOCK) or fail("a writer beside it: $!");
+close $both;
+{ local $SIG{PIPE} = "IGNORE"; defined(syswrite($one, "x")) and fail("a write with no reader left"); $!{EPIPE} or fail("no reader: $!") }
+# A title written over argv is what /proc shows; many arguments, long ones.
+$0 = "a title";
+open(my $cf, "<", "/proc/self/cmdline") or fail("cmdline: $!");
+my $cmdline = <$cf>;
+$cmdline =~ /^a title\0*$/ or fail("cmdline is $cmdline");
+seek($cf, 2, 0) && <$cf> =~ /^title/ or fail("seek in /proc: $!");
+open(my $maps, "-|", "cat", "/proc/self/maps") or fail("maps: $!");
+my @maps = <$maps>;
+my $ino = (stat("/usr/bin/cat"))[1];
+(grep { m{^[0-9a-f]+-[0-9a-f]+ r-xp [0-9a-f]{8} 00:01 $ino +/usr/bin/cat$} } @maps) == 1 or fail("cat is not mapped: @maps");
+(grep { / \[stack\]$/ } @maps) == 1 && (grep { / \[heap\]$/ } @maps) == 1 or fail("no stack or heap: @maps");
+system("/bin/sh", "-c", '[ $# = 20000 ] && [ ${#1} = 100000 ]', "sh", "x" x 100000, ("y") x 19999) == 0 or fail("20000 arguments: $?");
+system("/bin/true", "x" x 140000) != 0 && $!{E2BIG} or fail("an argument over 128 KiB: $!");
 print "debian: moves: splice, tee, copy_file_range, MSG_PEEK, timeouts, netlink, inotify and shared memory work\n";
 "#;
 

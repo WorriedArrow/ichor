@@ -107,7 +107,7 @@ not write it; merge its branch when it lands.
   pipes (`mknod`/`mknodat` S_IFIFO, blocking opens), robust futex lists;
   open TCP NAT mappings live five days (Linux's established timeout), not
   ten minutes. Known gaps from its runs: `test_math` cosh is 8 ulps off
-  under TCG (check on KVM), O_RDWR FIFOs, rseq (ENOSYS, glibc falls
+  under TCG (check on KVM), rseq (ENOSYS, glibc falls
   back). Latest recorded full run: 409 of 445 modules (91.9%),
   before shared file mappings; floor 88.0% in `workloads.toml`.
 - M7 Go (second suite): `cargo xtask workloads go` runs `go test -short
@@ -145,8 +145,15 @@ not write it; merge its branch when it lands.
   `/dev/fd`, `/dev/std*` and `/proc/self/fd/N` opened anew
   (`fs::reopen`), paths that lead into `/proc` any way
   (`Overlay::set_elsewhere`), `execve` of `/proc/self/exe`, and small calls
-  in `linuxabi/misc.rs`. Suites `node` (Node.js's `test.py`) and `jvm`
-  (jtreg, OpenJDK 21's tier 1) are defined, not run yet.
+  in `linuxabi/misc.rs`, O_RDWR FIFOs, file names in `/proc/<pid>/maps`,
+  `/proc/<pid>/cmdline` read from the process's memory (titles written over
+  argv), 2 MiB of arguments.
+- M7 Node.js (fourth suite): `cargo xtask workloads node` runs its
+  `test/parallel` and `test/sequential`; first run (2026-11-22, 130 min
+  under TCG) 4365 of 4400. Most of the 35 are fixed since, or were sources
+  the suite did not have; `cpu-prof-*worker*` livelock under TCG (V8
+  samples every 100 us). The `jvm` suite (jtreg, OpenJDK 21's tier 1) is
+  defined, not run yet.
 - M7 storage (ADR-0006's 2026-11-21 amendment): a cell's root writes are
   frames charged to its account (`page.rs`: one charged-page type for
   process memory and file pages; `overlay::Pages` is where the overlay

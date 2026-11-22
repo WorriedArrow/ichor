@@ -3,6 +3,7 @@
 //! verified page for a file page, which they map copy-on-write instead of
 //! copying.
 
+use alloc::string::String;
 use alloc::sync::Arc;
 
 use frame::mm::UFrame;
@@ -33,6 +34,11 @@ pub(crate) trait File: Send + Sync {
     /// lives, so its pages can be filled on demand (`None`: the caller must
     /// copy what it needs now, as for bytes it holds).
     fn mappable(&self) -> Option<Arc<dyn File>> {
+        None
+    }
+    /// Its inode number, and a path of it (none once it has been removed),
+    /// for `/proc/<pid>/maps`.
+    fn identity(&self) -> Option<(u64, Option<String>)> {
         None
     }
 }
@@ -73,7 +79,7 @@ impl VfsFile {
     }
 
     /// A path of the file in its root.
-    pub(crate) fn path(&self) -> Option<alloc::string::String> {
+    pub(crate) fn path(&self) -> Option<String> {
         self.vfs.lock().path(self.ino).ok()
     }
 }
@@ -108,5 +114,10 @@ impl File for VfsFile {
         VfsFile::open(&self.vfs, self.ino)
             .ok()
             .map(|f| Arc::new(f) as Arc<dyn File>)
+    }
+
+    fn identity(&self) -> Option<(u64, Option<String>)> {
+        let fs = self.vfs.lock();
+        Some((fs.stat(self.ino).ok()?.ino, fs.path(self.ino).ok()))
     }
 }

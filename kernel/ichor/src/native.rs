@@ -628,11 +628,7 @@ fn spawn(c: &Container, spec: &[u8]) -> Result<Arc<Process>, Error> {
     let output = Pipe::new(c.cell.account());
     p.close(1);
     p.close(2);
-    let end = PipeEnd {
-        pipe: output.clone(),
-        write: true,
-        nonblock: false,
-    };
+    let end = PipeEnd::one(output.clone(), true, false);
     if p.install_flags(Fd::Pipe(end), false) != Some(1) || p.dup_to(1, 2, false).is_none() {
         crate::proc::discard(p);
         return Err(Error::NoMemory);
@@ -683,14 +679,14 @@ fn spawn(c: &Container, spec: &[u8]) -> Result<Arc<Process>, Error> {
 /// or was killed by an exception.
 pub(crate) fn run(cell: &Arc<Cell>, elf: &[u8], argv: &[&str]) -> Option<u64> {
     let mut mm = Mm::new(cell.account())?;
-    let loaded =
-        match crate::loader::load(&mut mm, &crate::file::Bytes(elf), None, argv, &[], 1 << 20) {
-            Ok(l) => l,
-            Err(e) => {
-                println!("ichor: native: cannot load {:?}: {e:?}", argv.first());
-                return None;
-            }
-        };
+    let image = crate::file::Bytes(elf);
+    let loaded = match crate::loader::load(&mut mm, &image, None, argv, &[], 1 << 20, [0; 4]) {
+        Ok(l) => l,
+        Err(e) => {
+            println!("ichor: native: cannot load {:?}: {e:?}", argv.first());
+            return None;
+        }
+    };
     mm.space().bind_to_current_task();
     frame::task::set_current_domain(cell.id());
     let mut ctx = UserContext::new(loaded.entry, loaded.stack_pointer);

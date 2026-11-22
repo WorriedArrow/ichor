@@ -101,7 +101,7 @@ pub(super) fn splice(p: &mut LinuxProcess, a: &[u64; 6]) -> Result<u64, i64> {
     for (f, off, write) in [(&src, off_in, false), (&dst, off_out, true)] {
         match f {
             Fd::Pipe(_) if off != 0 => return Err(ESPIPE),
-            Fd::Pipe(e) if e.write != write => return Err(EBADF),
+            Fd::Pipe(e) if !(if write { e.write } else { e.read }) => return Err(EBADF),
             Fd::Pipe(_) => {}
             Fd::File(of) => {
                 let mode = of.flags & O_ACCMODE;
@@ -209,7 +209,7 @@ pub(super) fn tee(
     let (Fd::Pipe(i), Fd::Pipe(o)) = (p.fd(fd_in).ok_or(EBADF)?, p.fd(fd_out).ok_or(EBADF)?) else {
         return Err(EINVAL);
     };
-    if i.write || !o.write {
+    if !i.read || !o.write {
         return Err(EBADF);
     }
     if alloc::sync::Arc::ptr_eq(&i.pipe, &o.pipe) {

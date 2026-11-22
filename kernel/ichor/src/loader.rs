@@ -28,6 +28,17 @@ pub(crate) struct Loaded {
     pub entry: u64,
     /// Initial stack pointer (points at argc, 16-byte aligned).
     pub stack_pointer: u64,
+    /// Where its argument strings are.
+    pub args: Args,
+}
+
+/// Where a program's argv strings are (one after another, each with its
+/// NUL), and where the envp strings that follow them end.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Args {
+    pub start: u64,
+    pub end: u64,
+    pub env_end: u64,
 }
 
 /// Why a load failed.
@@ -54,8 +65,9 @@ const STACK_TOP: u64 = 0x7fff_f000_0000;
 /// it), and the least a process gets.
 const MAX_STACK: u64 = 1 << 30;
 const MIN_STACK: u64 = 128 << 10;
-/// Most bytes of argv/envp strings plus pointers.
-const MAX_ARGS: usize = 128 * 1024;
+/// Most bytes of argv/envp strings plus pointers (Linux's limit, for the
+/// default stack).
+pub(crate) const MAX_ARGS: usize = 2 << 20;
 
 // Auxiliary vector keys.
 const AT_NULL: u64 = 0;
@@ -252,7 +264,11 @@ struct Aux {
     entry: u64,
     /// Where the interpreter was loaded (0 without one).
     base: u64,
+    ids: Ids,
 }
+
+/// The uid, effective uid, gid and effective gid a program runs with.
+pub(crate) type Ids = [u32; 4];
 
 /// Loads `image` into the fresh address space `mm`, with `argv` and `envp`
 /// on the stack. A position-independent executable is placed at a fixed
@@ -270,6 +286,7 @@ pub(crate) fn load<S: AsRef<[u8]>>(
     argv: &[S],
     envp: &[S],
     stack_limit: u64,
+    ids: Ids,
 ) -> Result<Loaded, LoadError> {
     let stack_size = stack_limit.clamp(MIN_STACK, MAX_STACK) & !(PAGE_SIZE - 1);
     let plan = parse(image)?;
@@ -283,6 +300,7 @@ pub(crate) fn load<S: AsRef<[u8]>>(
         phnum: plan.phnum,
         entry: plan.entry.wrapping_add(bias),
         base: 0,
+        ids,
     };
     let mut start = aux.entry;
     match (plan.interp.is_some(), interp) {
@@ -304,10 +322,11 @@ pub(crate) fn load<S: AsRef<[u8]>>(
     if !mm.reserve_stack(STACK_TOP - stack_size, STACK_TOP) {
         return Err(LoadError::Map);
     }
-    let stack_pointer = build_stack(mm, &aux, argv, envp, stack_size)?;
+    let (stack_pointer, args) = build_stack(mm, &aux, argv, envp, stack_size)?;
     Ok(Loaded {
         entry: start,
         stack_pointer,
+        args,
     })
 }
 
@@ -341,7 +360,7 @@ fn random_bytes() -> [u8; 16] {
 }
 
 /// Writes the System V x86-64 entry frame at the top of the stack and
-/// returns the initial rsp:
+/// returns the initial rsp, and where the strings are:
 ///
 /// ```text
 /// rsp -> argc, argv[0..argc], NULL, envp[..], NULL, auxv pairs, AT_NULL
@@ -353,28 +372,31 @@ fn build_stack<S: AsRef<[u8]>>(
     argv: &[S],
     envp: &[S],
     stack_size: u64,
-) -> Result<u64, LoadError> {
-    // Strings and blobs go at the top, laid out downwards in `blob`, which
-    // is the memory [blob_base, STACK_TOP).
-    let mut strings: Vec<u8> = Vec::new();
-    let mut place = |bytes: &[u8], nul: bool| -> usize {
-        let at = strings.len();
-        strings.extend_from_slice(bytes);
-        if nul {
-            strings.push(0);
-        }
-        at
-    };
-    let random_at = place(&random_bytes(), false);
-    let platform_at = place(b"x86_64", true);
-    let execfn_at = place(argv.first().map_or(&[][..], AsRef::as_ref), true);
-    let argv_at: Vec<usize> = argv.iter().map(|a| place(a.as_ref(), true)).collect();
-    let envp_at: Vec<usize> = envp.iter().map(|e| place(e.as_ref(), true)).collect();
-    if strings.len() > MAX_ARGS {
+) -> Result<(u64, Args), LoadError> {
+    // Strings and blobs go at the top, in `[blob_base, STACK_TOP)`: what is
+    // fixed first, then argv's strings and envp's.
+    let random = random_bytes();
+    let platform = b"x86_64\0";
+    let execfn = argv.first().map_or(&[][..], AsRef::as_ref);
+    let long = |s: &[S]| s.iter().map(|s| s.as_ref().len() + 1).sum::<usize>();
+    let fixed = random.len() + platform.len() + execfn.len() + 1;
+    let blob = fixed + long(argv) + long(envp);
+    let pointers = (argv.len() + envp.len()) * 8;
+    // (What is fixed is not the caller's.)
+    let given = blob - fixed + pointers;
+    let most = (stack_size / 4).clamp(MIN_STACK, MAX_ARGS as u64);
+    if given as u64 > most || (blob + pointers) as u64 > stack_size * 3 / 4 {
         return Err(LoadError::ArgsTooLong);
     }
-    let blob_base = (STACK_TOP - strings.len() as u64) & !0xf;
-    let addr = |off: usize| blob_base + off as u64;
+    let blob_base = (STACK_TOP - blob as u64) & !0xf;
+    let random_at = blob_base;
+    let platform_at = random_at + random.len() as u64;
+    let execfn_at = platform_at + platform.len() as u64;
+    let args = Args {
+        start: blob_base + fixed as u64,
+        end: blob_base + (fixed + long(argv)) as u64,
+        env_end: blob_base + blob as u64,
+    };
 
     let mut auxv: Vec<(u64, u64)> = Vec::new();
     if let Some(phdr) = plan.phdr {
@@ -388,43 +410,85 @@ fn build_stack<S: AsRef<[u8]>>(
         (AT_PHNUM, u64::from(plan.phnum)),
         (AT_PAGESZ, PAGE_SIZE),
         (AT_ENTRY, plan.entry),
-        (AT_UID, 0),
-        (AT_EUID, 0),
-        (AT_GID, 0),
-        (AT_EGID, 0),
-        (AT_PLATFORM, addr(platform_at)),
+        (AT_UID, u64::from(plan.ids[0])),
+        (AT_EUID, u64::from(plan.ids[1])),
+        (AT_GID, u64::from(plan.ids[2])),
+        (AT_EGID, u64::from(plan.ids[3])),
+        (AT_PLATFORM, platform_at),
         (AT_HWCAP, 0),
         (AT_CLKTCK, 100),
         (AT_SECURE, 0),
-        (AT_RANDOM, addr(random_at)),
+        (AT_RANDOM, random_at),
         (AT_MINSIGSTKSZ, crate::signal::frame_stack_size()),
-        (AT_EXECFN, addr(execfn_at)),
+        (AT_EXECFN, execfn_at),
         (AT_NULL, 0),
     ]);
+    // argc, and the NULLs after argv and envp.
+    let words = 3 + argv.len() + envp.len() + 2 * auxv.len();
+    let sp = (blob_base - words as u64 * 8) & !0xf;
 
-    let mut words: Vec<u64> = Vec::new();
-    words.push(argv.len() as u64);
-    words.extend(argv_at.iter().map(|&o| addr(o)));
-    words.push(0);
-    words.extend(envp_at.iter().map(|&o| addr(o)));
-    words.push(0);
+    let mut out = Writer {
+        mm,
+        at: sp,
+        buf: Vec::new(),
+    };
+    let mut string_at = args.start;
+    out.word(argv.len() as u64)?;
+    for list in [argv, envp] {
+        for s in list {
+            out.word(string_at)?;
+            string_at += s.as_ref().len() as u64 + 1;
+        }
+        out.word(0)?;
+    }
     for (k, v) in auxv {
-        words.push(k);
-        words.push(v);
+        out.word(k)?;
+        out.word(v)?;
     }
-    let sp = (blob_base - words.len() as u64 * 8) & !0xf;
+    while out.position() < blob_base {
+        out.word(0)?;
+    }
+    out.bytes(&random)?;
+    out.bytes(platform)?;
+    for s in core::iter::once(execfn).chain(argv.iter().chain(envp).map(AsRef::as_ref)) {
+        out.bytes(s)?;
+        out.bytes(&[0])?;
+    }
+    out.flush()?;
+    Ok((sp, args))
+}
 
-    let mut frame_bytes: Vec<u8> = Vec::with_capacity((STACK_TOP - sp) as usize);
-    for w in &words {
-        frame_bytes.extend_from_slice(&w.to_le_bytes());
+/// Writes to fresh user memory, one thing after another, through a small
+/// buffer.
+struct Writer<'a> {
+    mm: &'a mut Mm,
+    at: u64,
+    buf: Vec<u8>,
+}
+
+impl Writer<'_> {
+    fn position(&self) -> u64 {
+        self.at + self.buf.len() as u64
     }
-    frame_bytes.resize((blob_base - sp) as usize, 0);
-    frame_bytes.extend_from_slice(&strings);
-    if frame_bytes.len() > (stack_size / 2) as usize {
-        return Err(LoadError::ArgsTooLong);
+
+    fn bytes(&mut self, data: &[u8]) -> Result<(), LoadError> {
+        self.buf.extend_from_slice(data);
+        if self.buf.len() >= PAGE_SIZE as usize {
+            self.flush()?;
+        }
+        Ok(())
     }
-    if mm.copy_to_user(sp, &frame_bytes) != frame_bytes.len() {
-        return Err(LoadError::OutOfMemory);
+
+    fn word(&mut self, w: u64) -> Result<(), LoadError> {
+        self.bytes(&w.to_le_bytes())
     }
-    Ok(sp)
+
+    fn flush(&mut self) -> Result<(), LoadError> {
+        if self.mm.copy_to_user(self.at, &self.buf) != self.buf.len() {
+            return Err(LoadError::OutOfMemory);
+        }
+        self.at += self.buf.len() as u64;
+        self.buf.clear();
+        Ok(())
+    }
 }
