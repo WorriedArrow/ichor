@@ -322,8 +322,17 @@ fn m1_boots_on_one_cpu() {
 
 #[test]
 fn m2_scheduler_on_eight_cpus() {
-    let out = boot("m2-smp8", "", 8);
+    // Page-table isolation, forced (ADR-0004): everything below runs with
+    // ring 3 on shadow roots, entries switching CR3, and TLB shootdowns
+    // across 8 CPUs (with PCID where the CPU has it, as under KVM).
+    let out = boot("m2-smp8", "force_pti", 8);
     out.assert_exit(Exit::Success);
+    out.assert_in_order(&[
+        "ichor: frame: mitigations (ADR-0004): VERW on return to ring 3 ",
+        "page-table isolation on (", // "forced, " unless the host is affected
+        "ichor: pti: user roots map only the entry area and user pages",
+        "ichor: boot complete",
+    ]);
     out.assert_in_order(&[
         "ichor: smp: 8 CPUs online, every CPU took 5 timer interrupts",
         "ichor: random: ChaCha20 seeded",

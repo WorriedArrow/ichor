@@ -72,8 +72,11 @@ pub fn online() -> impl Iterator<Item = CpuId> {
 }
 
 /// The per-CPU block GS points at. Field offsets are used by assembly
-/// (`arch::x86_64`), so the layout is fixed.
-#[repr(C)]
+/// (`arch::x86_64`), so the layout is fixed. A block fills its own page,
+/// which the entry area aliases (GS holds the alias): the entry code reads
+/// it before it switches to the kernel root (ADR-0004 §2), so nothing in
+/// it may be secret.
+#[repr(C, align(4096))]
 #[derive(Debug)]
 pub(crate) struct CpuBlock {
     /// 0: the block's own address.
@@ -96,15 +99,33 @@ pub(crate) struct CpuBlock {
     pub(crate) event_info: AtomicU64,
     /// 72: faulting address (CR2) for a user exception.
     pub(crate) event_cr2: AtomicU64,
-    /// 80: address of this CPU's TSS RSP0 field; the user-entry stub writes
-    /// the kernel stack a ring-3 trap should land on here.
-    pub(crate) rsp0_ptr: AtomicU64,
+    /// 80: top of this CPU's entry stack (TSS RSP0, in the entry area),
+    /// where ring-3 traps land and `iretq` frames to ring 3 are built.
+    pub(crate) entry_rsp: AtomicU64,
     /// 88: the security domain (cell) of the task running here, set on
     /// every switch (ADR-0004 §2).
     pub(crate) task_domain: AtomicU64,
     /// 96: the domain whose user code last ran on this CPU (IBPB when the
     /// next one differs).
     pub(crate) user_domain: AtomicU64,
+    /// 104: CR3 for the kernel side of the current address space (its full
+    /// root), loaded on entry from ring 3 under page-table isolation.
+    pub(crate) kernel_cr3: AtomicU64,
+    /// 112: CR3 of its shadow (user) root, loaded right before ring 3; bit
+    /// 63 (keep the PCID's TLB entries) is clear while a flush is owed.
+    pub(crate) user_cr3: AtomicU64,
+    /// 120: bit 63 if CR3 loads may keep a PCID's entries (PCID on), else 0.
+    pub(crate) cr3_noflush: AtomicU64,
+    /// 128: entry-area alias address minus image address of the entry code.
+    pub(crate) alias_delta: AtomicU64,
+    /// 136: address of the trap dispatcher, called from the entry area.
+    pub(crate) dispatch: AtomicU64,
+    /// 144: nonzero when page-table isolation is on.
+    pub(crate) pti: AtomicU64,
+    /// 152: nonzero for VERW before `iretq` to ring 3.
+    pub(crate) verw: AtomicU64,
+    /// 160: VERW's operand, a writable data selector.
+    pub(crate) verw_sel: AtomicU64,
 }
 
 impl CpuBlock {
@@ -120,9 +141,17 @@ impl CpuBlock {
             event_kind: AtomicU64::new(0),
             event_info: AtomicU64::new(0),
             event_cr2: AtomicU64::new(0),
-            rsp0_ptr: AtomicU64::new(0),
+            entry_rsp: AtomicU64::new(0),
             task_domain: AtomicU64::new(0),
             user_domain: AtomicU64::new(0),
+            kernel_cr3: AtomicU64::new(0),
+            user_cr3: AtomicU64::new(0),
+            cr3_noflush: AtomicU64::new(0),
+            alias_delta: AtomicU64::new(0),
+            dispatch: AtomicU64::new(0),
+            pti: AtomicU64::new(0),
+            verw: AtomicU64::new(0),
+            verw_sel: AtomicU64::new(0),
         }
     }
 }

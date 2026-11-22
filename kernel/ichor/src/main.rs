@@ -166,6 +166,19 @@ fn kmain(info: BootInfo) -> ! {
         }
     }
 
+    // ADR-0004: under page-table isolation, user roots map the entry area
+    // and user pages, and nothing else of the kernel.
+    match frame::user::isolation_selftest() {
+        Ok(true) => println!(
+            "ichor: pti: user roots map only the entry area and user pages (kernel text, stack, heap, linear map unmapped)"
+        ),
+        Ok(false) => {}
+        Err(e) => {
+            println!("ichor: FAILED: page-table isolation: {e}");
+            shutdown(ExitStatus::Failure);
+        }
+    }
+
     // ADR-0004: how often user code of one cell followed another's on a
     // CPU that needs a predictor barrier between them.
     println!(
