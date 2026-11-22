@@ -330,6 +330,20 @@ pub fn blob_read(blob: &Handle) -> Result<Vec<u8>> {
     }
 }
 
+/// Posts `signal` to every process of `cell`; returns how many.
+pub fn cell_signal(cell: &Handle, signal: u32) -> Result<u64> {
+    call(sys::CELL_SIGNAL, [cell.0, u64::from(signal), 0, 0, 0])
+}
+
+/// A cell's memory, processes and address.
+pub fn cell_inspect(cell: &Handle) -> Result<ichor_abi::CellInfo> {
+    let mut b = [0u8; ichor_abi::CELL_INFO_LEN];
+    // SAFETY: the kernel writes CELL_INFO_LEN bytes at `b`, which holds
+    // exactly that many.
+    decode(unsafe { syscall(sys::CELL_INSPECT, [cell.0, b.as_mut_ptr() as u64, 0, 0, 0]) })?;
+    Ok(ichor_abi::CellInfo::from_bytes(&b))
+}
+
 /// The address the switch gave a cell.
 pub fn cell_addr(cell: &Handle) -> Result<[u8; 4]> {
     call(sys::CELL_ADDR, [cell.0, 0, 0, 0, 0]).map(|a| (a as u32).to_be_bytes())

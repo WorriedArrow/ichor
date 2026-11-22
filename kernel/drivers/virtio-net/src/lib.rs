@@ -31,9 +31,12 @@ const F_MAC: u32 = 1 << 5;
 const HEADER: usize = 12;
 /// The largest frame: a 1500-byte MTU plus the Ethernet header.
 pub const MAX_FRAME: usize = 1514;
-/// Receive buffers kept posted.
-pub const RX_BUFFERS: u16 = 64;
-const TX_QUEUE: u16 = 128;
+/// Receive buffers kept posted (a polled driver must hold what arrives
+/// between two polls).
+pub const RX_BUFFERS: u16 = 256;
+/// Tell the device of reposted buffers at least this often.
+const RX_NOTIFY: u16 = 32;
+const TX_QUEUE: u16 = 256;
 
 /// A virtio-net device.
 #[derive(Debug)]
@@ -46,6 +49,9 @@ pub struct VirtioNet {
     mac: [u8; 6],
     /// Posted receive buffers by token.
     rx_bufs: BTreeMap<u16, DmaBuf>,
+    /// Buffers reposted that the device has not been told of (telling it
+    /// costs a VM exit).
+    rx_untold: u16,
     /// Frames dropped because the transmit queue was full.
     pub tx_dropped: u64,
 }
@@ -80,6 +86,7 @@ impl VirtioNet {
             tx_notify,
             mac,
             rx_bufs: BTreeMap::new(),
+            rx_untold: 0,
             tx_dropped: 0,
         };
         for _ in 0..net.rx.size() {
@@ -117,9 +124,20 @@ impl VirtioNet {
         }
     }
 
+    /// Tells the device of reposted buffers, if there are `enough`.
+    fn tell_rx(&mut self, enough: u16) {
+        if self.rx_untold >= enough {
+            self.transport.notify(self.rx_notify, 0);
+            self.rx_untold = 0;
+        }
+    }
+
     /// The next received frame, if any.
     pub fn receive(&mut self) -> Option<Vec<u8>> {
-        let (token, len) = self.rx.poll()?;
+        let Some((token, len)) = self.rx.poll() else {
+            self.tell_rx(1);
+            return None;
+        };
         let buf = self.rx_bufs.remove(&token)?;
         let len = (len as usize).min(HEADER + MAX_FRAME);
         let frame = if len > HEADER {
@@ -129,8 +147,10 @@ impl VirtioNet {
         } else {
             None
         };
-        self.post_rx(Some(buf));
-        self.transport.notify(self.rx_notify, 0);
+        if self.post_rx(Some(buf)) {
+            self.rx_untold += 1;
+        }
+        self.tell_rx(RX_NOTIFY);
         // A runt (header only) is skipped; try the next one.
         frame.or_else(|| self.receive())
     }
@@ -160,5 +180,20 @@ impl VirtioNet {
         }
         self.transport.notify(self.tx_notify, 1);
         true
+    }
+}
+
+impl net::link::Link for VirtioNet {
+    fn mac(&self) -> [u8; 6] {
+        VirtioNet::mac(self)
+    }
+    fn transmit(&mut self, frame: &[u8]) -> bool {
+        VirtioNet::transmit(self, frame)
+    }
+    fn receive(&mut self) -> Option<Vec<u8>> {
+        VirtioNet::receive(self)
+    }
+    fn name(&self) -> &str {
+        "virtio-net"
     }
 }

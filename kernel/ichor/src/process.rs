@@ -16,13 +16,16 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
+use frame::mm::VmSpace;
 use frame::sync::{Mutex, MutexGuard, SpinLock};
 
 use crate::kcell::Cell;
+use crate::loader::Args;
+use crate::page::Reserved;
 use crate::pipe::Pipe;
 use crate::proc::{self, ProcEntry};
 use crate::signal::{Actions, Signals};
-use crate::umem::Mm;
+use crate::umem::{self, Mm, UserBuf};
 use crate::vfs::{Ino, ROOT, Vfs};
 
 /// Most descriptors a process may hold: the hard `RLIMIT_NOFILE` ceiling.
@@ -44,13 +47,59 @@ pub(crate) struct OpenFile {
     pub(crate) flags: u64,
 }
 
-/// One end of a pipe, as a descriptor holds it.
+/// One end of a pipe, as a descriptor holds it, or (a FIFO opened O_RDWR)
+/// both.
 #[derive(Clone, Debug)]
 pub(crate) struct PipeEnd {
     pub(crate) pipe: Arc<Pipe>,
-    /// The write end (otherwise the read end).
+    pub(crate) read: bool,
     pub(crate) write: bool,
     pub(crate) nonblock: bool,
+}
+
+impl PipeEnd {
+    /// The read end, or the write end.
+    pub(crate) fn one(pipe: Arc<Pipe>, write: bool, nonblock: bool) -> PipeEnd {
+        PipeEnd {
+            pipe,
+            read: !write,
+            write,
+            nonblock,
+        }
+    }
+
+    /// The ends an open with access mode `acc` gives, opened.
+    pub(crate) fn open(pipe: Arc<Pipe>, acc: u64, nonblock: bool) -> PipeEnd {
+        let (read, write) = (acc != 1, acc != 0);
+        for (opens, end) in [(read, false), (write, true)] {
+            if opens {
+                pipe.add_end(end);
+            }
+        }
+        PipeEnd {
+            pipe,
+            read,
+            write,
+            nonblock,
+        }
+    }
+
+    /// Lets go of what it holds.
+    fn close(&self) {
+        for (held, end) in [(self.read, false), (self.write, true)] {
+            if held {
+                self.pipe.drop_end(end);
+            }
+        }
+    }
+
+    /// Readiness, as `poll` reports it.
+    pub(crate) fn poll(&self) -> u16 {
+        [(self.read, false), (self.write, true)]
+            .into_iter()
+            .filter(|&(held, _)| held)
+            .fold(0, |r, (_, end)| r | self.pipe.poll(end))
+    }
 }
 
 /// What a descriptor refers to.
@@ -120,8 +169,12 @@ impl Drop for Description {
         let st = self.state.lock();
         match &*st {
             Fd::Console | Fd::Dev(_) | Fd::Object(_) => {}
-            Fd::File(of) => self.vfs.lock().close(of.ino),
-            Fd::Pipe(e) => e.pipe.drop_end(e.write),
+            Fd::File(of) => {
+                let write = of.flags & 0o3 != 0; // not O_RDONLY
+                crate::linuxabi::inotify::note_close(&self.vfs, of.ino, write);
+                self.vfs.lock().close(of.ino)
+            }
+            Fd::Pipe(e) => e.close(),
         }
     }
 }
@@ -149,6 +202,9 @@ pub(crate) struct Group {
     pub(crate) leader: Arc<ProcEntry>,
     vfs: Arc<Vfs>,
     mm: Mutex<Mm>,
+    /// `mm`'s address space, for copies that run without the `Mm` lock
+    /// (changed only with `mm` locked, by `replace_mm`).
+    space: SpinLock<Arc<VmSpace>>,
     files: Mutex<Files>,
     pub(crate) actions: Mutex<Actions>,
     /// Live threads.
@@ -160,8 +216,10 @@ pub(crate) struct Group {
     pub(crate) gone: Arc<frame::task::WaitQueue>,
     /// Set by `exit_group` or a fatal signal: the group's wait status.
     exit: SpinLock<Option<u32>>,
-    /// The program's path and argv (NUL-separated), for `/proc`.
-    exe: SpinLock<(alloc::string::String, Vec<u8>)>,
+    /// The thread ending the others for its `execve`.
+    execing: SpinLock<Option<u64>>,
+    /// The program's path, and where its argv is, for `/proc`.
+    exe: SpinLock<(alloc::string::String, Args)>,
     /// Resource limits (soft, hard), by `RLIMIT_*`.
     limits: SpinLock<Limits>,
     /// Set in a `vfork` child: released when it execs or exits.
@@ -171,6 +229,8 @@ pub(crate) struct Group {
     /// `PR_SET_NAME` (per process here; Linux's is per thread), and the
     /// `PR_SET_DUMPABLE` / `PR_SET_NO_NEW_PRIVS` flags.
     pub(crate) prctl: SpinLock<Prctl>,
+    /// User CPU time of threads that have exited (`cpu_ns`).
+    gone_cpu_ns: core::sync::atomic::AtomicU64,
 }
 
 /// State `prctl` sets.
@@ -179,6 +239,14 @@ pub(crate) struct Prctl {
     pub(crate) name: Option<alloc::string::String>,
     pub(crate) dumpable: bool,
     pub(crate) no_new_privs: bool,
+    /// The nice value (`setpriority`), -20..=19; kept across fork and
+    /// exec. The scheduler does not use it yet.
+    pub(crate) nice: i32,
+    /// `sched_setaffinity`'s CPU mask (bit n: CPU n; `None`: every CPU),
+    /// kept across fork and exec. The scheduler does not apply it yet.
+    pub(crate) affinity: Option<u64>,
+    /// `personality`.
+    pub(crate) personality: u32,
 }
 
 impl Default for Prctl {
@@ -187,6 +255,9 @@ impl Default for Prctl {
             name: None,
             dumpable: true,
             no_new_privs: false,
+            nice: 0,
+            affinity: None,
+            personality: 0,
         }
     }
 }
@@ -222,13 +293,14 @@ impl Vfork {
 
 /// `RLIM_INFINITY`.
 pub(crate) const RLIM_INFINITY: u64 = u64::MAX;
+pub(crate) const RLIMIT_FSIZE: usize = 1;
 pub(crate) const RLIMIT_STACK: usize = 3;
 pub(crate) const RLIMIT_NOFILE: usize = 7;
 /// Number of Linux resource limits.
 pub(crate) const RLIM_NLIMITS: usize = 16;
 
-/// A process's resource limits. `NOFILE` and `STACK` are enforced; the
-/// others are stored and reported (nothing yet consumes them).
+/// A process's resource limits. `NOFILE`, `STACK` and `FSIZE` (but in
+/// `splice` and `copy_file_range`) are enforced; the others are stored and reported (nothing yet consumes them).
 pub(crate) type Limits = [(u64, u64); RLIM_NLIMITS];
 
 fn default_limits() -> Limits {
@@ -238,15 +310,15 @@ fn default_limits() -> Limits {
     l
 }
 
+/// Most of a command line that `/proc` shows.
+const CMDLINE_MAX: u64 = 1 << 20;
+
 impl Group {
     /// Records the program the process runs (load or `execve`).
-    pub(crate) fn set_exec(&self, path: &str, argv: &[&str]) {
-        let mut cmd = Vec::new();
-        for a in argv {
-            cmd.extend_from_slice(a.as_bytes());
-            cmd.push(0);
-        }
-        *self.exe.lock() = (alloc::string::String::from(path), cmd);
+    /// `name` is what the process is called (`comm`).
+    pub(crate) fn set_exec(&self, path: &str, name: &str, args: Args) {
+        *self.exe.lock() = (alloc::string::String::from(path), args);
+        self.prctl.lock().name = Some(name.chars().take(15).collect());
     }
 
     /// The program's path (`/proc/<pid>/exe`).
@@ -254,9 +326,69 @@ impl Group {
         self.exe.lock().0.clone()
     }
 
-    /// The program's argv, NUL-separated (`/proc/<pid>/cmdline`).
+    /// The program's argv, NUL-separated (`/proc/<pid>/cmdline`): what is
+    /// in its memory now, as a program may write a title for itself there.
+    /// A title that is longer (it took the last NUL) ends at the next.
     pub(crate) fn cmdline(&self) -> Vec<u8> {
-        self.exe.lock().1.clone()
+        let args = self.exe.lock().1;
+        let mut mm = self.mm();
+        let mut read = |from: u64, to: u64| {
+            let mut b = alloc::vec![0u8; to.saturating_sub(from).min(CMDLINE_MAX) as usize];
+            let n = mm.copy_from_user(from, &mut b);
+            b.truncate(n);
+            b
+        };
+        let cmd = read(args.start, args.end);
+        if cmd.last().is_none_or(|&b| b == 0) {
+            return cmd;
+        }
+        let mut title = read(args.start, args.env_end);
+        if let Some(end) = title.iter().position(|&b| b == 0) {
+            title.truncate(end);
+        }
+        title
+    }
+
+    /// The address space (locked).
+    pub(crate) fn mm(&self) -> MutexGuard<'_, Mm> {
+        self.mm.lock()
+    }
+
+    /// The root.
+    pub(crate) fn vfs(&self) -> &Arc<Vfs> {
+        &self.vfs
+    }
+
+    /// The working directory.
+    pub(crate) fn cwd(&self) -> Ino {
+        self.files.lock().cwd
+    }
+
+    pub(crate) fn umask(&self) -> u32 {
+        self.files.lock().umask
+    }
+
+    /// The descriptor `fd`'s description, if open.
+    pub(crate) fn desc(&self, fd: u64) -> Option<Arc<Description>> {
+        let files = self.files.lock();
+        let slot = files.fds.get(usize::try_from(fd).ok()?)?.as_ref()?;
+        Some(slot.desc.clone())
+    }
+
+    /// The open descriptor numbers, ascending.
+    pub(crate) fn open_fds(&self) -> Vec<u64> {
+        let files = self.files.lock();
+        (0u64..)
+            .zip(files.fds.iter())
+            .filter_map(|(n, s)| s.as_ref().map(|_| n))
+            .collect()
+    }
+
+    /// A snapshot of what descriptor `fd` names, if open.
+    pub(crate) fn fd(&self, fd: u64) -> Option<Fd> {
+        let d = self.desc(fd)?;
+        let f = d.state().clone();
+        Some(f)
     }
 
     /// A copy of the process's credentials.
@@ -319,17 +451,71 @@ impl Group {
                 *e = Some(status);
             }
         }
-        for t in self.threads() {
-            if t.pid != me.pid {
-                proc::post(&t, crate::signal::SIGKILL);
+        self.end_others(me);
+    }
+
+    /// Tells every thread but `me` to end.
+    pub(crate) fn end_others(&self, me: &ProcEntry) {
+        let others = {
+            let threads = self.threads.lock();
+            let mut others = threads.clone();
+            others.retain(|t| t.pid != me.pid);
+            // Under the lock: a thread one of them is making (it takes the
+            // lock to add it) is marked here, or inherits the mark.
+            others.iter().for_each(|t| proc::end_thread(t));
+            others
+        };
+        others.iter().for_each(|t| proc::wake(t));
+    }
+
+    /// `execve` by thread `me`: the others end, and it is the process's
+    /// first thread from here on (its entry is returned). `None` if another
+    /// thread was first, or the process is exiting: `me` is to end too.
+    pub(crate) fn sole_thread(&self, me: &Arc<ProcEntry>) -> Option<Arc<ProcEntry>> {
+        {
+            let mut by = self.execing.lock();
+            if by.is_some() || proc::ending(me) {
+                return None;
             }
+            *by = Some(me.pid);
         }
+        self.end_others(me);
+        self.wait_threads(1);
+        if self.exit.lock().is_some() {
+            return None; // `exit_group` was called meanwhile
+        }
+        let entry = proc::take_over_leader(me, &self.leader);
+        *self.threads.lock() = alloc::vec![entry.clone()];
+        *self.execing.lock() = None;
+        Some(entry)
+    }
+
+    /// Takes a thread that was made but never ran out of the live threads.
+    pub(crate) fn never_ran(&self, tid: u64) {
+        self.threads.lock().retain(|e| e.pid != tid);
+        self.gone.wake_all();
+    }
+
+    /// The process's user CPU time: its live threads' and those gone.
+    pub(crate) fn cpu_ns(&self) -> u64 {
+        use core::sync::atomic::Ordering::Relaxed;
+        let live: u64 = self
+            .threads
+            .lock()
+            .iter()
+            .map(|e| e.cpu_ns.load(Relaxed))
+            .sum();
+        live + self.gone_cpu_ns.load(Relaxed)
     }
 
     /// Removes `me` from the live threads; returns the group's wait status
     /// if it was the last (its exit status, or `status`, the last thread's).
     pub(crate) fn thread_exited(&self, me: &ProcEntry, status: u32) -> Option<u32> {
         let mut t = self.threads.lock();
+        self.gone_cpu_ns.fetch_add(
+            me.cpu_ns.load(core::sync::atomic::Ordering::Relaxed),
+            core::sync::atomic::Ordering::Relaxed,
+        );
         t.retain(|e| e.pid != me.pid);
         let last = t.is_empty();
         drop(t);
@@ -370,6 +556,26 @@ pub(crate) struct LinuxProcess {
     /// `CLONE_CHILD_CLEARTID` / `set_tid_address`: zeroed and futex-woken
     /// when the thread exits.
     pub(crate) clear_tid: u64,
+    /// `set_robust_list`: the head of the thread's robust futex list,
+    /// walked when it exits (`futex::exit_robust_list`). Not inherited.
+    pub(crate) robust_list: u64,
+    /// The deadline of a timed wait that a signal interrupted, for when the
+    /// call is restarted (no handler ran): it waits on, not over.
+    pub(crate) resume_until: Option<core::time::Duration>,
+    /// The cell pays for its kernel stack.
+    _stack: Reserved,
+}
+
+/// Pages a thread's kernel stack takes, and those that its entry in the
+/// process table (with what hangs off it) is counted as. A cell that forks
+/// without end runs out of its own memory, not the machine's.
+const STACK_PAGES: u64 = 16;
+const ENTRY_PAGES: u64 = 1;
+
+/// What a new thread costs its cell; `None` if that cannot pay.
+fn thread_cost(cell: &Cell) -> Option<(Reserved, Reserved)> {
+    let stack = Reserved::new(cell.account(), STACK_PAGES)?;
+    Some((stack, Reserved::new(cell.account(), ENTRY_PAGES)?))
 }
 
 impl LinuxProcess {
@@ -377,13 +583,15 @@ impl LinuxProcess {
     /// `/` as its working directory, and the console on fds 0–2. `None` if
     /// memory runs out.
     pub(crate) fn new(cell: Arc<Cell>, vfs: Arc<Vfs>) -> Option<Self> {
+        let (stack, kept) = thread_cost(&cell)?;
         let mm = Mm::new(cell.account())?;
         let _ = vfs.lock().open(ROOT);
-        let entry = proc::register(cell.id(), 0, None, None);
+        let entry = proc::register(cell.id(), 0, None, None, None, kept);
         let group = Arc::new(Group {
             tgid: entry.pid,
             leader: entry.clone(),
             vfs: vfs.clone(),
+            space: SpinLock::new(mm.shared_space()),
             mm: Mutex::new(mm),
             files: Mutex::new(Files {
                 // One console description on 0, 1 and 2, as a terminal is.
@@ -401,12 +609,15 @@ impl LinuxProcess {
             threads: SpinLock::new(alloc::vec![entry.clone()]),
             gone: Arc::new(frame::task::WaitQueue::new()),
             exit: SpinLock::new(None),
+            execing: SpinLock::new(None),
             exe: SpinLock::new(Default::default()),
             limits: SpinLock::new(default_limits()),
             vfork: SpinLock::new(None),
             creds: SpinLock::new(crate::cred::Creds::root()),
             prctl: SpinLock::new(Prctl::default()),
+            gone_cpu_ns: core::sync::atomic::AtomicU64::new(0),
         });
+        entry.set_group(&group);
         Some(Self {
             entry,
             group,
@@ -414,6 +625,9 @@ impl LinuxProcess {
             vfs,
             sig: Signals::new(),
             clear_tid: 0,
+            robust_list: 0,
+            resume_until: None,
+            _stack: stack,
         })
     }
 
@@ -422,6 +636,7 @@ impl LinuxProcess {
     /// directory, umask and signal state, in a new group whose parent is
     /// this process. Only the calling thread is copied.
     pub(crate) fn fork(&mut self) -> Option<Self> {
+        let (stack, kept) = thread_cost(&self.cell)?;
         let mm = self.mm().fork()?;
         let (fds, cwd, umask) = {
             let f = self.group.files.lock();
@@ -436,23 +651,29 @@ impl LinuxProcess {
             self.group.tgid,
             None,
             Some(self.group.leader.group()),
+            None,
+            kept,
         );
         let group = Arc::new(Group {
             tgid: entry.pid,
             leader: entry.clone(),
             vfs: self.vfs.clone(),
+            space: SpinLock::new(mm.shared_space()),
             mm: Mutex::new(mm),
             files: Mutex::new(Files { fds, cwd, umask }),
             actions: Mutex::new(actions),
             threads: SpinLock::new(alloc::vec![entry.clone()]),
             gone: Arc::new(frame::task::WaitQueue::new()),
             exit: SpinLock::new(None),
+            execing: SpinLock::new(None),
             exe: SpinLock::new(exe),
             limits: SpinLock::new(self.group.limits()),
             vfork: SpinLock::new(None),
             creds: SpinLock::new(self.group.creds()),
             prctl: SpinLock::new(self.group.prctl.lock().clone()),
+            gone_cpu_ns: core::sync::atomic::AtomicU64::new(0),
         });
+        entry.set_group(&group);
         let c = group.creds();
         entry.set_uids(c.ruid, c.suid);
         Some(Self {
@@ -462,29 +683,45 @@ impl LinuxProcess {
             vfs: self.vfs.clone(),
             sig: self.sig.clone(),
             clear_tid: 0,
+            robust_list: 0,
+            resume_until: None,
+            _stack: stack,
         })
     }
 
     /// A new thread in this process (`clone` with `CLONE_VM |
     /// CLONE_THREAD`): shares everything but its tid and signal mask.
-    pub(crate) fn new_thread(&self) -> Self {
+    /// `None` if the cell cannot pay for it.
+    pub(crate) fn new_thread(&self) -> Option<Self> {
+        let (stack, kept) = thread_cost(&self.cell)?;
         let entry = proc::register(
             self.cell.id(),
             self.entry.ppid(),
             Some(self.group.tgid),
             None,
+            Some(self.entry.shared.clone()),
+            kept,
         );
-        self.group.threads.lock().push(entry.clone());
+        {
+            let mut threads = self.group.threads.lock();
+            if proc::ending(&self.entry) {
+                proc::end_thread(&entry);
+            }
+            threads.push(entry.clone());
+        }
         let mut sig = self.sig.clone();
         sig.clear_alt_stack();
-        Self {
+        Some(Self {
             entry,
             group: self.group.clone(),
             cell: self.cell.clone(),
             vfs: self.vfs.clone(),
             sig,
             clear_tid: 0,
-        }
+            robust_list: 0,
+            resume_until: None,
+            _stack: stack,
+        })
     }
 
     /// A kernel helper thread of this process (an io_uring worker): it
@@ -492,25 +729,31 @@ impl LinuxProcess {
     /// thread id, blocks every signal SIGKILL and SIGSTOP aside, and is not
     /// one of the group's threads, so it neither keeps the process alive
     /// nor is waited for by `exit_group` or `execve`. Start it with
-    /// [`crate::proc::start_helper`].
-    pub(crate) fn helper(&self) -> Self {
+    /// [`crate::proc::start_helper`]. `None` if the cell cannot pay for it.
+    pub(crate) fn helper(&self) -> Option<Self> {
+        let (stack, kept) = thread_cost(&self.cell)?;
         let entry = proc::register(
             self.cell.id(),
             self.entry.ppid(),
             Some(self.group.tgid),
             None,
+            None,
+            kept,
         );
         let mut sig = Signals::new();
         sig.mask = !(crate::signal::bit(crate::signal::SIGKILL) | crate::signal::bit(19));
         proc::set_masks(&entry, sig.mask, 0);
-        Self {
+        Some(Self {
             entry,
             group: self.group.clone(),
             cell: self.cell.clone(),
             vfs: self.vfs.clone(),
             sig,
             clear_tid: 0,
-        }
+            robust_list: 0,
+            resume_until: None,
+            _stack: stack,
+        })
     }
 
     /// The process's address space (locked).
@@ -526,25 +769,44 @@ impl LinuxProcess {
 
     /// Replaces the address space (`execve`), returning the old one.
     pub(crate) fn replace_mm(&self, mm: Mm) -> Mm {
-        core::mem::replace(&mut *self.group.mm.lock(), mm)
+        let mut cur = self.group.mm.lock();
+        // Not the old space's last reference: the old `Mm` holds one.
+        *self.group.space.lock() = mm.shared_space();
+        core::mem::replace(&mut *cur, mm)
     }
 
     /// Copies `data` to user memory at `va` with the permissions a user
     /// store has (faulting pages in, breaking copy-on-write). Returns how
     /// many bytes were copied.
     pub(crate) fn copy_to_user(&mut self, va: u64, data: &[u8]) -> usize {
-        self.mm().copy_to_user(va, data)
+        self.copy_user(va, UserBuf::To(data))
     }
 
     /// Copies user memory at `va` into `out` with the permissions a user
     /// load has (faulting pages in). Returns how many bytes were copied.
     pub(crate) fn copy_from_user(&mut self, va: u64, out: &mut [u8]) -> usize {
-        self.mm().copy_from_user(va, out)
+        self.copy_user(va, UserBuf::From(out))
+    }
+
+    /// Both copies. The `Mm` lock is taken only to fault a page in where
+    /// frame's copy stopped (`umem::copy_user`), so a copy into resident
+    /// pages never waits for it, and other threads' `mmap`, `munmap`,
+    /// `mprotect` and page faults do not wait for the copy. If an `execve`
+    /// (by another thread, for a helper) replaced the space meanwhile, the
+    /// copy ends where it stopped: it never faults pages into the new
+    /// space for a copy into the old one.
+    fn copy_user(&self, va: u64, buf: UserBuf<'_>) -> usize {
+        let space = self.group.space.lock().clone();
+        let me: &LinuxProcess = self;
+        umem::copy_user(&space, va, buf, |at, write| {
+            let mut mm = me.mm();
+            (mm.owns(&space) && mm.fault(at, write, false)).then_some(mm)
+        })
     }
 
     /// The working directory.
     pub(crate) fn cwd(&self) -> Ino {
-        self.group.files.lock().cwd
+        self.group.cwd()
     }
 
     pub(crate) fn umask(&self) -> u32 {
@@ -568,25 +830,12 @@ impl LinuxProcess {
 
     /// The descriptor `fd`'s description, if open.
     pub(crate) fn desc(&self, fd: u64) -> Option<Arc<Description>> {
-        let files = self.group.files.lock();
-        let slot = files.fds.get(usize::try_from(fd).ok()?)?.as_ref()?;
-        Some(slot.desc.clone())
-    }
-
-    /// The open descriptor numbers, ascending.
-    pub(crate) fn open_fds(&self) -> Vec<u64> {
-        let files = self.group.files.lock();
-        (0u64..)
-            .zip(files.fds.iter())
-            .filter_map(|(n, s)| s.as_ref().map(|_| n))
-            .collect()
+        self.group.desc(fd)
     }
 
     /// A snapshot of what descriptor `fd` names, if open.
     pub(crate) fn fd(&self, fd: u64) -> Option<Fd> {
-        let d = self.desc(fd)?;
-        let f = d.state().clone();
-        Some(f)
+        self.group.fd(fd)
     }
 
     /// Runs `f` on an open file's state (its offset, say), shared by every
@@ -713,6 +962,31 @@ impl LinuxProcess {
                     }
                 })
                 .collect()
+        };
+        for s in gone {
+            self.closed(s.desc);
+        }
+    }
+
+    /// `close_range`: closes every open descriptor in `[first, last]`, or
+    /// with `cloexec` marks them close-on-exec instead.
+    pub(crate) fn close_range(&mut self, first: u64, last: u64, cloexec: bool) {
+        let gone: Vec<Slot> = {
+            let mut files = self.group.files.lock();
+            let len = files.fds.len();
+            let end = usize::try_from(last)
+                .map_or(len, |l| l.saturating_add(1))
+                .min(len);
+            let start = usize::try_from(first).map_or(end, |f| f.min(end));
+            let range = &mut files.fds[start..end];
+            if cloexec {
+                for s in range.iter_mut().flatten() {
+                    s.cloexec = true;
+                }
+                Vec::new()
+            } else {
+                range.iter_mut().filter_map(Option::take).collect()
+            }
         };
         for s in gone {
             self.closed(s.desc);

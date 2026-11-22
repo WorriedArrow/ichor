@@ -13,7 +13,7 @@
 //! dropped), so the endpoint left behind is an empty shell that is cheap to
 //! drop anywhere, wait conditions included.
 //!
-//! Partial: no `MSG_PEEK`, `MSG_OOB` or `MSG_WAITALL`; a socket whose own
+//! Partial: no `MSG_OOB` or `MSG_WAITALL`; a socket whose own
 //! descriptor is queued inside it (an `SCM_RIGHTS` cycle) is never freed
 //! (Linux has a collector for those); `O_ASYNC` posts `SIGIO` to the
 //! `F_SETOWN` process on arrival but carries no `F_SETSIG` siginfo.
@@ -29,6 +29,7 @@ use cell::Account;
 use frame::sync::SpinLock;
 
 use super::EFAULT;
+use super::socket::{SO_RCVTIMEO, SO_SNDTIMEO, Timeouts, block_on};
 use crate::netstack::Waiters;
 use crate::poll::{Object, POLLHUP, POLLIN, POLLOUT, Watchers};
 use crate::process::{Description, Fd, LinuxProcess, ObjectEnd};
@@ -37,7 +38,6 @@ use crate::{proc, signal};
 
 const EPERM: i64 = 1;
 const EBADF: i64 = 9;
-const EAGAIN: i64 = 11;
 const EEXIST: i64 = 17;
 const EINVAL: i64 = 22;
 const EMFILE: i64 = 24;
@@ -73,8 +73,6 @@ const SO_KEEPALIVE: u64 = 9;
 const SO_LINGER: u64 = 13;
 const SO_PASSCRED: u64 = 16;
 const SO_PEERCRED: u64 = 17;
-const SO_RCVTIMEO: u64 = 20;
-const SO_SNDTIMEO: u64 = 21;
 const SO_ACCEPTCONN: u64 = 30;
 const SO_SNDBUFFORCE: u64 = 32;
 const SO_RCVBUFFORCE: u64 = 33;
@@ -93,6 +91,8 @@ const MSG_CMSG_CLOEXEC: u64 = 0x4000_0000;
 
 /// Bytes a socket's receive queue holds (stream bytes, or datagrams).
 const BUFFER: usize = 256 * 1024;
+/// And messages (or writes to a stream), however small.
+const MESSAGES: usize = 4096;
 /// Most descriptors one `SCM_RIGHTS` message carries (Linux's limit).
 const SCM_MAX_FD: usize = 253;
 /// `sizeof(sun_path)`.
@@ -329,6 +329,7 @@ pub(crate) struct UnixSocket {
     vfs: Arc<Vfs>,
     /// Who created it: the credentials `write` sends with.
     cred: Ucred,
+    timeouts: Timeouts,
     opts: SpinLock<SockOpts>,
 }
 
@@ -346,6 +347,7 @@ impl UnixSocket {
             ep,
             vfs,
             cred,
+            timeouts: Timeouts::default(),
             opts: SpinLock::new(Vec::new()),
         }
     }
@@ -405,22 +407,6 @@ impl Drop for UnixSocket {
     }
 }
 
-/// Blocks on `w` until `attempt` yields, honoring non-blocking mode and
-/// signals.
-fn block<T>(
-    w: &Waiters,
-    nonblock: bool,
-    interrupted: &dyn Fn() -> bool,
-    mut attempt: impl FnMut() -> Option<Result<T, i64>>,
-) -> Result<T, i64> {
-    w.queue.wait_until(|| match attempt() {
-        Some(r) => Some(r),
-        None if nonblock => Some(Err(EAGAIN)),
-        None if interrupted() => Some(Err(signal::ERESTARTSYS)),
-        None => None,
-    })
-}
-
 /// What one receive took.
 pub(super) struct Received {
     data: Vec<u8>,
@@ -429,6 +415,36 @@ pub(super) struct Received {
     cred: Option<Ucred>,
     /// A datagram's or packet's full length (more than `data` when cut).
     full: usize,
+}
+
+/// What the next receive of up to `max` bytes would take (`MSG_PEEK`).
+fn peeked(ty: Type, rx: &VecDeque<Msg>, max: usize) -> Received {
+    let mut r = Received {
+        data: Vec::new(),
+        fds: Vec::new(),
+        from: None,
+        cred: None,
+        full: 0,
+    };
+    for m in rx {
+        if !r.data.is_empty() && !m.fds.is_empty() {
+            break;
+        }
+        r.fds.clone_from(&m.fds);
+        r.cred.get_or_insert(m.cred);
+        let room = max - r.data.len();
+        r.data.extend(m.data.iter().take(room));
+        if ty != Type::Stream {
+            r.from.clone_from(&m.from);
+            r.full = m.data.len();
+            return r;
+        }
+        if r.data.len() == max || !r.fds.is_empty() {
+            break;
+        }
+    }
+    r.full = r.data.len();
+    r
 }
 
 /// Wakes `to`'s readers and posts `SIGIO` if it asked for it.
@@ -459,6 +475,9 @@ impl Endpoint {
         let mut ps = peer.state.lock();
         if ps.closed || ps.shut_rd {
             return Some(Err(EPIPE));
+        }
+        if ps.rx.len() >= MESSAGES {
+            return None;
         }
         let room = BUFFER.saturating_sub(ps.rx_bytes);
         let n = match self.ty {
@@ -517,7 +536,7 @@ impl Endpoint {
         {
             return Some(Err(EPERM));
         }
-        if ts.rx_bytes + data.len() > BUFFER && ts.rx_bytes > 0 {
+        if ts.rx.len() >= MESSAGES || (ts.rx_bytes + data.len() > BUFFER && ts.rx_bytes > 0) {
             return None;
         }
         let after = ts.rx_bytes + data.len();
@@ -540,7 +559,8 @@ impl Endpoint {
 
     /// One attempt to receive up to `max` bytes: `None` while nothing is
     /// queued and more may come.
-    fn try_recv(&self, max: usize) -> Option<Result<Received, i64>> {
+    /// Left in place if `peek`.
+    fn try_recv(&self, max: usize, peek: bool) -> Option<Result<Received, i64>> {
         let mut st = self.state.lock();
         let empty = Received {
             data: Vec::new(),
@@ -561,6 +581,9 @@ impl Endpoint {
                 }));
             }
             return None;
+        }
+        if peek {
+            return Some(Ok(peeked(self.ty, &st.rx, max)));
         }
         if self.ty != Type::Stream {
             let m = st.rx.pop_front()?;
@@ -628,6 +651,7 @@ impl UnixSocket {
         interrupted: &dyn Fn() -> bool,
     ) -> Result<usize, i64> {
         let ep = &self.ep;
+        let timeout = self.timeouts.send.load(Ordering::Relaxed);
         if ep.ty == Type::Dgram {
             if data.len() > BUFFER {
                 return Err(EMSGSIZE);
@@ -643,7 +667,7 @@ impl UnixSocket {
                 return Err(EPROTOTYPE);
             }
             let from = ep.state.lock().name.clone();
-            let n = block(&target.wait, nonblock, interrupted, || {
+            let n = block_on(&target.wait, nonblock, timeout, interrupted, || {
                 ep.try_send_dgram(&target, data, &mut fds, &from, cred)
             })?;
             arrived(&target);
@@ -662,23 +686,39 @@ impl UnixSocket {
                 _ => return Err(ENOTCONN),
             }
         };
-        let n = block(&peer.wait, nonblock, interrupted, || {
-            ep.try_send_conn(&peer, data, &mut fds, cred)
-        })?;
-        arrived(&peer);
-        Ok(n)
+        // All of a stream's bytes, however long that takes (what fits, if
+        // it may not wait); an error after some went reports what went.
+        let mut done = 0;
+        loop {
+            match block_on(&peer.wait, nonblock, timeout, interrupted, || {
+                ep.try_send_conn(&peer, &data[done..], &mut fds, cred)
+            }) {
+                Ok(n) => done += n,
+                Err(e) if done == 0 => return Err(e),
+                Err(_) => return Ok(done),
+            }
+            arrived(&peer);
+            if ep.ty != Type::Stream || done >= data.len() {
+                return Ok(done);
+            }
+        }
     }
 
-    /// Receives up to `max` bytes.
+    /// Receives up to `max` bytes (a copy, if `peek`).
     fn recv(
         &self,
         max: usize,
         nonblock: bool,
+        peek: bool,
         interrupted: &dyn Fn() -> bool,
     ) -> Result<Received, i64> {
-        let r = block(&self.ep.wait, nonblock, interrupted, || {
-            self.ep.try_recv(max)
+        let timeout = self.timeouts.recv.load(Ordering::Relaxed);
+        let r = block_on(&self.ep.wait, nonblock, timeout, interrupted, || {
+            self.ep.try_recv(max, peek)
         })?;
+        if peek {
+            return Ok(r);
+        }
         // Room opened: wake writers waiting on us, and our peer's pollers.
         self.ep.wait.wake();
         if let Some(peer) = self.ep.peer() {
@@ -697,7 +737,7 @@ impl Object for UnixSocket {
     ) -> Result<Vec<u8>, i64> {
         // Descriptors sent with these bytes are dropped (closed), as a
         // plain read on Linux does.
-        self.recv(max, nonblock, interrupted).map(|r| r.data)
+        self.recv(max, nonblock, false, interrupted).map(|r| r.data)
     }
 
     fn write(
@@ -735,7 +775,7 @@ impl Object for UnixSocket {
         match peer.as_ref().map(Weak::upgrade) {
             Some(Some(pe)) => {
                 let ps = pe.state.lock();
-                if !ps.closed && ps.rx_bytes < BUFFER {
+                if !ps.closed && ps.rx_bytes < BUFFER && ps.rx.len() < MESSAGES {
                     r |= POLLOUT;
                 }
             }
@@ -761,6 +801,14 @@ impl Object for UnixSocket {
 
     fn unix(&self) -> Option<&UnixSocket> {
         Some(self)
+    }
+
+    fn readable(&self) -> Option<usize> {
+        let st = self.ep.state.lock();
+        Some(match self.ep.ty {
+            Type::Dgram => st.rx.front().map_or(0, |m| m.data.len()),
+            _ => st.rx_bytes,
+        })
     }
 }
 
@@ -793,10 +841,9 @@ fn read_sun(p: &mut LinuxProcess, addr: u64, len: u64) -> Result<Target, i64> {
         None => Ok(Target::Unnamed),
         Some(0) => Ok(Target::Abstract(path[1..].to_vec())),
         Some(_) => {
+            // A path name, escaped like every path (`overlay::name`).
             let end = path.iter().position(|&c| c == 0).unwrap_or(path.len());
-            String::from_utf8(path[..end].to_vec())
-                .map(Target::Path)
-                .map_err(|_| crate::vfs::errno::ENOENT)
+            Ok(Target::Path(overlay::name::encode(&path[..end])))
         }
     }
 }
@@ -807,18 +854,7 @@ fn write_sun(p: &mut LinuxProcess, addr: u64, lenp: u64, name: Option<&Name>) ->
     if lenp == 0 {
         return Ok(());
     }
-    let mut b = (AF_UNIX as u16).to_le_bytes().to_vec();
-    match name {
-        Some(Name::Path(s, _)) => {
-            b.extend_from_slice(s.as_bytes());
-            b.push(0);
-        }
-        Some(Name::Abstract(n)) => {
-            b.push(0);
-            b.extend_from_slice(n);
-        }
-        None => {}
-    }
+    let b = sun(name);
     let mut lb = [0u8; 4];
     if p.copy_from_user(lenp, &mut lb) != 4 {
         return Err(EFAULT);
@@ -830,6 +866,40 @@ fn write_sun(p: &mut LinuxProcess, addr: u64, lenp: u64, name: Option<&Name>) ->
         return Err(EFAULT);
     }
     Ok(())
+}
+
+/// Writes a message's source to a user `sockaddr`: a sender with no name has
+/// no address at all (length 0), not an empty one.
+fn write_source(
+    p: &mut LinuxProcess,
+    addr: u64,
+    lenp: u64,
+    name: Option<&Name>,
+) -> Result<(), i64> {
+    if name.is_some() {
+        return write_sun(p, addr, lenp, name);
+    }
+    if lenp != 0 && p.copy_to_user(lenp, &[0u8; 4]) != 4 {
+        return Err(EFAULT);
+    }
+    Ok(())
+}
+
+/// `name` as a `struct sockaddr_un`, as long as it is.
+fn sun(name: Option<&Name>) -> Vec<u8> {
+    let mut b = (AF_UNIX as u16).to_le_bytes().to_vec();
+    match name {
+        Some(Name::Path(s, _)) => {
+            b.extend_from_slice(&overlay::name::decode(s));
+            b.push(0);
+        }
+        Some(Name::Abstract(n)) => {
+            b.push(0);
+            b.extend_from_slice(n);
+        }
+        None => {}
+    }
+    b
 }
 
 /// The endpoint a name reaches from `p`.
@@ -1035,9 +1105,10 @@ pub(super) fn connect(
         ss.name = target.state.lock().name.clone();
     }
     let entry = p.entry.clone();
-    let listen_cred = block(
+    let listen_cred = block_on(
         &target.wait,
         nonblock,
+        u.timeouts.send.load(Ordering::Relaxed),
         &|| proc::interrupted(&entry),
         || {
             let mut ts = target.state.lock();
@@ -1079,9 +1150,10 @@ pub(super) fn accept(
         return Err(EOPNOTSUPP);
     }
     let entry = p.entry.clone();
-    let srv = block(
+    let srv = block_on(
         &u.ep.wait,
         nonblock,
+        u.timeouts.recv.load(Ordering::Relaxed),
         &|| proc::interrupted(&entry),
         || match &mut u.ep.state.lock().conn {
             Conn::Listening { backlog, .. } => backlog.pop_front().map(Ok),
@@ -1160,8 +1232,6 @@ fn recorded(name: u64) -> bool {
             | SO_RCVBUF
             | SO_KEEPALIVE
             | SO_LINGER
-            | SO_RCVTIMEO
-            | SO_SNDTIMEO
             | SO_SNDBUFFORCE
             | SO_RCVBUFFORCE
     )
@@ -1175,7 +1245,8 @@ pub(super) fn setsockopt(
     val: u64,
     len: u64,
 ) -> Result<u64, i64> {
-    if level != SOL_SOCKET || !(recorded(name) || name == SO_PASSCRED) {
+    let acts = matches!(name, SO_PASSCRED | SO_RCVTIMEO | SO_SNDTIMEO);
+    if level != SOL_SOCKET || !(recorded(name) || acts) {
         return Err(ENOPROTOOPT);
     }
     let len = usize::try_from(len).map_err(|_| EINVAL)?.min(64);
@@ -1186,6 +1257,9 @@ pub(super) fn setsockopt(
     if name == SO_PASSCRED {
         u.ep.state.lock().passcred = v.iter().any(|&b| b != 0);
         return Ok(0);
+    }
+    if matches!(name, SO_RCVTIMEO | SO_SNDTIMEO) {
+        return u.timeouts.set(name, &v).map(|()| 0);
     }
     let mut opts = u.opts.lock();
     opts.retain(|(k, _)| *k != (level, name));
@@ -1213,6 +1287,7 @@ pub(super) fn getsockopt(
             SO_PROTOCOL => int(0),
             SO_ACCEPTCONN => int(i32::from(matches!(st.conn, Conn::Listening { .. }))),
             SO_PASSCRED => int(i32::from(st.passcred)),
+            SO_RCVTIMEO | SO_SNDTIMEO => u.timeouts.get(name),
             // No peer: pid 0 and the overflow ids, as Linux reports.
             SO_PEERCRED => st
                 .peer_cred
@@ -1388,11 +1463,9 @@ fn recv_from(
     max: usize,
     flags: u64,
 ) -> Result<Received, i64> {
-    if flags & MSG_PEEK != 0 {
-        return Err(EOPNOTSUPP);
-    }
     let entry = p.entry.clone();
-    u.recv(max, nonblock || flags & MSG_DONTWAIT != 0, &|| {
+    let peek = flags & MSG_PEEK != 0;
+    u.recv(max, nonblock || flags & MSG_DONTWAIT != 0, peek, &|| {
         proc::interrupted(&entry)
     })
 }
@@ -1409,7 +1482,7 @@ pub(super) fn recvfrom(
         return Err(EFAULT);
     }
     if a[4] != 0 {
-        write_sun(p, a[4], a[5], r.from.as_ref())?;
+        write_source(p, a[4], a[5], r.from.as_ref())?;
     }
     let n = if a[3] & MSG_TRUNC != 0 {
         r.full
@@ -1450,7 +1523,7 @@ pub(super) fn recvmsg(
         at += n;
     }
     if h.name != 0 {
-        write_sun(p, h.name, msg + 8, r.from.as_ref())?;
+        write_source(p, h.name, msg + 8, r.from.as_ref())?;
     } else if p.copy_to_user(msg + 8, &[0u8; 4]) != 4 {
         return Err(EFAULT);
     }
@@ -1458,11 +1531,10 @@ pub(super) fn recvmsg(
     // that fit (the rest are closed, and MSG_CTRUNC says so).
     let room = usize::try_from(h.controllen).unwrap_or(usize::MAX);
     let mut ctl = Vec::new();
-    let mut mflags = if r.full > r.data.len() {
-        MSG_TRUNC as u32
-    } else {
-        0
-    };
+    let mut mflags = (flags & MSG_CMSG_CLOEXEC) as u32;
+    if r.full > r.data.len() {
+        mflags |= MSG_TRUNC as u32;
+    }
     if u.ep.state.lock().passcred
         && let Some(c) = r.cred
     {
@@ -1544,7 +1616,7 @@ pub(crate) fn accounting_selftest() {
         fail("unix: the queue did not stop at the cell's limit");
     }
     let mut got = 0;
-    while let Some(Ok(r)) = b.try_recv(BUFFER) {
+    while let Some(Ok(r)) = b.try_recv(BUFFER, false) {
         if r.data.is_empty() {
             break;
         }

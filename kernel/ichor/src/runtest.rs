@@ -57,6 +57,38 @@ mod sys {
     pub(super) const EVENTFD2: u64 = 290;
     pub(super) const EPOLL_CREATE1: u64 = 291;
     pub(super) const PIPE2: u64 = 293;
+    pub(super) const GETPRIORITY: u64 = 140;
+    pub(super) const SETPRIORITY: u64 = 141;
+    pub(super) const FADVISE64: u64 = 221;
+    pub(super) const CLOSE_RANGE: u64 = 436;
+    pub(super) const MEMFD_CREATE: u64 = 319;
+    pub(super) const CLOCK_GETTIME: u64 = 228;
+    pub(super) const MKNOD: u64 = 133;
+    pub(super) const SYMLINK: u64 = 88;
+    pub(super) const SENDFILE: u64 = 40;
+    pub(super) const FTRUNCATE: u64 = 77;
+    pub(super) const LSEEK: u64 = 8;
+    pub(super) const CLOCK_GETRES: u64 = 229;
+    pub(super) const FALLOCATE: u64 = 285;
+    pub(super) const SYNC_FILE_RANGE: u64 = 277;
+    pub(super) const MEMBARRIER: u64 = 324;
+    pub(super) const SETXATTR: u64 = 188;
+    pub(super) const WAITID: u64 = 247;
+    pub(super) const PREADV: u64 = 295;
+    pub(super) const RT_SIGPENDING: u64 = 127;
+    pub(super) const SCHED_GET_PRIORITY_MAX: u64 = 146;
+    pub(super) const SCHED_SETAFFINITY: u64 = 203;
+    pub(super) const SCHED_GETAFFINITY: u64 = 204;
+    pub(super) const CLOCK_SETTIME: u64 = 227;
+    pub(super) const GETXATTR: u64 = 191;
+    pub(super) const LISTXATTR: u64 = 194;
+    pub(super) const GETTID: u64 = 186;
+    pub(super) const SET_ROBUST_LIST: u64 = 273;
+    pub(super) const READLINK: u64 = 89;
+    pub(super) const CLOCK_NANOSLEEP: u64 = 230;
+    pub(super) const PREAD64: u64 = 17;
+    pub(super) const PWRITE64: u64 = 18;
+    pub(super) const MSYNC: u64 = 26;
     pub(super) const EXIT_GROUP: u64 = 231;
     pub(super) const RT_SIGACTION: u64 = 13;
     pub(super) const RT_SIGRETURN: u64 = 15;
@@ -513,6 +545,7 @@ pub(crate) fn run_linux(
         argv,
         ENVP,
         8 << 20,
+        [0; 4],
     ) {
         Ok(l) => l,
         Err(e) => {
@@ -520,11 +553,12 @@ pub(crate) fn run_linux(
             fail("could not load the ELF");
         }
     };
-    p.group.set_exec(argv.first().copied().unwrap_or(""), argv);
+    let path = argv.first().copied().unwrap_or("");
+    let name = path.rsplit('/').next().unwrap_or("");
+    p.group.set_exec(path, name, loaded.args);
     let cell = p.cell.clone();
-    // A root that opted out of page sharing charges its private cache pages
-    // to the cell too; those are the root's, not the process's.
-    let cache_ns = p.vfs.private_ns();
+    // What the root holds is not the process's to give back.
+    let vfs = p.vfs.clone();
     let leader = p.group.leader.clone();
     let ctx = UserContext::new(loaded.entry, loaded.stack_pointer);
     let (_, syscalls) = proc::run(p, ctx);
@@ -536,21 +570,19 @@ pub(crate) fn run_linux(
         }
         frame::task::yield_now();
     };
+    drop(leader);
     // Orphans the program left (killed, or exiting on their own) may still
     // be on their way out: give the cell's other processes time to go.
     let deadline = frame::time::now() + core::time::Duration::from_secs(30);
-    let cached = loop {
-        let cached = cache_ns.map_or(0, |ns| crate::pagecache::private_pages(ns) as u64);
-        if cell.account().used() == cached || frame::time::now() > deadline {
-            break cached;
-        }
+    while cell.account().used() != vfs.charged() && frame::time::now() <= deadline {
         frame::task::yield_now();
-    };
-    if cell.account().used() != cached {
+    }
+    let root = vfs.charged();
+    if cell.account().used() != root {
         let (threads, procs, _) = proc::census(cell.id());
         println!("ichor: runtest: {procs} processes ({threads} threads) still live in the cell");
         println!(
-            "ichor: runtest: {} pages still charged ({cached} private cache pages)",
+            "ichor: runtest: {} pages still charged ({root} of them the root's)",
             cell.account().used()
         );
         fail("process memory was not returned");
@@ -1105,6 +1137,793 @@ fn shootdown_program() -> Vec<u8> {
     static_elf(&a.finish(BLOB_VADDR).unwrap_or_else(|| fail("assembler")))
 }
 
+/// The direction flag belongs to user code: a backward `rep movsq` (what
+/// memmove does for overlapping copies) into 16 untouched pages faults on
+/// each page mid-copy, and must resume backward each time; then DF must
+/// survive a syscall. Exits 0, or 1 if the copy came out wrong, 2 if DF
+/// was lost across the syscall. (Clearing DF dropped it at every return
+/// to ring 3, and memmoves interrupted that way corrupted heaps.)
+fn direction_program() -> Vec<u8> {
+    const QWORDS: i32 = 0x1_0000 / 8;
+    const STD: u8 = 0xfd;
+    const CLD: u8 = 0xfc;
+    let mut a = Asm::new();
+    let fill = a.label();
+    let check = a.label();
+    let bad_copy = a.label();
+    let bad_flag = a.label();
+    // r12 = source, rbx = destination: 64 KiB each, untouched.
+    for dst in [Reg::R12, Reg::Rbx] {
+        a.mov_imm(Reg::Rdi, 0);
+        a.mov_imm(Reg::Rsi, 0x1_0000);
+        a.mov_imm(Reg::Rdx, 3);
+        a.mov_imm(Reg::R10, 0x22);
+        a.mov_imm(Reg::R8, u64::MAX);
+        a.mov_imm(Reg::R9, 0);
+        a.sys(sys::MMAP);
+        a.mov(dst, Reg::Rax);
+    }
+    // Source qword i holds i + 1.
+    a.mov_imm(Reg::Rax, 1);
+    a.mov(Reg::Rdx, Reg::R12);
+    a.bind(fill);
+    a.store(Reg::Rdx, 0, Reg::Rax);
+    a.add_imm(Reg::Rdx, 8);
+    a.add_imm(Reg::Rax, 1);
+    a.cmp_imm(Reg::Rax, QWORDS + 1);
+    a.jne(fill);
+    // Copy from the last qword down.
+    a.mov(Reg::Rsi, Reg::R12);
+    a.add_imm(Reg::Rsi, 0x1_0000 - 8);
+    a.mov(Reg::Rdi, Reg::Rbx);
+    a.add_imm(Reg::Rdi, 0x1_0000 - 8);
+    a.mov_imm(Reg::Rcx, QWORDS as u64);
+    a.raw(&[STD, 0xf3, 0x48, 0xa5, CLD]); // std; rep movsq; cld
+    a.mov_imm(Reg::Rax, 1);
+    a.mov(Reg::Rdx, Reg::Rbx);
+    a.bind(check);
+    a.load(Reg::Rcx, Reg::Rdx, 0);
+    a.cmp(Reg::Rcx, Reg::Rax);
+    a.jne(bad_copy);
+    a.add_imm(Reg::Rdx, 8);
+    a.add_imm(Reg::Rax, 1);
+    a.cmp_imm(Reg::Rax, QWORDS + 1);
+    a.jne(check);
+    // DF across a syscall.
+    a.raw(&[STD]);
+    a.sys(sys::GETPID);
+    a.raw(&[0x9c, 0x58, CLD]); // pushfq; pop rax; cld
+    a.raw(&[0xa9, 0x00, 0x04, 0x00, 0x00]); // test eax, 0x400
+    a.je(bad_flag);
+    a.mov_imm(Reg::Rdi, 0);
+    a.sys(sys::EXIT_GROUP);
+    a.bind(bad_copy);
+    a.mov_imm(Reg::Rdi, 1);
+    a.sys(sys::EXIT_GROUP);
+    a.bind(bad_flag);
+    a.mov_imm(Reg::Rdi, 2);
+    a.sys(sys::EXIT_GROUP);
+    static_elf(&a.finish(BLOB_VADDR).unwrap_or_else(|| fail("assembler")))
+}
+
+/// What CPython's subprocess and os modules call: `close_range` closes a
+/// pipe's two ends (fds 3 and 4) and nothing below them; `fadvise64` checks
+/// its descriptor; the nice value reads 0 (raw 20), rises to 5 (raw 15),
+/// and cannot be lowered again; `memfd_create` gives a close-on-exec file
+/// that keeps what is written. Exits 0, or the number of the failed check.
+fn misc_program() -> Vec<u8> {
+    const F_GETFD: u64 = 1;
+    let neg = |e: i64| (-e) as u64;
+    let mut a = Asm::new();
+    let bad = a.label();
+    let check = |a: &mut Asm, n: u64, want: u64| {
+        a.mov_imm(Reg::R14, want);
+        a.mov_imm(Reg::Rdi, n);
+        a.cmp(Reg::Rax, Reg::R14);
+        a.jne(bad);
+    };
+    a.mov(Reg::Rbp, Reg::Rsp);
+    a.sub_imm(Reg::Rbp, 4096);
+    a.mov(Reg::Rdi, Reg::Rbp);
+    a.mov_imm(Reg::Rsi, 0);
+    a.sys(sys::PIPE2);
+    check(&mut a, 1, 0);
+    a.mov_imm(Reg::Rdi, 3);
+    a.mov_imm(Reg::Rsi, u64::from(u32::MAX));
+    a.mov_imm(Reg::Rdx, 0);
+    a.sys(sys::CLOSE_RANGE);
+    check(&mut a, 2, 0);
+    for (n, fd, want) in [(3, 3, neg(9)), (4, 4, neg(9)), (5, 2, 0)] {
+        a.mov_imm(Reg::Rdi, fd);
+        a.mov_imm(Reg::Rsi, F_GETFD);
+        a.sys(sys::FCNTL);
+        check(&mut a, n, want);
+    }
+    a.mov_imm(Reg::Rdi, 3); // closed
+    a.mov_imm(Reg::Rsi, 0);
+    a.mov_imm(Reg::Rdx, 0);
+    a.mov_imm(Reg::R10, 0);
+    a.sys(sys::FADVISE64);
+    check(&mut a, 6, neg(9));
+    for (n, call, value, want) in [
+        (7, sys::GETPRIORITY, 0, 20),
+        (8, sys::SETPRIORITY, 5, 0),
+        (9, sys::GETPRIORITY, 0, 15),
+        (10, sys::SETPRIORITY, 0, neg(13)),
+    ] {
+        a.mov_imm(Reg::Rdi, 0); // PRIO_PROCESS
+        a.mov_imm(Reg::Rsi, 0); // the caller
+        a.mov_imm(Reg::Rdx, value);
+        a.sys(call);
+        check(&mut a, n, want);
+    }
+    // memfd_create("m", MFD_CLOEXEC) is the lowest free fd (3), close-on-
+    // exec, and holds what is written; MFD_HUGETLB is EINVAL.
+    let name = a.data(b"m\0");
+    let text = a.data(b"memfd");
+    a.mov_data(Reg::Rdi, name);
+    a.mov_imm(Reg::Rsi, 1);
+    a.sys(sys::MEMFD_CREATE);
+    check(&mut a, 11, 3);
+    a.mov_imm(Reg::Rdi, 3);
+    a.mov_imm(Reg::Rsi, F_GETFD);
+    a.sys(sys::FCNTL);
+    check(&mut a, 12, 1);
+    a.mov_imm(Reg::Rdi, 3);
+    a.mov_data(Reg::Rsi, text);
+    a.mov_imm(Reg::Rdx, 5);
+    a.sys(sys::WRITE);
+    check(&mut a, 13, 5);
+    a.mov_imm(Reg::Rdi, 3);
+    a.mov(Reg::Rsi, Reg::Rbp);
+    a.mov_imm(Reg::Rdx, 8);
+    a.mov_imm(Reg::R10, 0);
+    a.sys(sys::PREAD64);
+    check(&mut a, 14, 5);
+    a.load(Reg::Rax, Reg::Rbp, 0);
+    check(
+        &mut a,
+        15,
+        u64::from_le_bytes(*b"memfd\0\0\0") & 0xff_ffff_ffff,
+    );
+    a.mov_data(Reg::Rdi, name);
+    a.mov_imm(Reg::Rsi, 4);
+    a.sys(sys::MEMFD_CREATE);
+    check(&mut a, 16, neg(22));
+    // clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME) until the next whole
+    // second, and the clock is past it afterwards; CPU clocks are ENOTSUP.
+    a.mov_imm(Reg::Rdi, 1);
+    a.mov(Reg::Rsi, Reg::Rbp);
+    a.add_imm(Reg::Rsi, 16);
+    a.sys(sys::CLOCK_GETTIME);
+    a.load(Reg::Rax, Reg::Rbp, 16);
+    a.add_imm(Reg::Rax, 1);
+    a.store(Reg::Rbp, 16, Reg::Rax);
+    a.mov_imm(Reg::Rax, 0);
+    a.store(Reg::Rbp, 24, Reg::Rax);
+    a.mov_imm(Reg::Rdi, 1);
+    a.mov_imm(Reg::Rsi, 1);
+    a.mov(Reg::Rdx, Reg::Rbp);
+    a.add_imm(Reg::Rdx, 16);
+    a.mov_imm(Reg::R10, 0);
+    a.sys(sys::CLOCK_NANOSLEEP);
+    check(&mut a, 17, 0);
+    a.mov_imm(Reg::Rdi, 1);
+    a.mov(Reg::Rsi, Reg::Rbp);
+    a.add_imm(Reg::Rsi, 32);
+    a.sys(sys::CLOCK_GETTIME);
+    a.load(Reg::Rax, Reg::Rbp, 16);
+    a.load(Reg::Rcx, Reg::Rbp, 32);
+    a.mov_imm(Reg::Rdi, 18);
+    a.cmp(Reg::Rax, Reg::Rcx);
+    a.ja(bad); // woke before the deadline's second
+    a.mov_imm(Reg::Rdi, 2);
+    a.mov_imm(Reg::Rsi, 0);
+    a.mov(Reg::Rdx, Reg::Rbp);
+    a.add_imm(Reg::Rdx, 16);
+    a.mov_imm(Reg::R10, 0);
+    a.sys(sys::CLOCK_NANOSLEEP);
+    check(&mut a, 19, neg(95));
+    // Names are bytes: a directory named "x\xff" is made, entered, and
+    // getcwd gives the same bytes back; a symlink's non-UTF-8 target reads
+    // back unchanged.
+    let dir = a.data(b"/x\xff\0");
+    let target = a.data(b"t\xfe\0");
+    let link = a.data(b"/l\0");
+    a.mov_data(Reg::Rdi, dir);
+    a.mov_imm(Reg::Rsi, 0o755);
+    a.sys(sys::MKDIR);
+    check(&mut a, 20, 0);
+    a.mov_data(Reg::Rdi, dir);
+    a.sys(sys::CHDIR);
+    check(&mut a, 21, 0);
+    a.mov(Reg::Rdi, Reg::Rbp);
+    a.mov_imm(Reg::Rsi, 64);
+    a.sys(sys::GETCWD);
+    check(&mut a, 22, 4);
+    a.load32(Reg::Rax, Reg::Rbp, 0);
+    check(&mut a, 23, u64::from(u32::from_le_bytes(*b"/x\xff\0")));
+    a.mov_data(Reg::Rdi, target);
+    a.mov_data(Reg::Rsi, link);
+    a.sys(sys::SYMLINK);
+    check(&mut a, 24, 0);
+    a.mov_data(Reg::Rdi, link);
+    a.mov(Reg::Rsi, Reg::Rbp);
+    a.mov_imm(Reg::Rdx, 64);
+    a.sys(sys::READLINK);
+    check(&mut a, 25, 2);
+    a.load32(Reg::Rax, Reg::Rbp, 0);
+    a.mov_imm(Reg::Rcx, 0xffff);
+    a.raw(&[0x48, 0x21, 0xc8]); // and rax, rcx
+    check(&mut a, 26, u64::from(u16::from_le_bytes(*b"t\xfe")));
+    // clock_getres(CLOCK_MONOTONIC) is 1 ns; fallocate grows the memfd
+    // (fd 3) to 8 KiB; sync_file_range and membarrier's query succeed;
+    // /dev/shm exists.
+    a.mov_imm(Reg::Rdi, 1);
+    a.mov(Reg::Rsi, Reg::Rbp);
+    a.sys(sys::CLOCK_GETRES);
+    check(&mut a, 27, 0);
+    a.load(Reg::Rax, Reg::Rbp, 8);
+    check(&mut a, 28, 1);
+    a.mov_imm(Reg::Rdi, 3);
+    a.mov_imm(Reg::Rsi, 0);
+    a.mov_imm(Reg::Rdx, 0);
+    a.mov_imm(Reg::R10, 8192);
+    a.sys(sys::FALLOCATE);
+    check(&mut a, 29, 0);
+    a.mov_imm(Reg::Rdi, 3);
+    a.mov(Reg::Rsi, Reg::Rbp);
+    a.sys(sys::FSTAT);
+    a.load(Reg::Rax, Reg::Rbp, 48); // st_size
+    check(&mut a, 30, 8192);
+    a.mov_imm(Reg::Rdi, 3);
+    a.mov_imm(Reg::Rsi, 0);
+    a.mov_imm(Reg::Rdx, 0);
+    a.mov_imm(Reg::R10, 0);
+    a.sys(sys::SYNC_FILE_RANGE);
+    check(&mut a, 31, 0);
+    a.mov_imm(Reg::Rdi, 0);
+    a.mov_imm(Reg::Rsi, 0);
+    a.sys(sys::MEMBARRIER);
+    check(&mut a, 32, 0);
+    let shm = a.data(b"/dev/shm\0");
+    a.mov_data(Reg::Rdi, shm);
+    a.mov(Reg::Rsi, Reg::Rbp);
+    a.sys(sys::STAT);
+    check(&mut a, 33, 0);
+    // No extended attributes: an empty list, ENODATA, ENOTSUP; a missing
+    // file is ENOENT.
+    let attr = a.data(b"user.x\0");
+    let nope = a.data(b"/nope\0");
+    for (n, call, path, want) in [
+        (34, sys::LISTXATTR, shm, 0),
+        (35, sys::GETXATTR, shm, neg(61)),
+        (36, sys::SETXATTR, shm, neg(95)),
+        (37, sys::LISTXATTR, nope, neg(2)),
+    ] {
+        a.mov_data(Reg::Rdi, path);
+        if call == sys::LISTXATTR {
+            a.mov_imm(Reg::Rsi, 0);
+            a.mov_imm(Reg::Rdx, 0);
+        } else {
+            a.mov_data(Reg::Rsi, attr);
+            a.mov(Reg::Rdx, Reg::Rbp);
+            a.mov_imm(Reg::R10, 1);
+            a.mov_imm(Reg::R8, 0);
+        }
+        a.sys(call);
+        check(&mut a, n, want);
+    }
+    a.mov_imm(Reg::Rdi, 0);
+    a.bind(bad);
+    a.sys(sys::EXIT_GROUP);
+    static_elf(&a.finish(BLOB_VADDR).unwrap_or_else(|| fail("assembler")))
+}
+
+/// sendfile reports what it wrote: from a 1 MiB file into a non-blocking
+/// AF_UNIX stream socket nobody reads, the first call sends part of the
+/// file (more than 0, less than all; never EAGAIN after progress) and
+/// leaves the file offset there; the next call, with no room, is EAGAIN.
+/// Exits 0, or the failed check.
+fn sendfile_program() -> Vec<u8> {
+    const SOCK_STREAM_NONBLOCK: u64 = 1 | 0o4000;
+    const LEN: u64 = 1 << 20;
+    let mut a = Asm::new();
+    let bad = a.label();
+    let path = a.data(b"/sendfile\0");
+    a.mov(Reg::Rbp, Reg::Rsp);
+    a.sub_imm(Reg::Rbp, 4096);
+    a.mov_imm(Reg::Rdi, 1); // AF_UNIX
+    a.mov_imm(Reg::Rsi, SOCK_STREAM_NONBLOCK);
+    a.mov_imm(Reg::Rdx, 0);
+    a.mov(Reg::R10, Reg::Rbp);
+    a.sys(sys::SOCKETPAIR);
+    a.mov_imm(Reg::Rdi, 1);
+    a.cmp_imm(Reg::Rax, 0);
+    a.jne(bad);
+    a.load32(Reg::R12, Reg::Rbp, 0); // the end to send on
+    a.mov_data(Reg::Rdi, path);
+    a.mov_imm(Reg::Rsi, 0o102); // O_RDWR | O_CREAT
+    a.mov_imm(Reg::Rdx, 0o644);
+    a.sys(sys::OPEN);
+    a.mov(Reg::R13, Reg::Rax);
+    a.mov(Reg::Rdi, Reg::R13);
+    a.mov_imm(Reg::Rsi, LEN);
+    a.sys(sys::FTRUNCATE);
+    a.mov_imm(Reg::Rdi, 2);
+    a.cmp_imm(Reg::Rax, 0);
+    a.jne(bad);
+    // sendfile(sock, file, NULL, LEN): 0 < n < LEN.
+    a.mov(Reg::Rdi, Reg::R12);
+    a.mov(Reg::Rsi, Reg::R13);
+    a.mov_imm(Reg::Rdx, 0);
+    a.mov_imm(Reg::R10, LEN);
+    a.sys(sys::SENDFILE);
+    a.mov(Reg::R14, Reg::Rax);
+    a.mov_imm(Reg::Rdi, 3);
+    a.cmp_imm(Reg::Rax, 0);
+    a.jbe(bad); // 0, or an error (as unsigned: huge, caught below)
+    a.mov_imm(Reg::Rcx, LEN);
+    a.mov_imm(Reg::Rdi, 4);
+    a.cmp(Reg::Rcx, Reg::Rax);
+    a.jbe(bad); // LEN <= n: all of it, or an error's huge unsigned value
+    // The file offset is where the sending stopped.
+    a.mov(Reg::Rdi, Reg::R13);
+    a.mov_imm(Reg::Rsi, 0);
+    a.mov_imm(Reg::Rdx, 1); // SEEK_CUR
+    a.sys(sys::LSEEK);
+    a.mov_imm(Reg::Rdi, 5);
+    a.cmp(Reg::Rax, Reg::R14);
+    a.jne(bad);
+    // Nothing more fits: EAGAIN.
+    a.mov(Reg::Rdi, Reg::R12);
+    a.mov(Reg::Rsi, Reg::R13);
+    a.mov_imm(Reg::Rdx, 0);
+    a.mov_imm(Reg::R10, LEN);
+    a.sys(sys::SENDFILE);
+    a.mov_imm(Reg::Rcx, (-11i64) as u64);
+    a.mov_imm(Reg::Rdi, 6);
+    a.cmp(Reg::Rax, Reg::Rcx);
+    a.jne(bad);
+    a.mov_imm(Reg::Rdi, 0);
+    a.bind(bad);
+    a.sys(sys::EXIT_GROUP);
+    static_elf(&a.finish(BLOB_VADDR).unwrap_or_else(|| fail("assembler")))
+}
+
+/// A fork costs what it copies: in a 128-page cell, a process with 80
+/// touched pages forks (charging the child for all of them again would
+/// need 160 pages and fail), and the child copies one page by writing it.
+/// Exits 0; 1 if fork failed; 2 if the child did not exit 0.
+fn fork_charge_program() -> Vec<u8> {
+    const PAGES: u64 = 80;
+    let mut a = Asm::new();
+    let bad = a.label();
+    let parent = a.label();
+    let fill = a.label();
+    a.mov(Reg::Rbp, Reg::Rsp);
+    a.sub_imm(Reg::Rbp, 4096);
+    a.mov_imm(Reg::Rdi, 0);
+    a.mov_imm(Reg::Rsi, PAGES * 4096);
+    a.mov_imm(Reg::Rdx, 3);
+    a.mov_imm(Reg::R10, 0x22);
+    a.mov_imm(Reg::R8, u64::MAX);
+    a.mov_imm(Reg::R9, 0);
+    a.sys(sys::MMAP);
+    a.mov(Reg::R12, Reg::Rax);
+    a.mov_imm(Reg::Rcx, 0);
+    a.mov(Reg::Rdx, Reg::R12);
+    a.bind(fill);
+    a.store(Reg::Rdx, 0, Reg::Rcx);
+    a.add_imm(Reg::Rdx, 4096);
+    a.add_imm(Reg::Rcx, 1);
+    a.cmp_imm(Reg::Rcx, PAGES as i32);
+    a.jne(fill);
+    a.sys(sys::FORK);
+    a.mov_imm(Reg::Rdi, 1);
+    a.mov_imm(Reg::R14, (-4096i64) as u64);
+    a.cmp(Reg::Rax, Reg::R14);
+    a.ja(bad); // -errno
+    a.mov(Reg::R13, Reg::Rax);
+    a.cmp_imm(Reg::Rax, 0);
+    a.jne(parent);
+    // Child: write one page (its copy), check it, exit 0.
+    a.mov_imm(Reg::Rax, 0x77);
+    a.store(Reg::R12, 0, Reg::Rax);
+    a.load(Reg::Rcx, Reg::R12, 0);
+    a.mov_imm(Reg::Rdi, 9);
+    a.cmp(Reg::Rcx, Reg::Rax);
+    a.jne(bad);
+    a.mov_imm(Reg::Rdi, 0);
+    a.sys(sys::EXIT_GROUP);
+    a.bind(parent);
+    a.mov(Reg::Rdi, Reg::R13);
+    a.mov(Reg::Rsi, Reg::Rbp);
+    a.mov_imm(Reg::Rdx, 0);
+    a.mov_imm(Reg::R10, 0);
+    a.sys(sys::WAIT4);
+    a.load32(Reg::Rax, Reg::Rbp, 0);
+    a.mov_imm(Reg::Rdi, 2);
+    a.cmp_imm(Reg::Rax, 0);
+    a.jne(bad);
+    // The parent's page 0 still holds 0: the child's write was its own.
+    a.load(Reg::Rax, Reg::R12, 0);
+    a.mov_imm(Reg::Rdi, 3);
+    a.cmp_imm(Reg::Rax, 0);
+    a.jne(bad);
+    a.mov_imm(Reg::Rdi, 0);
+    a.bind(bad);
+    a.sys(sys::EXIT_GROUP);
+    static_elf(&a.finish(BLOB_VADDR).unwrap_or_else(|| fail("assembler")))
+}
+
+/// Ranges bigger than one batch of page bookkeeping (4096 pages): 4200
+/// touched pages, each holding its index, move with mremap and are all
+/// found at the new address, are made read-only, then unmapped. (Lists of
+/// every page used to be one allocation, which a 2 GiB process could not
+/// get.) Exits 0, or the failed check.
+fn big_range_program() -> Vec<u8> {
+    const PAGES: u64 = 4200;
+    const LEN: u64 = PAGES * 4096;
+    let mut a = Asm::new();
+    let bad = a.label();
+    let fill = a.label();
+    let check = a.label();
+    a.mov_imm(Reg::Rdi, 0);
+    a.mov_imm(Reg::Rsi, LEN);
+    a.mov_imm(Reg::Rdx, 3);
+    a.mov_imm(Reg::R10, 0x22);
+    a.mov_imm(Reg::R8, u64::MAX);
+    a.mov_imm(Reg::R9, 0);
+    a.sys(sys::MMAP);
+    a.mov(Reg::R12, Reg::Rax);
+    // Page i holds i.
+    a.mov_imm(Reg::Rcx, 0);
+    a.mov(Reg::Rdx, Reg::R12);
+    a.bind(fill);
+    a.store(Reg::Rdx, 0, Reg::Rcx);
+    a.add_imm(Reg::Rdx, 4096);
+    a.add_imm(Reg::Rcx, 1);
+    a.cmp_imm(Reg::Rcx, PAGES as i32);
+    a.jne(fill);
+    // mremap(old, LEN, 2 * LEN, MREMAP_MAYMOVE): a bigger region elsewhere.
+    a.mov(Reg::Rdi, Reg::R12);
+    a.mov_imm(Reg::Rsi, LEN);
+    a.mov_imm(Reg::Rdx, 2 * LEN);
+    a.mov_imm(Reg::R10, 1);
+    a.sys(sys::MREMAP);
+    a.mov(Reg::R13, Reg::Rax);
+    a.mov_imm(Reg::Rcx, 0);
+    a.mov(Reg::Rdx, Reg::R13);
+    a.bind(check);
+    a.load(Reg::Rax, Reg::Rdx, 0);
+    a.mov_imm(Reg::Rdi, 1);
+    a.cmp(Reg::Rax, Reg::Rcx);
+    a.jne(bad);
+    a.add_imm(Reg::Rdx, 4096);
+    a.add_imm(Reg::Rcx, 1);
+    a.cmp_imm(Reg::Rcx, PAGES as i32);
+    a.jne(check);
+    a.mov(Reg::Rdi, Reg::R13);
+    a.mov_imm(Reg::Rsi, 2 * LEN);
+    a.mov_imm(Reg::Rdx, 1); // PROT_READ
+    a.sys(sys::MPROTECT);
+    a.mov_imm(Reg::Rdi, 2);
+    a.cmp_imm(Reg::Rax, 0);
+    a.jne(bad);
+    a.load(Reg::Rax, Reg::R13, (4096 * (PAGES - 1)) as i32);
+    a.mov_imm(Reg::R14, PAGES - 1);
+    a.mov_imm(Reg::Rdi, 3);
+    a.cmp(Reg::Rax, Reg::R14);
+    a.jne(bad);
+    a.mov(Reg::Rdi, Reg::R13);
+    a.mov_imm(Reg::Rsi, 2 * LEN);
+    a.sys(sys::MUNMAP);
+    a.mov_imm(Reg::Rdi, 4);
+    a.cmp_imm(Reg::Rax, 0);
+    a.jne(bad);
+    a.mov_imm(Reg::Rdi, 0);
+    a.bind(bad);
+    a.sys(sys::EXIT_GROUP);
+    static_elf(&a.finish(BLOB_VADDR).unwrap_or_else(|| fail("assembler")))
+}
+
+/// More of what CPython's suite calls: waitid reports a child's exit as a
+/// siginfo (CLD_EXITED, status 5); preadv reads at an offset; nothing is
+/// pending for rt_sigpending; SCHED_FIFO's priorities top out at 99; an
+/// affinity mask set is the one read back; a pipe's capacity reads 64 KiB
+/// and can be set to one page; clock_settime is EPERM. Exits 0, or the
+/// failed check.
+fn misc2_program() -> Vec<u8> {
+    const WEXITED: u64 = 4;
+    let neg = |e: i64| (-e) as u64;
+    let mut a = Asm::new();
+    let bad = a.label();
+    let parent = a.label();
+    let check = |a: &mut Asm, n: u64, want: u64| {
+        a.mov_imm(Reg::R14, want);
+        a.mov_imm(Reg::Rdi, n);
+        a.cmp(Reg::Rax, Reg::R14);
+        a.jne(bad);
+    };
+    a.mov(Reg::Rbp, Reg::Rsp);
+    a.sub_imm(Reg::Rbp, 4096);
+    a.sys(sys::FORK);
+    a.mov(Reg::R12, Reg::Rax);
+    a.cmp_imm(Reg::Rax, 0);
+    a.jne(parent);
+    a.mov_imm(Reg::Rdi, 5);
+    a.sys(sys::EXIT_GROUP);
+    a.bind(parent);
+    a.mov_imm(Reg::Rdi, 1); // P_PID
+    a.mov(Reg::Rsi, Reg::R12);
+    a.mov(Reg::Rdx, Reg::Rbp);
+    a.mov_imm(Reg::R10, WEXITED);
+    a.mov_imm(Reg::R8, 0);
+    a.sys(sys::WAITID);
+    check(&mut a, 1, 0);
+    a.load32(Reg::Rax, Reg::Rbp, 8); // si_code
+    check(&mut a, 2, 1);
+    a.load32(Reg::Rax, Reg::Rbp, 24); // si_status
+    check(&mut a, 3, 5);
+    // A pipe: write "abcdef", preadv is ESPIPE on it; its capacity.
+    a.mov(Reg::Rdi, Reg::Rbp);
+    a.add_imm(Reg::Rdi, 256);
+    a.mov_imm(Reg::Rsi, 0);
+    a.sys(sys::PIPE2);
+    check(&mut a, 4, 0);
+    a.load32(Reg::R13, Reg::Rbp, 256); // read end
+    a.mov(Reg::Rdi, Reg::R13);
+    a.mov_imm(Reg::Rsi, 1032); // F_GETPIPE_SZ
+    a.sys(sys::FCNTL);
+    check(&mut a, 5, 64 * 1024);
+    a.mov(Reg::Rdi, Reg::R13);
+    a.mov_imm(Reg::Rsi, 1031); // F_SETPIPE_SZ
+    a.mov_imm(Reg::Rdx, 100);
+    a.sys(sys::FCNTL);
+    check(&mut a, 6, 4096);
+    // preadv on a file at offset 1: "/x" of a fresh file holding "hello".
+    let name = a.data(b"/preadv\0");
+    let text = a.data(b"hello");
+    a.mov_data(Reg::Rdi, name);
+    a.mov_imm(Reg::Rsi, 0o102); // O_RDWR | O_CREAT
+    a.mov_imm(Reg::Rdx, 0o644);
+    a.sys(sys::OPEN);
+    a.mov(Reg::R15, Reg::Rax);
+    a.mov(Reg::Rdi, Reg::R15);
+    a.mov_data(Reg::Rsi, text);
+    a.mov_imm(Reg::Rdx, 5);
+    a.sys(sys::WRITE);
+    check(&mut a, 7, 5);
+    // iovec { rbp + 512, 3 } at rbp + 64.
+    a.mov(Reg::Rax, Reg::Rbp);
+    a.add_imm(Reg::Rax, 512);
+    a.store(Reg::Rbp, 64, Reg::Rax);
+    a.mov_imm(Reg::Rax, 3);
+    a.store(Reg::Rbp, 72, Reg::Rax);
+    a.mov(Reg::Rdi, Reg::R15);
+    a.mov(Reg::Rsi, Reg::Rbp);
+    a.add_imm(Reg::Rsi, 64);
+    a.mov_imm(Reg::Rdx, 1);
+    a.mov_imm(Reg::R10, 1);
+    a.mov_imm(Reg::R8, 0);
+    a.sys(sys::PREADV);
+    check(&mut a, 8, 3);
+    a.load32(Reg::Rax, Reg::Rbp, 512);
+    a.mov_imm(Reg::Rcx, 0xff_ffff);
+    a.raw(&[0x48, 0x21, 0xc8]); // and rax, rcx
+    check(&mut a, 9, u64::from(u32::from_le_bytes(*b"ell\0")));
+    a.mov(Reg::Rdi, Reg::Rbp);
+    a.mov_imm(Reg::Rsi, 8);
+    a.sys(sys::RT_SIGPENDING);
+    check(&mut a, 10, 0);
+    a.load(Reg::Rax, Reg::Rbp, 0);
+    check(&mut a, 11, 0);
+    a.mov_imm(Reg::Rdi, 1); // SCHED_FIFO
+    a.sys(sys::SCHED_GET_PRIORITY_MAX);
+    check(&mut a, 12, 99);
+    a.mov_imm(Reg::Rax, 1); // CPU 0 only
+    a.store(Reg::Rbp, 0, Reg::Rax);
+    a.mov_imm(Reg::Rdi, 0);
+    a.mov_imm(Reg::Rsi, 8);
+    a.mov(Reg::Rdx, Reg::Rbp);
+    a.sys(sys::SCHED_SETAFFINITY);
+    check(&mut a, 13, 0);
+    a.mov_imm(Reg::Rax, 0);
+    a.store(Reg::Rbp, 0, Reg::Rax);
+    a.mov_imm(Reg::Rdi, 0);
+    a.mov_imm(Reg::Rsi, 8);
+    a.mov(Reg::Rdx, Reg::Rbp);
+    a.sys(sys::SCHED_GETAFFINITY);
+    check(&mut a, 14, 8);
+    a.load(Reg::Rax, Reg::Rbp, 0);
+    check(&mut a, 15, 1);
+    a.mov_imm(Reg::Rdi, 0);
+    a.mov(Reg::Rsi, Reg::Rbp);
+    a.sys(sys::CLOCK_SETTIME);
+    check(&mut a, 16, neg(1));
+    a.mov_imm(Reg::Rdi, 0);
+    a.bind(bad);
+    a.sys(sys::EXIT_GROUP);
+    static_elf(&a.finish(BLOB_VADDR).unwrap_or_else(|| fail("assembler")))
+}
+
+/// Robust futexes: a forked child registers a robust list (in MAP_SHARED
+/// memory) holding one lock whose word is its tid, and exits holding it;
+/// the parent then finds the word marked FUTEX_OWNER_DIED with the tid
+/// gone. A head length other than 24 is EINVAL. Exits 0, or the failed
+/// check.
+fn robust_program() -> Vec<u8> {
+    const OWNER_DIED: u64 = 0x4000_0000;
+    let mut a = Asm::new();
+    let bad = a.label();
+    let parent = a.label();
+    a.mov(Reg::Rbp, Reg::Rsp);
+    a.sub_imm(Reg::Rbp, 4096);
+    a.mov_imm(Reg::Rdi, 0);
+    a.mov_imm(Reg::Rsi, 4096);
+    a.mov_imm(Reg::Rdx, 3);
+    a.mov_imm(Reg::R10, 0x21); // MAP_SHARED | MAP_ANONYMOUS
+    a.mov_imm(Reg::R8, u64::MAX);
+    a.mov_imm(Reg::R9, 0);
+    a.sys(sys::MMAP);
+    a.mov(Reg::R13, Reg::Rax);
+    a.mov(Reg::Rdi, Reg::R13);
+    a.mov_imm(Reg::Rsi, 23);
+    a.sys(sys::SET_ROBUST_LIST);
+    a.mov_imm(Reg::R14, (-22i64) as u64);
+    a.mov_imm(Reg::Rdi, 1);
+    a.cmp(Reg::Rax, Reg::R14);
+    a.jne(bad);
+    a.sys(sys::FORK);
+    a.mov(Reg::R12, Reg::Rax);
+    a.cmp_imm(Reg::Rax, 0);
+    a.jne(parent);
+    // Child: head at +0 { next = +32, futex_offset = 8, pending = 0 };
+    // the lock's entry at +32 { next = head }, its word at +40 = tid.
+    a.sys(sys::GETTID);
+    a.store32(Reg::R13, 40, Reg::Rax);
+    a.mov(Reg::Rax, Reg::R13);
+    a.add_imm(Reg::Rax, 32);
+    a.store(Reg::R13, 0, Reg::Rax);
+    a.mov_imm(Reg::Rax, 8);
+    a.store(Reg::R13, 8, Reg::Rax);
+    a.mov_imm(Reg::Rax, 0);
+    a.store(Reg::R13, 16, Reg::Rax);
+    a.store(Reg::R13, 32, Reg::R13);
+    a.mov(Reg::Rdi, Reg::R13);
+    a.mov_imm(Reg::Rsi, 24);
+    a.sys(sys::SET_ROBUST_LIST);
+    a.mov(Reg::Rdi, Reg::Rax); // exit status: set_robust_list's result
+    a.sys(sys::EXIT);
+    a.bind(parent);
+    a.mov(Reg::Rdi, Reg::R12);
+    a.mov(Reg::Rsi, Reg::Rbp);
+    a.mov_imm(Reg::Rdx, 0);
+    a.mov_imm(Reg::R10, 0);
+    a.sys(sys::WAIT4);
+    a.mov_imm(Reg::Rdi, 2);
+    a.cmp(Reg::Rax, Reg::R12);
+    a.jne(bad);
+    a.load32(Reg::Rax, Reg::Rbp, 0);
+    a.mov_imm(Reg::R14, 0);
+    a.mov_imm(Reg::Rdi, 3); // the child's set_robust_list failed
+    a.cmp(Reg::Rax, Reg::R14);
+    a.jne(bad);
+    a.load32(Reg::Rax, Reg::R13, 40);
+    a.mov_imm(Reg::R14, OWNER_DIED);
+    a.mov_imm(Reg::Rdi, 4);
+    a.cmp(Reg::Rax, Reg::R14);
+    a.jne(bad);
+    a.mov_imm(Reg::Rdi, 0);
+    a.bind(bad);
+    a.sys(sys::EXIT_GROUP);
+    static_elf(&a.finish(BLOB_VADDR).unwrap_or_else(|| fail("assembler")))
+}
+
+/// Named pipes: `mknod(S_IFIFO)` makes one that stats as a FIFO; a
+/// non-blocking open for writing with no reader is ENXIO; with a reader
+/// open, bytes pass and the last writer's close is EOF; a blocking reader
+/// open waits for a forked child's blocking writer open (each waits for
+/// the other); device nodes are EPERM. Exits 0, or the failed check.
+fn fifo_program() -> Vec<u8> {
+    const S_IFIFO: u64 = 0o010_000;
+    const O_WRONLY: u64 = 1;
+    const O_NONBLOCK: u64 = 0o4000;
+    let neg = |e: i64| (-e) as u64;
+    let mut a = Asm::new();
+    let bad = a.label();
+    let parent = a.label();
+    let path = a.data(b"/fifo\0");
+    let dev = a.data(b"/dev0\0");
+    let text = a.data(b"abc");
+    let check = |a: &mut Asm, n: u64, want: u64| {
+        a.mov_imm(Reg::R14, want);
+        a.mov_imm(Reg::Rdi, n);
+        a.cmp(Reg::Rax, Reg::R14);
+        a.jne(bad);
+    };
+    let open = |a: &mut Asm, flags: u64| {
+        a.mov_data(Reg::Rdi, path);
+        a.mov_imm(Reg::Rsi, flags);
+        a.mov_imm(Reg::Rdx, 0);
+        a.sys(sys::OPEN);
+    };
+    a.mov(Reg::Rbp, Reg::Rsp);
+    a.sub_imm(Reg::Rbp, 4096);
+    a.mov_data(Reg::Rdi, path);
+    a.mov_imm(Reg::Rsi, S_IFIFO | 0o644);
+    a.mov_imm(Reg::Rdx, 0);
+    a.sys(sys::MKNOD);
+    check(&mut a, 1, 0);
+    a.mov_data(Reg::Rdi, path);
+    a.mov(Reg::Rsi, Reg::Rbp);
+    a.sys(sys::STAT);
+    check(&mut a, 2, 0);
+    a.load32(Reg::Rax, Reg::Rbp, 24); // st_mode
+    check(&mut a, 3, S_IFIFO | 0o644);
+    open(&mut a, O_WRONLY | O_NONBLOCK);
+    check(&mut a, 4, neg(6)); // ENXIO
+    open(&mut a, O_NONBLOCK);
+    check(&mut a, 5, 3);
+    open(&mut a, O_WRONLY | O_NONBLOCK);
+    check(&mut a, 6, 4);
+    a.mov_imm(Reg::Rdi, 4);
+    a.mov_data(Reg::Rsi, text);
+    a.mov_imm(Reg::Rdx, 3);
+    a.sys(sys::WRITE);
+    check(&mut a, 7, 3);
+    a.mov_imm(Reg::Rdi, 4);
+    a.sys(sys::CLOSE);
+    for (n, want) in [(8, 3), (9, 0)] {
+        a.mov_imm(Reg::Rdi, 3);
+        a.mov(Reg::Rsi, Reg::Rbp);
+        a.mov_imm(Reg::Rdx, 16);
+        a.sys(sys::READ);
+        check(&mut a, n, want); // the bytes, then EOF
+    }
+    a.mov_imm(Reg::Rdi, 3);
+    a.sys(sys::CLOSE);
+    // Blocking opens meet across fork.
+    a.sys(sys::FORK);
+    a.mov(Reg::R12, Reg::Rax);
+    a.cmp_imm(Reg::Rax, 0);
+    a.jne(parent);
+    open(&mut a, O_WRONLY);
+    a.mov(Reg::Rdi, Reg::Rax);
+    a.mov_data(Reg::Rsi, text);
+    a.mov_imm(Reg::Rdx, 1);
+    a.sys(sys::WRITE);
+    a.mov_imm(Reg::Rdi, 0);
+    a.sys(sys::EXIT_GROUP);
+    a.bind(parent);
+    open(&mut a, 0);
+    check(&mut a, 10, 3);
+    a.mov_imm(Reg::Rdi, 3);
+    a.mov(Reg::Rsi, Reg::Rbp);
+    a.mov_imm(Reg::Rdx, 16);
+    a.sys(sys::READ);
+    check(&mut a, 11, 1);
+    a.mov(Reg::Rdi, Reg::R12);
+    a.mov(Reg::Rsi, Reg::Rbp);
+    a.add_imm(Reg::Rsi, 64);
+    a.mov_imm(Reg::Rdx, 0);
+    a.mov_imm(Reg::R10, 0);
+    a.sys(sys::WAIT4);
+    a.mov_imm(Reg::Rdi, 12);
+    a.cmp(Reg::Rax, Reg::R12);
+    a.jne(bad);
+    a.mov_data(Reg::Rdi, dev);
+    a.mov_imm(Reg::Rsi, 0o020_000 | 0o644); // S_IFCHR
+    a.mov_imm(Reg::Rdx, 0x103);
+    a.sys(sys::MKNOD);
+    check(&mut a, 13, neg(1));
+    a.mov_imm(Reg::Rdi, 0);
+    a.bind(bad);
+    a.sys(sys::EXIT_GROUP);
+    static_elf(&a.finish(BLOB_VADDR).unwrap_or_else(|| fail("assembler")))
+}
+
 /// Readiness: poll on an empty pipe times out at once; a blocking poll
 /// wakes when a forked child writes 50 ms later; epoll reports the pipe
 /// with its registered data; an eventfd counts. Exits 0 if every check
@@ -1223,6 +2042,131 @@ fn poll_program() -> Vec<u8> {
     static_elf(&a.finish(BLOB_VADDR).unwrap_or_else(|| fail("assembler")))
 }
 
+/// A thread asleep in `epoll_wait` on an empty instance sees what another
+/// thread adds to it, and does not keep a pipe's write end open once it is
+/// closed: the read end (added edge-triggered) reports the hang-up, and
+/// reads end-of-file. Go's runtime parks a thread there all the time.
+/// Exits 0, or the failed check.
+fn epoll_threads_program() -> Vec<u8> {
+    const FLAGS: u64 = 0x35_0f00; // as `thread_program`
+    const FUTEX_WAIT_PRIVATE: u64 = 128;
+    const FUTEX_WAKE_PRIVATE: u64 = 129;
+    const IN_RDHUP_ET: u64 = 0x8000_2001;
+    let mut a = Asm::new();
+    let bad = a.label();
+    let main = a.label();
+    let wait = a.label();
+    let woken = a.label();
+    let ms50 = a.data(&[0, 0, 0, 0, 0, 0, 0, 0, 0x80, 0xf0, 0xfa, 0x02, 0, 0, 0, 0]);
+    let s5 = a.data(&[5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    let expect = |a: &mut Asm, n: u64, v: i32| {
+        a.mov_imm(Reg::R15, n);
+        a.cmp_imm(Reg::Rax, v);
+        a.jne(bad);
+    };
+    let nap = |a: &mut Asm| {
+        a.mov_data(Reg::Rdi, ms50);
+        a.mov_imm(Reg::Rsi, 0);
+        a.sys(sys::NANOSLEEP);
+    };
+    // [rbp] done, [rbp+8] epoll_wait's result, +16 the event added, +32 the
+    // pipe's ends, +48 the thread's tid, +64 the events reported.
+    a.mov(Reg::Rbp, Reg::Rsp);
+    a.sub_imm(Reg::Rbp, 4096);
+    a.mov_imm(Reg::Rax, 0);
+    a.store(Reg::Rbp, 0, Reg::Rax);
+    a.store(Reg::Rbp, 24, Reg::Rax);
+    a.mov_imm(Reg::Rax, IN_RDHUP_ET | (0x77 << 32));
+    a.store(Reg::Rbp, 16, Reg::Rax);
+    // 1: epoll -> 3, a pipe -> 4 and 5, a stack for the thread.
+    a.mov_imm(Reg::Rdi, 0);
+    a.sys(sys::EPOLL_CREATE1);
+    expect(&mut a, 1, 3);
+    a.mov(Reg::Rdi, Reg::Rbp);
+    a.add_imm(Reg::Rdi, 32);
+    a.mov_imm(Reg::Rsi, 0);
+    a.sys(sys::PIPE2);
+    expect(&mut a, 1, 0);
+    a.mov_imm(Reg::Rdi, 0);
+    a.mov_imm(Reg::Rsi, 0x1_0000);
+    a.mov_imm(Reg::Rdx, 3);
+    a.mov_imm(Reg::R10, 0x22);
+    a.mov_imm(Reg::R8, u64::MAX);
+    a.mov_imm(Reg::R9, 0);
+    a.sys(sys::MMAP);
+    a.mov(Reg::Rsi, Reg::Rax);
+    a.add_imm(Reg::Rsi, 0x1_0000);
+    a.mov_imm(Reg::Rdi, FLAGS);
+    a.mov(Reg::Rdx, Reg::Rbp);
+    a.add_imm(Reg::Rdx, 48);
+    a.mov(Reg::R10, Reg::Rdx);
+    a.mov_imm(Reg::R8, 0);
+    a.sys(sys::CLONE);
+    a.cmp_imm(Reg::Rax, 0);
+    a.jne(main);
+    // The thread: wait for whatever comes.
+    a.mov_imm(Reg::Rdi, 3);
+    a.mov(Reg::Rsi, Reg::Rbp);
+    a.add_imm(Reg::Rsi, 64);
+    a.mov_imm(Reg::Rdx, 4);
+    a.mov_imm(Reg::R10, u64::MAX); // -1: no timeout
+    a.sys(sys::EPOLL_WAIT);
+    a.store(Reg::Rbp, 8, Reg::Rax);
+    a.mov_imm(Reg::Rax, 1);
+    a.store(Reg::Rbp, 0, Reg::Rax);
+    a.mov(Reg::Rdi, Reg::Rbp);
+    a.mov_imm(Reg::Rsi, FUTEX_WAKE_PRIVATE);
+    a.mov_imm(Reg::Rdx, 1);
+    a.sys(sys::FUTEX);
+    a.mov_imm(Reg::Rdi, 0);
+    a.sys(sys::EXIT);
+    // Main: once it sleeps, add the read end; a while later close the
+    // write end.
+    a.bind(main);
+    nap(&mut a);
+    a.mov_imm(Reg::Rdi, 3);
+    a.mov_imm(Reg::Rsi, 1); // EPOLL_CTL_ADD
+    a.mov_imm(Reg::Rdx, 4);
+    a.mov(Reg::R10, Reg::Rbp);
+    a.add_imm(Reg::R10, 16);
+    a.sys(sys::EPOLL_CTL);
+    expect(&mut a, 2, 0);
+    nap(&mut a);
+    a.mov_imm(Reg::Rdi, 5);
+    a.sys(sys::CLOSE);
+    expect(&mut a, 2, 0);
+    // 3: the thread is woken (within 5 s).
+    a.bind(wait);
+    a.load(Reg::Rax, Reg::Rbp, 0);
+    a.cmp_imm(Reg::Rax, 0);
+    a.jne(woken);
+    a.mov(Reg::Rdi, Reg::Rbp);
+    a.mov_imm(Reg::Rsi, FUTEX_WAIT_PRIVATE);
+    a.mov_imm(Reg::Rdx, 0);
+    a.mov_data(Reg::R10, s5);
+    a.sys(sys::FUTEX);
+    a.mov_imm(Reg::R15, 3);
+    a.cmp_imm(Reg::Rax, -110); // ETIMEDOUT
+    a.je(bad);
+    a.jmp(wait);
+    // 4: with one event, the pipe's; 5: which reads end-of-file.
+    a.bind(woken);
+    a.load(Reg::Rax, Reg::Rbp, 8);
+    expect(&mut a, 4, 1);
+    a.load(Reg::Rax, Reg::Rbp, 68);
+    expect(&mut a, 4, 0x77);
+    a.mov_imm(Reg::Rdi, 4);
+    a.mov(Reg::Rsi, Reg::Rbp);
+    a.mov_imm(Reg::Rdx, 8);
+    a.sys(sys::READ);
+    expect(&mut a, 5, 0);
+    a.mov_imm(Reg::R15, 0);
+    a.bind(bad);
+    a.mov(Reg::Rdi, Reg::R15);
+    a.sys(sys::EXIT_GROUP);
+    static_elf(&a.finish(BLOB_VADDR).unwrap_or_else(|| fail("assembler")))
+}
+
 /// Close-on-exec: opens a file with and without `O_CLOEXEC` and a pipe with
 /// `O_CLOEXEC`, then execs `/bin/sh`, which checks through `/proc/self/fd`
 /// that only the plain descriptor survived. Needs a root with busybox.
@@ -1259,6 +2203,49 @@ pub(crate) fn cloexec_program() -> Vec<u8> {
     a.mov_data(Reg::Rdi, sh);
     a.mov(Reg::Rsi, Reg::Rbp);
     a.mov_imm(Reg::Rdx, 0);
+    a.sys(sys::EXECVE);
+    // Only reached if execve failed.
+    a.mov_imm(Reg::Rdi, 99);
+    a.sys(sys::EXIT_GROUP);
+    static_elf(&a.finish(BLOB_VADDR).unwrap_or_else(|| fail("assembler")))
+}
+
+/// argv and envp are bytes: execs `/bin/sh` with a 5,000-byte argument
+/// (longer than a path) and `X=\xff\xfe` (not UTF-8) in its environment;
+/// the shell checks both arrived whole. Exits 99 if execve failed. Needs a
+/// root with busybox.
+pub(crate) fn exec_bytes_program() -> Vec<u8> {
+    let mut a = Asm::new();
+    let sh = a.data(b"/bin/sh\0");
+    let arg0 = a.data(b"sh\0");
+    let arg1 = a.data(b"-c\0");
+    let arg2 = a.data(
+        b"[ ${#1} -eq 5000 ] && [ \"$X\" = \"$(printf '\\377\\376')\" ] \
+          && echo sh: exec passed a 5000-byte argument and a non-UTF-8 environment\0",
+    );
+    let arg3 = a.data(b"name\0");
+    let mut long = alloc::vec![b'a'; 5000];
+    long.push(0);
+    let arg4 = a.data(&long);
+    let env0 = a.data(b"X=\xff\xfe\0");
+    a.mov(Reg::Rbp, Reg::Rsp);
+    a.sub_imm(Reg::Rbp, 4096);
+    // argv = { "sh", "-c", script, "name", long, NULL } at rbp;
+    // envp = { "X=\xff\xfe", NULL } at rbp + 64.
+    for (i, d) in [arg0, arg1, arg2, arg3, arg4].into_iter().enumerate() {
+        a.mov_data(Reg::Rax, d);
+        a.store(Reg::Rbp, (i * 8) as i32, Reg::Rax);
+    }
+    a.mov_imm(Reg::Rax, 0);
+    a.store(Reg::Rbp, 40, Reg::Rax);
+    a.mov_data(Reg::Rax, env0);
+    a.store(Reg::Rbp, 64, Reg::Rax);
+    a.mov_imm(Reg::Rax, 0);
+    a.store(Reg::Rbp, 72, Reg::Rax);
+    a.mov_data(Reg::Rdi, sh);
+    a.mov(Reg::Rsi, Reg::Rbp);
+    a.mov(Reg::Rdx, Reg::Rbp);
+    a.add_imm(Reg::Rdx, 64);
     a.sys(sys::EXECVE);
     // Only reached if execve failed.
     a.mov_imm(Reg::Rdi, 99);
@@ -1790,6 +2777,153 @@ fn shared_program() -> Vec<u8> {
     static_elf(&a.finish(BLOB_VADDR).unwrap_or_else(|| fail("assembler")))
 }
 
+/// Shared file mappings are the file: what is stored through one, `pread`,
+/// another mapping and a forked child see, and the other way round; a
+/// write through a mapping of an image file copies it up; a private mapping
+/// keeps its stores; a descriptor opened for reading cannot be mapped (or
+/// made) writable. Exits 0, or the failed check.
+fn shared_file_program() -> Vec<u8> {
+    const RW: u64 = 3;
+    const SHARED: u64 = 1;
+    const PRIVATE: u64 = 2;
+    const EACCES: i32 = -13;
+    let mut a = Asm::new();
+    let bad = a.label();
+    let parent = a.label();
+    let path = a.data(b"/shfile\0");
+    let motd = a.data(b"/usr/share/motd\0");
+    let expect = |a: &mut Asm, n: u64, v: i32| {
+        a.mov_imm(Reg::R15, n);
+        a.cmp_imm(Reg::Rax, v);
+        a.jne(bad);
+    };
+    let open = |a: &mut Asm, path, flags: u64, n: u64, want: i32| {
+        a.mov_data(Reg::Rdi, path);
+        a.mov_imm(Reg::Rsi, flags);
+        a.mov_imm(Reg::Rdx, 0o644);
+        a.sys(sys::OPEN);
+        expect(a, n, want);
+    };
+    let map = |a: &mut Asm, len: u64, prot: u64, flags: u64, fd: u64| {
+        a.mov_imm(Reg::Rdi, 0);
+        a.mov_imm(Reg::Rsi, len);
+        a.mov_imm(Reg::Rdx, prot);
+        a.mov_imm(Reg::R10, flags);
+        a.mov_imm(Reg::R8, fd);
+        a.mov_imm(Reg::R9, 0);
+        a.sys(sys::MMAP);
+    };
+    // pread64/pwrite64(fd, rbp, 8, at), then the 8 bytes in rax.
+    let io = |a: &mut Asm, nr: u64, fd: u64, at: u64, n: u64| {
+        a.mov_imm(Reg::Rdi, fd);
+        a.mov(Reg::Rsi, Reg::Rbp);
+        a.mov_imm(Reg::Rdx, 8);
+        a.mov_imm(Reg::R10, at);
+        a.sys(nr);
+        expect(a, n, 8);
+        a.load(Reg::Rax, Reg::Rbp, 0);
+    };
+    let put = |a: &mut Asm, base: Reg, at: i32, v: u64| {
+        a.mov_imm(Reg::Rax, v);
+        a.store(base, at, Reg::Rax);
+    };
+    a.mov(Reg::Rbp, Reg::Rsp);
+    a.sub_imm(Reg::Rbp, 4096);
+    open(&mut a, path, 0o102, 1, 3); // O_RDWR | O_CREAT
+    a.mov_imm(Reg::Rdi, 3);
+    a.mov_imm(Reg::Rsi, 12288);
+    a.sys(sys::FTRUNCATE);
+    expect(&mut a, 1, 0);
+    map(&mut a, 12288, RW, SHARED, 3);
+    a.mov(Reg::R12, Reg::Rax);
+    // 2: a store is in the file (a hole was given a page).
+    put(&mut a, Reg::R12, 4104, 0x41);
+    io(&mut a, sys::PREAD64, 3, 4104, 2);
+    expect(&mut a, 2, 0x41);
+    // 3: a write is in the mapping.
+    put(&mut a, Reg::Rbp, 0, 0x42);
+    io(&mut a, sys::PWRITE64, 3, 16, 3);
+    a.load(Reg::Rax, Reg::R12, 16);
+    expect(&mut a, 3, 0x42);
+    // 4: a forked child's store (to a page nobody had touched) is ours.
+    a.sys(sys::FORK);
+    a.mov(Reg::Rbx, Reg::Rax);
+    a.cmp_imm(Reg::Rax, 0);
+    a.jne(parent);
+    put(&mut a, Reg::R12, 8192, 0x43);
+    put(&mut a, Reg::R12, 16, 0x46);
+    a.mov_imm(Reg::Rdi, 0);
+    a.sys(sys::EXIT_GROUP);
+    a.bind(parent);
+    a.mov(Reg::Rdi, Reg::Rbx);
+    a.mov_imm(Reg::Rsi, 0);
+    a.mov_imm(Reg::Rdx, 0);
+    a.mov_imm(Reg::R10, 0);
+    a.sys(sys::WAIT4);
+    a.load(Reg::Rax, Reg::R12, 8192);
+    expect(&mut a, 4, 0x43);
+    a.load(Reg::Rax, Reg::R12, 16);
+    expect(&mut a, 4, 0x46);
+    // 5, 6: so it is in another mapping, both ways.
+    map(&mut a, 12288, RW, SHARED, 3);
+    a.mov(Reg::R13, Reg::Rax);
+    a.load(Reg::Rax, Reg::R13, 8192);
+    expect(&mut a, 5, 0x43);
+    put(&mut a, Reg::R13, 0, 0x44);
+    a.load(Reg::Rax, Reg::R12, 0);
+    expect(&mut a, 6, 0x44);
+    // 7: msync of it, and of what is not mapped (ENOMEM).
+    a.mov(Reg::Rdi, Reg::R12);
+    a.mov_imm(Reg::Rsi, 12288);
+    a.mov_imm(Reg::Rdx, 4); // MS_SYNC
+    a.sys(sys::MSYNC);
+    expect(&mut a, 7, 0);
+    a.mov_imm(Reg::Rdi, 4096);
+    a.mov_imm(Reg::Rsi, 4096);
+    a.mov_imm(Reg::Rdx, 4);
+    a.sys(sys::MSYNC);
+    expect(&mut a, 7, -12);
+    // 8, 9: opened for reading, it cannot be written.
+    open(&mut a, path, 0, 8, 4);
+    map(&mut a, 4096, RW, SHARED, 4);
+    expect(&mut a, 8, EACCES);
+    map(&mut a, 4096, 1, SHARED, 4);
+    a.mov(Reg::R14, Reg::Rax);
+    a.mov(Reg::Rdi, Reg::R14);
+    a.mov_imm(Reg::Rsi, 4096);
+    a.mov_imm(Reg::Rdx, RW);
+    a.sys(sys::MPROTECT);
+    expect(&mut a, 9, EACCES);
+    a.load(Reg::Rax, Reg::R14, 0);
+    expect(&mut a, 9, 0x44);
+    // 10: an image file: read first, then written, copied up under us.
+    open(&mut a, motd, 2, 10, 5); // O_RDWR
+    map(&mut a, 4096, RW, SHARED, 5);
+    a.mov(Reg::R14, Reg::Rax);
+    io(&mut a, sys::PREAD64, 5, 0, 10);
+    a.mov(Reg::Rbx, Reg::Rax);
+    a.load(Reg::Rax, Reg::R14, 0);
+    a.mov_imm(Reg::R15, 10);
+    a.cmp(Reg::Rax, Reg::Rbx);
+    a.jne(bad);
+    put(&mut a, Reg::R14, 0, 0x45);
+    io(&mut a, sys::PREAD64, 5, 0, 10);
+    expect(&mut a, 10, 0x45);
+    // 11: a private mapping sees the file and keeps its stores.
+    map(&mut a, 4096, RW, PRIVATE, 3);
+    a.mov(Reg::R13, Reg::Rax);
+    a.load(Reg::Rax, Reg::R13, 0);
+    expect(&mut a, 11, 0x44);
+    put(&mut a, Reg::R13, 0, 0x47);
+    io(&mut a, sys::PREAD64, 3, 0, 11);
+    expect(&mut a, 11, 0x44);
+    a.mov_imm(Reg::R15, 0);
+    a.bind(bad);
+    a.mov(Reg::Rdi, Reg::R15);
+    a.sys(sys::EXIT_GROUP);
+    static_elf(&a.finish(BLOB_VADDR).unwrap_or_else(|| fail("assembler")))
+}
+
 /// Waits done right. An `EPOLLET` pipe entry reports a write once, stays
 /// quiet while the data sits unread, and reports the next write. With
 /// SIGUSR1 blocked and pending, `ppoll` and `epoll_pwait` given an empty
@@ -2077,10 +3211,11 @@ fn avx_program(magic: u64) -> Vec<u8> {
     a.bind(bad);
     a.mov(Reg::Rdi, Reg::R15);
     a.sys(sys::EXIT_GROUP);
-    // The handler: rdx = ucontext; fpstate = uc_mcontext (40) + 192.
+    // The handler: rdx = ucontext; fpstate = uc_mcontext (40) + 184 (glibc's
+    // `uc_mcontext.fpregs`, after 23 registers).
     let h_bad = a.label();
     a.bind(handler);
-    a.load(Reg::Rax, Reg::Rdx, 40 + 192);
+    a.load(Reg::Rax, Reg::Rdx, 40 + 184);
     a.load(Reg::R14, Reg::Rax, 464);
     a.mov_imm(Reg::R13, magic);
     a.cmp(Reg::R14, Reg::R13);
@@ -2316,13 +3451,93 @@ pub(crate) fn root_image() -> &'static [u8] {
     b.finish(root).leak()
 }
 
+/// What a process may ask for without end is bounded, or its cell's to pay
+/// for: a program in a cell must not be able to use up the kernel's memory.
+fn limits_selftest(system: &System, vfs: &Arc<Vfs>) {
+    use crate::umem::flags::{MAP_ANONYMOUS, MAP_PRIVATE};
+    const PAGE: u64 = 4096;
+    const ENOMEM: i64 = 12;
+    let cell = Cell::new(&system.root_account, 128).unwrap_or_else(|| fail("no process cell"));
+    let account = cell.account().clone();
+    let mut p = LinuxProcess::new(cell, vfs.clone()).unwrap_or_else(|| fail("limits: no process"));
+
+    // A mapping split at every other page: refused at Linux's limit, with
+    // what is there intact.
+    {
+        let mut mm = p.mm();
+        let n = vma::MAX_REGIONS as u64 + 64;
+        let anonymous = MAP_PRIVATE | MAP_ANONYMOUS;
+        let at = mm
+            .mmap(0, n * PAGE, 0, anonymous, None)
+            .unwrap_or_else(|_| fail("limits: mmap"));
+        let mut i = 1;
+        while i < n && mm.mprotect(at + i * PAGE, PAGE, 1).is_ok() {
+            i += 2;
+        }
+        let (mut lines, mut from) = (0, Some(0));
+        while let Some(at) = from {
+            let (text, next) = mm.maps(at);
+            lines += text.lines().count();
+            from = next;
+        }
+        if i >= n || lines != mm.mappings() || lines > vma::MAX_REGIONS {
+            fail("limits: a process has more than 65530 mappings");
+        }
+        let mut extra = Vec::new();
+        while mm.mappings() < vma::MAX_REGIONS {
+            match mm.mmap(0, PAGE, 1 + 2 * (extra.len() as u64 & 1), anonymous, None) {
+                Ok(va) => extra.push(va),
+                Err(_) => fail("limits: room for a mapping"),
+            }
+        }
+        let inside = at + (n - 2) * PAGE;
+        let one_too_many = [
+            mm.mprotect(inside, PAGE, 1),
+            mm.munmap(inside, PAGE),
+            mm.mmap(inside, PAGE, 3, anonymous | 0x10, None),
+        ];
+        if one_too_many.iter().any(|r| *r != Err(ENOMEM)) || !mm.all_mapped(at, at + n * PAGE) {
+            fail("limits: splitting a mapping at the limit");
+        }
+        if mm.munmap(at, n * PAGE).is_err() || mm.mappings() != extra.len() {
+            fail("limits: unmapping them");
+        }
+    }
+
+    // Threads, and processes that come and go: their cell pays.
+    let before = account.used();
+    let mut threads = Vec::new();
+    while let Some(t) = p.new_thread() {
+        threads.push(t);
+    }
+    let n = threads.len();
+    for t in threads {
+        proc::discard(t);
+    }
+    if !(1..8).contains(&n) || account.used() != before {
+        fail("limits: threads are not charged to their cell");
+    }
+    match p.fork() {
+        Some(child) if account.used() > before => proc::discard(child),
+        _ => fail("limits: a process is not charged to its cell"),
+    }
+    if account.used() != before {
+        fail("limits: a process that is gone is still charged");
+    }
+    proc::discard(p);
+    if account.used() != 0 {
+        fail("limits: a cell with nothing in it is charged");
+    }
+    println!("ichor: linux: mappings are limited to 65530, and threads charged to their cell");
+}
+
 pub(crate) fn run() {
     let system = System::new(4096).unwrap_or_else(|| fail("no system cell"));
     let vfs = Arc::new(
         Vfs::mount_slice(root_image()).unwrap_or_else(|_| fail("could not mount the root image")),
     );
     let new_process = || {
-        let cell = Cell::new(&system.root_account, 128).unwrap_or_else(|| fail("no process cell"));
+        let cell = Cell::new(&system.root_account, 512).unwrap_or_else(|| fail("no process cell"));
         LinuxProcess::new(cell, vfs.clone()).unwrap_or_else(|| fail("no process"))
     };
 
@@ -2383,12 +3598,97 @@ pub(crate) fn run() {
     }
     println!("ichor: linux: munmap shot down a page another thread was reading (it faulted)");
 
+    let (status, _) = run_linux(new_process(), &direction_program(), None, &["dirtest"]);
+    if status != 0 {
+        println!("ichor: linux: direction flag test failed check {status}");
+        fail("direction flag");
+    }
+    println!(
+        "ichor: linux: a backward rep movsq resumed backward across 16 page faults; DF kept across a syscall"
+    );
+
+    let (status, _) = run_linux(new_process(), &sendfile_program(), None, &["sendfiletest"]);
+    if status != 0 {
+        println!("ichor: linux: sendfiletest failed check {status}");
+        fail("sendfile progress");
+    }
+    println!(
+        "ichor: linux: sendfile into a full non-blocking socket reports what it sent, then EAGAIN"
+    );
+
+    // 128 pages, and two threads.
+    let cell =
+        Cell::new(&system.root_account, 128 + 2 * 17).unwrap_or_else(|| fail("no process cell"));
+    let p = LinuxProcess::new(cell, vfs.clone()).unwrap_or_else(|| fail("no process"));
+    let (status, _) = run_linux(p, &fork_charge_program(), None, &["forkcharge"]);
+    if status != 0 {
+        println!("ichor: linux: forkcharge failed check {status}");
+        fail("fork accounting");
+    }
+    println!("ichor: linux: fork charges only what is copied (80 shared pages in a 162-page cell)");
+    limits_selftest(&system, &vfs);
+
+    // Its own system and cell: the test needs more than one batch of
+    // pages (4200 pages, 16 MiB), more than the usual test cells hold.
+    let big = System::new(8192).unwrap_or_else(|| fail("no big system cell"));
+    let big_cell = Cell::new(&big.root_account, 5000).unwrap_or_else(|| fail("no big cell"));
+    let big_process =
+        LinuxProcess::new(big_cell, vfs.clone()).unwrap_or_else(|| fail("no process"));
+    let (status, _) = run_linux(big_process, &big_range_program(), None, &["bigrange"]);
+    if status != 0 {
+        println!("ichor: linux: bigrange failed check {status}");
+        fail("large ranges");
+    }
+    println!("ichor: linux: 4200 pages moved, protected and unmapped in batches");
+
+    let (status, _) = run_linux(new_process(), &misc2_program(), None, &["misc2test"]);
+    if status != 0 {
+        println!("ichor: linux: misc2test failed check {status}");
+        fail("waitid, preadv, sigpending, sched_*, pipe size");
+    }
+    println!(
+        "ichor: linux: waitid, preadv, rt_sigpending, sched priorities and affinity, F_SETPIPE_SZ ok"
+    );
+
+    let (status, _) = run_linux(new_process(), &robust_program(), None, &["robusttest"]);
+    if status != 0 {
+        println!("ichor: linux: robusttest failed check {status}");
+        fail("robust futexes");
+    }
+    println!("ichor: linux: a robust futex held by an exiting process is marked FUTEX_OWNER_DIED");
+
+    crate::pipe::fifo_selftest();
+    let (status, _) = run_linux(new_process(), &fifo_program(), None, &["fifotest"]);
+    if status != 0 {
+        println!("ichor: linux: fifotest failed check {status}");
+        fail("named pipes");
+    }
+    println!(
+        "ichor: linux: mknod FIFO: ENXIO without a reader, EOF after the writer, blocking opens meet"
+    );
+
+    let (status, _) = run_linux(new_process(), &misc_program(), None, &["misctest"]);
+    if status != 0 {
+        println!("ichor: linux: misctest failed check {status}");
+        fail("close_range, fadvise64, priorities");
+    }
+    println!(
+        "ichor: linux: close_range, fadvise64, get/setpriority, memfd_create, absolute clock_nanosleep, non-UTF-8 names ok"
+    );
+
     let (status, syscalls) = run_linux(new_process(), &poll_program(), None, &["polltest"]);
     if status != 0 {
         println!("ichor: linux: polltest failed check {status}");
         fail("polltest");
     }
     println!("ichor: linux: poll timeout and wakeup, epoll, eventfd ok ({syscalls} syscalls)");
+
+    let (status, _) = run_linux(new_process(), &epoll_threads_program(), None, &["epollthr"]);
+    if status != 0 {
+        println!("ichor: linux: epollthr failed check {status}");
+        fail("epoll across threads");
+    }
+    println!("ichor: linux: a sleeping epoll_wait sees what another thread adds and closes");
 
     let (status, syscalls) = run_linux(new_process(), &uring_program(), None, &["uringtest"]);
     if status != 0 {
@@ -2456,6 +3756,15 @@ pub(crate) fn run() {
     }
     println!(
         "ichor: linux: MAP_SHARED anonymous memory and its futex are shared across fork ({syscalls} syscalls)"
+    );
+
+    let (status, syscalls) = run_linux(new_process(), &shared_file_program(), None, &["shfile"]);
+    if status != 0 {
+        println!("ichor: linux: shfile failed check {status}");
+        fail("shared file mappings");
+    }
+    println!(
+        "ichor: linux: shared file mappings are the file, across fork, read, write and copy-up ({syscalls} syscalls)"
     );
 
     let (status, syscalls) = run_linux(new_process(), &mremap_program(), None, &["mremaptest"]);

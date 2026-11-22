@@ -136,6 +136,17 @@ impl Task {
         }
         true
     }
+
+    /// If the task is in ring 3 on another CPU, makes it leave with
+    /// [`UserEvent::Preempted`](crate::user::UserEvent::Preempted).
+    pub fn interrupt(&self) {
+        let on = self.running_on.load(Ordering::SeqCst);
+        if let Some(cpu) = cpu::online().find(|c| c.index() as u32 == on) {
+            let sched = SCHED.get_on(cpu);
+            sched.need_resched.store(true, Ordering::SeqCst);
+            kick(cpu);
+        }
+    }
 }
 
 impl fmt::Debug for Task {
@@ -503,11 +514,17 @@ fn pick_and_claim(s: &dyn Scheduler, cpu: CpuId) -> Option<Arc<Task>> {
         {
             continue;
         }
-        if t.state() == TaskState::Exited {
-            t.running_on.store(NOT_RUNNING, Ordering::SeqCst);
-            continue;
+        if t.state() == TaskState::Runnable {
+            return Some(t);
         }
-        return Some(t);
+        // A stale entry: `finish_switch` and a waker can both see a task
+        // become runnable, and the second queues it after it was picked,
+        // ran and blocked again. Running it would leave it marked blocked,
+        // lost at its next preemption. Put it back, as a switch out does.
+        t.running_on.store(NOT_RUNNING, Ordering::SeqCst);
+        if t.state() == TaskState::Runnable {
+            enqueue(t, Enqueue::Woken);
+        }
     }
 }
 

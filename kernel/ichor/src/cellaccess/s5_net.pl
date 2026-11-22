@@ -45,8 +45,33 @@ control("connect(127.0.0.1, B's port) [loopback is per cell]", syscall(42, filen
 close $c;
 close $l;
 # No raw or packet sockets, so A cannot send a packet with another source.
-want("socket(AF_INET, SOCK_RAW)", "ESOCKTNOSUPPORT", syscall(41, AF_INET, 3, 255));
+want("socket(AF_INET, SOCK_RAW)", "EPERM", syscall(41, AF_INET, 3, 255));
 want("socket(AF_PACKET, SOCK_RAW)", "EAFNOSUPPORT", syscall(41, 17, 3, 0));
+# rtnetlink answers for A's own interfaces: A's address, never B's.
+socket(my $nl, 16, 2, 0) or die "netlink: $!"; # AF_NETLINK, SOCK_DGRAM, NETLINK_ROUTE
+my $dump = "";
+for my $type (18, 22, 26) { # RTM_GETLINK, RTM_GETADDR, RTM_GETROUTE
+    my $ask = pack("LSSLL", 20, $type, 0x301, $type, 0) . "\0\0\0\0"; # NLM_F_REQUEST|NLM_F_DUMP
+    syswrite($nl, $ask) == 20 or die "netlink send: $!";
+    my ($answer, $end) = ("", 0);
+    while (!$end) {
+        my $rin = "";
+        vec($rin, fileno($nl), 1) = 1;
+        select(my $ro = $rin, undef, undef, 5) == 1 or last;
+        sysread($nl, my $buf, 32768) or last;
+        $answer .= $buf;
+        my $at = 0;
+        while ($at + 16 <= length($buf)) {
+            my ($len, $t) = unpack("LS", substr($buf, $at, 6));
+            $end = 1 if $t == 3 || $t == 2; # NLMSG_DONE, NLMSG_ERROR
+            last if $len < 16;
+            $at += ($len + 3) & ~3;
+        }
+    }
+    $dump .= $answer;
+}
+same("rtnetlink shows A's own address", index($dump, inet_aton($ME)) >= 0 ? "shown" : "absent", "shown");
+same("rtnetlink does not show B's address", index($dump, inet_aton($B{ip})) >= 0 ? "shown" : "absent", "absent");
 
 # Unix sockets: B's path is not in A's root; B's abstract names are B's.
 my $us = sock(AF_UNIX, SOCK_STREAM);

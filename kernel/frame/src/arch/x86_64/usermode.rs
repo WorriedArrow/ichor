@@ -4,7 +4,9 @@
 //! `syscall` instruction, by a CPU exception, or by an interrupt. On the way
 //! back the user registers are saved into the thread's [`UserContext`], and
 //! control returns to the kernel stack frame that called
-//! [`UserMode::execute`].
+//! [`UserMode::execute`]. Every way back into ring 3 goes through `execute`
+//! and `ichor_enter_user` (the entry code is in `entry.rs`), interrupts
+//! included: one that needs no reschedule just loops in `execute`.
 //!
 //! **GS stays pointed at the per-CPU block even in ring 3** (there is no
 //! `swapgs`), which sidesteps the NMI-in-`swapgs` window (asterinas#3904).
@@ -16,8 +18,7 @@
 //! The kernel never trusts the user's RFLAGS or segment selectors: entry
 //! loads the kernel's, and [`UserContext`] only exposes a safe RFLAGS subset.
 
-use core::arch::global_asm;
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64};
+use core::sync::atomic::{AtomicBool, AtomicU64};
 
 use super::regs::{self, rdmsr, wrmsr};
 use super::trap::{self, KERNEL_CS};
@@ -30,15 +31,22 @@ const MSR_PRED_CMD: u32 = 0x49;
 
 /// Side-channel mitigations on the way to ring 3 (ADR-0004 §2), chosen at
 /// boot from the CPU's enumerated vulnerabilities.
-/// VERW before `iretq` (MDS/TAA, with MD_CLEAR microcode); tested by the
-/// entry stub, so a byte.
-static VERW_ON: AtomicU8 = AtomicU8::new(0);
+/// VERW before `iretq` (MDS/TAA, with MD_CLEAR microcode); copied into each
+/// CPU's block, which the entry code tests.
+static VERW_ON: AtomicBool = AtomicBool::new(false);
 /// IBPB when this CPU starts running user code of another domain (cell).
 static IBPB_ON: AtomicBool = AtomicBool::new(false);
 /// IBPBs issued (all CPUs).
 static IBPBS: AtomicU64 = AtomicU64::new(0);
-/// VERW's operand: a valid, writable data segment selector.
-static VERW_SELECTOR: u16 = trap::KERNEL_SS;
+
+/// `IA32_SPEC_CTRL`, and the bits Ichor sets in it.
+const MSR_SPEC_CTRL: u32 = 0x48;
+const SPEC_CTRL_IBRS: u64 = 1;
+const SPEC_CTRL_BHI_DIS_S: u64 = 1 << 10;
+/// What every CPU writes to `IA32_SPEC_CTRL` as it comes up (0: nothing).
+/// Set only on CPUs that enumerate enhanced IBRS (ADR-0004 §2: Spectre v2
+/// and BHI in the kernel), where IBRS is set once and left on.
+static SPEC_CTRL: AtomicU64 = AtomicU64::new(0);
 
 /// What the boot CPU's vulnerabilities call for, switched on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,22 +59,71 @@ pub(crate) struct Mitigations {
     pub verw_missing: bool,
     /// IBPB between user code of different cells.
     pub ibpb: bool,
+    /// Page-table isolation (Meltdown), and whether it uses PCID.
+    pub pti: bool,
+    pub pcid: bool,
+    /// Enhanced IBRS on (Spectre v2 in the kernel), and BHI_DIS_S with it.
+    pub eibrs: bool,
+    pub bhi_dis_s: bool,
 }
 
 /// Switches on the mitigations `v` calls for (once, on the boot CPU,
 /// before any user code runs; all CPUs are assumed alike). `force_verw`
-/// turns VERW on regardless (tests: the instruction runs on any CPU, it
-/// only clears buffers with MD_CLEAR microcode).
-pub(crate) fn enable_mitigations(v: &super::cpu::Vulnerabilities, force_verw: bool) -> Mitigations {
+/// and `force_pti` turn VERW and page-table isolation on regardless
+/// (tests: they run on any CPU; VERW only clears buffers with MD_CLEAR
+/// microcode).
+pub(crate) fn enable_mitigations(
+    v: &super::cpu::Vulnerabilities,
+    force_verw: bool,
+    force_pti: bool,
+) -> Result<Mitigations, &'static str> {
     use core::sync::atomic::Ordering::Relaxed;
     let needs_verw = v.mds || v.taa;
     let verw = (needs_verw && v.md_clear) || force_verw;
-    VERW_ON.store(u8::from(verw), Relaxed);
+    VERW_ON.store(verw, Relaxed);
     IBPB_ON.store(v.ibpb, Relaxed);
-    Mitigations {
+    let pti = v.meltdown || force_pti;
+    if pti {
+        super::entry::enable()?;
+    }
+    // Enhanced IBRS: set once per CPU and left on, it keeps user-trained
+    // branch predictions out of the kernel's indirect branches; BHI_DIS_S
+    // does the same for branch history. Written only where enumerated
+    // (`IA32_SPEC_CTRL` needs CPUID.7:EDX[26]; a reserved bit would fault).
+    let eibrs = v.eibrs && v.ibpb;
+    let bhi_dis_s = eibrs && v.bhi_ctrl;
+    let spec =
+        if eibrs { SPEC_CTRL_IBRS } else { 0 } | if bhi_dis_s { SPEC_CTRL_BHI_DIS_S } else { 0 };
+    SPEC_CTRL.store(spec, Relaxed);
+    enable_cpu_mitigations();
+    Ok(Mitigations {
         verw,
         verw_missing: needs_verw && !v.md_clear,
         ibpb: v.ibpb,
+        pti,
+        pcid: pti && super::entry::pcid(),
+        eibrs,
+        bhi_dis_s,
+    })
+}
+
+/// Copies the mitigation switches into this CPU's block (the entry code
+/// reads them there) and turns isolation on here if it is on.
+pub(crate) fn enable_cpu_mitigations() {
+    use core::sync::atomic::Ordering::Relaxed;
+    let block = cpu::this_block();
+    block.verw.store(u64::from(VERW_ON.load(Relaxed)), Relaxed);
+    super::entry::enable_cpu(block);
+    let spec = SPEC_CTRL.load(Relaxed);
+    if spec != 0 {
+        // SAFETY: `spec` is nonzero only when CPUID enumerates
+        // IA32_SPEC_CTRL (on the boot CPU; all CPUs are assumed alike).
+        // Reading it has no side effects.
+        let firmware = unsafe { rdmsr(MSR_SPEC_CTRL) };
+        // SAFETY: the MSR exists, as above, and so does every bit set:
+        // those firmware set, IBRS (with the MSR) and BHI_DIS_S (only with
+        // its own CPUID bit). They only restrict speculation on this CPU.
+        unsafe { wrmsr(MSR_SPEC_CTRL, firmware | spec) };
     }
 }
 
@@ -81,13 +138,18 @@ const MSR_FMASK: u32 = 0xC000_0084;
 const EFER_SCE: u64 = 1; // syscall enable
 
 // RFLAGS bits the user may hold; everything else is forced safe (IF set,
-// IOPL 0, no DF/TF/AC). Reserved bit 1 is always set.
-const USER_RFLAGS_ALLOWED: u64 = 0x0000_08d5; // CF PF AF ZF SF OF
+// IOPL 0, no TF/AC). Reserved bit 1 is always set. DF is the user's: a
+// backward `rep movs` (memmove) interrupted by a fault, a preemption or
+// any interrupt must resume backward, or it copies the rest forward over
+// the bytes past its buffer. The kernel never runs with it: `syscall`
+// clears it (FMASK) and the trap tail clears every flag (`entry.rs`).
+const USER_RFLAGS_ALLOWED: u64 = 0x0000_0cd5; // CF PF AF ZF SF DF OF
+const RFLAGS_DF: u64 = 1 << 10;
 const RFLAGS_IF: u64 = 1 << 9;
 const RFLAGS_RESERVED1: u64 = 1 << 1;
 
 /// A user thread's saved register state. The field order matches the offsets
-/// the entry stubs use (see `usermode_asm`).
+/// the entry stubs use (`UC_*` in `entry.rs`).
 #[repr(C)]
 #[derive(Clone, Debug, Default)]
 pub struct UserContext {
@@ -151,6 +213,17 @@ impl UserContext {
         self.rflags = (value & USER_RFLAGS_ALLOWED) | RFLAGS_IF | RFLAGS_RESERVED1;
     }
 
+    /// Whether the direction flag is set (string instructions run down).
+    pub fn direction_down(&self) -> bool {
+        self.rflags & RFLAGS_DF != 0
+    }
+
+    /// Clears the direction flag, as the ABI requires on entry to a
+    /// function the kernel calls (a signal handler).
+    pub fn clear_direction(&mut self) {
+        self.rflags &= !RFLAGS_DF;
+    }
+
     /// The extended register state as a signal frame saves it: the
     /// standard-format XSAVE area ([`crate::cpu::xstate_size`] bytes), or a
     /// 512-byte FXSAVE image on CPUs without XSAVE.
@@ -179,16 +252,16 @@ pub enum UserEvent {
     Preempted,
 }
 
-/// Enables `syscall`/`sysret` on this CPU, and sets the kernel stack the CPU
-/// switches to on a trap from ring 3 (TSS RSP0). Call during per-CPU init,
-/// after the GDT/TSS and a fault stack exist.
-pub(crate) fn init_cpu(fault_stack_top: u64) {
-    trap::set_rsp0(fault_stack_top);
+/// Enables `syscall` on this CPU, entering at the syscall entry's alias in
+/// the entry area. Call during per-CPU init, after the GDT/TSS and the
+/// entry area exist.
+pub(crate) fn init_cpu() {
     let star = (u64::from(KERNEL_CS) << 32) | (u64::from(USER_CS - 16) << 48);
-    let lstar = ichor_syscall_entry as *const () as u64;
+    let lstar = super::entry::syscall_entry();
     // SAFETY: STAR/LSTAR/FMASK/EFER are the architectural syscall MSRs.
-    // LSTAR is our entry stub; FMASK clears IF/DF/TF/AC on entry; EFER.SCE
-    // enables the instruction. KERNEL_CS matches the GDT in `trap`.
+    // LSTAR is our entry stub (its alias, mapped in every root); FMASK
+    // clears IF/DF/TF/AC on entry; EFER.SCE enables the instruction.
+    // KERNEL_CS matches the GDT in `trap`.
     unsafe { wrmsr(MSR_STAR, star) };
     // SAFETY: as above.
     unsafe { wrmsr(MSR_LSTAR, lstar) };
@@ -215,6 +288,14 @@ impl<'a> UserMode<'a> {
     /// Enters ring 3 and returns when the thread traps, updating the context
     /// with the user's registers.
     pub fn execute(&mut self) -> UserEvent {
+        self.execute_unless(|| false)
+    }
+
+    /// [`Self::execute`], unless `hold` says not to enter: then
+    /// [`UserEvent::Preempted`] at once. It is asked with interrupts off, so
+    /// what becomes true later, announced with
+    /// [`Task::interrupt`](crate::task::Task::interrupt), ends the run.
+    pub fn execute_unless(&mut self, hold: impl FnOnce() -> bool) -> UserEvent {
         use core::sync::atomic::Ordering::Relaxed;
         // Never enter ring 3 with state `iretq` or `wrmsr` would fault on in
         // the kernel: RIP and RSP must be user addresses, and so must the FS
@@ -228,6 +309,9 @@ impl<'a> UserMode<'a> {
             };
         }
         let _guard = cpu::IrqGuard::new();
+        if hold() {
+            return UserEvent::Preempted;
+        }
         let block = cpu::this_block();
         self.ctx.rflags = (self.ctx.rflags & USER_RFLAGS_ALLOWED) | RFLAGS_IF | RFLAGS_RESERVED1;
         block
@@ -257,10 +341,21 @@ impl<'a> UserMode<'a> {
         // Interrupts stay off from here until the save below, and the kernel
         // never uses the FPU, so the registers hold only this thread's state.
         self.ctx.fpu.restore();
-        // SAFETY: entry builds a ring-3 `iretq` frame from `ctx` and returns
-        // here when the thread traps (the stubs load this kernel stack back).
-        // The guard keeps us on this CPU across the round trip.
-        unsafe { ichor_enter_user(core::ptr::from_mut(self.ctx).cast::<u8>()) };
+        loop {
+            // SAFETY: entry builds a ring-3 `iretq` frame from `ctx` and
+            // returns here when the thread traps (the stubs load this kernel
+            // stack back). The guard keeps us on this CPU across the round
+            // trip.
+            unsafe { ichor_enter_user(core::ptr::from_mut(self.ctx).cast::<u8>()) };
+            // An interrupt the thread need not hear about: straight back.
+            // The trap recorded the registers ring 3 really had, apart from
+            // flags it may not keep.
+            if block.event_kind.load(Relaxed) != 4 {
+                break;
+            }
+            self.ctx.rflags =
+                (self.ctx.rflags & USER_RFLAGS_ALLOWED) | RFLAGS_IF | RFLAGS_RESERVED1;
+        }
         self.ctx.fpu.save();
         let info = block.event_info.load(Relaxed);
         match block.event_kind.load(Relaxed) {
@@ -276,10 +371,9 @@ impl<'a> UserMode<'a> {
 }
 
 unsafe extern "sysv64" {
-    /// Takes a `*mut UserContext` (the stubs only touch its register
-    /// fields, at the offsets above).
+    /// Takes a `*mut UserContext` (the stubs in `entry.rs` only touch its
+    /// register fields, at the offsets above).
     fn ichor_enter_user(ctx: *mut u8);
-    fn ichor_syscall_entry();
 }
 
 /// Records a ring-3 exception into the per-CPU `UserContext` and event
@@ -331,116 +425,10 @@ pub(super) fn record_user_preempt(frame: &trap::TrapFrame) {
     cpu::this_block().event_kind.store(3, Relaxed);
 }
 
-// GPR offsets within UserContext, shared with the stubs.
-global_asm!(
-    ".set UC_RAX, 0",
-    ".set UC_RBX, 8",
-    ".set UC_RCX, 16",
-    ".set UC_RDX, 24",
-    ".set UC_RSI, 32",
-    ".set UC_RDI, 40",
-    ".set UC_RBP, 48",
-    ".set UC_RSP, 56",
-    ".set UC_R8, 64",
-    ".set UC_R9, 72",
-    ".set UC_R10, 80",
-    ".set UC_R11, 88",
-    ".set UC_R12, 96",
-    ".set UC_R13, 104",
-    ".set UC_R14, 112",
-    ".set UC_R15, 120",
-    ".set UC_RIP, 128",
-    ".set UC_RFLAGS, 136",
-    // Per-CPU block (GS) offsets.
-    ".set GS_RESUME, 16",
-    ".set GS_UCTX, 32",
-    ".set GS_SCRATCH, 40",
-    ".set GS_EVENT, 56",
-    ".set GS_RSP0PTR, 80",
-    ".set SEL_USER_CS, 0x23",
-    ".set SEL_USER_SS, 0x1b",
-    // fn ichor_enter_user(ctx: *mut UserContext)  [ctx in rdi]
-    ".global ichor_enter_user",
-    ".global ichor_user_resume",
-    "ichor_enter_user:",
-    "push rbx",
-    "push rbp",
-    "push r12",
-    "push r13",
-    "push r14",
-    "push r15",
-    "mov gs:[GS_RESUME], rsp",  // kernel stack to come back to
-    "mov rax, gs:[GS_RSP0PTR]", // land ring-3 traps just below this frame,
-    "mov [rax], rsp",           // not at the stack top (which `execute` uses)
-    "mov gs:[GS_UCTX], rdi",
-    // Build the iretq frame for ring 3.
-    "push SEL_USER_SS",
-    "mov rax, [rdi + UC_RSP]",
-    "push rax",
-    "mov rax, [rdi + UC_RFLAGS]",
-    "push rax",
-    "push SEL_USER_CS",
-    "mov rax, [rdi + UC_RIP]",
-    "push rax",
-    // Load user GPRs (rdi last, since it is our pointer).
-    "mov rax, [rdi + UC_RAX]",
-    "mov rbx, [rdi + UC_RBX]",
-    "mov rcx, [rdi + UC_RCX]",
-    "mov rdx, [rdi + UC_RDX]",
-    "mov rsi, [rdi + UC_RSI]",
-    "mov rbp, [rdi + UC_RBP]",
-    "mov r8,  [rdi + UC_R8]",
-    "mov r9,  [rdi + UC_R9]",
-    "mov r10, [rdi + UC_R10]",
-    "mov r11, [rdi + UC_R11]",
-    "mov r12, [rdi + UC_R12]",
-    "mov r13, [rdi + UC_R13]",
-    "mov r14, [rdi + UC_R14]",
-    "mov r15, [rdi + UC_R15]",
-    "mov rdi, [rdi + UC_RDI]",
-    // MDS/TAA: clear the CPU buffers last, with every user register loaded
-    // (VERW changes only ZF, and iretq reloads RFLAGS).
-    "test byte ptr [rip + {verw_on}], 1",
-    "jz 2f",
-    "verw word ptr [rip + {verw_sel}]",
-    "2:",
-    "iretq",
-    // The syscall/exception stubs jump here to return to the kernel caller.
-    "ichor_user_resume:",
-    "mov rsp, gs:[GS_RESUME]",
-    "pop r15",
-    "pop r14",
-    "pop r13",
-    "pop r12",
-    "pop rbp",
-    "pop rbx",
-    "ret",
-    // fn ichor_syscall_entry()  [via LSTAR: rcx=rip, r11=rflags, GS=block]
-    ".global ichor_syscall_entry",
-    "ichor_syscall_entry:",
-    "mov gs:[GS_SCRATCH], rdi", // free rdi (holds user rdi)
-    "mov rdi, gs:[GS_UCTX]",
-    "mov [rdi + UC_RAX], rax",
-    "mov [rdi + UC_RBX], rbx",
-    "mov [rdi + UC_RCX], rcx",
-    "mov [rdi + UC_RIP], rcx", // syscall puts the return rip in rcx
-    "mov [rdi + UC_RDX], rdx",
-    "mov [rdi + UC_RSI], rsi",
-    "mov [rdi + UC_RBP], rbp",
-    "mov [rdi + UC_RSP], rsp", // syscall does not change rsp: still the user's
-    "mov [rdi + UC_R8], r8",
-    "mov [rdi + UC_R9], r9",
-    "mov [rdi + UC_R10], r10",
-    "mov [rdi + UC_R11], r11",
-    "mov [rdi + UC_RFLAGS], r11", // syscall puts rflags in r11
-    "mov [rdi + UC_R12], r12",
-    "mov [rdi + UC_R13], r13",
-    "mov [rdi + UC_R14], r14",
-    "mov [rdi + UC_R15], r15",
-    "mov rax, gs:[GS_SCRATCH]",
-    "mov [rdi + UC_RDI], rax",
-    "mov qword ptr gs:[GS_EVENT], 1", // Syscall
-    "jmp ichor_user_resume",
-    verw_on = sym VERW_ON,
-    verw_sel = sym VERW_SELECTOR,
-);
+/// Records the registers of ring-3 code interrupted by an NMI or an
+/// interrupt that needs nothing more; [`UserMode::execute`] resumes it.
+pub(super) fn record_user_interrupt(frame: &trap::TrapFrame) {
+    use core::sync::atomic::Ordering::Relaxed;
+    record_user_trap(frame);
+    cpu::this_block().event_kind.store(4, Relaxed);
+}

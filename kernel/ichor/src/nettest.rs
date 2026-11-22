@@ -1,6 +1,7 @@
 //! Milestone 5, first network test: the virtio-net driver and the
 //! `kernel/net` stack against a real peer, QEMU's user-mode network
-//! (slirp: gateway 10.0.2.2, this host 10.0.2.15).
+//! (slirp: gateway 10.0.2.2, this host 10.0.2.15, which its DHCP server
+//! hands out; the same code configures the uplink on a cloud VPC).
 //!
 //! The interface resolves the gateway (ARP) and pings it (slirp's answer
 //! depends on the host's ICMP permissions, so a missing reply is reported,
@@ -34,6 +35,24 @@ static PUBLISH_PORT: AtomicU32 = AtomicU32::new(0);
 /// Sets the TCP echo test's port (`net_echo_port=N`).
 pub(crate) fn set_echo_port(port: u16) {
     ECHO_PORT.store(u32::from(port), Ordering::Relaxed);
+}
+
+/// The uplink's MTU from the command line (0: the DHCP lease's, else 1500).
+static MTU: AtomicU32 = AtomicU32::new(0);
+
+/// Sets the uplink's MTU (`uplink_mtu=N`), over what DHCP says.
+pub(crate) fn set_mtu(mtu: u16) {
+    MTU.store(u32::from(mtu), Ordering::Relaxed);
+}
+
+/// The longest the uplink's lease is taken to last, in seconds (0: as long
+/// as the server says).
+static LEASE_CAP: AtomicU32 = AtomicU32::new(0);
+
+/// Caps the uplink's lease (`dhcp_lease=SECONDS`), so it is renewed within
+/// a test.
+pub(crate) fn set_lease_cap(secs: u32) {
+    LEASE_CAP.store(secs, Ordering::Relaxed);
 }
 
 /// Sets the published-port test's uplink port (`net_publish=N`).
@@ -80,10 +99,41 @@ pub(crate) fn run() {
     });
     let m = dev.mac();
     println!(
-        "ichor: net: virtio-net {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, {GUEST}/24 via {GATEWAY}",
+        "ichor: net: virtio-net {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
         m[0], m[1], m[2], m[3], m[4], m[5]
     );
-    let mut ifc = Interface::new(Mac(m), GUEST, 24, Some(GATEWAY));
+    // The address from the network's DHCP server (a cloud VPC's, QEMU's),
+    // else QEMU's user-network defaults.
+    let mut client = None;
+    let (addr, prefix, router, mtu) = match dhcp(&mut dev, Mac(m)) {
+        Some((c, l)) => {
+            client = Some(c);
+            let dns: Vec<_> = l.dns.iter().map(|d| alloc::format!("{d}")).collect();
+            println!(
+                "ichor: net: DHCP lease {}/{} via {} from {}, DNS {}, for {}",
+                l.addr,
+                l.prefix,
+                l.router
+                    .map_or("no router".into(), |r| alloc::format!("{r}")),
+                l.server,
+                if dns.is_empty() {
+                    "none".into()
+                } else {
+                    dns.join(" ")
+                },
+                l.time
+                    .map_or("ever".into(), |t| alloc::format!("{} s", t.as_secs())),
+            );
+            crate::switch::set_uplink_dns(l.dns.clone());
+            (l.addr, l.prefix, l.router, l.mtu.unwrap_or(1500))
+        }
+        None => {
+            println!("ichor: net: no DHCP answer; using {GUEST}/24 via {GATEWAY}");
+            (GUEST, 24, Some(GATEWAY), 1500)
+        }
+    };
+    let gateway = router.unwrap_or(GATEWAY);
+    let mut ifc = Interface::new(Mac(m), addr, prefix, router);
 
     // Resolve the gateway and ping it.
     let req = Echo {
@@ -93,7 +143,7 @@ pub(crate) fn run() {
         data: b"ichor",
     }
     .emit();
-    ifc.send(now(), GATEWAY, wire::PROTO_ICMP, &req);
+    ifc.send(now(), gateway, wire::PROTO_ICMP, &req);
     let deadline = now() + Duration::from_secs(2);
     let mut pinged = false;
     while now() < deadline && !pinged {
@@ -102,16 +152,16 @@ pub(crate) fn run() {
                 && Echo::parse(&p.payload)
                     .is_some_and(|e| e.kind == wire::ICMP_ECHO_REPLY && e.ident == PING_IDENT);
         }
-        if ifc.neighbor(GATEWAY, now()).is_some() && pinged {
+        if ifc.neighbor(gateway, now()).is_some() && pinged {
             break;
         }
         frame::task::yield_now();
     }
-    let Some(gw) = ifc.neighbor(GATEWAY, now()) else {
+    let Some(gw) = ifc.neighbor(gateway, now()) else {
         fail("net: the gateway did not answer ARP");
     };
     println!(
-        "ichor: net: gateway {GATEWAY} is at {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}; ping {}",
+        "ichor: net: gateway {gateway} is at {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}; ping {}",
         gw.0[0],
         gw.0[1],
         gw.0[2],
@@ -130,9 +180,46 @@ pub(crate) fn run() {
         tcp_echo(&mut dev, &mut ifc, port);
     }
     // From here on the device is the cell switch's uplink.
-    crate::switch::set_uplink(dev, ifc);
+    let link: alloc::boxed::Box<dyn net::link::Link> = alloc::boxed::Box::new(dev);
+    let name = alloc::string::String::from(link.name());
+    let mtu = match MTU.load(Ordering::Relaxed) {
+        0 => mtu,
+        forced => forced as u16,
+    };
+    crate::switch::set_uplink(link, ifc, mtu, client);
     crate::netstack::start();
-    println!("ichor: net: uplink {GUEST} is the cell switch's (NAT for 10.88.0.0/16)");
+    println!(
+        "ichor: net: uplink {addr} on {name} is the cell switch's (NAT for 10.88.0.0/16, MTU {mtu})"
+    );
+}
+
+/// Asks the network's DHCP server for an address: up to 8 s, which
+/// covers the DISCOVER and two retransmissions. The client goes on with
+/// the uplink, which renews the lease.
+fn dhcp(
+    dev: &mut virtio_net::VirtioNet,
+    mac: Mac,
+) -> Option<(net::dhcp::Client, net::dhcp::Lease)> {
+    let mut xid = [0u8; 4];
+    crate::random::fill(&mut xid);
+    let mut c = net::dhcp::Client::new(mac, u32::from_le_bytes(xid));
+    match LEASE_CAP.load(Ordering::Relaxed) {
+        0 => {}
+        s => c.cap_lease(Duration::from_secs(u64::from(s))),
+    }
+    let deadline = now() + Duration::from_secs(8);
+    while now() < deadline {
+        if let Some(f) = c.poll(now()) {
+            dev.transmit(&f);
+        }
+        while let Some(f) = dev.receive() {
+            if let Some(lease) = c.receive(now(), &f) {
+                return Some((c, lease));
+            }
+        }
+        frame::task::yield_now();
+    }
+    None
 }
 
 /// The harness's TCP echo port (0: none).
@@ -147,7 +234,7 @@ fn tcp_echo(dev: &mut virtio_net::VirtioNet, ifc: &mut Interface, port: u16) {
         .collect();
     let mut iss = [0u8; 4];
     crate::random::fill(&mut iss);
-    let local = (GUEST, 40000); // below the NAT's port range
+    let local = (ifc.addr, 40000); // below the NAT's port range
     let remote = (GATEWAY, port);
     let start = now();
     let mut tcp = Tcp::connect(local, remote, u32::from_le_bytes(iss), start);

@@ -26,6 +26,7 @@ dependencies = [
  "ichor-virtio-blk",
  "ichor-virtio-net",
  "ichor-virtio-rng",
+ "ichor-virtio-scsi",
  "ichor-vma",
 ]
 
@@ -119,6 +120,7 @@ dependencies = [
  "ichor-http",
  "ichor-image",
  "ichor-layer",
+ "ichor-net",
  "ichor-oci",
  "ichor-tls",
  "ichor-x509",
@@ -245,6 +247,7 @@ name = "ichor-virtio-net"
 version = "0.0.0"
 dependencies = [
  "ichor-frame",
+ "ichor-net",
  "ichor-virtio-pci",
 ]
 
@@ -259,6 +262,15 @@ dependencies = [
 name = "ichor-virtio-rng"
 version = "0.0.0"
 dependencies = [
+ "ichor-frame",
+ "ichor-virtio-pci",
+]
+
+[[package]]
+name = "ichor-virtio-scsi"
+version = "0.0.0"
+dependencies = [
+ "ichor-block",
  "ichor-frame",
  "ichor-virtio-pci",
 ]
@@ -281,9 +293,11 @@ version = "0.0.0"
 dependencies = [
  "ichor-civil",
  "ichor-gpt",
+ "ichor-grpc",
  "ichor-image",
  "ichor-layer",
  "ichor-oci",
  "ichor-testprog",
+ "ichor-tls",
  "ichor-x509",
 ]

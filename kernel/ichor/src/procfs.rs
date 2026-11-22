@@ -1,26 +1,29 @@
-//! `/proc`: generated files about the calling process and the system.
+//! `/proc`: generated files about the cell's processes and the system.
 //!
-//! Absolute paths under `/proc` are answered here before the root overlay
-//! sees them. Opening a file snapshots its contents into a descriptor
-//! (like Linux's `seq_file`, reads continue through the snapshot);
-//! directories list their entries through `getdents64`; links answer
-//! `readlink` and are followed like symlinks.
+//! Paths under `/proc` are answered here: the root overlay hands on those
+//! that lead there (`Overlay::set_elsewhere`), by a symbolic link, a working
+//! directory or otherwise. Opening a file snapshots its contents into a
+//! descriptor (like Linux's `seq_file`, reads continue through the
+//! snapshot; `maps` is written as it is read); directories list their entries through `getdents64`; links
+//! answer `readlink` and are followed like symlinks, but for descriptors',
+//! which are opened anew (`fs::reopen`).
 //!
-//! Partial: only the calling process's own `/proc/<pid>` tree exists (as
-//! `self` or its pid); relative paths into `/proc` (a working directory
-//! there) see the image's empty `/proc` instead; descriptor links name
-//! files as `anon_inode:[file]` (open files do not record their paths).
+//! Partial: a zombie has only `stat` and `status`.
 
 use alloc::format;
 use alloc::string::{String, ToString};
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 
-use frame::sync::SpinLock;
+use frame::sync::{Mutex, SpinLock};
 
+use crate::page::Reserved;
 use crate::poll::Object;
-use crate::process::{Fd, LinuxProcess};
+use crate::proc::{self, ProcEntry};
+use crate::process::{Fd, Group, LinuxProcess};
 
 const ENOENT: i64 = 2;
+const EACCES: i64 = 13;
 const EINVAL: i64 = 22;
 
 const DT_DIR: u8 = 4;
@@ -32,11 +35,32 @@ const DT_LNK: u8 = 10;
 pub(crate) enum Node {
     Dir(Vec<(String, u8)>),
     File(Vec<u8>),
+    /// A process's `maps`, written as it is read: it may be long.
+    Maps(Weak<Group>),
     Link(String),
 }
 
 fn dir(names: &[(&str, u8)]) -> Node {
     Node::Dir(names.iter().map(|&(n, t)| (n.to_string(), t)).collect())
+}
+
+/// Whether an absolute path is one this answers.
+pub(crate) fn serves(path: &str) -> bool {
+    ["/proc", "/sys"].iter().any(|d| {
+        path.strip_prefix(d)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+    })
+}
+
+/// The caller's descriptor `path` names (`/proc/self/fd/N`).
+pub(crate) fn own_fd(p: &LinuxProcess, path: &str) -> Option<u64> {
+    let rest = path.strip_prefix("/proc/")?;
+    let c: Vec<&str> = rest.split('/').filter(|c| !c.is_empty()).collect();
+    let [who, "fd", n] = c.as_slice() else {
+        return None;
+    };
+    let mine = matches!(*who, "self" | "thread-self") || who.parse() == Ok(p.group.tgid);
+    n.parse().ok().filter(|_| mine)
 }
 
 /// Answers `path` if it is under `/proc` (`None` otherwise). With
@@ -56,11 +80,14 @@ pub(crate) fn lookup(p: &LinuxProcess, path: &str, follow_last: bool) -> Option<
         .map(ToString::to_string)
         .collect();
     let me = p.group.tgid.to_string();
-    if comps.first().map(String::as_str) == Some("self") {
+    if matches!(
+        comps.first().map(String::as_str),
+        Some("self" | "thread-self")
+    ) {
         if comps.len() == 1 && !follow_last {
             return Some(Ok(Node::Link(me)));
         }
-        comps[0] = me.clone();
+        comps[0] = me;
     }
     let c: Vec<&str> = comps.iter().map(String::as_str).collect();
     Some(match c.as_slice() {
@@ -80,7 +107,8 @@ pub(crate) fn lookup(p: &LinuxProcess, path: &str, follow_last: bool) -> Option<
             .iter()
             .map(|&(n, t)| (n.to_string(), t))
             .collect();
-            v.push((me, DT_DIR));
+            let pids = proc::pids(p.entry.cell);
+            v.extend(pids.into_iter().map(|n| (n.to_string(), DT_DIR)));
             Ok(Node::Dir(v))
         }
         ["cpuinfo"] => Ok(Node::File(cpuinfo())),
@@ -102,7 +130,11 @@ pub(crate) fn lookup(p: &LinuxProcess, path: &str, follow_last: bool) -> Option<
             b"Linux version 6.6.0-ichor (Ichor framekernel) #1 SMP\n".to_vec(),
         )),
         ["sys"] => Ok(dir(&[("kernel", DT_DIR), ("net", DT_DIR)])),
-        ["sys", "net"] => Ok(dir(&[("core", DT_DIR)])),
+        ["sys", "net"] => Ok(dir(&[("core", DT_DIR), ("ipv4", DT_DIR)])),
+        // Any user may bind any port, as in Docker's containers: a cell's
+        // ports are its own.
+        ["sys", "net", "ipv4"] => Ok(dir(&[("ip_unprivileged_port_start", DT_REG)])),
+        ["sys", "net", "ipv4", "ip_unprivileged_port_start"] => Ok(Node::File(b"0\n".to_vec())),
         ["sys", "net", "core"] => Ok(dir(&[("somaxconn", DT_REG)])),
         // `listen` clamps backlogs to this (redis checks it).
         ["sys", "net", "core", "somaxconn"] => Ok(Node::File(b"4096\n".to_vec())),
@@ -116,8 +148,10 @@ pub(crate) fn lookup(p: &LinuxProcess, path: &str, follow_last: bool) -> Option<
         ["sys", "kernel", "osrelease"] => Ok(Node::File(b"6.6.0-ichor\n".to_vec())),
         ["sys", "kernel", "ostype"] => Ok(Node::File(b"Linux\n".to_vec())),
         ["sys", "kernel", "pid_max"] => Ok(Node::File(b"4194304\n".to_vec())),
-        [pid, rest @ ..] if *pid == me => process(p, rest, follow_last),
-        _ => Err(ENOENT),
+        [pid, rest @ ..] => match pid.parse::<u64>() {
+            Ok(pid) => process(p, pid, rest),
+            Err(_) => Err(ENOENT),
+        },
     })
 }
 
@@ -133,12 +167,7 @@ fn sys(path: &str) -> Option<Result<Node, i64>> {
         .split('/')
         .filter(|c| !c.is_empty() && *c != ".")
         .collect();
-    let n = frame::cpu::online_count();
-    let list = if n <= 1 {
-        String::from("0\n")
-    } else {
-        alloc::format!("0-{}\n", n - 1)
-    };
+    let list = cpu_list() + "\n";
     Some(match c.as_slice() {
         [] => Ok(dir(&[("devices", DT_DIR)])),
         ["devices"] => Ok(dir(&[("system", DT_DIR)])),
@@ -158,31 +187,52 @@ fn sys(path: &str) -> Option<Result<Node, i64>> {
     })
 }
 
-fn process(p: &LinuxProcess, rest: &[&str], follow_last: bool) -> Result<Node, i64> {
-    let _ = follow_last;
+/// `/proc/<pid>/...` of a process of the caller's cell.
+fn process(p: &LinuxProcess, pid: u64, rest: &[&str]) -> Result<Node, i64> {
+    let e = proc::find(p.entry.cell, pid)
+        .and_then(|e| proc::find(p.entry.cell, e.tgid))
+        .ok_or(ENOENT)?;
+    let Some(g) = e.process() else {
+        return zombie(&e, rest);
+    };
+    // Where another's memory and files are is for those who may signal it.
+    let own = g.tgid == p.group.tgid;
+    let private = matches!(
+        rest.first(),
+        Some(&("cwd" | "exe" | "fd" | "maps" | "environ"))
+    );
+    if private && !own && !p.group.creds().may_signal(e.uids()) {
+        return Err(EACCES);
+    }
     match rest {
         [] => Ok(dir(&[
+            ("cgroup", DT_REG),
             ("cmdline", DT_REG),
             ("comm", DT_REG),
             ("cwd", DT_LNK),
             ("exe", DT_LNK),
             ("fd", DT_DIR),
             ("maps", DT_REG),
+            ("mountinfo", DT_REG),
             ("mounts", DT_REG),
             ("stat", DT_REG),
+            ("statm", DT_REG),
             ("status", DT_REG),
+            ("task", DT_DIR),
         ])),
-        ["cmdline"] => Ok(Node::File(p.group.cmdline())),
-        ["comm"] => Ok(Node::File(format!("{}\n", comm(p)).into_bytes())),
+        // A cell sees itself as the root of a cgroup (v2) namespace; there
+        // is no cgroup file system to look further in.
+        ["cgroup"] => Ok(Node::File(b"0::/\n".to_vec())),
+        ["cmdline"] => Ok(Node::File(g.cmdline())),
+        ["comm"] => Ok(Node::File(format!("{}\n", comm(&g)).into_bytes())),
         ["cwd"] => {
-            let cwd = p.cwd();
-            Ok(Node::Link(
-                p.vfs.lock().path(cwd).unwrap_or_else(|_| "/".to_string()),
-            ))
+            let cwd = g.cwd();
+            let path = g.vfs().lock().path(cwd);
+            Ok(Node::Link(path.unwrap_or_else(|_| "/".to_string())))
         }
-        ["exe"] => Ok(Node::Link(p.group.exe())),
+        ["exe"] => Ok(Node::Link(g.exe())),
         ["fd"] => {
-            let v = p
+            let v = g
                 .open_fds()
                 .into_iter()
                 .map(|n| (n.to_string(), DT_LNK))
@@ -191,27 +241,104 @@ fn process(p: &LinuxProcess, rest: &[&str], follow_last: bool) -> Result<Node, i
         }
         ["fd", n] => {
             let n: u64 = n.parse().map_err(|_| ENOENT)?;
-            let f = p.fd(n).ok_or(ENOENT)?;
-            Ok(Node::Link(describe(p, &f)))
+            let f = g.fd(n).ok_or(ENOENT)?;
+            Ok(Node::Link(describe(&g, &f)))
         }
-        ["maps"] => Ok(Node::File(p.mm().maps().into_bytes())),
+        ["maps"] => Ok(Node::Maps(Arc::downgrade(&g))),
+        ["mountinfo"] => Ok(Node::File(
+            b"1 0 0:1 / / rw - ichor rootfs rw\n2 1 0:2 / /proc rw - proc proc rw\n\
+              3 1 0:3 / /dev rw - devtmpfs devtmpfs rw\n"
+                .to_vec(),
+        )),
         ["mounts"] => Ok(Node::File(mounts())),
-        ["stat"] => Ok(Node::File(stat_process(p))),
-        ["status"] => Ok(Node::File(status(p))),
+        ["stat"] => Ok(Node::File(stat_process(&g, &g.leader))),
+        ["statm"] => {
+            let (size, rss) = {
+                let mm = g.mm();
+                (mm.virtual_size() / 4096, mm.resident_pages())
+            };
+            Ok(Node::File(
+                format!("{size} {rss} 0 0 0 {rss} 0\n").into_bytes(),
+            ))
+        }
+        ["status"] => Ok(Node::File(status(&g, &g.leader))),
+        ["task"] => {
+            let t = g.threads();
+            let names = t.iter().map(|t| (t.pid.to_string(), DT_DIR));
+            Ok(Node::Dir(names.collect()))
+        }
+        ["task", tid, rest @ ..] => {
+            let tid: u64 = tid.parse().map_err(|_| ENOENT)?;
+            let threads = g.threads();
+            let t = threads.iter().find(|t| t.pid == tid).ok_or(ENOENT)?;
+            match rest {
+                [] => Ok(dir(&[
+                    ("comm", DT_REG),
+                    ("stat", DT_REG),
+                    ("status", DT_REG),
+                ])),
+                ["comm"] => Ok(Node::File(format!("{}\n", comm(&g)).into_bytes())),
+                ["stat"] => Ok(Node::File(stat_process(&g, t))),
+                ["status"] => Ok(Node::File(status(&g, t))),
+                // Shared by the process's threads.
+                ["cmdline" | "cwd" | "exe" | "fd" | "maps" | "mounts", ..] => process(p, pid, rest),
+                _ => Err(ENOENT),
+            }
+        }
         _ => Err(ENOENT),
     }
 }
 
-fn comm(p: &LinuxProcess) -> String {
-    if let Some(n) = p.group.prctl.lock().name.clone() {
+/// A process that has exited and was not waited for.
+fn zombie(e: &ProcEntry, rest: &[&str]) -> Result<Node, i64> {
+    let (pgid, sid) = e.group();
+    match rest {
+        [] => Ok(dir(&[("stat", DT_REG), ("status", DT_REG)])),
+        ["stat"] => Ok(Node::File(
+            format!(
+                "{} (defunct) Z {} {pgid} {sid} 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 {} 0 0{}\n",
+                e.pid,
+                e.ppid(),
+                e.started,
+                " 0".repeat(28),
+            )
+            .into_bytes(),
+        )),
+        ["status"] => Ok(Node::File(
+            format!(
+                "Name:\tdefunct\nState:\tZ (zombie)\nTgid:\t{0}\nPid:\t{0}\nPPid:\t{1}\n\
+                 Threads:\t1\n",
+                e.pid,
+                e.ppid()
+            )
+            .into_bytes(),
+        )),
+        ["cmdline"] => Ok(Node::File(Vec::new())),
+        _ => Err(ENOENT),
+    }
+}
+
+fn comm(g: &Group) -> String {
+    if let Some(n) = g.prctl.lock().name.clone() {
         return n;
     }
-    let exe = p.group.exe();
+    let exe = g.exe();
     let base = exe.rsplit('/').next().unwrap_or("");
     base.chars().take(15).collect()
 }
 
-fn describe(p: &LinuxProcess, f: &Fd) -> String {
+/// A process's state as `stat` and `status` give it.
+fn state(g: &Group) -> (char, &'static str) {
+    if proc::stopping(&g.leader) {
+        ('T', "stopped")
+    } else if g.threads().iter().any(|t| t.runnable()) {
+        ('R', "running")
+    } else {
+        ('S', "sleeping")
+    }
+}
+
+fn describe(p: &Group, f: &Fd) -> String {
     match f {
         Fd::Console => "/dev/console".to_string(),
         Fd::Dev(d) => match d.rdev() {
@@ -221,7 +348,7 @@ fn describe(p: &LinuxProcess, f: &Fd) -> String {
             _ => "/dev/urandom".to_string(),
         },
         Fd::File(of) => p
-            .vfs
+            .vfs()
             .lock()
             .path(of.ino)
             .unwrap_or_else(|_| "anon_inode:[file]".to_string()),
@@ -293,45 +420,86 @@ fn stat_global(p: &LinuxProcess) -> Vec<u8> {
     s.into_bytes()
 }
 
-fn status(p: &LinuxProcess) -> Vec<u8> {
+/// `status` of thread `t` of a process.
+fn status(g: &Group, t: &ProcEntry) -> Vec<u8> {
     let (size, rss) = {
-        let mm = p.mm();
+        let mm = g.mm();
         (mm.virtual_size() / 1024, mm.resident_pages() as u64 * 4)
     };
+    let c = g.creds();
+    let (letter, word) = state(g);
+    let mut groups = String::new();
+    for n in &c.groups {
+        groups.push_str(&format!("{n} "));
+    }
+    let acts = g.actions.lock().clone();
     format!(
-        "Name:\t{}\nState:\tR (running)\nTgid:\t{}\nPid:\t{}\nPPid:\t{}\nUid:\t0\t0\t0\t0\n\
-         Gid:\t0\t0\t0\t0\nVmSize:\t{} kB\nVmRSS:\t{} kB\nThreads:\t{}\nSigBlk:\t{:016x}\n",
-        comm(p),
-        p.group.tgid,
-        p.entry.pid,
-        p.entry.ppid(),
-        size,
-        rss,
-        p.group.threads().len(),
-        p.sig.mask
+        "Name:\t{}\nUmask:\t{:04o}\nState:\t{letter} ({word})\nTgid:\t{}\nNgid:\t0\n\
+         Pid:\t{}\nPPid:\t{}\nTracerPid:\t0\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\n\
+         FDSize:\t{}\nGroups:\t{groups}\nVmPeak:\t{size} kB\nVmSize:\t{size} kB\n\
+         VmHWM:\t{rss} kB\nVmRSS:\t{rss} kB\nThreads:\t{}\nSigQ:\t0/4096\n\
+         SigPnd:\t0000000000000000\nShdPnd:\t{:016x}\nSigBlk:\t{:016x}\nSigIgn:\t{:016x}\n\
+         SigCgt:\t{:016x}\nCapInh:\t0000000000000000\nCapPrm:\t{:016x}\nCapEff:\t{:016x}\n\
+         CapBnd:\t{:016x}\nCapAmb:\t0000000000000000\nNoNewPrivs:\t{}\nSeccomp:\t0\n\
+         Cpus_allowed_list:\t{}\n",
+        comm(g),
+        g.umask(),
+        g.tgid,
+        t.pid,
+        g.leader.ppid(),
+        c.ruid,
+        c.euid,
+        c.suid,
+        c.fsuid,
+        c.rgid,
+        c.egid,
+        c.sgid,
+        c.fsgid,
+        g.open_fds().len().next_power_of_two().max(64),
+        g.threads().len(),
+        proc::pending(t),
+        proc::blocked(t),
+        acts.set_ignored(),
+        acts.caught(),
+        c.permitted,
+        c.effective,
+        crate::cred::BOUNDING,
+        u8::from(g.prctl.lock().no_new_privs),
+        cpu_list(),
     )
     .into_bytes()
 }
 
-/// `/proc/<pid>/stat` up to rss (field 24). CPU times are zero (not
-/// accounted yet); start time, size and resident pages are real.
-fn stat_process(p: &LinuxProcess) -> Vec<u8> {
-    let (pgid, sid) = p.group.leader.group();
+/// The CPUs, as a list ("0-3").
+fn cpu_list() -> String {
+    match frame::cpu::online_count() {
+        0 | 1 => String::from("0"),
+        n => format!("0-{}", n - 1),
+    }
+}
+
+/// `/proc/<pid>/stat`. User CPU time, start time, size and resident pages
+/// are real; what is not counted is zero.
+fn stat_process(g: &Group, t: &ProcEntry) -> Vec<u8> {
+    let (pgid, sid) = g.leader.group();
     let (vsize, rss) = {
-        let mm = p.mm();
+        let mm = g.mm();
         (mm.virtual_size(), mm.resident_pages())
     };
+    let (letter, _) = state(g);
+    let ticks = g.cpu_ns() / 10_000_000;
+    let nice = g.prctl.lock().nice;
     format!(
-        "{} ({}) R {} {} {} 0 -1 0 0 0 0 0 0 0 0 0 20 0 {} 0 {} {} {}\n",
-        p.group.tgid,
-        comm(p),
-        p.entry.ppid(),
-        pgid,
-        sid,
-        p.group.threads().len(),
-        p.group.leader.started,
-        vsize,
-        rss
+        "{} ({}) {letter} {} {pgid} {sid} 0 -1 0 0 0 0 0 {ticks} 0 0 0 {} {nice} {} 0 {} {vsize} \
+         {rss} {}{}\n",
+        t.pid,
+        comm(g),
+        g.leader.ppid(),
+        20 + nice,
+        g.threads().len(),
+        g.leader.started,
+        u64::MAX,
+        " 0".repeat(27),
     )
     .into_bytes()
 }
@@ -340,32 +508,62 @@ fn stat_process(p: &LinuxProcess) -> Vec<u8> {
 // Descriptors for opened /proc nodes.
 // ---------------------------------------------------------------------------
 
-/// An opened `/proc` file: a snapshot read sequentially.
+/// An opened `/proc` file: a snapshot read sequentially, or (`maps`) text
+/// made a piece at a time.
 #[derive(Debug)]
 pub(crate) struct ProcFile {
+    state: Mutex<Text>,
+    maps: Option<Weak<Group>>,
+    /// What the snapshot costs its opener's cell.
+    _kept: Option<Reserved>,
+}
+
+#[derive(Debug, Default)]
+struct Text {
     data: Vec<u8>,
-    pos: SpinLock<usize>,
+    pos: usize,
+    /// Where the next piece of `maps` starts.
+    next: Option<u64>,
 }
 
 /// An opened `/proc` directory.
 #[derive(Debug)]
 pub(crate) struct ProcDir {
+    path: String,
     entries: Vec<(String, u8)>,
     pos: SpinLock<u64>,
 }
 
 impl ProcFile {
-    pub(crate) fn new(data: Vec<u8>) -> ProcFile {
+    /// A snapshot, which `p`'s cell pays for; `None` if it cannot.
+    pub(crate) fn new(data: Vec<u8>, p: &LinuxProcess) -> Option<ProcFile> {
+        let pages = data.len().div_ceil(4096) as u64;
+        Some(ProcFile {
+            state: Mutex::new(Text {
+                data,
+                ..Text::default()
+            }),
+            maps: None,
+            _kept: Some(Reserved::new(p.cell.account(), pages)?),
+        })
+    }
+
+    pub(crate) fn maps(of: Weak<Group>) -> ProcFile {
         ProcFile {
-            data,
-            pos: SpinLock::new(0),
+            state: Mutex::new(Text {
+                next: Some(0),
+                ..Text::default()
+            }),
+            maps: Some(of),
+            _kept: None,
         }
     }
 }
 
 impl ProcDir {
-    pub(crate) fn new(entries: Vec<(String, u8)>) -> ProcDir {
+    pub(crate) fn new(path: &str, entries: Vec<(String, u8)>) -> ProcDir {
         ProcDir {
+            path: path.trim_end_matches('/').to_string(),
             entries,
             pos: SpinLock::new(0),
         }
@@ -374,14 +572,47 @@ impl ProcDir {
 
 impl Object for ProcFile {
     fn read(&self, max: usize, _: bool, _: &dyn Fn() -> bool) -> Result<Vec<u8>, i64> {
-        let mut pos = self.pos.lock();
-        let start = (*pos).min(self.data.len());
-        let end = start.saturating_add(max).min(self.data.len());
-        *pos = end;
-        Ok(self.data[start..end].to_vec())
+        let mut t = self.state.lock();
+        if t.pos >= t.data.len()
+            && let Some(from) = t.next
+        {
+            // A process that has exited maps nothing.
+            let group = self.maps.as_ref().and_then(Weak::upgrade);
+            let (text, next) = group.map_or_else(Default::default, |g| g.mm().maps(from));
+            *t = Text {
+                data: text.into_bytes(),
+                pos: 0,
+                next,
+            };
+        }
+        let start = t.pos.min(t.data.len());
+        let end = start.saturating_add(max).min(t.data.len());
+        t.pos = end;
+        Ok(t.data[start..end].to_vec())
     }
     fn write(&self, _: &[u8], _: bool, _: &dyn Fn() -> bool) -> Result<usize, i64> {
         Err(EINVAL)
+    }
+    fn seek(&self, offset: i64, whence: u64) -> Result<u64, i64> {
+        let mut t = self.state.lock();
+        let base = match whence {
+            0 => 0,
+            1 => t.pos as i64,
+            _ => return Err(EINVAL),
+        };
+        let to = base.checked_add(offset).and_then(|n| u64::try_from(n).ok());
+        let to = to.ok_or(EINVAL)?;
+        if self.maps.is_none() {
+            t.pos = usize::try_from(to).map_err(|_| EINVAL)?;
+        } else if to == 0 && whence == 0 {
+            *t = Text {
+                next: Some(0),
+                ..Text::default()
+            };
+        } else if whence == 0 || offset != 0 {
+            return Err(EINVAL);
+        }
+        Ok(to)
     }
     fn poll(&self) -> u16 {
         crate::poll::POLLIN | crate::poll::POLLOUT
@@ -404,7 +635,18 @@ impl Object for ProcDir {
     fn mode(&self) -> u32 {
         0o040_000 // S_IFDIR
     }
+    fn seek(&self, offset: i64, whence: u64) -> Result<u64, i64> {
+        let to = u64::try_from(offset).map_err(|_| EINVAL)?;
+        if whence != 0 {
+            return Err(EINVAL);
+        }
+        *self.pos.lock() = to;
+        Ok(to)
+    }
     fn dir(&self) -> Option<(&[crate::poll::DirEntry], &SpinLock<u64>)> {
         Some((&self.entries, &self.pos))
+    }
+    fn proc_dir(&self) -> Option<&str> {
+        Some(&self.path)
     }
 }

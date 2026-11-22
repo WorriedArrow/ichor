@@ -8,15 +8,19 @@
 //! once the last reader is gone. Writes of up to `PIPE_BUF` bytes are
 //! atomic, as POSIX requires; longer blocking writes complete in pieces.
 
-use alloc::collections::VecDeque;
-use alloc::sync::Arc;
+use alloc::collections::{BTreeMap, VecDeque};
+use alloc::sync::{Arc, Weak};
+use alloc::vec::Vec;
 
+use cell::Account;
 use frame::sync::SpinLock;
 use frame::task::WaitQueue;
 
-const EAGAIN: i64 = 11;
-const EPIPE: i64 = 32;
 use crate::signal::ERESTARTSYS;
+
+const EAGAIN: i64 = 11;
+const ENOMEM: i64 = 12;
+const EPIPE: i64 = 32;
 
 /// Bytes a pipe buffers (Linux's default).
 const CAPACITY: usize = 64 * 1024;
@@ -28,6 +32,40 @@ struct State {
     buf: VecDeque<u8>,
     readers: u32,
     writers: u32,
+    /// Opens of each end so far (a FIFO's blocking open waits for the other
+    /// end to be opened, even if it is closed again before the waiter runs).
+    reader_opens: u64,
+    writer_opens: u64,
+    /// Bytes the pipe holds (`F_SETPIPE_SZ`; CAPACITY to start).
+    capacity: usize,
+    /// The cell that made the pipe, and the pages of buffer it pays for.
+    account: Arc<Account>,
+    kept: u64,
+}
+
+impl State {
+    /// Makes room for `more` bytes, at the cell's cost; false if it cannot
+    /// pay.
+    fn grow(&mut self, more: usize) -> bool {
+        let need = self.buf.len() + more;
+        if need <= self.buf.capacity() {
+            return true;
+        }
+        let pages = need.div_ceil(PIPE_BUF).next_power_of_two();
+        let extra = (pages as u64).saturating_sub(self.kept);
+        if self.account.charge(extra).is_err() {
+            return false;
+        }
+        self.kept += extra;
+        self.buf.reserve_exact(pages * PIPE_BUF - self.buf.len());
+        true
+    }
+}
+
+impl Drop for State {
+    fn drop(&mut self) {
+        self.account.release(self.kept);
+    }
 }
 
 /// A pipe.
@@ -45,13 +83,29 @@ pub(crate) struct Pipe {
 }
 
 impl Pipe {
-    /// A new pipe with one reader and one writer reference.
-    pub(crate) fn new() -> Arc<Pipe> {
+    /// A new pipe with one reader and one writer reference, its buffer
+    /// charged to `account`.
+    pub(crate) fn new(account: &Arc<Account>) -> Arc<Pipe> {
+        Self::with_ends(1, account)
+    }
+
+    /// A named pipe's pipe: no ends until the FIFO is opened
+    /// ([`Pipe::add_end`]).
+    fn new_fifo(account: &Arc<Account>) -> Arc<Pipe> {
+        Self::with_ends(0, account)
+    }
+
+    fn with_ends(n: u32, account: &Arc<Account>) -> Arc<Pipe> {
         Arc::new(Pipe {
             state: SpinLock::new(State {
                 buf: VecDeque::new(),
-                readers: 1,
-                writers: 1,
+                readers: n,
+                writers: n,
+                reader_opens: u64::from(n),
+                writer_opens: u64::from(n),
+                capacity: CAPACITY,
+                account: account.clone(),
+                kept: 0,
             }),
             readable: WaitQueue::new(),
             writable: WaitQueue::new(),
@@ -63,6 +117,97 @@ impl Pipe {
     /// The tasks polling this pipe.
     pub(crate) fn watchers(&self) -> &crate::poll::Watchers {
         &self.watchers
+    }
+
+    /// Adds a reference to one end (a FIFO opened for reading or writing),
+    /// waking opens waiting for it. Returns how often the other end had
+    /// been opened, for [`Pipe::wait_peer`]: counted in the same step,
+    /// because the peer this wakes may open, write and close before the
+    /// caller gets to wait.
+    pub(crate) fn add_end(&self, write: bool) -> u64 {
+        let peer_opens = {
+            let mut s = self.state.lock();
+            if write {
+                s.writers += 1;
+                s.writer_opens += 1;
+                s.reader_opens
+            } else {
+                s.readers += 1;
+                s.reader_opens += 1;
+                s.writer_opens
+            }
+        };
+        self.readable.wake_all();
+        self.writable.wake_all();
+        self.changed();
+        peer_opens
+    }
+
+    /// `F_GETPIPE_SZ`: the bytes the pipe holds.
+    pub(crate) fn capacity(&self) -> usize {
+        self.state.lock().capacity
+    }
+
+    /// `F_SETPIPE_SZ`: rounds `size` up to a power-of-two number of pages
+    /// (at least one) and makes that the capacity, as Linux does; above
+    /// Linux's default `pipe-max-size` (1 MiB) is EPERM, and less than what
+    /// is buffered now is EBUSY. Returns the new capacity.
+    pub(crate) fn set_capacity(&self, size: u64) -> Result<usize, i64> {
+        const EPERM: i64 = 1;
+        const EBUSY: i64 = 16;
+        const MAX: usize = 1 << 20;
+        let want = usize::try_from(size).map_err(|_| EPERM)?;
+        if want > MAX {
+            return Err(EPERM);
+        }
+        let n = want.max(4096).next_power_of_two();
+        let mut s = self.state.lock();
+        if n < s.buf.len() {
+            return Err(EBUSY);
+        }
+        s.capacity = n;
+        drop(s);
+        self.writable.wake_all();
+        self.changed();
+        Ok(n)
+    }
+
+    /// Readers now (a FIFO's non-blocking open for writing needs one).
+    pub(crate) fn readers(&self) -> u32 {
+        self.state.lock().readers
+    }
+
+    /// Blocks a FIFO's open of one end until the other end is open, or has
+    /// been opened more than `start` times (what [`Pipe::add_end`] gave).
+    pub(crate) fn wait_peer(
+        &self,
+        write: bool,
+        start: u64,
+        interrupted: &dyn Fn() -> bool,
+    ) -> Result<(), i64> {
+        let opens = |s: &State| {
+            if write {
+                s.reader_opens
+            } else {
+                s.writer_opens
+            }
+        };
+        let q = if write {
+            &self.writable
+        } else {
+            &self.readable
+        };
+        q.wait_until(|| {
+            let s = self.state.lock();
+            let peers = if write { s.readers } else { s.writers };
+            if peers > 0 || opens(&s) != start {
+                Some(Ok(()))
+            } else if interrupted() {
+                Some(Err(ERESTARTSYS))
+            } else {
+                None
+            }
+        })
     }
 
     /// Drops a reference to one end, waking the other side so it sees EOF
@@ -100,7 +245,7 @@ impl Pipe {
         if write {
             if s.readers == 0 {
                 POLLERR
-            } else if CAPACITY - s.buf.len() >= PIPE_BUF {
+            } else if s.capacity.saturating_sub(s.buf.len()) >= PIPE_BUF.min(s.capacity) {
                 POLLOUT
             } else {
                 0
@@ -117,27 +262,36 @@ impl Pipe {
         }
     }
 
-    /// Reads up to `out.len()` bytes, blocking until some data is available
-    /// or every writer is gone (then 0, end of file).
+    /// Reads up to `out.len()` bytes (see [`Pipe::take`]).
     pub(crate) fn read(
         &self,
         out: &mut [u8],
         nonblock: bool,
         interrupted: &dyn Fn() -> bool,
     ) -> Result<usize, i64> {
-        if out.is_empty() {
-            return Ok(0);
+        let got = self.take(out.len(), nonblock, interrupted)?;
+        out[..got.len()].copy_from_slice(&got);
+        Ok(got.len())
+    }
+
+    /// Takes up to `max` bytes out, blocking until some data is available
+    /// or every writer is gone (then nothing, end of file).
+    pub(crate) fn take(
+        &self,
+        max: usize,
+        nonblock: bool,
+        interrupted: &dyn Fn() -> bool,
+    ) -> Result<Vec<u8>, i64> {
+        if max == 0 {
+            return Ok(Vec::new());
         }
         let r = self.readable.wait_until(|| {
             let mut s = self.state.lock();
             if !s.buf.is_empty() {
-                let n = out.len().min(s.buf.len());
-                for (o, b) in out.iter_mut().zip(s.buf.drain(..n)) {
-                    *o = b;
-                }
-                Some(Ok(n))
+                let n = max.min(s.buf.len());
+                Some(Ok(s.buf.drain(..n).collect()))
             } else if s.writers == 0 {
-                Some(Ok(0))
+                Some(Ok(Vec::new()))
             } else if nonblock {
                 Some(Err(EAGAIN))
             } else if interrupted() {
@@ -149,6 +303,73 @@ impl Pipe {
         self.writable.wake_all();
         self.changed();
         r
+    }
+
+    /// Bytes waiting to be read.
+    pub(crate) fn buffered(&self) -> usize {
+        self.state.lock().buf.len()
+    }
+
+    /// Puts back, in front, bytes [`Pipe::take`] gave that could not be
+    /// passed on (`splice` to a socket that took only part). Another reader
+    /// may have come in between: it then read later bytes first.
+    pub(crate) fn give_back(&self, data: &[u8]) {
+        if data.is_empty() {
+            return;
+        }
+        {
+            let mut s = self.state.lock();
+            for &b in data.iter().rev() {
+                s.buf.push_front(b);
+            }
+        }
+        self.readable.wake_all();
+        self.changed();
+    }
+
+    /// A copy of up to `max` bytes, left where they are (`tee`): blocking
+    /// as [`Pipe::take`].
+    pub(crate) fn peek(
+        &self,
+        max: usize,
+        nonblock: bool,
+        interrupted: &dyn Fn() -> bool,
+    ) -> Result<Vec<u8>, i64> {
+        self.readable.wait_until(|| {
+            let s = self.state.lock();
+            if !s.buf.is_empty() {
+                Some(Ok(s.buf.iter().take(max).copied().collect()))
+            } else if s.writers == 0 {
+                Some(Ok(Vec::new()))
+            } else if nonblock {
+                Some(Err(EAGAIN))
+            } else if interrupted() {
+                Some(Err(ERESTARTSYS))
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Waits until the pipe has room, and says how much: EPIPE once no
+    /// reader is left.
+    pub(crate) fn room(
+        &self,
+        nonblock: bool,
+        interrupted: &dyn Fn() -> bool,
+    ) -> Result<usize, i64> {
+        self.writable.wait_until(|| {
+            let s = self.state.lock();
+            if s.readers == 0 {
+                return Some(Err(EPIPE));
+            }
+            match s.capacity.saturating_sub(s.buf.len()) {
+                0 if nonblock => Some(Err(EAGAIN)),
+                0 if interrupted() => Some(Err(ERESTARTSYS)),
+                0 => None,
+                n => Some(Ok(n)),
+            }
+        })
     }
 
     /// Writes all of `data` (blocking while the pipe is full), or fails
@@ -173,9 +394,12 @@ impl Pipe {
                 if s.readers == 0 {
                     return Some(Err(EPIPE));
                 }
-                let room = CAPACITY - s.buf.len();
+                let room = s.capacity.saturating_sub(s.buf.len());
                 if room >= need {
                     let n = room.min(rest.len());
+                    if !s.grow(n) {
+                        return Some(Err(ENOMEM));
+                    }
                     s.buf.extend(&rest[..n]);
                     Some(Ok(n))
                 } else if nonblock {
@@ -196,4 +420,59 @@ impl Pipe {
         }
         Ok(done)
     }
+}
+
+/// Named pipes' pipes, by FIFO id (`Overlay::fifo_id`, never reused). A
+/// FIFO's pipe lives while any end of it is open; opened again after that,
+/// it starts empty, as on Linux.
+static FIFOS: SpinLock<BTreeMap<u64, Weak<Pipe>>> = SpinLock::new(BTreeMap::new());
+
+/// A blocking FIFO open whose peer opens and closes again before the wait
+/// begins returns at once (it used to wait forever).
+pub(crate) fn fifo_selftest() {
+    let account = Account::root(1);
+    for write in [false, true] {
+        let p = Pipe::new_fifo(&account);
+        let opens = p.add_end(write);
+        p.add_end(!write);
+        p.drop_end(!write);
+        // "Interrupted" at once: a wait that would block fails instead.
+        if p.wait_peer(write, opens, &|| true) != Ok(()) {
+            crate::runtest::fail("pipe: a FIFO open missed a peer that came and went");
+        }
+        // With no peer at all it does wait.
+        let lone = Pipe::new_fifo(&account);
+        let opens = lone.add_end(write);
+        if lone.wait_peer(write, opens, &|| true) != Err(ERESTARTSYS) {
+            crate::runtest::fail("pipe: a FIFO open did not wait for its peer");
+        }
+    }
+    // What a pipe holds is the cell's memory, until the pipe is gone.
+    let p = Pipe::new(&account);
+    let page = [7u8; PIPE_BUF];
+    if p.write(&page, true, &|| true) != Ok(PIPE_BUF)
+        || account.used() != 1
+        || p.write(&page, true, &|| true) != Err(ENOMEM)
+        || p.take(PIPE_BUF, true, &|| true) != Ok(page.to_vec())
+        || p.write(&page, true, &|| true) != Ok(PIPE_BUF)
+    {
+        crate::runtest::fail("pipe: the buffer's charge");
+    }
+    drop(p);
+    if account.used() != 0 {
+        crate::runtest::fail("pipe: a pipe that is gone is still charged");
+    }
+}
+
+/// The pipe behind FIFO `id`, made on its first open (by a process of the
+/// cell `account` is of).
+pub(crate) fn fifo(id: u64, account: &Arc<Account>) -> Arc<Pipe> {
+    let mut m = FIFOS.lock();
+    if let Some(p) = m.get(&id).and_then(Weak::upgrade) {
+        return p;
+    }
+    m.retain(|_, w| w.strong_count() > 0);
+    let p = Pipe::new_fifo(account);
+    m.insert(id, Arc::downgrade(&p));
+    p
 }

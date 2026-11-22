@@ -216,6 +216,8 @@ pub struct Tcp {
     irs: u32,
     rcv_nxt: u32,
     rcv_shift: u8,
+    /// Where the window we last told the peer of ends.
+    told_edge: u32,
     recv_buf: VecDeque<u8>,
     ooo: BTreeMap<u32, Vec<u8>>,
     ooo_bytes: usize,
@@ -265,6 +267,7 @@ impl Tcp {
             irs: 0,
             rcv_nxt: 0,
             rcv_shift: 0,
+            told_edge: 0,
             recv_buf: VecDeque::new(),
             ooo: BTreeMap::new(),
             ooo_bytes: 0,
@@ -366,9 +369,28 @@ impl Tcp {
     /// closes and writes find no room. Raising it announces a window that
     /// reopens.
     pub fn set_cap(&mut self, cap: usize, now: Duration) {
-        let closed = self.rcv_window() == 0;
         self.cap = cap.min(BUFFER);
-        if closed && self.rcv_window() > 0 && !self.peer_fin && self.state != State::Closed {
+        self.announce_window(now);
+    }
+
+    /// Tells the peer of a window that has grown by two segments (or half
+    /// the buffer) past what it was last told (RFC 9293 §3.8.6.2.2). Until
+    /// then it may be waiting for that: a sender does not fill a window
+    /// with tiny segments, and if nothing more arrives from it, nothing
+    /// else would carry the news. Not once it has finished sending (as
+    /// Linux, after RCV_SHUTDOWN): nothing more will come, and the peer may
+    /// already be gone, so the update would only draw a RST.
+    fn announce_window(&mut self, now: Duration) {
+        let open = matches!(
+            self.state,
+            State::Established | State::FinWait1 | State::FinWait2
+        );
+        if !open || self.peer_fin {
+            return;
+        }
+        let step = (2 * u32::from(MSS)).min(self.cap as u32 / 2).max(1);
+        let grown = self.window_edge().wrapping_sub(self.told_edge);
+        if grown >= step && (grown as i32) > 0 {
             self.ack_now = true;
             self.output(now);
         }
@@ -397,19 +419,21 @@ impl Tcp {
     /// Reads received bytes into `out`.
     pub fn recv(&mut self, out: &mut [u8], now: Duration) -> usize {
         let n = out.len().min(self.recv_buf.len());
-        let was_closed_window = self.rcv_window() == 0;
         for (o, b) in out.iter_mut().zip(self.recv_buf.drain(..n)) {
             *o = b;
         }
-        // A window that opens from zero is announced, unless the peer has
-        // finished sending (as Linux, after RCV_SHUTDOWN): nothing more
-        // will come, and the peer may already be gone, so the update would
-        // only draw a RST.
-        if was_closed_window && n > 0 && !self.peer_fin {
-            self.ack_now = true;
-            self.output(now);
+        if n > 0 {
+            self.announce_window(now);
         }
         n
+    }
+
+    /// Copies received bytes into `out`, leaving them to be read.
+    pub fn peek(&self, out: &mut [u8]) -> usize {
+        for (o, b) in out.iter_mut().zip(&self.recv_buf) {
+            *o = *b;
+        }
+        out.len().min(self.recv_buf.len())
     }
 
     /// The application is gone: drops what it never read, and answers any
@@ -463,7 +487,13 @@ impl Tcp {
         u16::try_from(self.rcv_window() >> self.rcv_shift).unwrap_or(u16::MAX)
     }
 
-    fn segment(&self, seq: u32, flags: u8, payload: &[u8], syn: bool) -> Vec<u8> {
+    /// Where the window we would advertise now ends.
+    fn window_edge(&self) -> u32 {
+        self.rcv_nxt
+            .wrapping_add(u32::from(self.window_field()) << self.rcv_shift)
+    }
+
+    fn segment(&mut self, seq: u32, flags: u8, payload: &[u8], syn: bool) -> Vec<u8> {
         let ack = if flags & ACK != 0 { self.rcv_nxt } else { 0 };
         let window = if syn {
             // The SYN's window is never scaled.
@@ -471,6 +501,13 @@ impl Tcp {
         } else {
             self.window_field()
         };
+        if flags & ACK != 0 {
+            self.told_edge = if syn {
+                self.rcv_nxt.wrapping_add(u32::from(window))
+            } else {
+                self.window_edge()
+            };
+        }
         let opts = syn.then_some((MSS, OUR_WSCALE));
         segment(
             self.local,
@@ -580,10 +617,22 @@ impl Tcp {
             self.arm_retransmit(now);
         }
         if !sent_any && self.ack_now {
-            let seg = self.segment(self.snd_nxt, ACK, &[], false);
+            let seg = self.segment(self.ack_seq(), ACK, &[], false);
             self.out.push_back(seg);
         }
         self.ack_now = false;
+    }
+
+    /// The sequence number of a bare ACK: past everything sent (not where a
+    /// retransmission has gone back to), but within the peer's window, so
+    /// that the peer takes it.
+    fn ack_seq(&self) -> u32 {
+        let end = self.snd_una.wrapping_add(self.snd_wnd);
+        if lt(end, self.snd_max) {
+            end
+        } else {
+            self.snd_max
+        }
     }
 
     fn enter_fin_sent(&mut self) {
@@ -652,7 +701,17 @@ impl Tcp {
         let start = seg.seq;
         let end = seg.seq.wrapping_add(len.max(1)).wrapping_sub(1);
         let in_window = |s: u32| le(self.rcv_nxt, s) && lt(s, self.rcv_nxt.wrapping_add(wnd));
+        // What carries nothing may also be at the window's edge, as a peer
+        // that has filled the window sends it, or (for a peer that counts
+        // its zero-window probe) one past a closed one. Else the ACKs of a
+        // peer we have stopped reading from would be lost, and what we send
+        // it with them.
+        let told = self.told_edge;
+        let edge = seq_max(self.rcv_nxt.wrapping_add(wnd), told);
+        let edge = if wnd == 0 { edge.wrapping_add(1) } else { edge };
+        let at_edge = le(self.rcv_nxt, start) && le(start, edge);
         let acceptable = match (len, wnd) {
+            (0, _) if seg.flags & RST == 0 => at_edge,
             (0, 0) => seg.seq == self.rcv_nxt,
             // A bare FIN at rcv_nxt needs no window (Linux takes it too),
             // so a reader with a full buffer still learns of the end.
@@ -661,11 +720,20 @@ impl Tcp {
             (_, 0) => false,
             _ => in_window(start) || in_window(end),
         };
+        // Data with no window for it: the ACK it carries counts all the
+        // same (RFC 9293 asks for that), and it is answered with one.
+        let only_ack = !acceptable
+            && wnd == 0
+            && at_edge
+            && !seg.payload.is_empty()
+            && seg.flags & (SYN | RST) == 0;
         if !acceptable {
             if seg.flags & RST == 0 {
                 self.ack_now = true;
             }
-            return;
+            if !only_ack {
+                return;
+            }
         }
         // 2. RST: exact match resets, otherwise a challenge ACK (RFC 5961).
         if seg.flags & RST != 0 {
@@ -713,7 +781,7 @@ impl Tcp {
             return;
         }
         self.on_ack(seg, now);
-        if self.state == State::Closed {
+        if self.state == State::Closed || only_ack {
             return;
         }
         // 5. Data and FIN. New data for an application that has gone away
@@ -977,13 +1045,12 @@ impl Tcp {
             {
                 // Zero-window probe: the byte at snd_una, past the closed
                 // window. A peer whose window has opened takes and
-                // acknowledges it.
+                // acknowledges it; until then it has not been sent.
                 let off = self.snd_una.wrapping_sub(self.buf_seq) as usize;
                 if let Some(&b) = self.send_buf.get(off) {
                     let seg = self.segment(self.snd_una, ACK, &[b], false);
                     self.out.push_back(seg);
-                    self.snd_nxt = seq_max(self.snd_nxt, self.snd_una.wrapping_add(1));
-                    self.snd_max = seq_max(self.snd_max, self.snd_nxt);
+                    self.snd_max = seq_max(self.snd_max, self.snd_una.wrapping_add(1));
                 }
                 self.retransmit_at = Some(now + self.rto);
                 return;
@@ -1288,6 +1355,61 @@ mod tests {
         assert_eq!(got, data);
     }
 
+    /// One direction's window is closed and probed (B does not read) while
+    /// the other carries data: A's ACKs count all the same, and what B
+    /// sends flows at its usual pace.
+    #[test]
+    fn a_closed_window_does_not_stop_the_other_direction() {
+        for loss in [0, 20] {
+            let mut sim = Sim::new(loss, 0, 23, 9);
+            for _ in 0..10 {
+                sim.step();
+            }
+            let up = pattern(2 * BUFFER, 7);
+            let mut sent_up = 0;
+            // B's buffer fills (the last bytes, less than the scaled window
+            // tells of, by A's probes) and A probes it, for a while.
+            let until = sim.now + Duration::from_secs(8000);
+            while sim.now < until {
+                let now = sim.now;
+                sent_up += sim.a.send(&up[sent_up..], now);
+                if !sim.step() {
+                    break;
+                }
+            }
+            assert_eq!(sim.b.as_ref().unwrap().readable(), BUFFER);
+            assert_eq!(sim.a.state(), State::Established);
+            let down = pattern(2 << 20, 8);
+            let (mut sent, mut got) = (0, Vec::new());
+            let mut buf = vec![0u8; 65536];
+            let start = sim.now;
+            while got.len() < down.len() {
+                let now = sim.now;
+                sent += sim.b.as_mut().unwrap().send(&down[sent..], now);
+                let n = sim.a.recv(&mut buf, now);
+                got.extend_from_slice(&buf[..n]);
+                let more = sim.step();
+                assert!(
+                    more && sim.now < start + Duration::from_secs(60),
+                    "loss {loss}: {} of {} bytes",
+                    got.len(),
+                    down.len()
+                );
+            }
+            assert_eq!(got, down);
+            // And once B reads, what waited arrives.
+            let mut got = Vec::new();
+            while got.len() < up.len() {
+                let now = sim.now;
+                sent_up += sim.a.send(&up[sent_up..], now);
+                let n = sim.b.as_mut().unwrap().recv(&mut buf, now);
+                got.extend_from_slice(&buf[..n]);
+                assert!(sim.step() || got.len() == up.len());
+            }
+            assert_eq!(got, up);
+        }
+    }
+
     /// A slow reader whose buffer is full still takes the peer's FIN, and
     /// draining the buffer afterwards sends nothing: the peer may already
     /// be gone, and an update would only draw its stack's RST.
@@ -1319,6 +1441,44 @@ mod tests {
         assert_eq!(b.recv(&mut buf, now), 4096);
         assert!(b.transmit().is_none(), "a window update after the FIN");
         assert_eq!(&buf[..], &data[..4096]);
+    }
+
+    /// A reader that leaves the window small but open tells the peer once it
+    /// has read two segments' worth: a sender avoiding tiny segments is
+    /// waiting for that, and would wait for its persist timer otherwise.
+    #[test]
+    fn a_small_window_that_grows_is_announced() {
+        let mut sim = Sim::new(0, 0, 23, 9);
+        for _ in 0..10 {
+            sim.step();
+        }
+        // All but 800 bytes of the buffer.
+        let data = pattern(BUFFER - 800, 4);
+        let mut sent = 0;
+        while sim.b.as_ref().unwrap().readable() < data.len() {
+            let now = sim.now;
+            sent += sim.a.send(&data[sent..], now);
+            assert!(sim.step());
+        }
+        let now = sim.now;
+        let b = sim.b.as_mut().unwrap();
+        while b.transmit().is_some() {}
+        let mut buf = vec![0u8; 8192];
+        // Less than two segments: no news yet.
+        assert_eq!(b.recv(&mut buf[..1000], now), 1000);
+        assert!(b.transmit().is_none());
+        // Now there is, once, whatever is read next.
+        assert_eq!(b.recv(&mut buf[..4096], now), 4096);
+        let (local, remote) = (b.local, b.remote);
+        let update = b.transmit().expect("a window update");
+        let seg = Segment::parse(&update, local.0, remote.0).unwrap();
+        assert_eq!(
+            usize::from(seg.window) << OUR_WSCALE,
+            (800 + 5096) >> OUR_WSCALE << OUR_WSCALE
+        );
+        assert!(b.transmit().is_none());
+        assert_eq!(b.recv(&mut buf[..1000], now), 1000);
+        assert!(b.transmit().is_none());
     }
 
     /// A receiver whose cap drops to nothing closes its window (the sender

@@ -24,6 +24,10 @@ use crate::signal::ERESTARTSYS;
 
 const EAGAIN: i64 = 11;
 const EWOULDBLOCK: i64 = EAGAIN;
+const ENOLCK: i64 = 37;
+
+/// Most locks one file has.
+const LOCKS_MAX: usize = 16 * 1024;
 
 /// (root identity, inode).
 pub(crate) type Key = (usize, overlay::Ino);
@@ -124,6 +128,10 @@ fn set(key: Key, req: Request, interrupted: &dyn Fn() -> bool) -> Result<(), i64
     let Some(write) = write else {
         let mut t = LOCKS.lock();
         if let Some(v) = t.get_mut(&key) {
+            // (An unlock may split a lock in two.)
+            if v.len() >= LOCKS_MAX && family == Family::Record && r.end != u64::MAX {
+                return Err(ENOLCK);
+            }
             carve(v, owner, family, r.start, r.end);
             if v.is_empty() {
                 t.remove(&key);
@@ -149,15 +157,29 @@ fn set(key: Key, req: Request, interrupted: &dyn Fn() -> bool) -> Result<(), i64
             }
             return None;
         }
+        if v.len() >= LOCKS_MAX {
+            return Some(Err(ENOLCK));
+        }
         carve(v, owner, family, r.start, r.end);
-        v.push(Lock {
+        let mut lock = Lock {
             owner,
             family,
             write,
             start: r.start,
             end: r.end,
             pid,
+        };
+        // Joins what the owner holds alike on either side.
+        v.retain(|l| {
+            let alike = l.owner == owner && l.family == family && l.write == write;
+            if !alike || (l.end != lock.start && l.start != lock.end) {
+                return true;
+            }
+            lock.start = lock.start.min(l.start);
+            lock.end = lock.end.max(l.end);
+            false
         });
+        v.push(lock);
         Some(Ok(()))
     })?;
     // Downgrades (exclusive to shared) can let others in.

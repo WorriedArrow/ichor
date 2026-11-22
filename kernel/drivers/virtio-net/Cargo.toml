@@ -11,6 +11,7 @@ name = "virtio_net"
 
 [dependencies]
 frame.workspace = true
+net.workspace = true
 virtio-pci.workspace = true
 
 [lints]

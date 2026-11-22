@@ -171,9 +171,17 @@ pub(crate) fn init_tsc() -> Option<(u64, &'static str)> {
     found
 }
 
+/// The TSC against the ACPI PM timer: the median of three windows, since a
+/// vCPU descheduled at either end of one measures it wrong.
+fn calibrate_with_pm_timer(t: acpi::PmTimer) -> Option<u64> {
+    let mut hz = [pm_window(t)?, pm_window(t)?, pm_window(t)?];
+    hz.sort_unstable();
+    Some(hz[1])
+}
+
 /// Measures the TSC over 10 ms of the ACPI PM timer (3.579545 MHz). `None`
 /// if the counter does not advance (no timer at that port).
-fn calibrate_with_pm_timer(t: acpi::PmTimer) -> Option<u64> {
+fn pm_window(t: acpi::PmTimer) -> Option<u64> {
     let mask: u32 = if t.bits32 { u32::MAX } else { 0x00ff_ffff };
     // SAFETY: the FADT names this port as the PM timer, a read-only
     // free-running counter: reading it has no side effects on any device.
@@ -253,11 +261,20 @@ pub(crate) fn init_timer() {
     // One-shot mode: measure LAPIC ticks per millisecond against the TSC.
     write(MSR_TIMER_DIVIDE, 0b0011); // divide by 16
     write(MSR_LVT_TIMER, LVT_MASKED | u64::from(TIMER_VECTOR));
-    write(MSR_TIMER_INIT, u64::from(u32::MAX));
-    delay_us(10_000);
-    let ticks = u64::from(u32::MAX) - read(MSR_TIMER_CURRENT);
+    // The lowest of three: a vCPU descheduled between the reads of the two
+    // clocks measures too high (every timer would be late) or too low
+    // (timers fire early and are armed again, which costs little).
+    let mut per_ms = u64::MAX;
+    for _ in 0..3 {
+        write(MSR_TIMER_INIT, u64::from(u32::MAX));
+        let start = rdtsc();
+        delay_us(3_000);
+        let ticks = u64::from(u32::MAX) - read(MSR_TIMER_CURRENT);
+        let elapsed = rdtsc().wrapping_sub(start).max(1);
+        per_ms = per_ms.min(ticks * (tsc_hz() / 1000) / elapsed);
+    }
     write(MSR_TIMER_INIT, 0);
-    LAPIC_TICKS_PER_MS.store((ticks / 10).max(1), Relaxed);
+    LAPIC_TICKS_PER_MS.store(per_ms.max(1), Relaxed);
     write(MSR_LVT_TIMER, u64::from(TIMER_VECTOR));
 }
 
@@ -277,16 +294,27 @@ const KINDS: usize = 3;
 crate::cpu_local! {
     /// Absolute TSC deadlines per kind; 0 means unarmed.
     static DEADLINES: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
+    /// What the hardware is programmed for (an absolute TSC; 0: nothing).
+    static HARDWARE: AtomicU64 = AtomicU64::new(0);
 }
 
 fn ns_to_tsc(ns: u64) -> u64 {
     (u128::from(ns) * u128::from(tsc_hz()) / 1_000_000_000) as u64
 }
 
-/// Programs the hardware for the earliest armed deadline.
-fn program(d: &[AtomicU64; KINDS]) {
+/// Programs the hardware for the earliest armed deadline. If it is already
+/// programmed for an earlier time, that interrupt will program the rest: a
+/// context switch pushes the slice later every time, and each write is a VM
+/// exit. (One long overdue is not waited for.)
+fn program(g: &crate::cpu::IrqGuard, d: &[AtomicU64; KINDS]) {
     let next = d.iter().map(|x| x.load(Relaxed)).filter(|&x| x != 0).min();
     let Some(at) = next else { return };
+    let hardware = HARDWARE.get(g);
+    let set = hardware.load(Relaxed);
+    if set != 0 && set <= at && rdtsc() < set.wrapping_add(tsc_hz() / 100) {
+        return;
+    }
+    hardware.store(at, Relaxed);
     if DEADLINE_MODE.load(Relaxed) {
         // SAFETY: IA32_TSC_DEADLINE exists when CPUID reports TSC-deadline
         // support (checked in `init_timer`); writing it only arms this
@@ -318,7 +346,7 @@ pub(crate) fn arm(kind: TimerKind, ns: u64) {
     let g = crate::cpu::IrqGuard::new();
     let d = DEADLINES.get(&g);
     d[kind as usize].store(rdtsc().wrapping_add(ns_to_tsc(ns).max(1)), Relaxed);
-    program(d);
+    program(&g, d);
 }
 
 /// Handles this CPU's timer interrupt: fires expired deadlines, re-arms.
@@ -340,7 +368,8 @@ fn on_timer_interrupt() {
             fired(TimerKind::Kernel),
             fired(TimerKind::Sleep),
         );
-        program(d);
+        HARDWARE.get(&g).store(0, Relaxed);
+        program(&g, d);
         r
     };
     if kernel {

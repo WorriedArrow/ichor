@@ -22,6 +22,15 @@ impl SchedInfo {
         group: GroupId(0),
         weight: DEFAULT_WEIGHT,
     };
+
+    /// A task of cell `cell`'s: cells share each CPU fairly, however many
+    /// tasks each has.
+    pub(crate) fn of_cell(cell: u64) -> SchedInfo {
+        SchedInfo {
+            group: GroupId(cell + 1),
+            weight: DEFAULT_WEIGHT,
+        }
+    }
 }
 
 fn info(t: &Task) -> SchedInfo {
@@ -60,6 +69,15 @@ fn now_ns() -> u64 {
     u64::try_from(frame::time::now().as_nanos()).unwrap_or(u64::MAX)
 }
 
+/// Wakes an idle CPU other than `here`, if there is one, to come and take
+/// work: an idle CPU halts with no tick, and only looks when told to.
+fn call_idle(here: CpuId) {
+    let idle = cpu::online().find(|&c| c != here && CPUS.get_on(c).group.load(Relaxed) == NO_GROUP);
+    if let Some(c) = idle {
+        task::kick(c);
+    }
+}
+
 impl Scheduler for FairScheduler {
     fn enqueue(&self, task: Arc<Task>, why: Enqueue) {
         let here = cpu::current();
@@ -73,9 +91,16 @@ impl Scheduler for FairScheduler {
             _ => here,
         };
         let SchedInfo { group, weight } = info(&task);
-        CPUS.get_on(target).rq.lock().enqueue(group, weight, task);
+        let waiting = {
+            let mut rq = CPUS.get_on(target).rq.lock();
+            rq.enqueue(group, weight, task);
+            rq.len()
+        };
         if target != here {
             task::kick(target);
+        } else if waiting > 1 {
+            // More than the current task's leaving will serve at once.
+            call_idle(here);
         }
     }
 
@@ -92,6 +117,7 @@ impl Scheduler for FairScheduler {
             pc.group.store(g.0, Relaxed);
             return Some(t);
         }
+        rq.prune(); // cells come and go
         drop(rq);
         // Nothing local: steal from the first busy CPU after this one.
         let n = cpu::online_count();
@@ -112,8 +138,17 @@ impl Scheduler for FairScheduler {
     }
 
     fn tick(&self, cpu: CpuId, _current: &Arc<Task>) -> bool {
-        // Preempt only if someone else is waiting on this CPU.
-        !CPUS.get_on(cpu).rq.lock().is_empty()
+        // Preempt only if someone else is waiting on this CPU, or a
+        // CPU-time timer has to be looked at.
+        let waiting = !CPUS.get_on(cpu).rq.lock().is_empty();
+        if waiting {
+            // A task woken here waits for this CPU, which did not become
+            // free soon: one with nothing to do may have it. (Not asked as
+            // it is woken: its waker often stops at once, and it then runs
+            // here sooner than another CPU could wake up for it.)
+            call_idle(cpu);
+        }
+        crate::itimer::watching_cpu_time() || waiting
     }
 
     fn timeslice(&self) -> Duration {

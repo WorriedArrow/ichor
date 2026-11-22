@@ -209,6 +209,355 @@ $!{EAGAIN} or fail("empty non-blocking udp read: $!");
 print "debian: udp: datagrams keep boundaries and sources, truncate, connect filters, ports are per protocol\n";
 "#;
 
+/// Signals beyond delivery to a handler: stopping and continuing (what
+/// `waitpid` reports, a sleep that goes on over it), who sent one, queued
+/// real-time ones, `rt_sigtimedwait`, children nobody waits for, POSIX and
+/// CPU-time timers, and process descriptors.
+const SIGNAL_SCRIPT: &str = r#"use strict; use warnings; use Errno;
+use POSIX qw(:signal_h :sys_wait_h setpgid);
+$| = 1;
+my $pid;
+sub fail { print "debian: signals FAILED: @_\n"; kill KILL => $pid if $pid; POSIX::_exit(1) }
+my $WCONTINUED = 8;
+sub child { my $f = shift; my $pid = fork() // fail("fork: $!"); if (!$pid) { $f->(); POSIX::_exit(0) } $pid }
+# The status as the kernel gave it ($? leaves stops out).
+our $status = 0;
+sub native { $status }
+BEGIN {
+    package Wait;
+    *main::waitpid = sub { my $s = "\0" x 4; my $r = syscall(61, $_[0] + 0, $s, $_[1] + 0, 0); $main::status = unpack("I", $s); $r };
+}
+$SIG{ALRM} = sub { my (undef, undef, $l) = caller; fail("timed out at line $l") };
+alarm 60;
+# Stop and continue, each reported once.
+$pid = child(sub { setpgid(0, 0); while (1) { select(undef, undef, undef, 1) } });
+setpgid($pid, $pid);
+for my $sig (SIGSTOP, SIGTSTP) {
+    kill $sig => $pid or fail("kill $sig: $!");
+    waitpid($pid, WUNTRACED) == $pid or fail("wait for a stop: $!");
+    (native() & 0xff) == 0x7f && native() >> 8 == $sig or fail("stop status " . native());
+    waitpid($pid, WUNTRACED | WNOHANG) == 0 or fail("stop reported twice");
+    kill CONT => $pid;
+    waitpid($pid, $WCONTINUED) == $pid && native() == 0xffff or fail("continue status " . native());
+    waitpid($pid, $WCONTINUED | WNOHANG) == 0 or fail("continue reported twice");
+}
+# A stopped process dies of SIGKILL, not of a pending SIGTERM.
+kill STOP => $pid; waitpid($pid, WUNTRACED) == $pid or fail("stop: $!");
+kill TERM => $pid;
+waitpid($pid, WNOHANG) == 0 or fail("a stopped process took SIGTERM");
+kill KILL => $pid;
+waitpid($pid, 0) == $pid && native() == SIGKILL or fail("kill status " . native());
+# A sleep goes on over a stop, to its own deadline.
+sub now { my $ts = "\0" x 16; syscall(228, 1, $ts); my ($s, $n) = unpack("qq", $ts); $s + $n / 1e9 }
+$pid = child(sub {
+    my $t = now();
+    select(undef, undef, undef, 0.4) == 0 or POSIX::_exit(2);
+    POSIX::_exit(now() - $t < 0.39 ? 3 : 0);
+});
+select(undef, undef, undef, 0.05);
+kill STOP => $pid; waitpid($pid, WUNTRACED) == $pid or fail("stop a sleeper: $!");
+kill CONT => $pid;
+waitpid($pid, 0) == $pid && native() == 0 or fail("the sleeper ended with " . native());
+# Who sent it. (Perl runs this kind of handler at once, wherever it is, so
+# let it be in sigsuspend.)
+my ($from, $code);
+sigprocmask(SIG_BLOCK, POSIX::SigSet->new(SIGUSR1)) or fail("sigprocmask: $!");
+my $act = POSIX::SigAction->new(sub { $from = $_[1]{pid}; $code = $_[1]{code} }, POSIX::SigSet->new, SA_SIGINFO);
+sigaction(SIGUSR1, $act) or fail("sigaction: $!");
+my $me = $$;
+$pid = child(sub { kill USR1 => $me });
+waitpid($pid, 0) == $pid or fail("a blocked signal interrupted a wait: $!");
+POSIX::sigsuspend(POSIX::SigSet->new);
+defined $from or fail("sigsuspend returned without its signal");
+$from == $pid && $code == 0 or fail("SIGUSR1 from " . $from . " code " . $code);
+# Real-time signals queue, with their values; taken by rt_sigtimedwait.
+my $set = POSIX::SigSet->new(40, 41, SIGCHLD);
+sigprocmask(SIG_BLOCK, $set) or fail("sigprocmask: $!");
+sub info { pack("i i i i i I q x96", $_[0], 0, -1, 0, $$, 0, $_[1]) }
+syscall(129, $$, 40, my $one = info(40, 111)) == 0 or fail("sigqueue: $!");
+syscall(129, $$, 40, my $two = info(40, 222)) == 0 or fail("sigqueue: $!");
+sub timedwait {
+    my ($bits, $sec) = @_;
+    my ($s, $i, $t) = (pack("Q", $bits), "\0" x 128, pack("qq", $sec, 0));
+    my $r = syscall(128, $s, $i, $t, 8);
+    ($r, unpack("x8 i x12 q", $i));
+}
+for my $want (111, 222) {
+    my ($r, $c, $v) = timedwait(1 << 39, 5);
+    $r == 40 && $c == -1 && $v == $want or fail("sigtimedwait gave $r, code $c, value $v");
+}
+my ($r) = timedwait(1 << 39, 0);
+$r == -1 && $!{EAGAIN} or fail("empty sigtimedwait gave $r: $!");
+$pid = child(sub { select(undef, undef, undef, 0.05) });
+($r, $code) = timedwait(1 << (SIGCHLD - 1), 5);
+$r == SIGCHLD && $code == 1 or fail("waiting for SIGCHLD gave $r, code $code");
+waitpid($pid, 0);
+# A POSIX timer.
+my $ev = pack("Q i i x48", 77, 41, 0);
+my $id = pack("i", -1);
+syscall(222, 1, $ev, $id) == 0 or fail("timer_create: $!");
+$id = unpack("i", $id);
+my $spec = pack("q4", 0, 0, 0, 10_000_000);
+syscall(223, $id, 0, $spec, 0) == 0 or fail("timer_settime: $!");
+($r, $code, my $v) = timedwait(1 << 40, 5);
+$r == 41 && $code == -2 && $v == 77 or fail("timer gave $r, code $code, value $v");
+syscall(226, $id) == 0 or fail("timer_delete: $!");
+syscall(226, $id) == -1 && $!{EINVAL} or fail("a deleted timer is still there");
+# CPU time: ITIMER_PROF fires while computing.
+my $prof = 0;
+$SIG{PROF} = sub { $prof++ };
+my $it = pack("q4", 0, 20_000, 0, 20_000);
+syscall(38, 2, $it, 0) == 0 or fail("setitimer: $!");
+my $x = 0;
+while ($prof < 3) { $x += $_ for 1 .. 10000 }
+$it = "\0" x 32;
+syscall(38, 2, $it, 0) == 0 or fail("setitimer off: $!");
+# Process descriptors.
+$pid = child(sub { while (1) { select(undef, undef, undef, 1) } });
+my $fd = syscall(434, $pid, 0);
+$fd >= 0 or fail("pidfd_open: $!");
+my $rin = ""; vec($rin, $fd, 1) = 1;
+select(my $rout = $rin, undef, undef, 0) == 0 or fail("a running process's pidfd is readable");
+syscall(424, $fd, SIGTERM, 0, 0) == 0 or fail("pidfd_send_signal: $!");
+select($rout = $rin, undef, undef, 5) == 1 or fail("an exited process's pidfd is not readable");
+my $si = "\0" x 128;
+syscall(247, 3, $fd, $si, 4, 0) == 0 or fail("waitid(P_PIDFD): $!");
+my ($signo, $c2, $spid, $st) = unpack("i x4 i x4 i x4 i", $si);
+$signo == SIGCHLD && $c2 == 2 && $spid == $pid && $st == SIGTERM or fail("waitid: $signo $c2 $spid $st");
+syscall(434, $pid, 0) == -1 && $!{ESRCH} or fail("a reaped process still opens");
+# Timers and signals as descriptors.
+my $tfd = syscall(283, 1, 04000);
+$tfd >= 0 or fail("timerfd_create: $!");
+$spec = pack("q4", 0, 10_000_000, 0, 10_000_000);
+syscall(286, $tfd, 0, $spec, 0) == 0 or fail("timerfd_settime: $!");
+$rin = ""; vec($rin, $tfd, 1) = 1;
+select($rout = $rin, undef, undef, 5) == 1 or fail("the timer never expired");
+select(undef, undef, undef, 0.03);
+open(my $th, "<&=", $tfd) or fail("fdopen: $!");
+my $count = "";
+sysread($th, $count, 8) == 8 && unpack("Q", $count) >= 2 or fail("timer read: $!");
+sigprocmask(SIG_BLOCK, POSIX::SigSet->new(SIGUSR2)) or fail("sigprocmask: $!");
+my $mask = pack("Q", 1 << (SIGUSR2 - 1));
+my $sfd = syscall(289, -1, $mask, 8, 04000);
+$sfd >= 0 or fail("signalfd: $!");
+$rin = ""; vec($rin, $sfd, 1) = 1;
+select($rout = $rin, undef, undef, 0) == 0 or fail("an empty signalfd is readable");
+$pid = child(sub { kill USR2 => $me });
+select($rout = $rin, undef, undef, 5) == 1 or fail("the signal never arrived");
+open(my $sh, "<&=", $sfd) or fail("fdopen: $!");
+sysread($sh, my $rec, 1024) == 128 or fail("signalfd read: $!");
+($signo, my $spid2) = unpack("I x8 I", $rec);
+$signo == SIGUSR2 && $spid2 == $pid or fail("signalfd gave $signo from $spid2");
+waitpid($pid, 0);
+# An epoll instance watching another.
+my ($outer, $inner) = (syscall(291, 0), syscall(291, 0));
+pipe(my $pr, my $pw) or fail("pipe: $!");
+my $eev = pack("I Q", 1, 7);
+syscall(233, $inner, 1, fileno $pr, $eev) == 0 && syscall(233, $outer, 1, $inner, $eev) == 0 or fail("epoll_ctl: $!");
+syscall(233, $inner, 1, $outer, $eev) == -1 && $!{ELOOP} or fail("epoll instances in a circle: $!");
+my $evs = "\0" x 48;
+syscall(232, $outer, $evs, 4, 0) == 0 or fail("an idle nested epoll is ready");
+$pid = child(sub { select(undef, undef, undef, 0.05); syswrite($pw, "x") });
+syscall(232, $outer, $evs, 4, 5000) == 1 or fail("a nested epoll never became ready");
+waitpid($pid, 0);
+# Children of a process that ignores SIGCHLD are not waited for.
+$SIG{CHLD} = "IGNORE";
+$pid = child(sub { });
+waitpid($pid, 0) == -1 && $!{ECHILD} or fail("an ignored child was waited for");
+print "debian: signals: stop and continue, senders, queues, timers and process descriptors work\n";
+"#;
+
+/// Moving and looking at bytes inside the kernel: `splice`, `tee`,
+/// `copy_file_range`, gathered writes, `MSG_PEEK`, `FIONREAD`, socket
+/// timeouts, and what netlink and the interface ioctls say of the cell.
+const MOVE_SCRIPT: &str = r#"use strict; use warnings; use Socket; use Errno; use Fcntl;
+sub fail { print "debian: moves FAILED: @_\n"; exit 1 }
+$SIG{ALRM} = sub { fail("timed out") };
+alarm 60;
+my $m;
+sub full { my ($f, $n) = @_; my $got = ""; while (length $got < $n) { sysread($f, $got, $n - length $got, length $got) or last } $got }
+pipe(my $r, my $w) or fail("pipe: $!");
+socketpair(my $a, my $b, AF_UNIX, SOCK_STREAM, 0) or fail("socketpair: $!");
+my ($rf, $wf, $af) = (fileno $r, fileno $w, fileno $a);
+# Pipe to socket, socket to pipe, file to pipe, pipe to file.
+syswrite($w, "hello splice") == 12 or fail("write: $!");
+syscall(275, $rf, 0, $af, 0, 100, 0) == 12 or fail("splice to a socket: $!");
+full($b, 12) eq "hello splice" or fail("spliced bytes");
+syswrite($b, "back") == 4 or fail("write: $!");
+syscall(275, $af, 0, $wf, 0, 100, 0) == 4 or fail("splice from a socket: $!");
+full($r, 4) eq "back" or fail("bytes spliced back");
+my $p = "/tmp/ichor-move";
+open(my $f, "+>", $p) or fail("open: $!");
+syswrite($f, "0123456789" x 100) == 1000 or fail("write: $!");
+my $off = pack("q", 10);
+syscall(275, fileno $f, $off, $wf, 0, 20, 0) == 20 or fail("splice from a file: $!");
+unpack("q", $off) == 30 or fail("the offset did not move");
+# tee leaves what it copies; a full copy then goes to a file.
+pipe(my $r2, my $w2) or fail("pipe: $!");
+syscall(276, $rf, fileno $w2, 100, 0) == 20 or fail("tee: $!");
+full($r2, 20) eq "0123456789" x 2 or fail("teed bytes");
+open(my $g, "+>", "$p.2") or fail("open: $!");
+syscall(275, $rf, 0, fileno $g, 0, 100, 0) == 20 or fail("splice to a file: $!");
+sysseek($g, 0, 0); full($g, 20) eq "0123456789" x 2 or fail("bytes spliced to a file");
+# Refusals.
+syscall(275, fileno $f, 0, fileno $g, 0, 1, 0) == -1 && $!{EINVAL} or fail("splice without a pipe: $!");
+$off = pack("q", 0);
+syscall(275, $rf, $off, $af, 0, 1, 0) == -1 && $!{ESPIPE} or fail("splice at a pipe's offset: $!");
+syscall(275, $rf, 0, $af, 0, 1, 2) == -1 && $!{EAGAIN} or fail("splice of an empty pipe: $!");
+# A socket that takes only part leaves the rest in the pipe.
+fcntl($a, F_SETFL, O_NONBLOCK) or fail("fcntl: $!");
+my $big = join("", map { chr(33 + $_ % 90) } 0 .. 59999);
+my ($in, $out) = (0, "");
+while (1) {
+    syswrite($w, $big) == length $big or fail("write: $!") if $in == 0;
+    my $n = syscall(275, $rf, 0, $af, 0, 1 << 20, 0);
+    if ($n < 0) { $!{EAGAIN} or fail("splice: $!"); last }
+    $in = ($in + $n) % length $big;
+}
+my $queued = pack("i", 0);
+ioctl($r, 0x541b, $queued) or fail("FIONREAD: $!");
+unpack("i", $queued) == length($big) - $in or fail("the pipe holds " . unpack("i", $queued) . ", not " . (length($big) - $in));
+ioctl($b, 0x541b, $queued) or fail("FIONREAD: $!");
+my $sock = unpack("i", $queued);
+my $all = full($b, $sock);
+$all eq substr($big x 10, 0, $sock) or fail("the socket's bytes are not in order");
+full($r, length($big) - $in) eq substr($big, $in) or fail("the pipe's bytes are not in order");
+# copy_file_range, and an overlapping one.
+my ($o1, $o2) = (pack("q", 5), pack("q", 0));
+syscall(326, fileno $f, $o1, fileno $g, $o2, 995, 0) == 995 or fail("copy_file_range: $!");
+sysseek($g, 0, 0); full($g, 995) eq substr("0123456789" x 100, 5) or fail("copied bytes");
+($o1, $o2) = (pack("q", 0), pack("q", 50));
+syscall(326, fileno $f, $o1, fileno $f, $o2, 100, 0) == -1 && $!{EINVAL} or fail("overlapping copy: $!");
+# Peeking, on a stream and at a datagram.
+for my $fam ([AF_UNIX, SOCK_STREAM], [AF_UNIX, SOCK_DGRAM]) {
+    socketpair(my $s, my $t, $fam->[0], $fam->[1], 0) or fail("socketpair: $!");
+    syswrite($s, "peekaboo") == 8 or fail("write: $!");
+    for (1, 2) { defined recv($t, $m, 4, MSG_PEEK) && $m eq "peek" or fail("MSG_PEEK gave [$m]: $!") }
+    sysread($t, $m, 100) == 8 && $m eq "peekaboo" or fail("read after a peek [$m]");
+    # A receive timeout.
+    setsockopt($t, SOL_SOCKET, SO_RCVTIMEO, pack("qq", 0, 30_000)) or fail("SO_RCVTIMEO: $!");
+    join(",", unpack("qq", getsockopt($t, SOL_SOCKET, SO_RCVTIMEO))) eq "0,30000" or fail("SO_RCVTIMEO reads back wrong");
+    !defined(sysread($t, $m, 1)) && $!{EAGAIN} or fail("a timed read gave $!");
+}
+# TCP: 0.0.0.0 is this host; peeking; a reset on close without lingering.
+socket(my $l, AF_INET, SOCK_STREAM, 0) or fail("socket: $!");
+listen($l, 1) or fail("listen: $!");
+my ($port) = unpack_sockaddr_in(getsockname($l));
+socket(my $c, AF_INET, SOCK_STREAM, 0) or fail("socket: $!");
+connect($c, pack_sockaddr_in($port, INADDR_ANY)) or fail("connect to 0.0.0.0: $!");
+accept(my $s, $l) or fail("accept: $!");
+syswrite($c, "peek") == 4 or fail("write: $!");
+for (1, 2) { defined recv($s, $m, 2, MSG_PEEK) && $m eq "pe" or fail("TCP MSG_PEEK gave [$m]: $!") }
+sysread($s, $m, 10) == 4 or fail("read: $!");
+setsockopt($c, SOL_SOCKET, SO_LINGER, pack("ii", 1, 0)) or fail("SO_LINGER: $!");
+close $c;
+!defined(sysread($s, $m, 1)) && $!{ECONNRESET} or fail("no reset from a close without lingering");
+# Two listeners share a port, and its connections; a third may not.
+my (@shared, @counts, @clients);
+for my $n (0, 1) {
+    socket($shared[$n], AF_INET, SOCK_STREAM, 0) or fail("socket: $!");
+    setsockopt($shared[$n], SOL_SOCKET, 15, 1) or fail("SO_REUSEPORT: $!");
+    bind($shared[$n], pack_sockaddr_in(4712, inet_aton("127.0.0.1"))) or fail("shared bind: $!");
+    listen($shared[$n], 64) or fail("shared listen: $!");
+    fcntl($shared[$n], F_SETFL, O_NONBLOCK);
+}
+socket(my $alone, AF_INET, SOCK_STREAM, 0) or fail("socket: $!");
+bind($alone, pack_sockaddr_in(4712, inet_aton("127.0.0.1"))) and fail("bound a port others share");
+for (1 .. 32) {
+    socket(my $cc, AF_INET, SOCK_STREAM, 0) or fail("socket: $!");
+    connect($cc, pack_sockaddr_in(4712, inet_aton("127.0.0.1"))) or fail("connect: $!");
+    push @clients, $cc;
+}
+for my $n (0, 1) { while (accept(my $ac, $shared[$n])) { $counts[$n]++ } }
+($counts[0] // 0) > 0 && ($counts[1] // 0) > 0 && $counts[0] + $counts[1] == 32 or fail("a shared port gave " . join(",", map { $_ // 0 } @counts));
+# What the cell's interfaces are.
+socket(my $n, 16, 3, 0) or fail("netlink: $!");
+send($n, pack("L S S L L C x3", 20, 22, 0x301, 1, 0, 0), 0) == 20 or fail("netlink send: $!");
+my $answer = "";
+while (1) {
+    defined recv($n, $m, 8192, 0) or fail("netlink recv: $!");
+    $answer .= $m;
+    last if unpack("x4 S", $m) == 3;
+}
+index($answer, "lo\0") > 0 && index($answer, inet_aton("127.0.0.1")) > 0 or fail("no loopback address");
+my $req = pack("a16 x24", "lo");
+ioctl($l, 0x8913, $req) or fail("SIOCGIFFLAGS: $!");
+(unpack("x16 S", $req) & 0x49) == 0x49 or fail("loopback flags");
+open(my $tty, "<", "/dev/tty") and fail("/dev/tty opened without a terminal");
+$!{ENXIO} or fail("/dev/tty: $!");
+# inotify on a directory.
+my $d = "/tmp/ichor-watched";
+mkdir $d or fail("mkdir: $!");
+my $ifd = syscall(294, 04000);
+$ifd >= 0 or fail("inotify_init1: $!");
+my $wd = syscall(254, $ifd, $d, 0xfff);
+$wd > 0 or fail("inotify_add_watch: $!");
+open(my $nf, ">", "$d/f") or fail("open: $!");
+syswrite($nf, "x"); syswrite($nf, "y"); close $nf;
+rename "$d/f", "$d/g"; chmod 0600, "$d/g"; unlink "$d/g"; rmdir $d or fail("rmdir: $!");
+open(my $inh, "<&=", $ifd) or fail("fdopen: $!");
+my ($buf, $seen, $cookies) = ("", "", "");
+sysread($inh, $buf, 8192) or fail("inotify read: $!");
+while (length $buf) {
+    my ($w, $mask, $cookie, $len) = unpack("iIII", $buf);
+    my $name = unpack("Z*", substr($buf, 16, $len));
+    $w == $wd or fail("event for watch $w");
+    $cookies .= "$cookie " if $mask & 0xc0;
+    $seen .= sprintf("%x%s ", $mask, $name);
+    substr($buf, 0, 16 + $len) = "";
+}
+$seen eq "100f 20f 2f 8f 40f 80g 4g 200g 40000400 8000 " or fail("inotify saw $seen");
+$cookies =~ /^([1-9]\d*) \1 $/ or fail("move cookies $cookies");
+!defined(sysread($inh, $buf, 8192)) && $!{EAGAIN} or fail("inotify has more to say");
+readlink("/proc/self/fd/" . fileno $f) eq $p or fail("/proc/self/fd names " . readlink("/proc/self/fd/" . fileno $f));
+system("/usr/bin/perl", "-e", 'system("/proc/self/exe", "-e", "exit 3"); exit($? >> 8)');
+$? >> 8 == 3 or fail("/proc/self/exe ran with status $?");
+# System V shared memory: shared over fork, attachments counted, removed
+# with the last one.
+my $id = shmget(4711, 5000, 01600) // fail("shmget: $!");
+shmget(4711, 5000, 03600) and fail("an exclusive shmget of a key in use worked");
+$!{EEXIST} or fail("exclusive shmget: $!");
+shmget(4711, 5000, 0) == $id or fail("the key finds another segment");
+my $at = syscall(30, $id, 0, 0);
+$at > 0 or fail("shmat: $!");
+sub put { my ($a, $s) = @_; pipe(my $pr, my $pw); syswrite($pw, $s); syscall(0, fileno $pr, $a, length $s) == length $s or fail("write to shared memory: $!") }
+sub peek { unpack("P$_[1]", pack("Q", $_[0])) }
+sub attached { shmctl($id, 2, my $ds) or return -1; unpack("x88 Q", $ds) }
+put($at + 4096, "hello");
+my $pid = fork() // fail("fork: $!");
+if (!$pid) { peek($at + 4096, 5) eq "hello" or exit 2; attached() == 2 or exit 3; put($at, "world"); kill KILL => $$ }
+waitpid($pid, 0); $? == 9 or fail("the child ended with $?");
+peek($at, 5) eq "world" or fail("the child's write is not shared");
+attached() == 1 or fail("a killed child still counts: " . attached());
+shmctl($id, 0, 0) or fail("IPC_RMID: $!");
+attached() == 1 or fail("a removed segment went with an attachment left");
+syscall(67, $at) == 0 or fail("shmdt: $!");
+attached() == -1 && $!{EINVAL} or fail("a removed segment outlived its attachments");
+# A FIFO opened for both: no peer needed, and it is its own.
+require POSIX;
+unlink "/tmp/both"; POSIX::mkfifo("/tmp/both", 0600) or fail("mkfifo: $!");
+sysopen(my $both, "/tmp/both", O_RDWR) or fail("O_RDWR FIFO: $!");
+(fcntl($both, F_GETFL, 0) & 3) == O_RDWR or fail("F_GETFL of an O_RDWR FIFO");
+syswrite($both, "round") == 5 && sysread($both, $m, 10) == 5 && $m eq "round" or fail("through an O_RDWR FIFO: $!");
+sysopen(my $one, "/tmp/both", O_WRONLY | O_NONBLOCK) or fail("a writer beside it: $!");
+close $both;
+{ local $SIG{PIPE} = "IGNORE"; defined(syswrite($one, "x")) and fail("a write with no reader left"); $!{EPIPE} or fail("no reader: $!") }
+# A title written over argv is what /proc shows; many arguments, long ones.
+$0 = "a title";
+open(my $cf, "<", "/proc/self/cmdline") or fail("cmdline: $!");
+my $cmdline = <$cf>;
+$cmdline =~ /^a title\0*$/ or fail("cmdline is $cmdline");
+seek($cf, 2, 0) && <$cf> =~ /^title/ or fail("seek in /proc: $!");
+open(my $maps, "-|", "cat", "/proc/self/maps") or fail("maps: $!");
+my @maps = <$maps>;
+my $ino = (stat("/usr/bin/cat"))[1];
+(grep { m{^[0-9a-f]+-[0-9a-f]+ r-xp [0-9a-f]{8} 00:01 $ino +/usr/bin/cat$} } @maps) == 1 or fail("cat is not mapped: @maps");
+(grep { / \[stack\]$/ } @maps) == 1 && (grep { / \[heap\]$/ } @maps) == 1 or fail("no stack or heap: @maps");
+system("/bin/sh", "-c", '[ $# = 20000 ] && [ ${#1} = 100000 ]', "sh", "x" x 100000, ("y") x 19999) == 0 or fail("20000 arguments: $?");
+system("/bin/true", "x" x 140000) != 0 && $!{E2BIG} or fail("an argument over 128 KiB: $!");
+print "debian: moves: splice, tee, copy_file_range, MSG_PEEK, timeouts, netlink, inotify and shared memory work\n";
+"#;
+
 /// `AF_UNIX`: a socketpair with credentials and end of file; a stream
 /// server on a path in the root (a socket node, EADDRINUSE, a forked client
 /// sending 300 KB through a half-close, ECONNREFUSED once it is gone);
@@ -311,7 +660,7 @@ syscall(38, $zero, $none, $zero) == 0 or fail("disarm: $!");
 $n = 0;
 select(undef, undef, undef, 0.6);
 $n == 0 or fail("disarmed timer fired");
-syscall(38, 1, $it, $zero) == -1 && $!{EINVAL} or fail("ITIMER_VIRTUAL accepted");
+syscall(38, 3, $it, $zero) == -1 && $!{EINVAL} or fail("a fourth interval timer accepted");
 print "debian: alarm and setitimer deliver SIGALRM, getitimer reads back\n";
 "#;
 
@@ -488,6 +837,8 @@ const RUNS: &[(&[&str], i32)] = &[
     (&["perl", "-e", SOCKET_SCRIPT], 0),
     (&["perl", "-e", TIMER_SCRIPT], 0),
     (&["perl", "-e", UNIX_SCRIPT], 0),
+    (&["perl", "-e", SIGNAL_SCRIPT], 0),
+    (&["perl", "-e", MOVE_SCRIPT], 0),
     (
         &[
             "dash",

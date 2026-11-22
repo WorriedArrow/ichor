@@ -14,7 +14,7 @@ sub record {
 }
 sub slurp { open(my $f, "<", $_[0]) or return undef; local $/; my $v = <$f>; close $f; $v }
 # Every catchable signal that arrives in B is written down: none may.
-my @CAUGHT = qw(HUP INT QUIT USR1 USR2 PIPE ALRM TERM CONT TSTP TTIN TTOU WINCH URG);
+my @CAUGHT = qw(HUP INT QUIT USR1 USR2 PIPE ALRM TERM CONT TSTP TTIN TTOU WINCH URG IO);
 $SIG{$_} = eval "sub { record('signals', \"\$\$ SIG$_\") }" for @CAUGHT;
 
 # A file and a directory that exist only in this root.
@@ -29,24 +29,43 @@ my $child = fork() // die "fork: $!";
 if ($child == 0) { POSIX::pause() while 1; POSIX::_exit(0) }
 push @KIDS, $child;
 
-# The futex waiter: a child that maps page 1 of /usr/bin/dash at a fixed
-# address and waits on its first word. Only the harness's SIGUSR1 may end
-# the wait; it writes how the wait ended to /run/ichor/futex-result.
+# The futex waiters: children that map page 1 of /usr/bin/dash at a fixed
+# address and wait on its first word, one through a shared mapping (the
+# page cache's own page, so the futex is kept by physical address) and one
+# through a private one. Only the harness's SIGUSR1 may end the waits; each
+# writes how its wait ended to /run/ichor/futex-KIND.
 my ($FVA, $FOFF) = (0x5a00_0000_0000, 4096);
-my $fpid = fork() // die "fork: $!";
-if ($fpid == 0) {
+sub waiter {
+    my ($kind, $flags) = @_;
+    my $pid = fork() // die "fork: $!";
+    return $pid if $pid;
     $SIG{USR1} = sub { };
     open(my $d, "<", "/usr/bin/dash") or POSIX::_exit(20);
-    my $a = syscall(9, $FVA, 8192, 1, 0x12, fileno($d), 0); # PROT_READ, MAP_PRIVATE|MAP_FIXED
+    my $a = syscall(9, $FVA, 8192, 1, $flags | 0x10, fileno($d), 0); # PROT_READ, MAP_FIXED
     $a == $FVA or POSIX::_exit(21);
     my $word = unpack("L", peek($FVA + $FOFF, 4));
-    record("futex-ready", "word=$word");
+    record("futex-ready", "$kind word=$word");
     my $r = syscall(202, $FVA + $FOFF, 0, $word, 0, 0, 0); # FUTEX_WAIT
     my $e = $! + 0;
-    record("futex-result", $r == -1 ? en($e) : "woken $r");
+    record("futex-$kind", $r == -1 ? en($e) : "woken:$r");
     POSIX::_exit(0);
 }
+my $fpid = waiter("shared", 0x01);
 push @KIDS, $fpid;
+my $fpid2 = waiter("private", 0x02);
+push @KIDS, $fpid2;
+
+# A System V shared memory segment holding B's words, attached.
+my $SHMKEY = 0x1c0b0b0;
+my $shmid = syscall(29, $SHMKEY, 4096, 01000 | 02000 | 0600); # IPC_CREAT|IPC_EXCL
+$shmid >= 0 or die "shmget: $!";
+my $shm = syscall(30, $shmid, 0, 0);
+$shm > 0 or die "shmat: $!";
+{
+    pipe(my $r, my $w) or die "pipe: $!";
+    syswrite($w, "B's shared memory");
+    syscall(0, fileno($r), $shm, 17) == 17 or die "fill shm: $!";
+}
 
 # B's own view of the same file, page 1 (section 4 compares it).
 open(my $dash, "<", "/usr/bin/dash") or die "dash: $!";
@@ -91,9 +110,12 @@ for (1 .. 2) {
 open(my $held, "<", "/b-only/secret") or die "secret: $!";
 POSIX::dup2(fileno($held), 200) // die "dup2: $!";
 
-# Wait until the futex child is in (or about to enter) its wait.
-for (1 .. 500) { last if -e "/run/ichor/futex-ready"; select(undef, undef, undef, 0.02) }
--e "/run/ichor/futex-ready" or die "the futex child never got ready";
+# Wait until both futex children are in (or about to enter) their waits.
+for (1 .. 500) {
+    last if (slurp("/run/ichor/futex-ready") // "") =~ /\n.*\n/;
+    select(undef, undef, undef, 0.02);
+}
+(slurp("/run/ichor/futex-ready") // "") =~ /\n.*\n/ or die "the futex children never got ready";
 my $host = (POSIX::uname())[1];
 my ($pgid, $sid) = (getpgrp(), syscall(124, 0));
 put("ids", join(" ",
@@ -101,15 +123,23 @@ put("ids", join(" ",
     "hostname=$host", "only=/b-only/secret", "ip=$ARG{ip}", "port=$ARG{port}",
     "uplink=$ARG{uplink}", "upath=$UPATH", "abstract=ichor-b-stream", "dgram=ichor-b-dgram",
     "pts=" . join(",", map { $_->[1] } @pts), "futex_va=$FVA", "futex_off=$FOFF",
-    "file=/usr/bin/dash", "fd=200"));
+    "file=/usr/bin/dash", "fd=200", "futex2_pid=$fpid2", "shmkey=$SHMKEY", "shmid=$shmid"));
 
 # What A's checks may have changed, as B sees it now.
 sub status {
     my @s = ("alive=1");
     push @s, "child=" . (kill(0, $child) ? "live" : "gone");
-    my $fx = slurp("/run/ichor/futex-result") // "waiting";
-    chomp $fx;
-    push @s, "futex=$fx";
+    for my $kind ("shared", "private") {
+        my $fx = slurp("/run/ichor/futex-$kind") // "waiting";
+        chomp $fx;
+        push @s, ($kind eq "shared" ? "futex" : "futex2") . "=$fx";
+    }
+    # The segment: B's words, one attachment (B's own), still under its key.
+    my $ds = "\0" x 112;
+    my $st = syscall(31, $shmid, 2, $ds); # IPC_STAT
+    my $there = $st == 0 && unpack("Q", substr($ds, 88, 8)) == 1
+        && syscall(29, $SHMKEY, 0, 0) == $shmid && peek($shm, 17) eq "B's shared memory";
+    push @s, "shm=" . ($there ? "intact" : "changed");
     my $sig = slurp("/run/ichor/signals") // "";
     chomp $sig;
     $sig =~ s/\n/;/g;
@@ -178,9 +208,10 @@ while (1) {
     }
     last if defined poll_in("exit");
 }
-kill("KILL", $child, $fpid);
-waitpid($child, 0);
-waitpid($fpid, 0);
+kill("KILL", $child, $fpid, $fpid2);
+waitpid($_, 0) for ($child, $fpid, $fpid2);
+syscall(67, $shm); # shmdt
+syscall(31, $shmid, 0, 0); # IPC_RMID
 close $_->[0] for @pts;
 unlink $UPATH;
 put("bye", "ok");

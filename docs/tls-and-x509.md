@@ -2,9 +2,10 @@
 
 The control plane pulls images over HTTPS with our own TLS client
 (`services/tls`) and certificate verification (`services/x509`), on our
-own cryptography (`services/crypto`) (ADR-0012 §3, §4). This page says how
-that code is tested beyond its unit tests, and what it deliberately does
-not do.
+own cryptography (`services/crypto`) (ADR-0012 §3, §4), and serves its API
+over TLS 1.3 (`services/tls::server`; ADR-0012's 2026-11-21 amendment).
+This page says how that code is tested beyond its unit tests, and what it
+deliberately does not do.
 
 ## How it is tested
 
@@ -12,6 +13,12 @@ not do.
   and its CDN, recorded with fixed client randomness, replay offline
   (`services/tls/src/tests.rs`); a whole `hello-world` pull replays through
   the OCI client (`services/oci`).
+- **The server** runs against our own client (data both ways, a byte at a
+  time, key updates, every unsuitable or tampered client refused), against
+  OpenSSL's (`cargo test -p ichor-tls -- --ignored openssl`), and end to
+  end: `tests/control.rs` pulls and runs images through the API over TLS,
+  after checking that it answers nobody in the clear. Ed25519 is checked
+  against RFC 8032's vectors and OpenSSL.
 - **Certificate path validation: x509-limbo.** `cargo xtask x509-limbo`
   runs C2SP's x509-limbo suite (pinned to commit `519f4bcf`) through
   `verify_chain` and writes [`x509-limbo.md`](x509-limbo.md): the pass rate
@@ -22,7 +29,8 @@ not do.
   refuse cases.
 - **Fuzzing.** `fuzz/` mutation-fuzzes every parser that takes untrusted
   input: the TLS client fed a server's side of a session (records,
-  handshake messages, certificates, key exchange), X.509/DER and PEM,
+  handshake messages, certificates, key exchange), the TLS server fed a
+  client's, X.509/DER and PEM (private keys too),
   HPACK, HTTP/2 (both ends) and gRPC, protobuf, HTTP/1.1, the registry
   protocol and its JSON, DNS, gzip, tar and the Ichor image format. Seeds
   are real inputs (the recordings, Docker Hub's chains, RFC vectors,
@@ -44,7 +52,8 @@ when some path from the leaf, through the certificates the server sent
 root, with:
 
 - every certificate on the path valid at `now`, and every signature
-  verified (RSA PKCS#1 v1.5 and ECDSA P-256/P-384 with SHA-2);
+  verified (RSA PKCS#1 v1.5 and ECDSA P-256/P-384 with SHA-2, and
+  Ed25519);
 - path building that backtracks over every candidate issuer, trust
   anchors first, bounded at 8 certificates and 64 signature checks;
 - each issuer a CA (basicConstraints `cA`, keyCertSign if keyUsage is
@@ -77,7 +86,8 @@ amendment.
 | No Public Suffix List: a wildcard like `*.co.uk` in a SAN is honored | Matters for CAs that would mis-issue; trusted roots do not issue such certificates. |
 | Web PKI policy where x509-limbo's RFC and Web PKI cases conflict | A leaf must have `serverAuth` EKU and must not be a CA; RFC 5280 allows both. We follow the Web PKI (rustls-webpki, Chromium). |
 | No certificate policies processing | Not used by the Web PKI for path validation. |
-| ML-DSA (RFC 9881), RSA-PSS and Ed25519 certificate signatures are not accepted | Not used by any registry we pull from; TLS 1.3 handshake signatures do use RSA-PSS (supported there). |
-| TLS: AES-GCM is not offered | Every Docker Hub endpoint negotiates ChaCha20-Poly1305 (ADR-0012 amendment). Some registries may need it; adding it is a `services/crypto` change. |
+| ML-DSA (RFC 9881) and RSA-PSS certificate signatures are not accepted | Not used by any registry we pull from; TLS 1.3 handshake signatures do use RSA-PSS (supported there). |
+| The TLS server takes only Ed25519 certificates, TLS 1.3, ChaCha20-Poly1305 and X25519, and no HelloRetryRequest | One constant-time path through a long-lived key (ADR-0012's 2026-11-21 amendment). |
+| TLS: AES-128-GCM, not AES-256-GCM; SHA-256 suites only; X25519 and P-256 only | ChaCha20-Poly1305 is offered first; AES-128-GCM (bitsliced, constant-time) is for registries without it (Amazon ECR, Microsoft's, Quay). No registry tried needs the others. |
 | TLS: no session resumption, 0-RTT, renegotiation, client certificates or record-size limits negotiation | Simplicity; none is needed for pulls. |
 | TLS 1.2: only ECDHE with AEAD suites and extended master secret | The suites without forward secrecy or with CBC are not offered. |

@@ -98,6 +98,12 @@ pub mod sys {
     /// Copy up to `arg3` bytes of blob `arg0` from offset `arg1` into
     /// `arg2`; returns the count (0 past the end). Needs READ.
     pub const BLOB_READ: u64 = 27;
+    /// Post signal `arg1` (1-64) to every process of cell `arg0` (a
+    /// container handle with WRITE); returns how many processes.
+    pub const CELL_SIGNAL: u64 = 28;
+    /// Write cell `arg0`'s state to the [`super::CELL_INFO_LEN`] bytes at
+    /// `arg1` (a [`super::CellInfo`]); needs INSPECT.
+    pub const CELL_INSPECT: u64 = 29;
 }
 
 /// [`sys::CLOCK`] clocks.
@@ -109,6 +115,48 @@ pub const READABLE: u32 = 0x001;
 pub const WRITABLE: u32 = 0x004;
 pub const FAILED: u32 = 0x008;
 pub const HANGUP: u32 = 0x010;
+
+/// What [`sys::CELL_INSPECT`] reports, 40 bytes little-endian.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CellInfo {
+    /// Pages charged to the cell, and its limit.
+    pub memory_used: u64,
+    pub memory_limit: u64,
+    /// Live processes and threads.
+    pub processes: u64,
+    pub threads: u64,
+    /// The switch address (`a.b.c.d` as a big-endian `u32`; 0: none).
+    pub address: u32,
+}
+
+pub const CELL_INFO_LEN: usize = 40;
+
+impl CellInfo {
+    pub fn to_bytes(self) -> [u8; CELL_INFO_LEN] {
+        let mut b = [0u8; CELL_INFO_LEN];
+        b[..8].copy_from_slice(&self.memory_used.to_le_bytes());
+        b[8..16].copy_from_slice(&self.memory_limit.to_le_bytes());
+        b[16..24].copy_from_slice(&self.processes.to_le_bytes());
+        b[24..32].copy_from_slice(&self.threads.to_le_bytes());
+        b[32..36].copy_from_slice(&self.address.to_le_bytes());
+        b
+    }
+
+    pub fn from_bytes(b: &[u8; CELL_INFO_LEN]) -> CellInfo {
+        let q = |i: usize| {
+            let mut a = [0u8; 8];
+            a.copy_from_slice(&b[i..i + 8]);
+            u64::from_le_bytes(a)
+        };
+        CellInfo {
+            memory_used: q(0),
+            memory_limit: q(8),
+            processes: q(16),
+            threads: q(24),
+            address: u32::from_le_bytes([b[32], b[33], b[34], b[35]]),
+        }
+    }
+}
 
 /// One [`sys::OBJECT_WAIT`] entry: 16 bytes, little-endian.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -213,6 +261,18 @@ mod tests {
             revents: HANGUP,
         };
         assert_eq!(WaitItem::from_bytes(&w.to_bytes()), w);
+    }
+
+    #[test]
+    fn cell_info_round_trips() {
+        let c = CellInfo {
+            memory_used: 7,
+            memory_limit: 1 << 40,
+            processes: 3,
+            threads: 9,
+            address: 0x0a58_0004,
+        };
+        assert_eq!(CellInfo::from_bytes(&c.to_bytes()), c);
     }
 
     #[test]

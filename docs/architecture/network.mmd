@@ -1,0 +1,20 @@
+flowchart LR
+  subgraph a["Cell A"]
+    pa["processes"] --> sa["its own TCP/UDP stack<br/>10.88.0.a"]
+  end
+  subgraph b["Cell B"]
+    pb["processes"] --> sb["its own stack<br/>10.88.0.b"]
+  end
+  subgraph s["System cell"]
+    cp["control plane"] --> ss["its own stack<br/>API on loopback unless published"]
+  end
+  sw["Cell switch<br/>assigned addresses, anti-spoofing,<br/>rate limits, cross-cell fast path"]
+  up["Uplink<br/>source NAT, published ports"]
+  nic["a Link: virtio-net today<br/>(ENA, gVNIC, VMBus next;<br/>or a VPN around a NIC)"]
+  world["outside"]
+  sa <--> sw
+  sb <--> sw
+  ss <--> sw
+  sw <--> up
+  up <--> nic
+  nic <--> world

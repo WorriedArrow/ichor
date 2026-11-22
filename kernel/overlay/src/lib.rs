@@ -25,9 +25,13 @@ extern crate alloc;
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::{String, ToString};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::cell::RefCell;
 
 use image::{ChunkSource, Image, Node};
+
+pub mod name;
 
 /// Linux errno values.
 pub mod errno {
@@ -35,6 +39,7 @@ pub mod errno {
     pub const EACCES: i64 = 13;
     pub const ENOENT: i64 = 2;
     pub const EIO: i64 = 5;
+    pub const ENOMEM: i64 = 12;
     pub const EEXIST: i64 = 17;
     pub const ENOTDIR: i64 = 20;
     pub const EISDIR: i64 = 21;
@@ -45,6 +50,9 @@ pub mod errno {
     pub const ENOTEMPTY: i64 = 39;
     pub const ELOOP: i64 = 40;
     pub const EMLINK: i64 = 31;
+    /// Not an error of Linux's: the path leads into a directory something
+    /// else serves (`Overlay::set_elsewhere`).
+    pub const ELSEWHERE: i64 = 600;
 }
 use errno::*;
 
@@ -124,6 +132,8 @@ pub enum Kind {
     /// A socket node (`bind` of an `AF_UNIX` path); the kernel keeps what
     /// listens there.
     Socket,
+    /// A named pipe (`mkfifo`); the kernel keeps the pipe.
+    Fifo,
 }
 
 /// A timestamp (seconds and nanoseconds since the epoch the kernel's
@@ -155,28 +165,115 @@ pub struct Stat {
 
 #[derive(Clone, Copy, Debug)]
 enum Entry {
-    Ino(Ino),
+    /// An inode, and the entry's place in the listing.
+    Ino(Ino, u64),
     Whiteout,
 }
 
 #[derive(Debug)]
 struct Dir<'a> {
     lower: Option<Node<'a>>,
-    entries: BTreeMap<String, Entry>,
+    entries: BTreeMap<Arc<str>, Entry>,
+    /// The entries that are inodes, in the order they came: a listing goes
+    /// on from where it was, whatever is added and removed meanwhile.
+    order: BTreeMap<u64, Arc<str>>,
+    /// The last place given out in `order`.
+    last: u64,
     /// Whether every lower child already has an entry.
     complete: bool,
     parent: Ino,
 }
 
-/// An upper-layer file's bytes: pages by index, absent pages read as zero
-/// (files are sparse). The layer's budget counts allocated pages.
-#[derive(Debug, Default)]
-struct FileData {
-    size: u64,
-    pages: BTreeMap<u64, Box<[u8; PAGE]>>,
+impl Dir<'_> {
+    /// Adds the name `name` for `ino` (there is none by that name, or a
+    /// whiteout).
+    fn put(&mut self, name: &str, ino: Ino) {
+        let name: Arc<str> = Arc::from(name);
+        self.last += 1;
+        self.order.insert(self.last, name.clone());
+        self.entries.insert(name, Entry::Ino(ino, self.last));
+    }
+
+    /// Removes the name `name`, leaving a whiteout if the lower layer has
+    /// it.
+    fn take(&mut self, name: &str) {
+        let in_lower = self.lower.is_some_and(|l| l.child(name).is_some());
+        if let Some((name, entry)) = self.entries.remove_entry(name) {
+            if let Entry::Ino(_, at) = entry {
+                self.order.remove(&at);
+            }
+            if in_lower {
+                self.entries.insert(name, Entry::Whiteout);
+            }
+        }
+    }
 }
 
-impl FileData {
+/// A page of an upper-layer file, zeroed when made. Writing takes `&self`:
+/// the kernel's pages are frames that processes may have mapped as well
+/// (shared file mappings), so nothing holds one exclusively.
+pub trait Page: core::fmt::Debug {
+    /// Copies out bytes from `at` on (`at + out.len() <= 4096`).
+    fn read(&self, at: usize, out: &mut [u8]);
+    /// Copies `data` in at `at` (`at + data.len() <= 4096`).
+    fn write(&self, at: usize, data: &[u8]);
+}
+
+/// Where upper-layer pages come from (the kernel's charge them to a cell).
+pub trait Pages: core::fmt::Debug {
+    type Page: Page;
+    /// A zeroed page, or `None` if there is no memory (or no charge) left.
+    fn alloc(&self) -> Option<Self::Page>;
+    /// Accounts for the upper layer's inodes and names taking `pages` pages
+    /// of kernel memory from now on (it was told an earlier number before);
+    /// false, changing nothing, if there is no room for that.
+    fn keep(&mut self, pages: usize) -> bool {
+        let _ = pages;
+        true
+    }
+}
+
+/// Pages on the heap (tests, and file systems nothing maps).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Heap;
+
+/// A [`Heap`] page.
+#[derive(Debug)]
+pub struct HeapPage(RefCell<Box<[u8; PAGE]>>);
+
+impl Page for HeapPage {
+    fn read(&self, at: usize, out: &mut [u8]) {
+        out.copy_from_slice(&self.0.borrow()[at..at + out.len()]);
+    }
+
+    fn write(&self, at: usize, data: &[u8]) {
+        self.0.borrow_mut()[at..at + data.len()].copy_from_slice(data);
+    }
+}
+
+impl Pages for Heap {
+    type Page = HeapPage;
+    fn alloc(&self) -> Option<HeapPage> {
+        Some(HeapPage(RefCell::new(Box::new([0u8; PAGE]))))
+    }
+}
+
+/// An upper-layer file's bytes: pages by index, absent pages read as zero
+/// (files are sparse). The layer's budget counts allocated pages.
+#[derive(Debug)]
+struct FileData<P> {
+    size: u64,
+    pages: BTreeMap<u64, P>,
+}
+
+impl<P: Page> FileData<P> {
+    fn empty() -> FileData<P> {
+        FileData {
+            size: 0,
+            pages: BTreeMap::new(),
+        }
+    }
+
     /// Bytes of memory the file holds.
     fn bytes(&self) -> usize {
         self.pages.len() * PAGE
@@ -193,7 +290,7 @@ impl FileData {
             let n = ((end - pos) as usize).min(PAGE - at);
             let dst = &mut out[(pos - offset) as usize..(pos - offset) as usize + n];
             match self.pages.get(&idx) {
-                Some(p) => dst.copy_from_slice(&p[at..at + n]),
+                Some(p) => p.read(at, dst),
                 None => dst.fill(0),
             }
             pos += n as u64;
@@ -201,33 +298,49 @@ impl FileData {
         (end - offset) as usize
     }
 
-    /// Pages a write of `len` bytes at `offset` would add.
-    fn new_pages(&self, offset: u64, len: usize) -> usize {
-        if len == 0 {
-            return 0;
+    /// Page `index`, made from `from` if it is absent and `room` (bytes
+    /// the layer may still grow by) has a page left.
+    fn page(&mut self, index: u64, from: &impl Pages<Page = P>, room: &mut usize) -> Option<&P> {
+        use alloc::collections::btree_map::Entry;
+        match self.pages.entry(index) {
+            Entry::Occupied(e) => Some(e.into_mut()),
+            Entry::Vacant(e) => {
+                *room = room.checked_sub(PAGE)?;
+                match from.alloc() {
+                    Some(p) => Some(e.insert(p)),
+                    None => {
+                        *room += PAGE;
+                        None
+                    }
+                }
+            }
         }
-        let first = offset / PAGE as u64;
-        let last = (offset + len as u64 - 1) / PAGE as u64;
-        (first..=last)
-            .filter(|i| !self.pages.contains_key(i))
-            .count()
     }
 
-    fn write(&mut self, offset: u64, data: &[u8]) {
-        let mut pos = offset;
-        let end = offset + data.len() as u64;
-        while pos < end {
+    /// Writes as much of `data` at `offset` as there are pages for;
+    /// returns how much.
+    fn write(
+        &mut self,
+        offset: u64,
+        data: &[u8],
+        from: &impl Pages<Page = P>,
+        room: &mut usize,
+    ) -> usize {
+        let mut done = 0;
+        while done < data.len() {
+            let pos = offset + done as u64;
             let (idx, at) = (pos / PAGE as u64, (pos % PAGE as u64) as usize);
-            let n = ((end - pos) as usize).min(PAGE - at);
-            let page = self
-                .pages
-                .entry(idx)
-                .or_insert_with(|| Box::new([0u8; PAGE]));
-            let src = (pos - offset) as usize;
-            page[at..at + n].copy_from_slice(&data[src..src + n]);
-            pos += n as u64;
+            let n = (data.len() - done).min(PAGE - at);
+            let Some(page) = self.page(idx, from, room) else {
+                break;
+            };
+            page.write(at, &data[done..done + n]);
+            done += n;
         }
-        self.size = self.size.max(end);
+        if done > 0 {
+            self.size = self.size.max(offset + done as u64);
+        }
+        done
     }
 
     /// Sets the length; pages past it are freed and the tail of the last
@@ -238,9 +351,9 @@ impl FileData {
             self.pages.retain(|&i, _| i < keep);
             let at = (len % PAGE as u64) as usize;
             if at != 0
-                && let Some(p) = self.pages.get_mut(&(len / PAGE as u64))
+                && let Some(p) = self.pages.get(&(len / PAGE as u64))
             {
-                p[at..].fill(0);
+                p.write(at, &[0u8; PAGE][at..]);
             }
         }
         self.size = len;
@@ -248,31 +361,42 @@ impl FileData {
 }
 
 #[derive(Debug)]
-enum Data<'a> {
+enum Data<'a, P> {
     LowerFile(Node<'a>),
-    File(FileData),
+    File(FileData<P>),
     Dir(Dir<'a>),
     Symlink(String),
     Device(u32),
     Socket,
+    /// A named pipe, by its id ([`Overlay::fifo_id`]).
+    Fifo(u64),
 }
 
+/// Ids of named pipes, unique for the kernel's lifetime: the kernel keys
+/// the pipe behind a FIFO by it, so a reused inode number never reaches an
+/// older FIFO's pipe.
+static NEXT_FIFO: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+
 #[derive(Debug)]
-struct Inode<'a> {
-    data: Data<'a>,
+struct Inode<'a, P> {
+    data: Data<'a, P>,
     mode: u32,
     nlink: u32,
     opens: u32,
     uid: u32,
     gid: u32,
+    /// What it counts for, if made in the upper layer ([`Overlay::grow`]).
+    cost: usize,
+    /// The directory that has (one of) its names, if it ever had one.
+    home: Option<Ino>,
     atime: Time,
     mtime: Time,
     ctime: Time,
 }
 
-impl<'a> Inode<'a> {
+impl<'a, P> Inode<'a, P> {
     /// A new upper-layer inode, owned by root, all times `now`.
-    fn fresh(data: Data<'a>, mode: u32, nlink: u32, now: Time) -> Inode<'a> {
+    fn fresh(data: Data<'a, P>, mode: u32, nlink: u32, now: Time) -> Inode<'a, P> {
         Inode {
             data,
             mode,
@@ -280,6 +404,8 @@ impl<'a> Inode<'a> {
             opens: 0,
             uid: 0,
             gid: 0,
+            cost: 0,
+            home: None,
             atime: now,
             mtime: now,
             ctime: now,
@@ -287,7 +413,7 @@ impl<'a> Inode<'a> {
     }
 }
 
-impl Inode<'_> {
+impl<P> Inode<'_, P> {
     fn kind(&self) -> Kind {
         match self.data {
             Data::LowerFile(_) | Data::File(_) => Kind::File,
@@ -295,6 +421,7 @@ impl Inode<'_> {
             Data::Symlink(_) => Kind::Symlink,
             Data::Device(_) => Kind::CharDevice,
             Data::Socket => Kind::Socket,
+            Data::Fifo(_) => Kind::Fifo,
         }
     }
 }
@@ -315,10 +442,13 @@ impl LowerReader<'_> {
     }
 }
 
-/// An image with a copy-on-write upper layer.
+/// An image with a copy-on-write upper layer, whose file pages come from
+/// `A`.
 #[derive(Debug)]
-pub struct Overlay<'a> {
-    inodes: Vec<Option<Inode<'a>>>,
+pub struct Overlay<'a, A: Pages = Heap> {
+    /// Boxed, so a root with many files needs no large table.
+    inodes: Vec<Option<Box<Inode<'a, A::Page>>>>,
+    pages: A,
     /// Where the lower layer's file data comes from (verified chunks).
     src: Option<&'a (dyn ChunkSource + Sync)>,
     /// The credentials operations are checked against; `None` (the
@@ -329,18 +459,30 @@ pub struct Overlay<'a> {
     free: Vec<Ino>,
     used_bytes: usize,
     max_bytes: usize,
+    /// Upper inodes (a long symlink as several) plus the names past an
+    /// inode's first, and the pages [`Pages::keep`] was told they take.
+    made: usize,
+    kept: usize,
+    /// Changes not taken yet; `None` while nobody watches.
+    changes: Option<Vec<Change>>,
+    /// Directories something else serves (`/proc`), and where in one the
+    /// last resolution that came there was going.
+    elsewhere: Vec<Ino>,
+    crossing: String,
 }
 
-fn upper_dir<'a>(parent: Ino, lower: Option<Node<'a>>) -> Data<'a> {
+fn upper_dir<'a, P>(parent: Ino, lower: Option<Node<'a>>) -> Data<'a, P> {
     Data::Dir(Dir {
         complete: lower.is_none(),
         lower,
         entries: BTreeMap::new(),
+        order: BTreeMap::new(),
+        last: 0,
         parent,
     })
 }
 
-fn from_lower<'a>(node: Node<'a>, parent: Ino) -> Inode<'a> {
+fn from_lower<'a, P>(node: Node<'a>, parent: Ino) -> Inode<'a, P> {
     let data = match node.kind() {
         image::Kind::File => Data::LowerFile(node),
         image::Kind::Directory => upper_dir(parent, Some(node)),
@@ -354,8 +496,48 @@ fn from_lower<'a>(node: Node<'a>, parent: Ino) -> Inode<'a> {
     let mut i = Inode::fresh(data, node.mode & 0o7777, 1, t);
     i.uid = node.uid;
     i.gid = node.gid;
+    i.home = Some(parent);
     i
 }
+
+/// What changed in a watched tree ([`Overlay::watch`]), for `inotify`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Change {
+    /// A name was added to a directory.
+    Created {
+        dir: Ino,
+        name: String,
+        is_dir: bool,
+    },
+    /// A name was removed from a directory.
+    Removed {
+        dir: Ino,
+        name: String,
+        is_dir: bool,
+    },
+    /// An inode lost its last name.
+    Gone(Ino),
+    Moved {
+        from: (Ino, String),
+        to: (Ino, String),
+        ino: Ino,
+        is_dir: bool,
+    },
+    /// A file's contents or length.
+    Modified(Ino),
+    /// Mode, owner, times or link count.
+    Attributes(Ino),
+}
+
+/// Most inodes a root has at once, upper and lower, so the table of them
+/// stays an allocation the kernel can make (4 MiB).
+const INODES_MAX: usize = 1 << 19;
+
+/// How many upper inodes or names count as a page of kernel memory.
+const PER_PAGE: usize = 8;
+
+/// Most changes held for whoever watches; later ones are dropped.
+const CHANGES_MAX: usize = 4096;
 
 fn check_name(name: &str) -> Result<(), i64> {
     if name.is_empty() || name.contains('/') {
@@ -367,22 +549,44 @@ fn check_name(name: &str) -> Result<(), i64> {
     Ok(())
 }
 
+/// A path's components; a trailing slash is a `.` after the last, so that
+/// has to be a directory, or a symlink to one, which is followed.
 fn components(path: &str) -> impl Iterator<Item = String> + '_ {
+    let dir = path.ends_with('/').then_some(".");
     path.split('/')
         .filter(|c| !c.is_empty())
+        .chain(dir)
         .map(ToString::to_string)
 }
 
 impl<'a> Overlay<'a> {
     /// An overlay over `lower`, whose file data `src` provides, with an
-    /// upper layer that may hold `max_bytes`.
+    /// upper layer on the heap that may hold `max_bytes`.
     pub fn new(
         lower: &Image<'a>,
         src: &'a (dyn ChunkSource + Sync),
         max_bytes: usize,
     ) -> Result<Overlay<'a>, image::Error> {
+        Overlay::with_pages(lower, src, Heap, max_bytes)
+    }
+
+    /// An overlay on the heap with no lower layer (a `tmpfs`).
+    pub fn empty(max_bytes: usize) -> Overlay<'a> {
+        Overlay::bare(Heap, max_bytes)
+    }
+}
+
+impl<'a, A: Pages> Overlay<'a, A> {
+    /// An overlay over `lower`, whose file data `src` provides, with an
+    /// upper layer of at most `max_bytes` in pages from `pages`.
+    pub fn with_pages(
+        lower: &Image<'a>,
+        src: &'a (dyn ChunkSource + Sync),
+        pages: A,
+        max_bytes: usize,
+    ) -> Result<Overlay<'a, A>, image::Error> {
         let root = lower.root()?;
-        let mut fs = Overlay::empty(max_bytes);
+        let mut fs = Overlay::bare(pages, max_bytes);
         fs.src = Some(src);
         if let Some(Some(r)) = fs.inodes.get_mut(ROOT) {
             r.data = upper_dir(ROOT, Some(root));
@@ -391,22 +595,86 @@ impl<'a> Overlay<'a> {
         Ok(fs)
     }
 
-    /// An overlay with no lower layer (a `tmpfs`).
-    pub fn empty(max_bytes: usize) -> Overlay<'a> {
+    fn bare(pages: A, max_bytes: usize) -> Overlay<'a, A> {
         Overlay {
-            inodes: alloc::vec![Some(Inode::fresh(
+            inodes: alloc::vec![Some(Box::new(Inode::fresh(
                 upper_dir(ROOT, None),
                 0o755,
                 2,
                 Time::default()
-            ))],
+            )))],
+            pages,
             src: None,
             cred: None,
             free: Vec::new(),
             clock: || Time::default(),
             used_bytes: 0,
             max_bytes,
+            made: 0,
+            kept: 0,
+            changes: None,
+            elsewhere: Vec::new(),
+            crossing: String::new(),
         }
+    }
+
+    /// Makes `dir` a directory whose contents something else serves (a
+    /// mount point): resolving a path into it is [`errno::ELSEWHERE`], and
+    /// [`Self::take_crossing`] says where it was going. The directory
+    /// itself still resolves.
+    pub fn set_elsewhere(&mut self, dir: Ino) {
+        self.elsewhere.push(dir);
+    }
+
+    /// Whether `dir` is served by something else.
+    pub fn is_elsewhere(&self, dir: Ino) -> bool {
+        self.elsewhere.contains(&dir)
+    }
+
+    /// The absolute path the resolution that was last `ELSEWHERE` led to.
+    pub fn take_crossing(&mut self) -> String {
+        core::mem::take(&mut self.crossing)
+    }
+
+    /// Starts or stops recording changes ([`Self::take_changes`]).
+    pub fn watch(&mut self, on: bool) {
+        if on != self.changes.is_some() {
+            self.changes = on.then(Vec::new);
+        }
+    }
+
+    /// The changes since this was last called.
+    pub fn take_changes(&mut self) -> Vec<Change> {
+        self.changes
+            .as_mut()
+            .map(core::mem::take)
+            .unwrap_or_default()
+    }
+
+    fn changed(&mut self, what: impl FnOnce() -> Change) {
+        if let Some(c) = &mut self.changes
+            && c.len() < CHANGES_MAX
+        {
+            c.push(what());
+        }
+    }
+
+    /// The directory and name `ino` has there (one of them, for a file with
+    /// several); `None` if it is the root or has none.
+    pub fn name_of(&self, ino: Ino) -> Option<(Ino, String)> {
+        if ino == ROOT {
+            return None;
+        }
+        let dir = match &self.get(ino).ok()?.data {
+            Data::Dir(d) => d.parent,
+            _ => self.get(ino).ok()?.home?,
+        };
+        let entries = &self.dir(dir).ok()?.entries;
+        let named = |e: &Entry| matches!(e, Entry::Ino(i, _) if *i == ino);
+        entries
+            .iter()
+            .find(|(_, e)| named(e))
+            .map(|(n, _)| (dir, n.to_string()))
     }
 
     /// Sets the credentials later operations are checked against (`None`:
@@ -523,6 +791,7 @@ impl<'a> Overlay<'a> {
             i.mode &= !(S_ISUID | S_ISGID); // as Linux does on chown
         }
         i.ctime = now;
+        self.changed(|| Change::Attributes(ino));
         Ok(())
     }
 
@@ -543,6 +812,7 @@ impl<'a> Overlay<'a> {
             i.mtime = m;
         }
         i.ctime = now;
+        self.changed(|| Change::Attributes(ino));
         Ok(())
     }
 
@@ -556,14 +826,22 @@ impl<'a> Overlay<'a> {
         self.used_bytes
     }
 
-    fn get(&self, ino: Ino) -> Result<&Inode<'a>, i64> {
-        self.inodes.get(ino).and_then(Option::as_ref).ok_or(ENOENT)
+    /// Pages its inodes and names count for ([`Pages::keep`]).
+    pub fn kept_pages(&self) -> usize {
+        self.kept
     }
 
-    fn get_mut(&mut self, ino: Ino) -> Result<&mut Inode<'a>, i64> {
+    fn get(&self, ino: Ino) -> Result<&Inode<'a, A::Page>, i64> {
+        self.inodes
+            .get(ino)
+            .and_then(Option::as_deref)
+            .ok_or(ENOENT)
+    }
+
+    fn get_mut(&mut self, ino: Ino) -> Result<&mut Inode<'a, A::Page>, i64> {
         self.inodes
             .get_mut(ino)
-            .and_then(Option::as_mut)
+            .and_then(Option::as_deref_mut)
             .ok_or(ENOENT)
     }
 
@@ -581,15 +859,60 @@ impl<'a> Overlay<'a> {
         }
     }
 
-    fn alloc(&mut self, inode: Inode<'a>) -> Ino {
+    fn alloc(&mut self, inode: Inode<'a, A::Page>) -> Result<Ino, i64> {
+        let inode = Box::new(inode);
         if let Some(i) = self.free.pop()
             && let Some(slot) = self.inodes.get_mut(i)
         {
             *slot = Some(inode);
-            return i;
+            return Ok(i);
+        }
+        if self.inodes.len() >= INODES_MAX {
+            return Err(ENOSPC);
         }
         self.inodes.push(Some(inode));
-        self.inodes.len() - 1
+        Ok(self.inodes.len() - 1)
+    }
+
+    /// [`Self::alloc`] for a new inode of the upper layer, counted.
+    fn make(&mut self, mut inode: Inode<'a, A::Page>) -> Result<Ino, i64> {
+        let cost = match &inode.data {
+            Data::Symlink(target) => 1 + target.len() * PER_PAGE / PAGE,
+            _ => 1,
+        };
+        self.grow(cost)?;
+        inode.cost = cost;
+        self.alloc(inode).inspect_err(|_| self.shrink(cost))
+    }
+
+    /// An inode of the lower layer, met for the first time.
+    fn meet(&mut self, dir: Ino, child: Node<'a>) -> Result<Ino, i64> {
+        let ino = self.alloc(from_lower(child, dir)).map_err(|_| ENOMEM)?;
+        self.dir_mut(dir)?.put(child.name(), ino);
+        Ok(ino)
+    }
+
+    /// Counts another upper inode, or another name of one: they take kernel
+    /// memory, so a cell pays for them.
+    fn grow(&mut self, cost: usize) -> Result<(), i64> {
+        let pages = (self.made + cost).div_ceil(PER_PAGE);
+        if pages > self.kept {
+            if !self.pages.keep(pages) {
+                return Err(ENOSPC);
+            }
+            self.kept = pages;
+        }
+        self.made += cost;
+        Ok(())
+    }
+
+    /// Takes back what [`Self::grow`] counted.
+    fn shrink(&mut self, cost: usize) {
+        self.made = self.made.saturating_sub(cost);
+        let pages = self.made.div_ceil(PER_PAGE);
+        if pages < self.kept && self.pages.keep(pages) {
+            self.kept = pages;
+        }
     }
 
     fn maybe_free(&mut self, ino: Ino) {
@@ -601,12 +924,12 @@ impl<'a> Overlay<'a> {
             return;
         }
         if let Some(slot) = self.inodes.get_mut(ino)
-            && let Some(Inode {
-                data: Data::File(f),
-                ..
-            }) = slot.take()
+            && let Some(inode) = slot.take()
         {
-            self.used_bytes -= f.bytes();
+            if let Data::File(f) = &inode.data {
+                self.used_bytes -= f.bytes();
+            }
+            self.shrink(inode.cost);
         }
         self.free.push(ino);
     }
@@ -634,16 +957,12 @@ impl<'a> Overlay<'a> {
             _ => {}
         }
         match d.entries.get(name) {
-            Some(Entry::Ino(i)) => return Ok(*i),
+            Some(Entry::Ino(i, _)) => return Ok(*i),
             Some(Entry::Whiteout) => return Err(ENOENT),
             None => {}
         }
         let child = d.lower.and_then(|l| l.child(name)).ok_or(ENOENT)?;
-        let ino = self.alloc(from_lower(child, dir));
-        self.dir_mut(dir)?
-            .entries
-            .insert(name.to_string(), Entry::Ino(ino));
-        Ok(ino)
+        self.meet(dir, child)
     }
 
     /// Whether `name` exists in `dir`.
@@ -662,7 +981,7 @@ impl<'a> Overlay<'a> {
             Data::File(f) => f.size,
             Data::Dir(_) => 4096,
             Data::Symlink(t) => t.len() as u64,
-            Data::Device(_) | Data::Socket => 0,
+            Data::Device(_) | Data::Socket | Data::Fifo(_) => 0,
         };
         let rdev = match i.data {
             Data::Device(d) => d,
@@ -693,7 +1012,7 @@ impl<'a> Overlay<'a> {
             Data::LowerFile(n) => self.read_lower(n, offset, out),
             Data::File(f) => Ok(f.read(offset, out)),
             Data::Dir(_) => Err(EISDIR),
-            Data::Symlink(_) | Data::Device(_) | Data::Socket => Err(EINVAL),
+            Data::Symlink(_) | Data::Device(_) | Data::Socket | Data::Fifo(_) => Err(EINVAL),
         }
     }
 
@@ -741,7 +1060,9 @@ impl<'a> Overlay<'a> {
             Data::LowerFile(n) => *n,
             Data::File(_) => return Ok(()),
             Data::Dir(_) => return Err(EISDIR),
-            Data::Symlink(_) | Data::Device(_) | Data::Socket => return Err(EINVAL),
+            Data::Symlink(_) | Data::Device(_) | Data::Socket | Data::Fifo(_) => {
+                return Err(EINVAL);
+            }
         };
         let size = usize::try_from(node.size()).map_err(|_| EFBIG)?;
         if size > MAX_FILE {
@@ -752,7 +1073,8 @@ impl<'a> Overlay<'a> {
             return Err(ENOSPC);
         }
         // Page by page: no buffer the size of the file.
-        let mut f = FileData::default();
+        let mut f = FileData::empty();
+        let mut room = need;
         let mut page = [0u8; PAGE];
         let mut at = 0u64;
         while at < size as u64 {
@@ -760,7 +1082,9 @@ impl<'a> Overlay<'a> {
             if n == 0 {
                 break;
             }
-            f.write(at, &page[..n]);
+            if f.write(at, &page[..n], &self.pages, &mut room) < n {
+                return Err(ENOSPC);
+            }
             at += n as u64;
         }
         f.size = at;
@@ -776,14 +1100,16 @@ impl<'a> Overlay<'a> {
             return Err(EFBIG);
         }
         match self.get(ino)?.data {
-            Data::Device(_) => return Ok(()), // `O_TRUNC` on /dev/null and friends
+            // `O_TRUNC` on /dev/null and friends, or on a FIFO.
+            Data::Device(_) | Data::Fifo(_) => return Ok(()),
             Data::Socket => return Err(EINVAL),
             _ => {}
         }
         if len == 0 && matches!(self.get(ino)?.data, Data::LowerFile(_)) {
             // No need to copy bytes that are about to be dropped.
-            self.get_mut(ino)?.data = Data::File(FileData::default());
+            self.get_mut(ino)?.data = Data::File(FileData::empty());
             self.touch(ino);
+            self.changed(|| Change::Modified(ino));
             return Ok(());
         }
         self.copy_up(ino)?;
@@ -796,10 +1122,13 @@ impl<'a> Overlay<'a> {
         let after = f.bytes();
         self.used_bytes = self.used_bytes - before + after;
         self.touch(ino);
+        self.changed(|| Change::Modified(ino));
         Ok(())
     }
 
-    /// Writes `data` at `offset` (zero-filling any gap); returns its length.
+    /// Writes `data` at `offset` (zero-filling any gap); returns how much
+    /// was written: less than all of it when the layer fills up part way
+    /// (ENOSPC if nothing fits).
     pub fn write(&mut self, ino: Ino, offset: u64, data: &[u8]) -> Result<usize, i64> {
         self.copy_up(ino)?;
         // A write by someone without CAP_FSETID drops set-id bits.
@@ -814,27 +1143,61 @@ impl<'a> Overlay<'a> {
         if end > MAX_FILE {
             return Err(EFBIG);
         }
-        let used = self.used_bytes;
-        let max = self.max_bytes;
-        let Data::File(f) = &mut self.get_mut(ino)?.data else {
+        let before = self.max_bytes.saturating_sub(self.used_bytes);
+        let mut room = before;
+        // The inode and the page source are separate fields.
+        let Some(Some(inode)) = self.inodes.get_mut(ino) else {
+            return Err(ENOENT);
+        };
+        let Data::File(f) = &mut inode.data else {
             return Err(EINVAL);
         };
-        let grow = f.new_pages(off as u64, data.len()) * PAGE;
-        if used + grow > max {
+        let n = f.write(off as u64, data, &self.pages, &mut room);
+        self.used_bytes += before - room;
+        if n == 0 && !data.is_empty() {
             return Err(ENOSPC);
         }
-        f.write(off as u64, data);
-        self.used_bytes = used + grow;
         self.touch(ino);
-        Ok(data.len())
+        self.changed(|| Change::Modified(ino));
+        Ok(n)
     }
 
     /// Appends `data` at the current end of the file in one step (so two
-    /// `O_APPEND` writers never overwrite each other); returns the new end.
-    pub fn append(&mut self, ino: Ino, data: &[u8]) -> Result<u64, i64> {
+    /// `O_APPEND` writers never overwrite each other); returns the new end
+    /// and how much was written (as [`Self::write`]).
+    pub fn append(&mut self, ino: Ino, data: &[u8]) -> Result<(u64, usize), i64> {
         let end = self.stat(ino)?.size;
-        self.write(ino, end, data)?;
-        Ok(end + data.len() as u64)
+        let n = self.write(ino, end, data)?;
+        Ok((end + n as u64, n))
+    }
+
+    /// Page `index` of the file `ino`, for a shared mapping to map: every
+    /// mapper, reader and writer of the file sees that one page. A hole is
+    /// given a page. `None` for a lower file nothing has written yet, unless
+    /// `write`, which copies it up first. EINVAL past the end of the file.
+    pub fn page(&mut self, ino: Ino, index: u64, write: bool) -> Result<Option<A::Page>, i64>
+    where
+        A::Page: Clone,
+    {
+        if index * PAGE as u64 >= self.stat(ino)?.size {
+            return Err(EINVAL);
+        }
+        if write {
+            self.copy_up(ino)?;
+            self.touch(ino);
+        }
+        let before = self.max_bytes.saturating_sub(self.used_bytes);
+        let mut room = before;
+        let Some(Some(inode)) = self.inodes.get_mut(ino) else {
+            return Err(ENOENT);
+        };
+        let page = match &mut inode.data {
+            Data::File(f) => f.page(index, &self.pages, &mut room).cloned(),
+            Data::LowerFile(_) => return Ok(None),
+            _ => return Err(EINVAL),
+        };
+        self.used_bytes += before - room;
+        page.map(Some).ok_or(ENOSPC)
     }
 
     /// Changes permission bits.
@@ -854,12 +1217,23 @@ impl<'a> Overlay<'a> {
         let i = self.get_mut(ino)?;
         i.mode = mode;
         i.ctime = now;
+        self.changed(|| Change::Attributes(ino));
         Ok(())
     }
 
-    fn add(&mut self, dir: Ino, name: &str, mut inode: Inode<'a>) -> Result<Ino, i64> {
+    /// A directory that was removed (a working directory, say) takes no new
+    /// names.
+    fn still_there(&self, dir: Ino) -> Result<(), i64> {
+        if self.get(dir)?.nlink == 0 {
+            return Err(ENOENT);
+        }
+        Ok(())
+    }
+
+    fn add(&mut self, dir: Ino, name: &str, mut inode: Inode<'a, A::Page>) -> Result<Ino, i64> {
         check_name(name)?;
         self.dir(dir)?;
+        self.still_there(dir)?;
         if self.find(dir, name)?.is_some() {
             return Err(EEXIST);
         }
@@ -877,23 +1251,46 @@ impl<'a> Overlay<'a> {
                 inode.mode |= S_ISGID;
             }
         }
-        let ino = self.alloc(inode);
-        self.dir_mut(dir)?
-            .entries
-            .insert(name.to_string(), Entry::Ino(ino));
+        inode.home = Some(dir);
+        let is_dir = inode.kind() == Kind::Directory;
+        let ino = self.make(inode)?;
+        self.dir_mut(dir)?.put(name, ino);
         self.touch(dir);
+        self.changed(|| Change::Created {
+            dir,
+            name: name.to_string(),
+            is_dir,
+        });
         Ok(ino)
     }
 
     /// Creates an empty file.
     pub fn create(&mut self, dir: Ino, name: &str, mode: u32) -> Result<Ino, i64> {
         let inode = Inode::fresh(
-            Data::File(FileData::default()),
+            Data::File(FileData::empty()),
             mode & 0o7777,
             1,
             (self.clock)(),
         );
         self.add(dir, name, inode)
+    }
+
+    /// Creates a file with no name (`memfd_create`), counted as open once:
+    /// it lives until that handle and every later one is closed, and its
+    /// pages count against the byte budget like any upper file's.
+    pub fn create_unnamed(&mut self, mode: u32) -> Result<Ino, i64> {
+        let mut inode = Inode::fresh(
+            Data::File(FileData::empty()),
+            mode & 0o7777,
+            0,
+            (self.clock)(),
+        );
+        if let Some(c) = &self.cred {
+            inode.uid = c.uid;
+            inode.gid = c.gid;
+        }
+        inode.opens = 1;
+        self.make(inode)
     }
 
     /// Adds the name `ndir/nname` for the existing non-directory `ino` (a
@@ -912,18 +1309,24 @@ impl<'a> Overlay<'a> {
             return Err(EMLINK);
         }
         self.dir(ndir)?;
+        self.still_there(ndir)?;
         if self.find(ndir, nname)?.is_some() {
             return Err(EEXIST);
         }
         self.permission(ndir, MAY_WRITE | MAY_EXEC)?;
-        self.dir_mut(ndir)?
-            .entries
-            .insert(nname.to_string(), Entry::Ino(ino));
+        self.grow(1)?;
+        self.dir_mut(ndir)?.put(nname, ino);
         self.touch(ndir);
         let now = (self.clock)();
         let i = self.get_mut(ino)?;
         i.nlink += 1;
         i.ctime = now;
+        self.changed(|| Change::Attributes(ino));
+        self.changed(|| Change::Created {
+            dir: ndir,
+            name: nname.to_string(),
+            is_dir: false,
+        });
         Ok(())
     }
 
@@ -935,7 +1338,7 @@ impl<'a> Overlay<'a> {
         };
         let mut n = 0u32;
         for e in d.entries.values() {
-            if let Entry::Ino(i) = e
+            if let Entry::Ino(i, _) = e
                 && self.get(*i).is_ok_and(|i| i.kind() == Kind::Directory)
             {
                 n += 1;
@@ -964,6 +1367,22 @@ impl<'a> Overlay<'a> {
         self.add(dir, name, inode)
     }
 
+    /// Creates a named pipe (`mkfifo`).
+    pub fn mkfifo(&mut self, dir: Ino, name: &str, mode: u32) -> Result<Ino, i64> {
+        let id = NEXT_FIFO.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        let inode = Inode::fresh(Data::Fifo(id), mode & 0o7777, 1, (self.clock)());
+        self.add(dir, name, inode)
+    }
+
+    /// The id of the named pipe `ino`, if it is one: the same for every
+    /// name and open of that FIFO, never reused.
+    pub fn fifo_id(&self, ino: Ino) -> Option<u64> {
+        match self.get(ino).ok()?.data {
+            Data::Fifo(id) => Some(id),
+            _ => None,
+        }
+    }
+
     /// Creates a socket node (what `bind` of an `AF_UNIX` path leaves).
     pub fn mksocket(&mut self, dir: Ino, name: &str, mode: u32) -> Result<Ino, i64> {
         let inode = Inode::fresh(Data::Socket, mode & 0o7777, 1, (self.clock)());
@@ -985,13 +1404,7 @@ impl<'a> Overlay<'a> {
     /// Removes the entry `name` from `dir`, leaving a whiteout if the lower
     /// layer has that name.
     fn detach(&mut self, dir: Ino, name: &str) -> Result<(), i64> {
-        let d = self.dir_mut(dir)?;
-        let in_lower = d.lower.is_some_and(|l| l.child(name).is_some());
-        if in_lower {
-            d.entries.insert(name.to_string(), Entry::Whiteout);
-        } else {
-            d.entries.remove(name);
-        }
+        self.dir_mut(dir)?.take(name);
         self.touch(dir);
         Ok(())
     }
@@ -999,6 +1412,9 @@ impl<'a> Overlay<'a> {
     fn drop_link(&mut self, ino: Ino) -> Result<(), i64> {
         let i = self.get_mut(ino)?;
         i.nlink = i.nlink.saturating_sub(1);
+        if i.nlink > 0 {
+            self.shrink(1); // a name past the first
+        }
         self.maybe_free(ino);
         Ok(())
     }
@@ -1012,12 +1428,38 @@ impl<'a> Overlay<'a> {
         }
         self.may_delete(dir, ino)?;
         self.detach(dir, name)?;
+        self.removed(dir, name, ino, false);
         self.drop_link(ino)
+    }
+
+    /// Records that `ino` is about to lose its name `name` in `dir`.
+    fn removed(&mut self, dir: Ino, name: &str, ino: Ino, is_dir: bool) {
+        self.changed(|| Change::Removed {
+            dir,
+            name: name.to_string(),
+            is_dir,
+        });
+        self.unnamed(ino);
+    }
+
+    /// Records that `ino` is about to lose a name.
+    fn unnamed(&mut self, ino: Ino) {
+        let last = self
+            .get(ino)
+            .is_ok_and(|i| i.nlink <= 1 || i.kind() == Kind::Directory);
+        self.changed(|| {
+            if last {
+                Change::Gone(ino)
+            } else {
+                Change::Attributes(ino)
+            }
+        });
     }
 
     /// Whether a directory has no entries.
     fn is_empty_dir(&mut self, ino: Ino) -> Result<bool, i64> {
-        Ok(self.readdir(ino)?.is_empty())
+        self.complete(ino)?;
+        Ok(self.dir(ino)?.order.is_empty())
     }
 
     /// Removes an empty directory.
@@ -1038,6 +1480,7 @@ impl<'a> Overlay<'a> {
         }
         self.may_delete(dir, ino)?;
         self.detach(dir, name)?;
+        self.removed(dir, name, ino, true);
         self.drop_link(ino)
     }
 
@@ -1066,6 +1509,7 @@ impl<'a> Overlay<'a> {
         }
         let src = self.lookup(odir, oname)?;
         self.dir(ndir)?;
+        self.still_there(ndir)?;
         let src_dir = self.get(src)?.kind() == Kind::Directory;
         if src_dir && self.is_ancestor(src, ndir) {
             return Err(EINVAL);
@@ -1088,67 +1532,85 @@ impl<'a> Overlay<'a> {
                 _ => {}
             }
             self.detach(ndir, nname)?;
+            // (As `inotify` tells it, the name is replaced, not removed.)
+            self.unnamed(dst);
             self.drop_link(dst)?;
         }
         self.detach(odir, oname)?;
-        self.dir_mut(ndir)?
-            .entries
-            .insert(nname.to_string(), Entry::Ino(src));
+        self.dir_mut(ndir)?.put(nname, src);
         if let Data::Dir(d) = &mut self.get_mut(src)?.data {
             d.parent = ndir;
         }
         self.touch(ndir);
         let now = (self.clock)();
-        self.get_mut(src)?.ctime = now;
+        let i = self.get_mut(src)?;
+        i.ctime = now;
+        i.home = Some(ndir);
+        self.changed(|| Change::Moved {
+            from: (odir, oname.to_string()),
+            to: (ndir, nname.to_string()),
+            ino: src,
+            is_dir: src_dir,
+        });
         Ok(())
     }
 
-    /// A directory's entries in name order (without `.` and `..`).
-    pub fn readdir(&mut self, dir: Ino) -> Result<Vec<(String, Ino, Kind)>, i64> {
+    /// Meets every lower child of `dir` (whiteouts stay hidden).
+    fn complete(&mut self, dir: Ino) -> Result<(), i64> {
         let d = self.dir(dir)?;
-        if !d.complete {
-            let names: Vec<String> = d
-                .lower
-                .map(|l| l.entries().map(|e| e.name().to_string()).collect())
-                .unwrap_or_default();
-            for n in names {
-                // Materializes lower children; whiteouts stay hidden.
-                let _ = self.find(dir, &n)?;
-            }
-            self.dir_mut(dir)?.complete = true;
+        if d.complete {
+            return Ok(());
         }
-        let entries: Vec<(String, Ino)> = self
-            .dir(dir)?
-            .entries
-            .iter()
-            .filter_map(|(n, e)| match e {
-                Entry::Ino(i) => Some((n.clone(), *i)),
-                Entry::Whiteout => None,
-            })
-            .collect();
-        entries
-            .into_iter()
-            .map(|(n, i)| Ok((n, i, self.get(i)?.kind())))
-            .collect()
+        if let Some(lower) = d.lower {
+            for child in lower.entries() {
+                if !self.dir(dir)?.entries.contains_key(child.name()) {
+                    self.meet(dir, child)?;
+                }
+            }
+        }
+        self.dir_mut(dir)?.complete = true;
+        Ok(())
     }
 
-    /// The absolute path of directory `ino` (for `getcwd`); `ENOENT` if
-    /// it has been removed.
+    /// Calls `each(place, name, stat ino, kind)` for a directory's entries
+    /// (without `.` and `..`) whose place in the listing is after `after`
+    /// (0: from the start), in order of place, until it returns false. A
+    /// listing that goes on from the last place it saw meets every entry
+    /// that was there all along exactly once.
+    pub fn list(
+        &mut self,
+        dir: Ino,
+        after: u64,
+        mut each: impl FnMut(u64, &str, u64, Kind) -> bool,
+    ) -> Result<(), i64> {
+        self.complete(dir)?;
+        let d = self.dir(dir)?;
+        for (&at, name) in d.order.range(after.saturating_add(1)..) {
+            let Some(Entry::Ino(i, _)) = d.entries.get(name) else {
+                continue;
+            };
+            if !each(at, name, *i as u64 + 1, self.get(*i)?.kind()) {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// An absolute path of `ino` (for `getcwd` and `/proc`); `ENOENT` if it
+    /// has been removed.
     pub fn path(&self, ino: Ino) -> Result<String, i64> {
         let mut parts: Vec<String> = Vec::new();
+        let mut length = 0;
         let mut cur = ino;
         for _ in 0..self.inodes.len() {
             if cur == ROOT {
                 break;
             }
-            let parent = self.dir(cur)?.parent;
-            let name = self
-                .dir(parent)?
-                .entries
-                .iter()
-                .find(|(_, e)| matches!(e, Entry::Ino(i) if *i == cur))
-                .map(|(n, _)| n.clone())
-                .ok_or(ENOENT)?;
+            let (parent, name) = self.name_of(cur).ok_or(ENOENT)?;
+            length += name.len() + 1;
+            if length > 16 * PATH_MAX {
+                return Err(ENAMETOOLONG);
+            }
             parts.push(name);
             cur = parent;
         }
@@ -1183,6 +1645,16 @@ impl<'a> Overlay<'a> {
                 return Err(ENOTDIR);
             }
             self.permission(cur, MAY_EXEC)?;
+            if self.is_elsewhere(cur) && comp != "." && comp != ".." {
+                let mut to = self.path(cur)?;
+                let rest = core::iter::once(&comp).chain(&pending);
+                for c in rest.filter(|c| *c != ".") {
+                    to.push('/');
+                    to.push_str(c);
+                }
+                self.crossing = to;
+                return Err(ELSEWHERE);
+            }
             let child = self.lookup(cur, &comp)?;
             let is_last = pending.is_empty();
             if self.get(child)?.kind() == Kind::Symlink && (follow_last || !is_last) {
@@ -1201,10 +1673,32 @@ impl<'a> Overlay<'a> {
             }
             cur = child;
         }
-        if path.ends_with('/') && self.get(cur)?.kind() != Kind::Directory {
-            return Err(ENOTDIR);
-        }
         Ok(cur)
+    }
+
+    /// Where creating `path` from `cwd` would put it: as
+    /// [`Self::resolve_parent`], but through symlinks that name nothing yet
+    /// in the final component, if `follow` (`open` with `O_CREAT` makes
+    /// what they name).
+    pub fn resolve_create(
+        &mut self,
+        cwd: Ino,
+        path: &str,
+        follow: bool,
+    ) -> Result<(Ino, String), i64> {
+        let (mut dir, mut name) = self.resolve_parent(cwd, path)?;
+        for _ in 0..=MAX_SYMLINK_HOPS {
+            let link = match self.find(dir, &name)? {
+                Some(i) if follow && self.get(i)?.kind() == Kind::Symlink => i,
+                _ => return Ok((dir, name)),
+            };
+            let target = self.readlink(link)?;
+            (dir, name) = self.resolve_parent(dir, &target)?;
+            if target.ends_with('/') && self.find(dir, &name)?.is_none() {
+                return Err(EISDIR); // a directory is not created so
+            }
+        }
+        Err(ELOOP)
     }
 
     /// Resolves all but the last component of `path`; returns the parent
@@ -1227,10 +1721,23 @@ impl<'a> Overlay<'a> {
             None => ("", trimmed),
         };
         let dir = if dir_part.is_empty() {
-            cwd
+            Ok(cwd)
         } else {
-            self.resolve(cwd, dir_part, true)?
+            self.resolve(cwd, dir_part, true)
         };
+        let dir = match dir {
+            Ok(d) if self.is_elsewhere(d) => {
+                self.crossing = self.path(d)?;
+                Err(ELSEWHERE)
+            }
+            r => r,
+        }
+        .inspect_err(|&e| {
+            if e == ELSEWHERE {
+                self.crossing.push('/');
+                self.crossing.push_str(name);
+            }
+        })?;
         if self.get(dir)?.kind() != Kind::Directory {
             return Err(ENOTDIR);
         }
@@ -1265,8 +1772,273 @@ mod tests {
         v
     }
 
+    /// A whole listing, in name order.
+    fn entries<A: Pages>(fs: &mut Overlay<'_, A>, dir: Ino) -> Vec<(String, u64, Kind)> {
+        let mut all = Vec::new();
+        fs.list(dir, 0, |_, name, ino, kind| {
+            all.push((name.to_string(), ino, kind));
+            true
+        })
+        .unwrap();
+        all.sort_by(|a, b| a.0.cmp(&b.0));
+        all
+    }
+
     fn names(fs: &mut Overlay<'_>, dir: Ino) -> Vec<String> {
-        fs.readdir(dir).unwrap().into_iter().map(|e| e.0).collect()
+        entries(fs, dir).into_iter().map(|e| e.0).collect()
+    }
+
+    #[test]
+    fn a_listing_goes_on_where_it_was() {
+        let bytes: &'static [u8] = std::vec::Vec::leak(lower_image());
+        let image = Image::mount(bytes).unwrap();
+        let src: &'static image::SliceSource = Box::leak(Box::new(image::SliceSource(bytes)));
+        let mut fs = Overlay::new(&image, src, 1 << 20).unwrap();
+        let etc = fs.resolve(ROOT, "/etc", true).unwrap();
+        for i in 0..10 {
+            fs.create(etc, &std::format!("f{i}"), 0o644).unwrap();
+        }
+        // Two at a time, removing each as it is seen, as `rm -r` does.
+        let mut seen = Vec::new();
+        let mut at = 0;
+        loop {
+            let mut some = Vec::new();
+            fs.list(etc, at, |place, name, _, _| {
+                at = place;
+                some.push(name.to_string());
+                some.len() < 2
+            })
+            .unwrap();
+            if some.is_empty() {
+                break;
+            }
+            for name in some {
+                fs.unlink(etc, &name).unwrap();
+                seen.push(name);
+            }
+            if seen.len() == 4 {
+                // Added meanwhile: seen too, since it comes last.
+                fs.create(etc, "late", 0o644).unwrap();
+            }
+        }
+        assert_eq!(seen.len(), 13, "{seen:?}");
+        assert!(fs.is_empty_dir(etc).unwrap());
+        // A name that was there (in either layer) lists once when it is
+        // back, a whiteout not at all.
+        fs.create(etc, "motd", 0o644).unwrap();
+        assert_eq!(names(&mut fs, etc), ["motd"]);
+        fs.rename(etc, "motd", etc, "link").unwrap();
+        assert_eq!(names(&mut fs, etc), ["link"]);
+    }
+
+    /// Room for a number of pages of inodes.
+    #[derive(Debug)]
+    struct Little(usize);
+
+    impl Pages for Little {
+        type Page = HeapPage;
+        fn alloc(&self) -> Option<HeapPage> {
+            Heap.alloc()
+        }
+        fn keep(&mut self, pages: usize) -> bool {
+            pages <= self.0
+        }
+    }
+
+    #[test]
+    fn inodes_and_names_are_counted() {
+        let bytes: &'static [u8] = std::vec::Vec::leak(lower_image());
+        let image = Image::mount(bytes).unwrap();
+        let src: &'static image::SliceSource = Box::leak(Box::new(image::SliceSource(bytes)));
+        let mut fs = Overlay::with_pages(&image, src, Little(2), 1 << 20).unwrap();
+        // What the image has costs nothing.
+        assert_eq!(entries(&mut fs, ROOT).len(), 3);
+        let f = fs.create(ROOT, "f", 0o644).unwrap();
+        for i in 0..5 {
+            fs.mkdir(ROOT, &std::format!("d{i}"), 0o755).unwrap();
+        }
+        for i in 0..10 {
+            fs.link(f, ROOT, &std::format!("l{i}")).unwrap();
+        }
+        assert_eq!(fs.made, 16);
+        assert_eq!(fs.create(ROOT, "x", 0o644), Err(ENOSPC));
+        assert_eq!(fs.link(f, ROOT, "x"), Err(ENOSPC));
+        assert_eq!(fs.create_unnamed(0o600), Err(ENOSPC));
+        assert_eq!(fs.find(ROOT, "x"), Ok(None));
+        // An image's file can still be changed, moved and removed.
+        let motd = fs.resolve(ROOT, "/etc/motd", true).unwrap();
+        fs.write(motd, 0, b"x").unwrap();
+        let etc = fs.resolve(ROOT, "/etc", true).unwrap();
+        fs.rename(etc, "motd", ROOT, "motd").unwrap();
+        fs.unlink(ROOT, "motd").unwrap();
+        assert_eq!(fs.made, 16);
+        // Removing gives the room back; an open file keeps its own.
+        fs.unlink(ROOT, "l3").unwrap();
+        let u = fs.create_unnamed(0o600).unwrap();
+        assert_eq!(fs.create(ROOT, "x", 0o644), Err(ENOSPC));
+        fs.close(u);
+        fs.rmdir(ROOT, "d1").unwrap();
+        fs.open(f).unwrap();
+        for i in (0..10).filter(|&i| i != 3) {
+            fs.unlink(ROOT, &std::format!("l{i}")).unwrap();
+        }
+        fs.unlink(ROOT, "f").unwrap();
+        assert_eq!(fs.made, 5);
+        fs.close(f);
+        assert_eq!(fs.made, 4);
+        for i in (0..5).filter(|&i| i != 1) {
+            fs.rmdir(ROOT, &std::format!("d{i}")).unwrap();
+        }
+        assert_eq!((fs.made, fs.kept), (0, 0));
+    }
+
+    #[test]
+    fn files_know_their_paths() {
+        let bytes: &'static [u8] = std::vec::Vec::leak(lower_image());
+        let image = Image::mount(bytes).unwrap();
+        let src: &'static image::SliceSource = Box::leak(Box::new(image::SliceSource(bytes)));
+        let mut fs = Overlay::new(&image, src, 1 << 20).unwrap();
+        let motd = fs.resolve(ROOT, "/etc/motd", true).unwrap();
+        assert_eq!(fs.path(motd).unwrap(), "/etc/motd");
+        let usr = fs.resolve(ROOT, "/usr", true).unwrap();
+        let etc = fs.resolve(ROOT, "/etc", true).unwrap();
+        fs.rename(etc, "motd", usr, "moved").unwrap();
+        assert_eq!(fs.path(motd).unwrap(), "/usr/moved");
+        fs.open(motd).unwrap();
+        fs.unlink(usr, "moved").unwrap();
+        assert_eq!(fs.path(motd), Err(ENOENT));
+        assert_eq!(fs.name_of(ROOT), None);
+    }
+
+    #[test]
+    fn a_trailing_slash_means_a_directory() {
+        let mut fs = Overlay::empty(1 << 20);
+        let d = fs.mkdir(ROOT, "d", 0o755).unwrap();
+        let f = fs.create(ROOT, "f", 0o644).unwrap();
+        let l = fs.symlink(ROOT, "l", "d").unwrap();
+        fs.symlink(ROOT, "lf", "f").unwrap();
+        fs.symlink(ROOT, "slash", "f/").unwrap();
+        fs.symlink(d, "up", "../new").unwrap();
+        assert_eq!(fs.resolve(ROOT, "l", false), Ok(l));
+        assert_eq!(fs.resolve(ROOT, "l/", false), Ok(d));
+        assert_eq!(fs.resolve(ROOT, "lf", true), Ok(f));
+        assert_eq!(fs.resolve(ROOT, "lf/", false), Err(ENOTDIR));
+        assert_eq!(fs.resolve(ROOT, "slash", true), Err(ENOTDIR));
+        assert_eq!(fs.resolve(ROOT, "f/", true), Err(ENOTDIR));
+        assert_eq!(fs.resolve(ROOT, "/", true), Ok(ROOT));
+        // Creating through a dangling symlink creates what it names.
+        let made = |n: &str| Ok((ROOT, n.to_string()));
+        assert_eq!(fs.resolve_create(ROOT, "d/up", true), made("new"));
+        let (dir, name) = fs.resolve_create(ROOT, "d/up", false).unwrap();
+        assert_eq!((dir, name.as_str()), (d, "up"));
+        fs.symlink(ROOT, "loop", "loop").unwrap();
+        assert_eq!(fs.resolve_create(ROOT, "loop", true), Err(ELOOP));
+    }
+
+    #[test]
+    fn paths_cross_into_what_is_served_elsewhere() {
+        let mut fs = Overlay::empty(1 << 20);
+        let proc = fs.mkdir(ROOT, "proc", 0o555).unwrap();
+        let dev = fs.mkdir(ROOT, "dev", 0o755).unwrap();
+        fs.symlink(dev, "fd", "/proc/self/fd").unwrap();
+        fs.symlink(dev, "mounts", "../proc/self/mounts").unwrap();
+        fs.set_elsewhere(proc);
+        let mut to = |from: Ino, path: &str, follow: bool| {
+            let r = fs.resolve(from, path, follow);
+            (r, fs.take_crossing())
+        };
+        let crossed = |p: &str| (Err(ELSEWHERE), p.to_string());
+        assert_eq!(to(ROOT, "/dev/fd/3", true), crossed("/proc/self/fd/3"));
+        assert_eq!(to(dev, "mounts", true), crossed("/proc/self/mounts"));
+        assert_eq!(to(proc, "1/stat", true), crossed("/proc/1/stat"));
+        assert!(to(dev, "mounts", false).0.is_ok(), "the link itself");
+        let r = fs.resolve_create(dev, "mounts", true);
+        assert_eq!(
+            (r, fs.take_crossing()),
+            (Err(ELSEWHERE), "/proc/self/mounts".to_string())
+        );
+        let r = fs.resolve_parent(dev, "../proc/new");
+        assert_eq!(
+            (r, fs.take_crossing()),
+            (Err(ELSEWHERE), "/proc/new".to_string())
+        );
+        let mut to = |from: Ino, path: &str, follow: bool| {
+            let r = fs.resolve(from, path, follow);
+            (r, fs.take_crossing())
+        };
+        assert_eq!(to(ROOT, "proc", true).0, Ok(proc));
+        assert_eq!(to(proc, "../dev", true).0, Ok(dev));
+    }
+
+    #[test]
+    fn a_watched_tree_records_changes() {
+        let mut fs = Overlay::empty(1 << 20);
+        let quiet = fs.create(ROOT, "quiet", 0o644).unwrap();
+        assert!(fs.take_changes().is_empty());
+        fs.watch(true);
+        let f = fs.create(ROOT, "f", 0o644).unwrap();
+        let d = fs.mkdir(ROOT, "d", 0o755).unwrap();
+        fs.write(f, 0, b"x").unwrap();
+        fs.chmod(f, 0o600).unwrap();
+        fs.link(f, d, "g").unwrap();
+        fs.unlink(d, "g").unwrap();
+        let s = |n: &str| n.to_string();
+        assert_eq!(
+            fs.take_changes(),
+            [
+                Change::Created {
+                    dir: ROOT,
+                    name: s("f"),
+                    is_dir: false
+                },
+                Change::Created {
+                    dir: ROOT,
+                    name: s("d"),
+                    is_dir: true
+                },
+                Change::Modified(f),
+                Change::Attributes(f),
+                Change::Attributes(f),
+                Change::Created {
+                    dir: d,
+                    name: s("g"),
+                    is_dir: false
+                },
+                Change::Removed {
+                    dir: d,
+                    name: s("g"),
+                    is_dir: false
+                },
+                Change::Attributes(f),
+            ]
+        );
+        fs.rename(ROOT, "f", ROOT, "quiet").unwrap();
+        fs.open(d).unwrap();
+        fs.rmdir(ROOT, "d").unwrap();
+        assert_eq!(fs.mkdir(d, "x", 0o755), Err(ENOENT), "removed");
+        assert_eq!(fs.link(f, d, "x"), Err(ENOENT), "removed");
+        assert_eq!(fs.rename(ROOT, "quiet", d, "x"), Err(ENOENT), "removed");
+        assert_eq!(
+            fs.take_changes(),
+            [
+                Change::Gone(quiet),
+                Change::Moved {
+                    from: (ROOT, s("f")),
+                    to: (ROOT, s("quiet")),
+                    ino: f,
+                    is_dir: false
+                },
+                Change::Removed {
+                    dir: ROOT,
+                    name: s("d"),
+                    is_dir: true
+                },
+                Change::Gone(d),
+            ]
+        );
+        fs.watch(false);
+        fs.write(f, 0, b"y").unwrap();
+        assert!(fs.take_changes().is_empty());
     }
 
     #[test]
@@ -1382,6 +2154,45 @@ mod tests {
     }
 
     #[test]
+    fn fifos_have_their_own_ids() {
+        let mut fs = Overlay::empty(1 << 20);
+        let a = fs.mkfifo(ROOT, "a", 0o644).unwrap();
+        let b = fs.mkfifo(ROOT, "b", 0o600).unwrap();
+        let st = fs.stat(a).unwrap();
+        assert_eq!((st.kind, st.mode, st.size), (Kind::Fifo, 0o644, 0));
+        assert_eq!(entries(&mut fs, ROOT)[0].2, Kind::Fifo);
+        let (ia, ib) = (fs.fifo_id(a).unwrap(), fs.fifo_id(b).unwrap());
+        assert_ne!(ia, ib);
+        fs.link(a, ROOT, "c").unwrap();
+        let c = fs.resolve(ROOT, "/c", true).unwrap();
+        assert_eq!(fs.fifo_id(c), Some(ia));
+        assert_eq!(fs.read(a, 0, &mut [0; 4]), Err(EINVAL));
+        assert_eq!(fs.truncate(a, 0), Ok(()));
+        fs.unlink(ROOT, "a").unwrap();
+        fs.unlink(ROOT, "c").unwrap();
+        let d = fs.mkfifo(ROOT, "d", 0o644).unwrap();
+        assert_ne!(fs.fifo_id(d), Some(ia), "a reused inode gets a new id");
+        assert_eq!(fs.fifo_id(ROOT), None);
+    }
+
+    #[test]
+    fn unnamed_files_live_while_open() {
+        let mut fs = Overlay::empty(1 << 20);
+        let f = fs.create_unnamed(0o600).unwrap();
+        fs.write(f, 0, b"memfd").unwrap();
+        let st = fs.stat(f).unwrap();
+        assert_eq!((st.kind, st.nlink, st.size), (Kind::File, 0, 5));
+        assert!(names(&mut fs, ROOT).is_empty());
+        assert_eq!(fs.link(f, ROOT, "x"), Err(ENOENT));
+        fs.open(f).unwrap(); // a dup'd description
+        fs.close(f);
+        assert_eq!(read_all(&fs, f), b"memfd");
+        fs.close(f);
+        assert_eq!(fs.used_bytes(), 0);
+        assert!(fs.stat(f).is_err());
+    }
+
+    #[test]
     fn directories() {
         let img = lower_image();
         let image = Image::mount(&img).unwrap();
@@ -1441,7 +2252,7 @@ mod tests {
         assert_eq!(fs.resolve(ROOT, "/dev/null", true).unwrap(), null);
         assert!(fs.truncate(null, 0).is_ok());
         assert_eq!(fs.write(null, 0, b"x"), Err(EINVAL));
-        assert_eq!(fs.readdir(dev).unwrap()[0].2, Kind::CharDevice);
+        assert_eq!(entries(&mut fs, dev)[0].2, Kind::CharDevice);
     }
 
     #[test]
@@ -1456,7 +2267,7 @@ mod tests {
         assert_eq!(fs.read(s, 0, &mut buf), Err(EINVAL));
         assert_eq!(fs.write(s, 0, b"x"), Err(EINVAL));
         assert_eq!(fs.truncate(s, 0), Err(EINVAL));
-        assert_eq!(fs.readdir(run).unwrap()[0].2, Kind::Socket);
+        assert_eq!(entries(&mut fs, run)[0].2, Kind::Socket);
         fs.unlink(run, "app.sock").unwrap();
         assert_eq!(fs.lookup(run, "app.sock"), Err(ENOENT));
     }
@@ -1554,13 +2365,83 @@ mod tests {
         fs.truncate(f, PAGE as u64 + 10).unwrap();
         assert_eq!(fs.read(f, PAGE as u64 - 2, &mut buf[..4]).unwrap(), 4);
         assert_eq!(&buf[..4], b"a\0\0\0");
-        // The budget counts pages.
+        // The budget counts pages; what fits is written.
         assert_eq!(
-            fs.write(f, 100 * PAGE as u64, &[0u8; 64 * PAGE]),
-            Err(ENOSPC)
+            fs.write(f, 100 * PAGE as u64, &[1u8; 64 * PAGE]),
+            Ok(63 * PAGE)
         );
+        assert_eq!(fs.stat(f).unwrap().size, 163 * PAGE as u64);
+        assert_eq!(fs.write(f, 163 * PAGE as u64, b"x"), Err(ENOSPC));
+        assert_eq!(fs.stat(f).unwrap().size, 163 * PAGE as u64);
         fs.unlink(ROOT, "f").unwrap();
         assert_eq!(fs.used_bytes(), 0);
+    }
+
+    /// Pages that are shared handles, as the kernel's are, from a source
+    /// that can run out.
+    #[derive(Debug)]
+    struct Few(core::cell::Cell<usize>);
+    #[derive(Clone, Debug)]
+    struct Shared(std::rc::Rc<HeapPage>);
+    impl Page for Shared {
+        fn read(&self, at: usize, out: &mut [u8]) {
+            self.0.read(at, out);
+        }
+        fn write(&self, at: usize, data: &[u8]) {
+            self.0.write(at, data);
+        }
+    }
+    impl Pages for Few {
+        type Page = Shared;
+        fn alloc(&self) -> Option<Shared> {
+            self.0.set(self.0.get().checked_sub(1)?);
+            Heap.alloc().map(|p| Shared(std::rc::Rc::new(p)))
+        }
+    }
+
+    #[test]
+    fn a_files_pages_can_be_shared() {
+        let img = lower_image();
+        let image = Image::mount(&img).unwrap();
+        let src = image::SliceSource(&img);
+        let few = Few(core::cell::Cell::new(3));
+        let mut fs = Overlay::with_pages(&image, &src, few, 1 << 20).unwrap();
+        let f = fs.create(ROOT, "f", 0o644).unwrap();
+        fs.write(f, 0, b"hello").unwrap(); // one page
+        fs.truncate(f, 3 * PAGE as u64).unwrap();
+        // What a mapper writes, readers see, and the other way round.
+        let p = fs.page(f, 0, true).unwrap().unwrap();
+        p.write(0, b"J");
+        let mut buf = [0u8; 5];
+        fs.read(f, 0, &mut buf).unwrap();
+        assert_eq!(&buf, b"Jello");
+        fs.write(f, 4, b"y").unwrap();
+        p.read(0, &mut buf);
+        assert_eq!(&buf, b"Jelly");
+        // A hole is given a page; past the end there is none.
+        let hole = fs.page(f, 2, false).unwrap().unwrap();
+        hole.write(7, b"z");
+        fs.read(f, 2 * PAGE as u64 + 7, &mut buf[..1]).unwrap();
+        assert_eq!(&buf[..1], b"z");
+        assert_eq!(fs.used_bytes(), 2 * PAGE);
+        assert!(matches!(fs.page(f, 3, true), Err(EINVAL)));
+        // A lower file is shared only once it is to be written (the last
+        // page goes to its copy).
+        let h = fs.resolve(ROOT, "/etc/motd", true).unwrap();
+        assert!(fs.page(h, 0, false).unwrap().is_none());
+        let up = fs.page(h, 0, true).unwrap().unwrap();
+        up.write(0, b"I");
+        fs.read(h, 0, &mut buf).unwrap();
+        assert_eq!(buf[0], b'I');
+        assert!(fs.page(h, 0, false).unwrap().is_some());
+        // No pages left: the hole stays one.
+        assert!(matches!(fs.page(f, 1, true), Err(ENOSPC)));
+        assert_eq!(fs.write(f, PAGE as u64, b"x"), Err(ENOSPC));
+        // Truncated away, a mapper keeps its page but the file has none.
+        fs.truncate(f, 1).unwrap();
+        assert_eq!(fs.used_bytes(), 2 * PAGE);
+        p.read(1, &mut buf);
+        assert_eq!(buf, [0; 5], "the tail of the kept page is zeroed");
     }
 
     #[test]

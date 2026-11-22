@@ -7,15 +7,19 @@
 //! esp/EFI/BOOT/BOOTX64.EFI   the kernel
 //! esp/ichor/cmdline          the kernel command line
 //! esp/ichor/roots.pem        the control plane's CA bundle (Mozilla's, pinned)
+//! esp/ichor/apitoken         the control plane's API token (when configured)
+//! esp/ichor/apitls.pem       its TLS certificates and key (when configured)
 //! root.img                   the root image, attached as virtio-blk and NVMe disks
 //! ```
 //!
 //! OVMF finds `BOOTX64.EFI` through the removable-media boot path, so no boot
 //! entries need to be configured.
 
-use std::io::Read;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use std::{env, fs, thread};
@@ -84,6 +88,10 @@ impl Accel {
     pub fn cpu_model(self) -> &'static str {
         match self {
             Accel::Kvm | Accel::Hvf => "host",
+            // TCG computes a fused multiply-add with the host C library's
+            // `fma`, and mingw's rounds twice: programs that use FMA where
+            // there is one (libm, PostgreSQL, Go) get wrong last digits.
+            Accel::Tcg if cfg!(windows) => "max,-fma",
             _ => "max",
         }
     }
@@ -214,6 +222,10 @@ pub struct RunConfig {
     /// Disk mode: extra properties for the boot NVMe controller (for
     /// example `mdts=1`, a small maximum transfer).
     pub disk_nvme_props: String,
+    /// Disk mode: put the boot disk on a virtio-scsi controller (as GCP's
+    /// general-purpose machine types attach theirs) instead of NVMe, at
+    /// this SCSI target.
+    pub disk_scsi_target: Option<u8>,
     /// Disk mode: QEMU arguments placed before the boot disk, so devices
     /// they add come first in PCI order (a blank volume ahead of the boot
     /// disk, as instance storage can be).
@@ -228,6 +240,11 @@ pub struct RunConfig {
     /// Extra options for the user-mode network backend (for example
     /// `hostfwd=tcp:127.0.0.1:8080-:80`).
     pub net_user_opts: String,
+    /// The control plane's API token, written to `\ichor\apitoken`.
+    pub api_token: Option<String>,
+    /// The API's TLS certificates and key (PEM), written to
+    /// `\ichor\apitls.pem`.
+    pub api_tls: Option<String>,
 }
 
 impl RunConfig {
@@ -281,10 +298,13 @@ impl RunConfig {
             window: false,
             disk_image: None,
             disk_nvme_props: String::new(),
+            disk_scsi_target: None,
             disk_devices_before: Vec::new(),
             machine_props: String::new(),
             smp_topology: String::new(),
             net_user_opts: String::new(),
+            api_token: None,
+            api_tls: None,
         }
     }
 }
@@ -364,6 +384,12 @@ fn prepare_run_dir(cfg: &RunConfig, fw: &Firmware) -> Result<PathBuf> {
         crate::artifact::MOZILLA_ROOTS.bytes()?,
     )
     .map_err(|e| format!("writing roots.pem: {e}"))?;
+    if let Some(t) = &cfg.api_token {
+        fs::write(cfg_dir.join("apitoken"), t).map_err(|e| format!("writing apitoken: {e}"))?;
+    }
+    if let Some(t) = &cfg.api_tls {
+        fs::write(cfg_dir.join("apitls.pem"), t).map_err(|e| format!("writing apitls.pem: {e}"))?;
+    }
     fs::write(dir.join("root.img"), root_image()?)
         .map_err(|e| format!("writing root image: {e}"))?;
     fs::write(dir.join("alpine.img"), alpine_image()?)
@@ -612,15 +638,20 @@ fn disk_command(cfg: &RunConfig, qemu: &Path, fw: &Firmware, img: &Path) -> Resu
             drive_path(img)
         ))
         .arg("-device")
-        .arg(format!(
-            "nvme,serial=ichor-boot,drive=disk,bootindex=0{}{}",
-            if cfg.disk_nvme_props.is_empty() {
-                ""
-            } else {
-                ","
-            },
-            cfg.disk_nvme_props
-        ))
+        .arg(match cfg.disk_scsi_target {
+            // On the virtio-scsi controller the test's earlier devices
+            // may have added (`scsi0`), or one of its own.
+            Some(t) => format!("scsi-hd,drive=disk,bus=scsi0.0,scsi-id={t},bootindex=0"),
+            None => format!(
+                "nvme,serial=ichor-boot,drive=disk,bootindex=0{}{}",
+                if cfg.disk_nvme_props.is_empty() {
+                    ""
+                } else {
+                    ","
+                },
+                cfg.disk_nvme_props
+            ),
+        })
         .args(["-device", "virtio-rng-pci,disable-legacy=on"])
         .args(cfg.net_args())
         .args(&cfg.extra_args);
@@ -632,9 +663,76 @@ pub fn run(cfg: &RunConfig) -> Result<Outcome> {
     run_command(command(cfg)?, cfg.capture, cfg.timeout)
 }
 
+/// A loopback port nothing listens on right now, and that nothing else is
+/// likely to take before QEMU does: below the ports systems hand out by
+/// themselves, and never the same twice in this process (parallel tests).
+fn free_port() -> Option<u16> {
+    static NEXT: AtomicU16 = AtomicU16::new(0);
+    const FIRST: u16 = 20_000;
+    const RANGE: u16 = 10_000;
+    let start = (std::process::id() % 100) as u16 * 100;
+    (0..RANGE).find_map(|_| {
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let port = FIRST + start.wrapping_add(n) % RANGE;
+        TcpListener::bind(("127.0.0.1", port)).ok().map(|_| port)
+    })
+}
+
+/// What QEMU's human monitor on `port` answers to each command (with a
+/// half-second silence taken as the end of an answer).
+fn monitor(port: u16, commands: &[String]) -> std::io::Result<String> {
+    let mut s = TcpStream::connect(("127.0.0.1", port))?;
+    s.set_read_timeout(Some(Duration::from_millis(500)))?;
+    let mut out = Vec::new();
+    let mut buf = [0u8; 4096];
+    for c in core::iter::once("").chain(commands.iter().map(String::as_str)) {
+        if !c.is_empty() {
+            s.write_all(format!("{c}\n").as_bytes())?;
+        }
+        while let Ok(n) = s.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&buf[..n]);
+        }
+    }
+    Ok(String::from_utf8_lossy(&out).into_owned())
+}
+
+/// Where every vCPU of a run that will not end is: registers twice, a
+/// second apart (does it move? is it halted?), its local APIC's timer and
+/// pending interrupts, and the top of its stack.
+fn vcpu_state(port: u16) -> String {
+    let regs = ["info registers -a".to_string()];
+    let first = match monitor(port, &regs) {
+        Ok(t) => t,
+        Err(e) => return format!("(no monitor: {e})"),
+    };
+    thread::sleep(Duration::from_secs(1));
+    let cpus = first.matches("CPU#").count();
+    let mut commands = regs.to_vec();
+    for n in 0..cpus {
+        commands.push(format!("cpu {n}"));
+        commands.push("info lapic".into());
+        commands.push("x /8i $rip".into());
+        commands.push("x /96gx $rsp".into());
+    }
+    let second = monitor(port, &commands).unwrap_or_else(|e| format!("(monitor: {e})"));
+    format!("{first}\n--- one second later ---\n{second}")
+}
+
 /// Runs a prepared QEMU command to exit (or `timeout`), capturing its
-/// serial output on stdout if `capture`.
+/// serial output on stdout if `capture`. A run that times out has its
+/// vCPUs' state ([`vcpu_state`]) appended to the captured output.
 pub fn run_command(mut cmd: Command, capture: bool, timeout: Option<Duration>) -> Result<Outcome> {
+    let monitor_port = timeout
+        .filter(|_| capture)
+        .and_then(|_| free_port())
+        .inspect(|port| {
+            cmd.arg("-monitor")
+                .arg(format!("tcp:127.0.0.1:{port},server=on,wait=off"));
+        });
+    let mut stuck = String::new();
     if capture {
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -675,6 +773,12 @@ pub fn run_command(mut cmd: Command, capture: bool, timeout: Option<Duration>) -
             };
         }
         if timeout.is_some_and(|t| start.elapsed() > t) {
+            if let Some(port) = monitor_port {
+                stuck = format!(
+                    "\n=== vCPUs at the timeout ===\n{}\n",
+                    vcpu_state(port).replace('\r', "")
+                );
+            }
             let _ = child.kill();
             let _ = child.wait();
             break Exit::Timeout;
@@ -685,7 +789,8 @@ pub fn run_command(mut cmd: Command, capture: bool, timeout: Option<Duration>) -
     if let Some(reader) = reader {
         let _ = reader.join();
     }
-    let serial = String::from_utf8_lossy(&serial.lock().unwrap()).into_owned();
+    let mut serial = String::from_utf8_lossy(&serial.lock().unwrap()).into_owned();
+    serial.push_str(&stuck);
     Ok(Outcome {
         exit,
         serial,

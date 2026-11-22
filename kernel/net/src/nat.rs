@@ -20,8 +20,13 @@ pub type Endpoint = (Ipv4Addr, u16);
 
 /// Ports the table hands out for outbound connections.
 pub const PORTS: core::ops::RangeInclusive<u16> = 49152..=65535;
-/// How long an idle mapping lives.
+/// How long an idle mapping lives (UDP and anything but open TCP).
 pub const IDLE: Duration = Duration::from_secs(600);
+/// How long an idle open TCP connection's mapping lives: Linux's
+/// `nf_conntrack_tcp_timeout_established` (five days). A connection quiet
+/// for longer than `IDLE` (a long API call streaming nothing) must not
+/// lose its mapping.
+pub const TCP_ESTABLISHED: Duration = Duration::from_secs(5 * 24 * 3600);
 /// How long a TCP mapping lives after both FINs or a RST.
 pub const CLOSING: Duration = Duration::from_secs(60);
 
@@ -36,6 +41,8 @@ struct Mapping {
     remote: Endpoint,
     outside_port: u16,
     last: Duration,
+    /// A TCP mapping (open ones live `TCP_ESTABLISHED`).
+    tcp: bool,
     /// FIN seen from the inside / from the outside.
     fin_in: bool,
     fin_out: bool,
@@ -46,6 +53,8 @@ impl Mapping {
     fn expired(&self, now: Duration) -> bool {
         let life = if self.reset || (self.fin_in && self.fin_out) {
             CLOSING
+        } else if self.tcp {
+            TCP_ESTABLISHED
         } else {
             IDLE
         };
@@ -94,6 +103,14 @@ impl Nat {
     /// The uplink's address.
     pub fn outside(&self) -> Ipv4Addr {
         self.outside
+    }
+
+    /// Moves the uplink to another address: published ports stay, and every
+    /// mapping goes (its remote only knows the old address).
+    pub fn set_outside(&mut self, outside: Ipv4Addr) {
+        self.outside = outside;
+        self.by_inside.clear();
+        self.by_outside.clear();
     }
 
     /// Publishes `port` on the uplink to `inside`. Fails if the port is
@@ -192,6 +209,7 @@ impl Nat {
                     remote,
                     outside_port: port,
                     last: now,
+                    tcp: proto == PROTO_TCP,
                     fin_in: false,
                     fin_out: false,
                     reset: false,
@@ -236,6 +254,7 @@ impl Nat {
                 remote,
                 outside_port: port,
                 last: now,
+                tcp: proto == PROTO_TCP,
                 fin_in: false,
                 fin_out: false,
                 reset: false,
@@ -294,6 +313,53 @@ pub fn tcp_flags(seg: &[u8]) -> u8 {
     seg.get(13).copied().unwrap_or(0)
 }
 
+/// MSS clamping (what Linux's `TCPMSS --clamp-mss-to-pmtu` does): if `seg`
+/// (a TCP segment from `src` to `dst`, its checksum already right) is a
+/// SYN whose MSS option asks for more than `max`, lowers it to `max` and
+/// fixes the checksum. The uplink clamps every SYN crossing it to its MTU
+/// less 40 (GCP's VPC MTU is 1460), so neither end of a connection sends
+/// segments the link cannot carry. Returns whether it changed anything.
+pub fn clamp_mss(src: Ipv4Addr, dst: Ipv4Addr, seg: &mut [u8], max: u16) -> bool {
+    if seg.len() < 20 || tcp_flags(seg) & SYN == 0 {
+        return false;
+    }
+    let header = usize::from(seg[12] >> 4) * 4;
+    if header < 20 || header > seg.len() {
+        return false;
+    }
+    let mut at = 20;
+    let mut changed = false;
+    while at < header {
+        match seg[at] {
+            0 => break,   // end of options
+            1 => at += 1, // no-op
+            kind => {
+                let Some(&len) = seg.get(at + 1) else {
+                    return false;
+                };
+                let len = usize::from(len);
+                if len < 2 || at + len > header {
+                    return false;
+                }
+                if kind == 2 && len == 4 {
+                    let mss = u16::from_be_bytes([seg[at + 2], seg[at + 3]]);
+                    if mss > max {
+                        seg[at + 2..at + 4].copy_from_slice(&max.to_be_bytes());
+                        changed = true;
+                    }
+                }
+                at += len;
+            }
+        }
+    }
+    if changed {
+        seg[16..18].copy_from_slice(&[0, 0]);
+        let c = fold(sum(pseudo_header(src, dst, PROTO_TCP, seg.len()), seg));
+        seg[16..18].copy_from_slice(&c.to_be_bytes());
+    }
+    changed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -306,6 +372,41 @@ mod tests {
 
     fn t(s: u64) -> Duration {
         Duration::from_secs(s)
+    }
+
+    #[test]
+    fn syns_are_clamped_to_the_link() {
+        let syn = |mss: u16, flags: u8| {
+            tcp::segment(
+                (CELL, 40000),
+                (FAR, 443),
+                1,
+                0,
+                flags,
+                65535,
+                Some((mss, 7)),
+                &[],
+            )
+        };
+        // A SYN asking for 1460 is lowered to 1420 and still checks out.
+        let mut s = syn(1460, SYN);
+        assert!(clamp_mss(CELL, FAR, &mut s, 1420));
+        let seg = Segment::parse(&s, CELL, FAR).expect("checksum fixed");
+        assert_eq!(seg.mss, Some(1420));
+        // Already small enough, or not a SYN: untouched.
+        let mut s = syn(1200, SYN);
+        let before = s.clone();
+        assert!(!clamp_mss(CELL, FAR, &mut s, 1420));
+        assert_eq!(s, before);
+        let mut s = tcp::segment((CELL, 40000), (FAR, 443), 1, 1, ACK, 65535, None, b"x");
+        assert!(!clamp_mss(CELL, FAR, &mut s, 1420));
+        // A SYN-ACK is clamped too; truncated or odd options do no harm.
+        let mut s = syn(1460, SYN | ACK);
+        assert!(clamp_mss(CELL, FAR, &mut s, 1420));
+        for n in 0..s.len() {
+            let mut t = s[..n].to_vec();
+            let _ = clamp_mss(CELL, FAR, &mut t, 1000);
+        }
     }
 
     #[test]
@@ -386,6 +487,25 @@ mod tests {
     }
 
     #[test]
+    fn a_new_outside_address_keeps_published_ports_only() {
+        const NEW: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 77);
+        let mut n = Nat::new(UP);
+        assert!(n.publish(PROTO_TCP, 8080, (CELL, 80)));
+        let old = n.outbound(PROTO_TCP, (CELL, 40000), (FAR, 443), SYN, t(0));
+        assert_eq!(old.map(|e| e.0), Some(UP));
+        n.set_outside(NEW);
+        assert!(n.is_empty());
+        let p = old.unwrap().1;
+        assert_eq!(n.inbound(PROTO_TCP, (FAR, 443), p, ACK, t(1)), None);
+        assert_eq!(
+            n.inbound(PROTO_TCP, (FAR, 5000), 8080, SYN, t(1)),
+            Some((CELL, 80))
+        );
+        let new = n.outbound(PROTO_TCP, (CELL, 40001), (FAR, 443), SYN, t(1));
+        assert_eq!(new.map(|e| e.0), Some(NEW));
+    }
+
+    #[test]
     fn mappings_expire_when_idle_or_closed() {
         let mut n = Nat::new(UP);
         let a = n
@@ -400,9 +520,20 @@ mod tests {
         n.expire(t(10) + CLOSING + t(1));
         assert_eq!(n.len(), 1, "the closed mapping went first");
         assert_eq!(n.inbound(PROTO_TCP, (FAR, 80), b.1, ACK, t(80)), None);
+        // A quiet UDP mapping goes after IDLE; an open TCP one does not (a
+        // long call that streams nothing keeps its connection).
+        let u = n
+            .outbound(PROTO_UDP, (CELL, 3), (FAR, 53), 0, t(0))
+            .unwrap();
         n.expire(t(0) + IDLE + t(1));
+        assert_eq!(n.len(), 1, "the open TCP mapping stays");
+        assert_eq!(n.inbound(PROTO_UDP, (FAR, 53), u.1, 0, IDLE + t(2)), None);
+        assert_eq!(
+            n.inbound(PROTO_TCP, (FAR, 80), a.1, ACK, IDLE + t(2)),
+            Some((CELL, 1))
+        );
+        n.expire(IDLE + t(2) + TCP_ESTABLISHED + t(1));
         assert!(n.is_empty());
-        assert_eq!(n.inbound(PROTO_TCP, (FAR, 80), a.1, ACK, IDLE + t(2)), None);
     }
 
     /// A SYN on a finished mapping starts over: to the cell the port is

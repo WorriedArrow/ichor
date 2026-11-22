@@ -110,3 +110,31 @@ they return immediately.
   on-disk field as untrusted. It is written in safe Rust, so the worst case
   is a wrong answer or an error, not memory corruption in the kernel.
 - **Testing.** CI gains `e2fsprogs` for `mkfs.ext4` and `e2fsck`.
+
+## Amendment (2026-11-21): charged pages, shared mappings, large images
+
+- **A cell's writes are charged to the cell**, as this ADR required before
+  multi-tenant use. The overlay takes its file pages from a source
+  (`overlay::Pages`); the kernel's (`kernel/ichor/src/page.rs`) is a frame
+  charged to the cell's account for as long as anything holds it, the same
+  charged page process memory is made of. There is no separate budget: a
+  root and the cell's processes share the cell's memory, as a container
+  whose writable layer is tmpfs would. Full is ENOSPC, after a short write
+  where part fits; `statfs` shows the account. A root no cell owns
+  (self-tests) keeps a 64 MiB budget. Inodes, directory entries and
+  metadata are kernel heap and not charged (partial).
+- **Shared file mappings.** Since a file's pages are frames, `MAP_SHARED`
+  maps them: mappings, `read` and `write` of a file (`/dev/shm` and
+  `memfd_create` included) see one copy, across `fork` and processes. An
+  image file is mapped from the page cache until somebody writes it
+  through a mapping, which copies it up. Partial, because nothing records
+  who maps a file page: a mapping that already touched an image page does
+  not see another's later copy-up, nor one of a truncated-away page the
+  file's growing again; and touching past the end is SIGSEGV, not SIGBUS.
+- **Image format 4.** Metadata (names, nodes, and a 48-byte entry per
+  chunk) was one contiguous buffer of at most 4 MiB, which Go's official
+  image exceeds three times over. It is now read in 64 KiB segments, which
+  table entries may straddle and names may not (the builder pads). The
+  root hash is unchanged in meaning. Up to 64 MiB of metadata is accepted;
+  it is kept in memory, charged to whoever handed the image in. Overlay
+  inodes are boxed, so a root with many files needs no large table.

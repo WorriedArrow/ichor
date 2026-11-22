@@ -13,14 +13,23 @@
 //! - [`switch`]: the cell switch's forwarding decisions (assigned
 //!   addresses, anti-spoofing, token-bucket rate limits).
 //! - [`nat`]: source NAT and published ports at the uplink.
+//! - [`link`]: the trait every Ethernet link implements (NIC drivers, and
+//!   software links such as a VPN wrapped around one).
+//! - [`dhcp`]: the client that gets the uplink its address, router and
+//!   DNS servers.
+//! - [`rtnl`]: answers to `NETLINK_ROUTE` requests (a cell's links,
+//!   addresses and routes).
 
 #![no_std]
 #![forbid(unsafe_code)]
 
 extern crate alloc;
 
+pub mod dhcp;
 pub mod iface;
+pub mod link;
 pub mod nat;
+pub mod rtnl;
 pub mod switch;
 pub mod tcp;
 pub mod wire;

@@ -9,7 +9,7 @@
 //! two devices, with the same chunk share one page, and a device that
 //! returns wrong bytes yields EIO instead of corrupt data.
 //!
-//! The shared namespace is global and bounded ([`CAPACITY`] pages) with
+//! The shared namespace is global and bounded ([`capacity`] pages) with
 //! clock eviction. The loader and file mappings map cached pages into
 //! processes copy-on-write (see `file.rs`), so a library or executable that
 //! many processes run shares one physical copy; each mapping is charged to
@@ -23,19 +23,32 @@ use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use block::{BlockDevice, SECTOR_SIZE};
 use cell::Account;
 use frame::mm::UFrame;
 use frame::sync::Mutex;
-use image::{CHUNK_SIZE, ChunkSource, Error, Extent, Hash};
+use image::{CHUNK_SIZE, ChunkSource, Error, Extent, Hash, Image, SEGMENT};
 
-/// Most pages the cache holds (32 MiB).
-pub(crate) const CAPACITY: usize = 8192;
-/// Largest image metadata read at mount: one contiguous buffer, so at most
-/// the allocator's largest block (4 MiB, enough for ~80,000 files).
-pub(crate) const MAX_METADATA: usize = 4 << 20;
+/// Most pages a namespace holds: an eighth of memory, but at least 32 MiB,
+/// and at most 256 MiB (the clock is one list of their hashes, and no
+/// allocation may pass 4 MiB).
+fn capacity() -> usize {
+    static CAPACITY: AtomicUsize = AtomicUsize::new(0);
+    match CAPACITY.load(Ordering::Relaxed) {
+        0 => {
+            let n = (frame::mm::stats().total_pages / 8).clamp(8192, 65_536);
+            CAPACITY.store(n, Ordering::Relaxed);
+            n
+        }
+        n => n,
+    }
+}
+
+/// Largest image metadata read at mount and kept (Go's official image has
+/// 12 MiB, nearly all of it chunk hashes). Held in `image::SEGMENT` pieces.
+const MAX_METADATA: usize = 64 << 20;
 
 struct Entry {
     frame: UFrame,
@@ -98,7 +111,7 @@ struct Private {
 
 struct Cache {
     /// The namespace every sharing root reads through, bounded by
-    /// [`CAPACITY`].
+    /// [`capacity`].
     shared: Pool,
     /// Private namespaces by id.
     private: BTreeMap<u64, Private>,
@@ -162,7 +175,7 @@ fn insert(ns: u64, hash: Hash, frame: UFrame, disk: u64) {
         if pool.map.contains_key(&hash) {
             return; // another reader filled it meanwhile
         }
-        while pool.map.len() >= CAPACITY && pool.evict_one() {}
+        while pool.map.len() >= capacity() && pool.evict_one() {}
         pool.put(hash, frame, disk);
         return;
     }
@@ -178,7 +191,7 @@ fn insert(ns: u64, hash: Hash, frame: UFrame, disk: u64) {
     // per-namespace cap) it evicts its own, never another namespace's. A
     // cell with nothing left to evict reads uncached.
     loop {
-        if p.pages.map.len() < CAPACITY && p.account.charge(1).is_ok() {
+        if p.pages.map.len() < capacity() && p.account.charge(1).is_ok() {
             break;
         }
         if !p.pages.evict_one() {
@@ -315,16 +328,16 @@ impl ChunkSource for View {
     }
 }
 
-/// An image mounted from a disk: its metadata (read once, kept for the
-/// life of the system) and the disk its chunks come from.
+/// An image mounted from a disk: its metadata (read and checked once, kept
+/// for the life of the system) and the disk its chunks come from.
 pub(crate) struct Mounted {
-    pub(crate) metadata: &'static [u8],
+    pub(crate) image: Image<'static>,
     pub(crate) disk: &'static Disk,
 }
 
 /// Reads an image's metadata from `dev` (the header page, then everything
-/// before the chunk data) and makes the device the image's chunk source.
-/// The root hash is checked when the metadata is mounted.
+/// before the chunk data), checks its root hash and makes the device the
+/// image's chunk source.
 pub(crate) fn mount_disk(mut dev: impl BlockDevice + Send + 'static) -> Result<Mounted, Error> {
     let mut head = alloc::vec![0u8; CHUNK_SIZE as usize];
     dev.read(0, &mut head).map_err(|_| Error::Io)?;
@@ -332,16 +345,23 @@ pub(crate) fn mount_disk(mut dev: impl BlockDevice + Send + 'static) -> Result<M
     if len > MAX_METADATA || len as u64 > dev.sector_count() * SECTOR_SIZE as u64 {
         return Err(Error::Corrupt);
     }
-    let padded = len.next_multiple_of(CHUNK_SIZE as usize);
-    let mut meta: Vec<u8> =
-        block::read_prefix(&mut dev, padded, 64 * 1024).map_err(|_| Error::Io)?;
-    meta.truncate(len);
+    let mut pieces: Vec<Vec<u8>> = Vec::new();
+    while pieces.len() * SEGMENT < len {
+        let at = pieces.len() * SEGMENT;
+        let n = (len - at).min(SEGMENT);
+        let mut piece = alloc::vec![0u8; n.next_multiple_of(SECTOR_SIZE)];
+        dev.read((at / SECTOR_SIZE) as u64, &mut piece)
+            .map_err(|_| Error::Io)?;
+        piece.truncate(n);
+        pieces.push(piece);
+    }
+    // Checked while it can still be freed; then kept for good.
+    Image::mount_segments(&pieces.iter().map(Vec::as_slice).collect::<Vec<_>>())?;
+    let pieces: Vec<&'static [u8]> = pieces.into_iter().map(|p| &*p.leak()).collect();
+    let image = Image::mount_segments(pieces.leak())?;
     let disk = Box::leak(Box::new(Disk {
         id: NEXT_DISK.fetch_add(1, Ordering::Relaxed),
         dev: Mutex::new(Box::new(dev)),
     }));
-    Ok(Mounted {
-        metadata: meta.leak(),
-        disk,
-    })
+    Ok(Mounted { image, disk })
 }

@@ -15,7 +15,7 @@ use alloc::vec::Vec;
 
 use crate::{
     CHUNK_LEN, CHUNK_SIZE, HASH_KIND_BLAKE3, HEADER_LEN, Hash, MAGIC, NODE_LEN, ROOT_HASH_AT,
-    VERSION,
+    SEGMENT, VERSION,
 };
 
 /// Identifies a node added to a [`Builder`].
@@ -60,6 +60,13 @@ impl Builder {
     }
 
     fn string(&mut self, s: &str) -> (u64, u64) {
+        // The table follows the header, so where a string lands in the
+        // image is known here: not across a segment boundary.
+        let at = HEADER_LEN + self.strings.len();
+        if at % SEGMENT + s.len() > SEGMENT {
+            let pad = SEGMENT - at % SEGMENT;
+            self.strings.resize(self.strings.len() + pad, 0);
+        }
         let off = self.strings.len() as u64;
         self.strings.extend_from_slice(s.as_bytes());
         (off, s.len() as u64)
@@ -179,12 +186,12 @@ impl Builder {
         let node_count = self.nodes.len();
         let chunk_count = self.chunk_table.len();
         let dirents_count = self.dirents.len();
-        let nodes_offset = HEADER_LEN;
+        let strings_offset = HEADER_LEN;
+        let nodes_offset = (strings_offset + self.strings.len()).next_multiple_of(8);
         let dirents_offset = nodes_offset + node_count * NODE_LEN;
         let chunk_table_offset = dirents_offset + dirents_count * 8;
-        let strings_offset = chunk_table_offset + chunk_count * CHUNK_LEN;
         let data_offset =
-            (strings_offset + self.strings.len()).next_multiple_of(CHUNK_SIZE as usize);
+            (chunk_table_offset + chunk_count * CHUNK_LEN).next_multiple_of(CHUNK_SIZE as usize);
 
         let mut b = Vec::with_capacity(data_offset + self.data.len());
         b.extend_from_slice(MAGIC);
@@ -204,6 +211,8 @@ impl Builder {
             b.extend_from_slice(&(v as u64).to_le_bytes());
         }
         b.extend_from_slice(&[0u8; 32]); // root hash, filled in below
+        b.extend_from_slice(&self.strings);
+        b.resize(nodes_offset, 0);
         for n in &self.nodes {
             for v in [
                 u64::from(n.kind) | (u64::from(n.mode) << 32),
@@ -226,9 +235,8 @@ impl Builder {
             b.extend_from_slice(&len.to_le_bytes());
             b.extend_from_slice(hash);
         }
-        b.extend_from_slice(&self.strings);
         b.resize(data_offset, 0);
-        let root = crate::metadata_hash(&b);
+        let root = crate::metadata_hash(&b, core::iter::empty());
         b[ROOT_HASH_AT..HEADER_LEN].copy_from_slice(&root);
         b.extend_from_slice(&self.data);
         b

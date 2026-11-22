@@ -27,6 +27,7 @@ members = [
     "kernel/drivers/virtio-rng",
     "kernel/drivers/virtio-net",
     "kernel/drivers/nvme",
+    "kernel/drivers/virtio-scsi",
     "kernel/ichor",
     "services/crypto",
     "services/x509",
@@ -113,6 +114,7 @@ net = { package = "ichor-net", path = "kernel/net" }
 uring = { package = "ichor-uring", path = "kernel/uring" }
 virtio-blk = { package = "ichor-virtio-blk", path = "kernel/drivers/virtio-blk" }
 nvme = { package = "ichor-nvme", path = "kernel/drivers/nvme" }
+virtio-scsi = { package = "ichor-virtio-scsi", path = "kernel/drivers/virtio-scsi" }
 crypto = { package = "ichor-crypto", path = "services/crypto" }
 x509 = { package = "ichor-x509", path = "services/x509" }
 layer = { package = "ichor-layer", path = "services/layer" }
@@ -145,3 +147,10 @@ panic = "abort"
 lto = "fat"
 codegen-units = 1
 debug = "line-tables-only"
+
+# The native services in release builds (xtask's `build::services`):
+# release without LTO, which cannot mix their small code model with the
+# kernel code model of x86_64-unknown-none's prebuilt core and alloc.
+[profile.services-release]
+inherits = "release"
+lto = false

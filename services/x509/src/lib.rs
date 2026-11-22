@@ -23,7 +23,7 @@ use alloc::vec::Vec;
 pub mod cert;
 pub mod der;
 
-pub use cert::{Certificate, PublicKey, SigAlg, parse};
+pub use cert::{Certificate, PublicKey, SigAlg, ed25519_seed, parse};
 
 /// Why a certificate or chain was refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -80,13 +80,24 @@ impl RootStore {
 
 /// The DER of every `CERTIFICATE` block in `pem`.
 pub fn pem_certificates(pem: &str) -> Vec<Vec<u8>> {
+    pem_blocks(pem, "CERTIFICATE")
+}
+
+/// The DER of every `label` block in `pem`.
+pub fn pem_blocks(pem: &str, label: &str) -> Vec<Vec<u8>> {
+    let is = |line: &str, edge: &str| {
+        line.strip_prefix("-----")
+            .and_then(|l| l.strip_prefix(edge))
+            .and_then(|l| l.strip_prefix(label))
+            == Some("-----")
+    };
     let mut out = Vec::new();
     let mut body: Option<alloc::string::String> = None;
     for line in pem.lines() {
         let line = line.trim();
-        if line == "-----BEGIN CERTIFICATE-----" {
+        if is(line, "BEGIN ") {
             body = Some(alloc::string::String::new());
-        } else if line == "-----END CERTIFICATE-----" {
+        } else if is(line, "END ") {
             if let Some(b) = body.take()
                 && let Some(der) = base64(&b)
             {
@@ -317,7 +328,7 @@ mod tests {
     #[test]
     fn docker_hub_chains_verify() {
         let roots = RootStore::from_pem(ROOTS);
-        assert_eq!(roots.len(), 3);
+        assert_eq!(roots.len(), 4);
         // RSA, ending in a cross-signed Amazon root under Starfield G2.
         assert_eq!(check(REGISTRY, "registry-1.docker.io", NOW), Ok(()));
         // ECDSA P-256 and P-384 under ISRG Root X2.

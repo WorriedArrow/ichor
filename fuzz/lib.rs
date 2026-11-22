@@ -233,17 +233,19 @@ fn layer_gz() -> Vec<u8> {
 }
 
 /// A recorded TLS session: its client config, and the server's bytes.
-const SESSIONS: [(&str, &str); 2] = [
+const SESSIONS: [(&str, &str); 4] = [
     ("registry", "registry-1.docker.io"),
     ("cloudflare", "production.cloudflare.docker.com"),
+    ("adoptium", "ci.adoptium.net"),
+    ("mcr", "mcr.microsoft.com"),
 ];
-const NOW: u64 = 1_794_786_687;
+const NOW: u64 = 1_795_343_900;
 
 fn tls_config(name: &str, host: &str) -> tls::Config {
     use crypto::sha2::Digest;
-    let mut random = [0u8; 96];
+    let mut random = [0u8; 128];
     random[..64].copy_from_slice(&crypto::sha2::Sha512::digest(name.as_bytes()));
-    random[64..].copy_from_slice(&crypto::sha2::Sha256::hash(host.as_bytes()));
+    random[64..].copy_from_slice(&crypto::sha2::Sha512::digest(host.as_bytes()));
     static ROOTS: std::sync::OnceLock<Arc<x509::RootStore>> = std::sync::OnceLock::new();
     let roots = ROOTS
         .get_or_init(|| {
@@ -256,6 +258,8 @@ fn tls_config(name: &str, host: &str) -> tls::Config {
         roots,
         now: NOW,
         random,
+        ed25519: false,
+        alpn: None,
     }
 }
 
@@ -302,16 +306,16 @@ fn tls_seeds() -> Vec<Vec<u8>> {
 /// The server's side of a TLS session: records, handshake messages, the
 /// certificate chain (in TLS 1.2 in the clear), key exchange, records.
 fn tls_run(input: &[u8]) {
-    // Which recording's client to pair it with: the TLS 1.2 one if the
-    // input looks like it, so mutations reach past the ServerHello.
-    let (name, host) = if input.len() > 10
-        && input[9..11] == [3, 3]
-        && input.windows(2).any(|w| w == [0xcc, 0xa9])
-    {
-        SESSIONS[1]
-    } else {
-        SESSIONS[0]
-    };
+    // Which recording's client to pair it with: the one whose server's
+    // random it starts with, so mutations reach past the ServerHello.
+    static SEEDS: std::sync::OnceLock<Vec<Vec<u8>>> = std::sync::OnceLock::new();
+    let seeds = SEEDS.get_or_init(tls_seeds);
+    let random = |b: &[u8]| b.get(11..19).map(<[u8]>::to_vec);
+    let (name, host) = SESSIONS
+        .into_iter()
+        .zip(seeds)
+        .find(|(_, seed)| random(seed) == random(input))
+        .map_or(SESSIONS[0], |(s, _)| s);
     for cfg in [
         tls_config(name, host),
         tls_config(SESSIONS[1].0, SESSIONS[1].1),
@@ -327,6 +331,62 @@ fn tls_run(input: &[u8]) {
         let _ = c.read();
         let _ = c.take_output();
     }
+}
+
+/// The control API's identity, and what its clients send: this crate's
+/// client with the matching randomness, so the mutations land in a session
+/// whose Finished is right.
+fn api_identity() -> Arc<tls::server::Identity> {
+    static ID: std::sync::OnceLock<Arc<tls::server::Identity>> = std::sync::OnceLock::new();
+    ID.get_or_init(|| {
+        let pem = String::from_utf8(read("services/tls/testdata/api.pem")).unwrap();
+        Arc::new(tls::server::Identity::from_pem(&pem).unwrap())
+    })
+    .clone()
+}
+
+fn api_server() -> tls::server::Server {
+    tls::server::Server::new(tls::server::ServerConfig {
+        identity: api_identity(),
+        alpn: b"h2",
+        random: [0x42; 64],
+    })
+}
+
+fn tls_server_seeds() -> Vec<Vec<u8>> {
+    let ca = String::from_utf8(read("services/tls/testdata/api-ca.pem")).unwrap();
+    let mut c = tls::Client::new(tls::Config {
+        host: "ichor-api.test".into(),
+        roots: Arc::new(x509::RootStore::from_pem(&ca)),
+        now: 1_795_400_000,
+        random: [0x17; 128],
+        ed25519: true,
+        alpn: Some(b"h2"),
+    });
+    let mut s = api_server();
+    let hello = c.take_output();
+    s.feed(&hello).unwrap();
+    c.feed(&s.take_output()).unwrap();
+    c.write(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+    c.close();
+    let mut all = hello.clone();
+    all.extend(c.take_output());
+    s.feed(&all[hello.len()..]).unwrap();
+    assert!(s.is_closed() && !s.read().is_empty());
+    vec![hello, all]
+}
+
+/// What an API client may send before and after the handshake.
+fn tls_server_run(input: &[u8]) {
+    let mut s = api_server();
+    s.write(b"pending");
+    let cut = input.len() / 3;
+    if s.feed(&input[..cut]).is_ok() {
+        let _ = s.feed(&input[cut..]);
+    }
+    let _ = s.read();
+    s.close();
+    let _ = s.take_output();
 }
 
 fn x509_run(input: &[u8]) {
@@ -351,10 +411,15 @@ fn pem_run(input: &[u8]) {
     let s = String::from_utf8_lossy(input);
     let _ = x509::RootStore::from_pem(&s);
     let _ = x509::base64(&s);
+    let _ = x509::ed25519_seed(input);
+    let _ = tls::server::Identity::from_pem(&s);
 }
 
 fn pem_seeds() -> Vec<Vec<u8>> {
-    PEMS.iter().map(|p| read(p)).collect()
+    PEMS.iter()
+        .chain(&["services/tls/testdata/api.pem"])
+        .map(|p| read(p))
+        .collect()
 }
 
 fn hpack_seeds() -> Vec<Vec<u8>> {
@@ -550,6 +615,77 @@ fn dns_run(input: &[u8]) {
     let _ = dns::parse_a(input, 7, "registry-1.docker.io");
 }
 
+const FUZZ_MAC: net::Mac = net::Mac([0x52, 0x54, 0, 0x12, 0x34, 0x56]);
+
+/// A DHCP reply of `kind` (2 OFFER, 5 ACK) to transaction 7 for
+/// `FUZZ_MAC`, in a broadcast frame from QEMU's DHCP server.
+fn dhcp_reply(kind: u8) -> Vec<u8> {
+    use net::Ipv4Addr;
+    let server = Ipv4Addr::new(10, 0, 2, 2);
+    let mut m = vec![0u8; 236];
+    m[0] = 2;
+    m[1] = 1;
+    m[2] = 6;
+    m[4..8].copy_from_slice(&7u32.to_be_bytes());
+    m[16..20].copy_from_slice(&[10, 0, 2, 15]);
+    m[28..34].copy_from_slice(&FUZZ_MAC.0);
+    m.extend_from_slice(&[99, 130, 83, 99, 53, 1, kind, 54, 4, 10, 0, 2, 2]);
+    m.extend_from_slice(&[1, 4, 255, 255, 255, 0, 3, 4, 10, 0, 2, 2]);
+    m.extend_from_slice(&[6, 4, 10, 0, 2, 3, 51, 4, 0, 1, 81, 128, 26, 2, 5, 220, 255]);
+    let udp = net::wire::udp(server, 67, Ipv4Addr::BROADCAST, 68, &m);
+    let ip = net::wire::ipv4(server, Ipv4Addr::BROADCAST, net::wire::PROTO_UDP, 1, &udp);
+    net::wire::ethernet(
+        net::Mac::BROADCAST,
+        net::Mac([2, 0, 0, 0, 0, 2]),
+        net::wire::ETHERTYPE_IPV4,
+        &ip,
+    )
+}
+
+/// Ethernet frames off the wire (the uplink's NIC): DHCP replies, ARP,
+/// IPv4, ICMP, UDP and TCP segments.
+fn ethernet_seeds() -> Vec<Vec<u8>> {
+    let arp = net::wire::Arp {
+        op: net::wire::ARP_REPLY,
+        sender_mac: net::Mac([2, 0, 0, 0, 0, 2]),
+        sender_ip: net::Ipv4Addr::new(10, 0, 2, 2),
+        target_mac: FUZZ_MAC,
+        target_ip: net::Ipv4Addr::new(10, 0, 2, 15),
+    };
+    let arp = net::wire::ethernet(
+        FUZZ_MAC,
+        net::Mac([2, 0, 0, 0, 0, 2]),
+        net::wire::ETHERTYPE_ARP,
+        &arp.emit(),
+    );
+    vec![dhcp_reply(2), dhcp_reply(5), arp]
+}
+
+fn ethernet_run(input: &[u8]) {
+    let t = std::time::Duration::from_secs(1);
+    // A DHCP client waiting for an offer, and one waiting for its ACK.
+    let mut c = net::dhcp::Client::new(FUZZ_MAC, 7);
+    let _ = c.poll(t);
+    let _ = c.receive(t, input);
+    let mut c = net::dhcp::Client::new(FUZZ_MAC, 7);
+    let _ = c.poll(t);
+    let _ = c.receive(t, &dhcp_reply(2));
+    let _ = c.poll(t);
+    if let Some(l) = c.receive(t, input) {
+        // A lease that bound must make sense.
+        assert!(l.prefix <= 32);
+    }
+    // The uplink's interface.
+    let mut ifc = net::iface::Interface::new(
+        FUZZ_MAC,
+        net::Ipv4Addr::new(10, 0, 2, 15),
+        24,
+        Some(net::Ipv4Addr::new(10, 0, 2, 2)),
+    );
+    let _ = ifc.receive(t, input);
+    while ifc.transmit().is_some() {}
+}
+
 fn gzip_run(input: &[u8]) {
     let _ = layer::gunzip(input);
     let _ = layer::inflate::inflate(input);
@@ -592,6 +728,11 @@ pub const TARGETS: &[Target] = &[
         name: "tls",
         seeds: tls_seeds,
         run: tls_run,
+    },
+    Target {
+        name: "tls-server",
+        seeds: tls_server_seeds,
+        run: tls_server_run,
     },
     Target {
         name: "x509",
@@ -642,6 +783,11 @@ pub const TARGETS: &[Target] = &[
         name: "dns",
         seeds: dns_seeds,
         run: dns_run,
+    },
+    Target {
+        name: "ethernet",
+        seeds: ethernet_seeds,
+        run: ethernet_run,
     },
     Target {
         name: "gzip",

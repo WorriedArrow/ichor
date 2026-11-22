@@ -6,15 +6,21 @@ $RULE = "proc_and_sys_show_only_their_cell";
 my %B = kv(@ARGV);
 my $st = "\0" x 144;
 my $lbuf = "\0" x 4096;
-for my $p ($B{pid}, $B{child}, $B{futex_pid}) {
-    for my $f ("", "/status", "/stat", "/cmdline", "/cwd", "/exe", "/fd", "/fd/0", "/maps", "/root", "/mem", "/mounts") {
+my @FILES = ("", "/cgroup", "/cmdline", "/comm", "/cwd", "/exe", "/fd", "/fd/0", "/maps",
+    "/mountinfo", "/mounts", "/stat", "/statm", "/status", "/task");
+for my $p ($B{pid}, $B{child}, $B{futex_pid}, $B{futex2_pid}) {
+    for my $f (@FILES, "/task/$p", "/task/$p/stat", "/root", "/mem") {
         want("stat /proc/$p$f (B)", "ENOENT", syscall(4, my $x = "/proc/$p$f", $st));
     }
     want("readlink /proc/$p/cwd (B)", "ENOENT", syscall(89, my $x = "/proc/$p/cwd", $lbuf, 4096));
     want("open /proc/$p/status (B)", "ENOENT", syscall(2, my $y = "/proc/$p/status", 0, 0));
 }
-for my $f ("", "/status", "/stat", "/cmdline", "/cwd", "/exe", "/fd", "/fd/0", "/maps", "/mounts") {
-    control("stat /proc/<pid>$f (A's own pid)", syscall(4, my $x = "/proc/" . $$ . $f, $st));
+# A process of A's other than the caller, so the control is the same
+# lookup by pid that B's fails.
+my $kid = fork() // die "fork: $!";
+if ($kid == 0) { POSIX::pause() while 1; POSIX::_exit(0) }
+for my $f (@FILES, "/task/$kid", "/task/$kid/stat") {
+    control("stat /proc/<pid>$f (A's own child)", syscall(4, my $x = "/proc/$kid$f", $st));
 }
 control("readlink /proc/<pid>/cwd (A's own pid)", syscall(89, my $c = "/proc/" . $$ . "/cwd", $lbuf, 4096));
 control("open /proc/<pid>/status (A's own pid)", syscall(2, my $s = "/proc/" . $$ . "/status", 0, 0));
@@ -22,11 +28,13 @@ control("open /proc/<pid>/status (A's own pid)", syscall(2, my $s = "/proc/" . $
 want("stat /proc/self/root [not in /proc yet]", "ENOENT", syscall(4, my $r = "/proc/self/root", $st));
 want("stat /proc/self/mem [not in /proc yet]", "ENOENT", syscall(4, my $m = "/proc/self/mem", $st));
 
-# Listing /proc: the only process directory is A's own.
+# Listing /proc: the only process directories are A's own two.
 opendir(my $d, "/proc") or die "opendir /proc: $!";
 my @pids = sort { $a <=> $b } grep { /^\d+$/ } readdir($d);
 closedir $d;
-same("/proc lists only A's process", join(",", @pids), $$);
+same("/proc lists only A's processes", join(",", @pids), join(",", sort { $a <=> $b } ($$, $kid)));
+kill("KILL", $kid);
+waitpid($kid, 0);
 
 # /proc/self's links name A's own files and resolve in A's root.
 chdir("/tmp") or die "chdir: $!";
@@ -42,12 +50,7 @@ close $via;
 want("open /proc/self/cwd/a-file [links not followed mid-path yet]", "ENOENT", syscall(2, my $ac = "/proc/self/cwd/a-file", 0, 0));
 want("open /proc/self/cwd/../b-only/secret", "ENOENT", syscall(2, my $bc = "/proc/self/cwd/../b-only/secret", 0, 0));
 open(my $fdf, "<", "/tmp/a-file") or die "a-file: $!";
-# procfs names open files anon_inode:[file] when it cannot find their path
-# (documented as partial in procfs.rs); anything else must be A's file.
-my $link = readlink("/proc/self/fd/" . fileno($fdf)) // "none: $!";
-print "cellaccess: $RULE: /proc/self/fd/N for /tmp/a-file reads $link\n";
-same("/proc/self/fd/N names A's open file (or the documented placeholder)",
-    $link =~ m{^(/tmp/a-file|anon_inode:\[file\])$} ? "A's" : $link, "A's");
+same("/proc/self/fd/N names A's open file", readlink("/proc/self/fd/" . fileno($fdf)), "/tmp/a-file");
 opendir(my $fdd, "/proc/self/fd") or die "fd dir: $!";
 my @fds = grep { /^\d+$/ } readdir($fdd);
 closedir $fdd;

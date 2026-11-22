@@ -12,28 +12,36 @@ my $orig = "";
 sysseek($f, $OFF, 0);
 sysread($f, $orig, 16) == 16 or die "read: $!";
 
-# The futex: B's waiter sits on the first word of page 1 of the file,
-# mapped at $VA. A maps the same page at the same address and wakes it.
-my $m = syscall(9, $VA, 8192, 1, 0x12, fileno($f), 0); # PROT_READ, MAP_PRIVATE|MAP_FIXED
-same("A maps the file at B's futex address", $m, $VA);
-same("A's page holds the same bytes as B's", unpack("H*", peek($VA + $OFF, 16)), unpack("H*", $orig));
-same("FUTEX_WAKE at B's futex wakes nobody", syscall(202, $VA + $OFF, 1, 0x7fffffff, 0, 0, 0), 0);
-same("FUTEX_WAKE (private) at B's futex wakes nobody", syscall(202, $VA + $OFF, 1 | 128, 0x7fffffff, 0, 0, 0), 0);
-# Control: a waiter of A's own (a child, on shared anonymous memory) is woken.
-my $sh = syscall(9, 0, 4096, 3, 0x21, -1, 0); # MAP_SHARED|MAP_ANONYMOUS
-$sh > 0 or die "mmap shared: $!";
+# The futexes: B's waiters sit on the first word of page 1 of the file,
+# mapped at $VA, one shared and one private. A maps the same page at the
+# same address both ways and wakes it. (The harness has checked that both
+# roots' page 1 is the same physical page.)
+for (["shared", 0x01], ["private", 0x02]) {
+    my ($kind, $flags) = @$_;
+    my $m = syscall(9, $VA, 8192, 1, $flags | 0x10, fileno($f), 0); # PROT_READ, MAP_FIXED
+    same("A maps the file at B's futex address ($kind)", $m, $VA);
+    same("A's page holds the same bytes as B's ($kind)", unpack("H*", peek($VA + $OFF, 16)), unpack("H*", $orig));
+    same("FUTEX_WAKE at B's futex ($kind mapping) wakes nobody", syscall(202, $VA + $OFF, 1, 0x7fffffff, 0, 0, 0), 0);
+    same("FUTEX_WAKE|PRIVATE at B's futex ($kind mapping) wakes nobody", syscall(202, $VA + $OFF, 1 | 128, 0x7fffffff, 0, 0, 0), 0);
+    syscall(11, $VA, 8192);
+}
+# Control: a waiter of A's own, another process of A's waiting on the same
+# file page through a shared mapping, is woken.
+my $m = syscall(9, $VA, 8192, 1, 0x11, fileno($f), 0);
+$m == $VA or die "mmap: $!";
+my $word = unpack("L", peek($VA + $OFF, 4));
 my $kid = fork() // die "fork: $!";
 if ($kid == 0) {
-    my $r = syscall(202, $sh, 0, 0, 0, 0, 0);
+    my $r = syscall(202, $VA + $OFF, 0, $word, 0, 0, 0);
     POSIX::_exit($r == 0 ? 0 : 1);
 }
 my $woken = 0;
 for (1 .. 500) {
-    $woken = syscall(202, $sh, 1, 1, 0, 0, 0);
+    $woken = syscall(202, $VA + $OFF, 1, 0x7fffffff, 0, 0, 0);
     last if $woken == 1;
     select(undef, undef, undef, 0.01);
 }
-same("FUTEX_WAKE at B's futex: control (A's own waiter is woken)", $woken, 1);
+same("FUTEX_WAKE at B's futex: control (wakes A's own waiter on that page, and only it)", $woken, 1);
 waitpid($kid, 0);
 same("A's waiter returned from its wait", $? >> 8, 0);
 syscall(11, $VA, 8192);

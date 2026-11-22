@@ -195,4 +195,5 @@ fix, against 5,608 / 243 before (budget 5,800 / 250).
   copy as well.
 - The Phase E "Mm lock not held across whole user copies" item is now
   unblocked but not done. When it lands, the stress test and
-  `frame_race` are the guards.
+  `frame_race` are the guards. (Since done: see ADR-0011's amendment,
+  "Copies without the Mm lock".)

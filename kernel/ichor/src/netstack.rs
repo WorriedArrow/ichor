@@ -73,6 +73,15 @@ fn now() -> Duration {
     frame::time::now()
 }
 
+/// Sending to 0.0.0.0 means this host, as on Linux.
+fn to_this_host(a: Addr) -> Addr {
+    if a.0.is_unspecified() {
+        (Ipv4Addr::LOCALHOST, a.1)
+    } else {
+        a
+    }
+}
+
 /// What a socket's readers and pollers wait on.
 #[derive(Debug, Default)]
 pub(crate) struct Waiters {
@@ -136,6 +145,8 @@ const PAGE: usize = 4096;
 
 /// Most bytes a UDP socket queues before it drops datagrams.
 pub(crate) const UDP_BUFFER: usize = 256 * 1024;
+/// And datagrams, however small.
+const UDP_DATAGRAMS: usize = 4096;
 /// Largest UDP payload over IPv4.
 pub(crate) const UDP_MAX: usize = 65507;
 
@@ -145,6 +156,7 @@ struct Sock {
     local: Option<Addr>,
     wait: Arc<Waiters>,
     reuse_addr: bool,
+    reuse_port: bool,
     /// The application closed it: reap once the connection is done.
     orphan: bool,
     /// `shutdown(SHUT_RD)`: reads see EOF.
@@ -281,7 +293,7 @@ pub(crate) fn accounting_selftest() {
         fail("net: accounting: the sender was not held to the cell's memory");
     }
     for id in [a, c, l] {
-        st.release(id);
+        st.release(id, false);
     }
     let deadline = now() + Duration::from_secs(30);
     while cell.account().used() != 0 {
@@ -391,9 +403,14 @@ impl Inner {
     }
 
     /// Whether `port` on `ip` is taken for a new bind by `by` (TCP and
-    /// UDP have separate port spaces).
+    /// UDP have separate port spaces). Sockets that all ask for it share a
+    /// port: with SO_REUSEPORT whatever they are, with SO_REUSEADDR for
+    /// datagrams, or for TCP while none of them listens.
     fn port_taken(&self, ip: Ipv4Addr, port: u16, by: u64, reuse: bool) -> bool {
-        let udp = self.socks.get(&by).is_some_and(|s| s.kind.is_udp());
+        let (udp, reuse_port) = self
+            .socks
+            .get(&by)
+            .map_or((false, false), |s| (s.kind.is_udp(), s.reuse_port));
         self.socks.iter().any(|(&id, s)| {
             let Some((sip, sport)) = s.local else {
                 return false;
@@ -402,10 +419,11 @@ impl Inner {
                 return false;
             }
             let overlap = sip == ip || sip.is_unspecified() || ip.is_unspecified();
-            if !overlap {
+            if !overlap || (reuse_port && s.reuse_port) {
                 return false;
             }
             match &s.kind {
+                Kind::Udp { .. } | Kind::Fresh if reuse && s.reuse_addr => false,
                 // A connection only blocks the port while it is live, and
                 // not at all for SO_REUSEADDR binds.
                 Kind::Conn { tcp, parent, .. } => {
@@ -439,7 +457,7 @@ impl Inner {
     /// its bound port or a new ephemeral one.
     fn source_for(&mut self, id: u64, dst: Ipv4Addr) -> Result<Addr, i64> {
         let loopback = dst.is_loopback();
-        if dst.is_unspecified() || dst.is_broadcast() || dst.is_multicast() {
+        if dst.is_broadcast() || dst.is_multicast() {
             return Err(ENETUNREACH);
         }
         let bound = self.sock(id)?.local;
@@ -515,28 +533,56 @@ impl Inner {
         };
         let from = (src, d.src_port);
         let starved = self.starved;
-        let target = self.socks.iter_mut().find_map(|(&id, s)| {
-            let (ip, port) = s.local?;
-            match &mut s.kind {
-                Kind::Udp { rx, bytes, peer }
-                    if port == d.dst_port
-                        && (ip.is_unspecified() || ip == dst)
-                        && peer.is_none_or(|p| p == from) =>
-                {
-                    Some((id, rx, bytes))
+        // The socket connected to the source first, then one bound to the
+        // address, then one bound to all.
+        let found: Vec<(u32, u64)> = self
+            .socks
+            .iter()
+            .filter_map(|(&id, s)| {
+                let (ip, port) = s.local?;
+                match &s.kind {
+                    Kind::Udp { peer, .. }
+                        if port == d.dst_port
+                            && (ip.is_unspecified() || ip == dst)
+                            && peer.is_none_or(|p| p == from) =>
+                    {
+                        let fit = 2 * u32::from(peer.is_some()) + u32::from(ip == dst);
+                        Some((fit, id))
+                    }
+                    _ => None,
                 }
-                _ => None,
-            }
-        });
+            })
+            .collect();
+        let Some(id) = self.choose(&found, from) else {
+            return;
+        };
         // A full queue, or a cell short of memory, drops the datagram.
-        if let Some((id, rx, queued)) = target
-            && *queued + d.payload.len() <= UDP_BUFFER
+        if let Some(s) = self.socks.get_mut(&id)
+            && let Kind::Udp { rx, bytes, .. } = &mut s.kind
+            && *bytes + d.payload.len() <= UDP_BUFFER
+            && rx.len() < UDP_DATAGRAMS
             && !starved
         {
-            *queued += d.payload.len();
+            *bytes += d.payload.len();
             rx.push_back((from, d.payload.to_vec()));
             self.touched.insert(id);
         }
+    }
+
+    /// Which of `found` (how well each fits, and its id) takes what comes
+    /// from `from`: of the best, one by the sender if they share the port
+    /// for that (SO_REUSEPORT), else the last bound.
+    fn choose(&self, found: &[(u32, u64)], from: Addr) -> Option<u64> {
+        let best = found.iter().map(|f| f.0).max()?;
+        let best: Vec<u64> = found.iter().filter(|f| f.0 == best).map(|f| f.1).collect();
+        let shared = best
+            .iter()
+            .all(|id| self.socks.get(id).is_some_and(|s| s.reuse_port));
+        if !shared {
+            return best.last().copied();
+        }
+        let h = (u32::from(from.0) ^ u32::from(from.1)).wrapping_mul(0x9E37_79B1) >> 16;
+        best.get(h as usize % best.len()).copied()
     }
 
     /// One segment arriving at this stack.
@@ -564,18 +610,19 @@ impl Inner {
         }
         // A new connection for a listener.
         if seg.flags & tcp::SYN != 0 && seg.flags & (tcp::ACK | tcp::RST) == 0 {
-            let listener = self
+            let listeners: Vec<(u32, u64)> = self
                 .socks
                 .iter()
-                .find_map(|(&id, s)| match (&s.kind, s.local) {
+                .filter_map(|(&id, s)| match (&s.kind, s.local) {
                     (Kind::Listening { .. }, Some((ip, port)))
                         if port == local.1 && (ip.is_unspecified() || ip == local.0) =>
                     {
-                        Some(id)
+                        Some((u32::from(ip == local.0), id))
                     }
                     _ => None,
-                });
-            if let Some(lid) = listener {
+                })
+                .collect();
+            if let Some(lid) = self.choose(&listeners, remote) {
                 let room = {
                     let pending = self
                         .socks
@@ -604,6 +651,7 @@ impl Inner {
                             local: Some(local),
                             wait: Arc::new(Waiters::default()),
                             reuse_addr: false,
+                            reuse_port: false,
                             orphan: false,
                             shut_rd: false,
                             error: None,
@@ -829,6 +877,7 @@ impl Stack {
                 local: None,
                 wait: wait.clone(),
                 reuse_addr: false,
+                reuse_port: false,
                 orphan: false,
                 shut_rd: false,
                 error: None,
@@ -840,6 +889,11 @@ impl Stack {
 
     pub(crate) fn set_reuse_addr(&self, id: u64, on: bool) -> Result<(), i64> {
         self.inner.lock().sock(id)?.reuse_addr = on;
+        Ok(())
+    }
+
+    pub(crate) fn set_reuse_port(&self, id: u64, on: bool) -> Result<(), i64> {
+        self.inner.lock().sock(id)?.reuse_port = on;
         Ok(())
     }
 
@@ -875,6 +929,21 @@ impl Stack {
             let p = i.ephemeral(Ipv4Addr::UNSPECIFIED, id)?;
             i.sock(id)?.local = Some((Ipv4Addr::UNSPECIFIED, p));
         }
+        // SO_REUSEADDR let several bind the port; one of them listens.
+        let me = i.sock(id)?;
+        let (local, shares) = (me.local, me.reuse_port);
+        let other = i.socks.iter().any(|(&n, s)| {
+            let (Kind::Listening { .. }, Some((ip, port)), Some((mine, my_port))) =
+                (&s.kind, s.local, local)
+            else {
+                return false;
+            };
+            let overlap = ip == mine || ip.is_unspecified() || mine.is_unspecified();
+            n != id && port == my_port && overlap && !(shares && s.reuse_port)
+        });
+        if other {
+            return Err(EADDRINUSE);
+        }
         let s = i.sock(id)?;
         match &mut s.kind {
             Kind::Fresh => {
@@ -895,6 +964,7 @@ impl Stack {
 
     /// Starts connecting to `remote` (for UDP: fixes the peer).
     pub(crate) fn connect(&self, id: u64, remote: Addr) -> Result<(), i64> {
+        let remote = to_this_host(remote);
         self.with(|i| {
             let udp = match i.sock(id)?.kind {
                 Kind::Fresh => false,
@@ -996,7 +1066,7 @@ impl Stack {
             };
             if tcp.readable() > 0 {
                 if peek {
-                    return Err(EOPNOTSUPP);
+                    return Ok(Some(tcp.peek(out)));
                 }
                 let n = tcp.recv(out, now());
                 i.touched.insert(id);
@@ -1038,8 +1108,9 @@ impl Stack {
     }
 
     /// The descriptor went away: close gracefully (a listener resets its
-    /// queued connections) and forget the socket once done.
-    pub(crate) fn release(&self, id: u64) {
+    /// queued connections; a connection resets if told to `reset`) and
+    /// forget the socket once done.
+    pub(crate) fn release(&self, id: u64, reset: bool) {
         self.with(|i| {
             let mut doomed = Vec::new();
             if let Some(s) = i.socks.get_mut(&id) {
@@ -1058,8 +1129,15 @@ impl Stack {
                     Kind::Conn { tcp, .. } => {
                         // What the application never read goes, and its
                         // memory with it.
+                        let unread = tcp.readable() > 0;
                         tcp.discard_received();
-                        tcp.close(now());
+                        // Closing on unread data resets too, as on Linux:
+                        // the peer learns that not all of it was read.
+                        if reset || unread {
+                            tcp.abort();
+                        } else {
+                            tcp.close(now());
+                        }
                         s.orphan = true;
                         i.touched.insert(id);
                     }
@@ -1119,6 +1197,15 @@ impl Stack {
         r
     }
 
+    /// Bytes the next read would give: a stream's, or one datagram's.
+    pub(crate) fn readable(&self, id: u64) -> usize {
+        match self.inner.lock().socks.get(&id).map(|s| &s.kind) {
+            Some(Kind::Conn { tcp, .. }) => tcp.readable(),
+            Some(Kind::Udp { rx, .. }) => rx.front().map_or(0, |(_, d)| d.len()),
+            _ => 0,
+        }
+    }
+
     /// `getsockname`.
     pub(crate) fn local_addr(&self, id: u64) -> Result<Addr, i64> {
         let i = self.inner.lock();
@@ -1163,7 +1250,7 @@ impl Stack {
                 return Err(EOPNOTSUPP);
             };
             let dst = match (to, *peer) {
-                (Some(t), _) => t,
+                (Some(t), _) => to_this_host(t),
                 (None, Some(p)) => p,
                 (None, None) => return Err(EDESTADDRREQ),
             };
@@ -1181,9 +1268,9 @@ impl Stack {
         })
     }
 
-    /// Takes the next received datagram and its source: `Ok(None)` when
-    /// none is queued.
-    pub(crate) fn recv_from(&self, id: u64) -> Result<Option<(Addr, Vec<u8>)>, i64> {
+    /// Takes the next received datagram and its source (a copy, if `peek`):
+    /// `Ok(None)` when none is queued.
+    pub(crate) fn recv_from(&self, id: u64, peek: bool) -> Result<Option<(Addr, Vec<u8>)>, i64> {
         let mut i = self.inner.lock();
         let s = i.sock(id)?;
         if let Some(e) = s.error.take() {
@@ -1193,6 +1280,9 @@ impl Stack {
         let Kind::Udp { rx, bytes, .. } = &mut s.kind else {
             return Err(EOPNOTSUPP);
         };
+        if peek && let Some(d) = rx.front() {
+            return Ok(Some(d.clone()));
+        }
         match rx.pop_front() {
             Some((from, d)) => {
                 *bytes -= d.len();

@@ -30,7 +30,9 @@ Commands:
   disk-image   Write target/ichor-disk.img: a bootable GPT disk (FAT32 ESP with
                ichor.efi, Ichor root partition), for cloud import or bare metal;
                the kernel command line is --cmdline (default: empty);
-               --size-gib N pads it; --gcp also writes target/ichor-gcp.tar.gz
+               --size-gib N pads it; --gcp also writes target/ichor-gcp.tar.gz;
+               --api-token-file F puts the control plane's API token on it,
+               --api-tls-file F its TLS certificate and Ed25519 key (PEM)
   help         Show this message
 
 Options:
@@ -69,6 +71,10 @@ struct Opts {
     size_gib: Option<u64>,
     /// `disk-image`: also write the GCP import archive.
     gcp: bool,
+    /// `disk-image`: the control plane's API token, from this file.
+    api_token_file: Option<std::path::PathBuf>,
+    /// `disk-image`: the API's TLS certificates and key, from this file.
+    api_tls_file: Option<std::path::PathBuf>,
     /// `run`: boot this whole-disk image from NVMe instead.
     disk: Option<std::path::PathBuf>,
     extra: Vec<String>,
@@ -87,6 +93,8 @@ fn parse(args: &[String]) -> Result<Opts> {
         name: None,
         size_gib: None,
         gcp: false,
+        api_token_file: None,
+        api_tls_file: None,
         disk: None,
         extra: Vec::new(),
     };
@@ -124,6 +132,8 @@ fn parse(args: &[String]) -> Result<Opts> {
                 )
             }
             "--gcp" => o.gcp = true,
+            "--api-token-file" => o.api_token_file = Some(value("--api-token-file")?.into()),
+            "--api-tls-file" => o.api_tls_file = Some(value("--api-tls-file")?.into()),
             "--disk" => o.disk = Some(value("--disk")?.into()),
             "--" => {
                 o.extra.extend(it.by_ref().cloned());
@@ -246,7 +256,26 @@ fn cmd_disk_image(o: &Opts, args: &[String]) -> Result<()> {
     let kernel = build::kernel(o.profile)?;
     // GCP requires a whole number of GiB; cloud volumes are sized in GiB.
     let gib = o.size_gib.unwrap_or(if o.gcp { 1 } else { 0 });
-    let img = xtask::disk::image_sized(&kernel, &cmdline, gib << 30)?;
+    let read = |p: &Option<std::path::PathBuf>| match p {
+        Some(p) => std::fs::read(p)
+            .map(Some)
+            .map_err(|e| format!("reading {}: {e}", p.display())),
+        None => Ok(None),
+    };
+    let token = read(&o.api_token_file)?;
+    let tls = read(&o.api_tls_file)?;
+    // What the service would refuse at boot, said now.
+    if let Some(pem) = &tls {
+        tls::server::Identity::from_pem(&String::from_utf8_lossy(pem))
+            .map_err(|e| format!("--api-tls-file: {e:?}"))?;
+    }
+    let img = xtask::disk::image_sized(
+        &kernel,
+        &cmdline,
+        gib << 30,
+        token.as_deref(),
+        tls.as_deref(),
+    )?;
     if o.gcp && !img.len().is_multiple_of(1 << 30) {
         return Err(format!(
             "the disk is {} MiB, more than --size-gib {gib}; give a larger size",
@@ -285,6 +314,7 @@ const KERNEL_ONLY: &[&str] = &[
     "ichor-virtio-rng",
     "ichor-virtio-net",
     "ichor-nvme",
+    "ichor-virtio-scsi",
 ];
 
 /// Crates that only build for the services target (the native runtime
@@ -326,7 +356,8 @@ fn cmd_test(o: &Opts) -> Result<()> {
         a.bytes()?;
     }
     let mut cmd = cargo();
-    cmd.args(["test", "--package", "ichor-tests"]);
+    // Every test file runs even if an earlier one failed.
+    cmd.args(["test", "--no-fail-fast", "--package", "ichor-tests"]);
     if std::env::var_os("ICHOR_TEST_VERBOSE").is_some() {
         cmd.args(["--", "--nocapture"]);
     }
@@ -335,6 +366,113 @@ fn cmd_test(o: &Opts) -> Result<()> {
         format!("{:?}", o.accel.resolve()).to_lowercase(),
     );
     run_cmd(&mut cmd)
+}
+
+/// `cargo xtask workloads SUITE [--tests "a b"] [--cmd "shell command"]
+/// [--follow FILE] [--accel A] [--cmdline "kernel options"]`: a runtime's own test suite through the control plane
+/// (ADR-0013 §2); prints the pass rate.
+fn cmd_workloads(args: &[String]) -> Result<()> {
+    use xtask::workloads;
+    let mut it = args.iter();
+    let mut suite = None;
+    let (mut tests, mut cmd, mut accel) = (None, None, None);
+    let mut follow = None;
+    let mut extra = String::new();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--tests" => tests = Some(it.next().ok_or("--tests needs a value")?.clone()),
+            "--cmd" => cmd = Some(it.next().ok_or("--cmd needs a value")?.clone()),
+            "--follow" => follow = Some(it.next().ok_or("--follow needs a value")?.into()),
+            "--accel" => accel = Some(it.next().ok_or("--accel needs a value")?.clone()),
+            // Extra kernel options (`trace_errors`, `trace_pid=N`).
+            "--cmdline" => extra = it.next().ok_or("--cmdline needs a value")?.clone(),
+            s if !s.starts_with('-') => {
+                suite = Some(
+                    workloads::SUITES
+                        .iter()
+                        .find(|x| x.name == s)
+                        .ok_or_else(|| format!("no suite {s:?}"))?,
+                );
+            }
+            other => return Err(format!("workloads: unknown option {other:?}")),
+        }
+    }
+    let suite = suite.ok_or_else(|| {
+        let names: Vec<&str> = workloads::SUITES.iter().map(|s| s.name).collect();
+        format!("which suite? ({})", names.join(", "))
+    })?;
+    let argv: Vec<String> = match &cmd {
+        Some(c) => vec!["/bin/sh".into(), "-c".into(), c.clone()],
+        None => {
+            let mut v: Vec<String> = suite.argv.iter().map(|s| s.to_string()).collect();
+            match &tests {
+                Some(t) => v.extend(t.split_whitespace().map(str::to_string)),
+                None => v.extend(suite.all.iter().map(|s| s.to_string())),
+            }
+            v
+        }
+    };
+    let kernel = build::kernel(Profile::Release)?;
+    let accel = match accel.as_deref() {
+        Some(a) => a.parse().map_err(|e| format!("--accel: {e}"))?,
+        None => Accel::Auto,
+    };
+    let started = std::time::Instant::now();
+    let (out, status) = workloads::run(suite, argv, follow, kernel, |c| {
+        c.accel = accel;
+        if !extra.is_empty() {
+            c.cmdline = format!("{} {extra}", c.cmdline);
+        }
+    })?;
+    print!("{out}");
+    println!("workloads: {} exited with status {status:#x}", suite.name);
+    if cmd.is_some() {
+        return Ok(());
+    }
+    let s = (suite.parse)(&out);
+    let total = s.run();
+    println!(
+        "workloads: {}: {} of {total} {} passed ({} skipped); failed: {}",
+        suite.name,
+        s.passed.len(),
+        suite.unit,
+        s.skipped.len(),
+        s.failed.join(" ")
+    );
+    // A run that scored nothing did not run the suite (a usage error, a
+    // crash before the summary): that is a failure, not 0 of 0.
+    if total == 0 {
+        return Err(format!(
+            "workloads: {} reported no results (status {status:#x})",
+            suite.name
+        ));
+    }
+    // Only a full run is recorded and held to its floor.
+    if tests.is_some() {
+        return Ok(());
+    }
+    let root = xtask::workspace_root();
+    let floors = std::fs::read_to_string(root.join("workloads.toml")).unwrap_or_default();
+    let floor = workloads::floors(&floors)
+        .into_iter()
+        .find(|(n, _)| n == suite.name)
+        .map_or(0, |(_, f)| f);
+    let doc_path = root.join("docs").join("workloads.md");
+    let old = std::fs::read_to_string(&doc_path).unwrap_or_default();
+    let machine = format!("{:?}", accel.resolve()).to_lowercase();
+    let secs = started.elapsed().as_secs();
+    let section = workloads::section(suite, &s, secs, &machine, floor);
+    std::fs::write(&doc_path, workloads::merge_doc(&old, suite.name, &section))
+        .map_err(|e| format!("{}: {e}", doc_path.display()))?;
+    println!("workloads: wrote {}", doc_path.display());
+    if s.per_mille() < floor {
+        return Err(format!(
+            "workloads: {} passed {} per mille, below its floor of {floor}",
+            suite.name,
+            s.per_mille()
+        ));
+    }
+    Ok(())
 }
 
 /// `cargo xtask fuzz [TARGET] [--iterations N] [--seed S]`: the fuzz
@@ -414,8 +552,12 @@ fn main() -> ExitCode {
     let (command, rest) = args
         .split_first()
         .map_or(("help", &[][..]), |(c, r)| (c.as_str(), r));
-    // `fuzz` takes its own arguments.
-    let rest_for_parse = if command == "fuzz" { &[][..] } else { rest };
+    // `fuzz` and `workloads` take their own arguments.
+    let rest_for_parse = if command == "fuzz" || command == "workloads" {
+        &[][..]
+    } else {
+        rest
+    };
     let result = parse(rest_for_parse).and_then(|o| match command {
         "build" => build::kernel(o.profile).map(|p| println!("{}", p.display())),
         "run" => cmd_run(&o),
@@ -428,6 +570,7 @@ fn main() -> ExitCode {
         "bench" => cmd_bench(&o),
         "x509-limbo" => xtask::limbo::run(),
         "fuzz" => cmd_fuzz(rest),
+        "workloads" => cmd_workloads(rest),
         "disk-image" => cmd_disk_image(&o, rest),
         "help" | "--help" | "-h" => {
             print!("{HELP}");

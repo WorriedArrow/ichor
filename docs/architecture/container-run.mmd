@@ -1,0 +1,18 @@
+sequenceDiagram
+  participant C as API client
+  participant CP as Control plane (system cell)
+  participant R as Registry and CDN
+  participant K as Kernel (native ABI)
+  participant L as Container cell
+  C->>CP: PullImage(name@digest, extra layers)
+  CP->>R: DNS, TCP, TLS, HTTP: token, manifest, blobs
+  R-->>CP: layers, each checked against its sha256
+  CP->>CP: gunzip, tar, whiteouts: one Ichor image
+  CP->>K: IMAGE_CREATE (root hash checked)
+  C->>CP: CreateCell(image, memory)
+  CP->>K: CELL_CREATE (account, address, /etc/hosts)
+  C->>CP: Run(argv, env)
+  CP->>K: CELL_SPAWN
+  K->>L: execve in the cell's overlay root
+  L-->>CP: stdout and stderr (PROCESS_READ)
+  CP-->>C: RunEvent stream, then the exit status

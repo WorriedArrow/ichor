@@ -12,6 +12,9 @@ a framekernel. The founding brief is the source of truth until an ADR in
   model, frame's planned API surface, the unsafe policy, and the frame budget.
 - `docs/adr/0002-cells-and-capabilities.md`: cells, capabilities, and how the
   Linux ABI's namespaces and cgroups map onto them.
+- `docs/architecture.md`: the map: layers, a container's path, storage,
+  networking, and where Ichor is meant to be extended (diagrams in
+  `docs/architecture/`, Excalidraw sources beside their SVGs).
 
 ## Status
 
@@ -31,7 +34,9 @@ validation on x509-limbo, write up the gaps [done]; (2) an ADR for
 fails if frame or rt relaxes an unsafe-code lint]; (3) the control-plane
 listener local unless configured, with a test [done:
 `the_control_api_is_local_unless_configured`], then API authentication and
-Signal/Inspect/Destroy before any cloud boot; (4) io_uring completions
+Signal/Inspect/Destroy before any cloud boot [done: bearer token from
+`\ichor\apitoken`, ADR-0012 amendment; then TLS 1.3 from
+`\ichor\apitls.pem`, its 2026-11-21 amendment]; (4) io_uring completions
 without an enter (epoll on the ring fd, registered eventfd), with a test,
 before the Node.js suite [done]; (5) extra layers in PullImage, each pinned and
 verified by digest, with a refusal test [done: `LayerSource` (url, sha256
@@ -39,8 +44,22 @@ digest, `from`/`to` remap via `layer::Tree::add_tar_at`), fetched after
 the image, checked with `oci::digest_of` before `oci::convert_with`;
 tests/control.rs serves one from the host and refuses a wrong digest]; (6) ADR-0004's owed mitigations
 (VERW, IBPB on cross-cell switches, page-table isolation), logged at
-boot. The cell access-control suite is written in another worktree: do
+boot [done: VERW, IBPB, and page-table isolation (ADR-0004's second
+2026-11-16 amendment)]. The cell access-control suite is written in another worktree: do
 not write it; merge its branch when it lands.
+
+- M7 page-table isolation (`kernel/frame/src/arch/x86_64/entry.rs`): the
+  entry area (`mm::ENTRY_BASE`, one PML4 slot) aliases the entry code, the
+  IDT and per CPU its block (GS), GDT/TSS, entry stack (RSP0) and IST
+  stacks; the CPU always enters through the aliases. On Meltdown-affected
+  CPUs, or with `force_pti`, a `VmSpace` root is an 8 KiB pair (full root,
+  then a shadow with only the entry slot plus the shared user slots), ring
+  3 runs on the shadow, every entry loads the full root first, PGE is off,
+  and PCID (0 kernel, 1 user; user flushes owed by root changes and
+  shootdowns) avoids flushes. Every trap from ring 3 now returns through
+  `UserMode::execute` and `ichor_enter_user` (the one way into ring 3).
+  `m2_scheduler_on_eight_cpus` boots with `force_pti`;
+  `frame::user::isolation_selftest` checks the shadow on isolated boots.
 
 - M7 parsers and certificates: `fuzz/` (host-only) mutation-fuzzes every
   parser of untrusted input (TLS server side, X.509/DER, PEM, HPACK,
@@ -76,6 +95,105 @@ not write it; merge its branch when it lands.
   checks completion while blocked on a registered eventfd and on
   `epoll_wait` of the ring fd. Not yet: registered files/buffers,
   LINK_TIMEOUT, the EXT_ARG signal mask, liburing's tests.
+- M7 CPython (first suite): `cargo xtask workloads python` pulls
+  `python:3.12-slim-bookworm` plus the 3.12.16 source tree's `Lib/test`
+  as a pinned layer and runs `python -m test -j0` in a cell. Fixed on
+  the way: the direction flag was cleared on every return to ring 3,
+  corrupting memory past interrupted backward copies
+  (`docs/reports/direction-flag-fix.md`); `execve` argv/envp are bytes;
+  file names are bytes (`overlay::name`: a reversible escape for
+  non-UTF-8 bytes at the syscall boundary); `close_range`, `fadvise64`,
+  get/setpriority, `memfd_create`, absolute `clock_nanosleep`, named
+  pipes (`mknod`/`mknodat` S_IFIFO, blocking opens), robust futex lists;
+  open TCP NAT mappings live five days (Linux's established timeout), not
+  ten minutes. Known gaps from its runs: `test_math` cosh is 8 ulps off
+  under TCG (check on KVM), rseq (ENOSYS, glibc falls
+  back). Latest recorded full run: 409 of 445 modules (91.9%),
+  before shared file mappings; floor 88.0% in `workloads.toml`.
+- M7 Go (second suite): `cargo xtask workloads go` runs `go test -short
+  std` on the official `golang` image. Fixed on the way: `epoll_wait` held
+  descriptors and a fixed interest list while asleep (an epoll instance is
+  now an eventcount hub: `Poller`, `Watchers::notify`); TCP announces a
+  window that grew (pulls crawled at 0.8 MB/s); pulls time out on silence,
+  not on size; signals sent to a process go to a thread that does not block
+  them, `siginfo` says who sent one, real-time ones queue
+  (`proc::Shared`, `proc::Pending`), and one posted to a thread spinning in
+  ring 3 on an otherwise idle CPU takes it out (`Task::interrupt`,
+  `UserMode::execute_unless`; it used to wait for a trap); `execve` from a
+  process with threads killed the process; stop signals stop
+  (`proc::begin_stop`, parked in `signal::deliver`), `wait4`/`waitid`
+  report it, ptys send SIGTTIN/SIGTTOU; calls a signal interrupts without a
+  handler go on to their deadline (`ERESTARTNOHAND`, `resume_until`);
+  `splice` and friends (`linuxabi/splice.rs`), streams move more than 4 KiB
+  a call and gathered writes are one; `MSG_PEEK`, `SO_RCVTIMEO`,
+  `SO_LINGER` resets, `recvmmsg`; `NETLINK_ROUTE` reads (`net::rtnl`,
+  `linuxabi/netlink.rs`); CPU-time and POSIX timers (`itimer.rs`); pidfds
+  and `clone3`. Debian's perl checks most of it on every boot
+  (`SIGNAL_SCRIPT`, `MOVE_SCRIPT`). Explore with
+  `--cmd "go version" --follow FILE` (append shell lines to FILE). Under
+  TCG only: `crypto/sha1` (QEMU reads 32 bytes for a 16-byte AVX2 operand).
+- M7 PostgreSQL (third suite): `cargo xtask workloads postgres` builds
+  16.16 in `buildpack-deps` (the official image carries no `pg_regress`)
+  and runs `make check`; first run 223 of 224 (the other was QEMU's FMA on
+  Windows, which `Accel::cpu_model` now leaves out). Needed: System V
+  shared memory (`linuxabi/shm.rs`), `signalfd` (`linuxabi/timerfd.rs`,
+  with `timerfd`), and a scheduler that calls idle CPUs to steal (a woken
+  task waits on its waker's CPU; `sched::call_idle` at the tick). Tasks are
+  scheduled by cell now (`SchedInfo::of_cell`).
+- M7 also: `inotify` (the overlay records changes while watched), nested
+  epoll, O_TMPFILE, `/proc/<pid>` of every process of the cell,
+  `/dev/fd`, `/dev/std*` and `/proc/self/fd/N` opened anew
+  (`fs::reopen`), paths that lead into `/proc` any way
+  (`Overlay::set_elsewhere`), `execve` of `/proc/self/exe`, and small calls
+  in `linuxabi/misc.rs`, O_RDWR FIFOs, file names in `/proc/<pid>/maps`,
+  `/proc/<pid>/cmdline` read from the process's memory (titles written over
+  argv), 2 MiB of arguments.
+- M7 Node.js (fourth suite): `cargo xtask workloads node` runs its
+  `test/parallel` and `test/sequential`; first run (2026-11-22, 130 min
+  under TCG) 4365 of 4400. Most of the 35 are fixed since, or were sources
+  the suite did not have; `cpu-prof-*worker*` livelock under TCG (V8
+  samples every 100 us). The `jvm` suite (jtreg, OpenJDK 21's tier 1) is
+  defined, not run yet.
+- M7 storage (ADR-0006's 2026-11-21 amendment): a cell's root writes are
+  frames charged to its account (`page.rs`: one charged-page type for
+  process memory and file pages; `overlay::Pages` is where the overlay
+  gets them), so `MAP_SHARED` file mappings map the file's own pages
+  (`umem::fault_shared`, `runtest::shared_file_program`,
+  `blktest::root_charges`), and images with megabytes of metadata mount
+  (format v4: 64 KiB segments, `Image::mount_segments`).
+- M7 what a cell takes of the kernel (2026-11-22; Go's runtime tests split
+  a mapping into 40,000 pieces and the kernel panicked on one 4.5 MiB list
+  of them): no list a program can lengthen is one allocation without a
+  bound (an allocation over 4 MiB, or one that fails, is a kernel panic:
+  bound it, page it, or keep it in a tree), and what is held for long is
+  charged to the cell. Mappings: one `vma::RegionMap` with each region's
+  backing (alike neighbors joined), at most 65,530 (`max_map_count`);
+  `/proc/<pid>/maps` is written as it is read. Charged: upper inodes,
+  names and long symlinks (`overlay::Pages::keep`, 8 a page), a thread's
+  kernel stack and table entry (`page::Reserved`: 17 pages; EAGAIN), pipe
+  buffers (ENOMEM). Bounded: 524,288 inodes a root, 16,384 locks a file,
+  4,096 queued datagrams or `AF_UNIX` messages a socket. Directories are
+  listed by an entry's place (`Overlay::list`), not its index, so removing
+  while reading skips nothing. Not charged yet: page tables, region maps,
+  epoll interest, open file descriptions, sockets' own state, futex and
+  timer entries; kernel stacks are pooled, never freed.
+- Boot hangs under the full gate's load (2026-11-21), found by booting 30
+  VMs at a time until one stuck (1 in 60) and by reading. Fixed: a
+  blocking FIFO open missed a peer that opened, wrote and closed between
+  its count and its wait (reproduced: both CPUs halted, nothing armed;
+  `pipe::fifo_selftest`); the timer self-test could halt after its last
+  tick; `finish_switch` and a waker could both queue a task, and the stale
+  entry then ran it while marked blocked, to be lost at its next
+  preemption (`pick_and_claim` now refuses it; suspected for the one hang
+  seen in `copytest::frame_race`, not proven); and the LAPIC and PM timer
+  calibrations took one sample, which a descheduled vCPU spoils. A test
+  boot that times out now appends every vCPU's registers, LAPIC and stack
+  to its log (`qemu::vcpu_state`): read that first. Both CPUs at the idle
+  `hlt` with no timer armed means a lost wake-up, not a lost interrupt.
+- The uplink is any `net::link::Link` (`kernel/net/src/link.rs`:
+  `mac`/`transmit`/`receive`): NIC drivers implement it (virtio-net), and
+  a software link such as a VPN can wrap one. New NIC drivers (ENA,
+  gVNIC, VMBus) implement it too.
 
 **Milestone 6 is done** (2026-11-15): the control plane pulls a real OCI
 image from a registry, verifies it, converts it, and runs it through the
@@ -117,10 +235,12 @@ the acceptance test.
   shims), `services/oci` (references, Bearer token flow, index to
   linux/amd64, digest-verified manifests and blobs, CDN redirects without
   the token, conversion, image config; a real `hello-world` pull recorded
-  and replayed), `services/dns` (A records, CNAME chains). AES-GCM is left
-  out: every Docker Hub endpoint accepts ChaCha20-Poly1305. Refresh a
-  recording with `cargo test -p ichor-tls -- --ignored record_live` (or
-  `-p ichor-oci`); it needs the internet and the Windows-exported roots in
+  and replayed), `services/dns` (A records, CNAME chains). The TLS client
+  also speaks AES-128-GCM (bitsliced) and P-256 (constant-time) since
+  2026-11-22: Amazon's, Microsoft's and Quay's registries want them. Refresh
+  a recording with `cargo test -p ichor-tls -- --ignored record_live` (or
+  `-p ichor-oci`), and the clocks beside `SESSIONS` (there and in `fuzz`);
+  it needs the internet and the roots in
   `services/x509/testdata/roots.pem`.
 - M6 native ABI v2 (`docs/abi/native.md`): `kernel/ichor/src/native.rs`
   runs native processes (a demand-paged `Mm` charged to the cell, the ELF
@@ -217,17 +337,21 @@ uplink; virtio-net (polled). Open from it: IPv6, ICMP errors for UDP,
 
 Milestones 0-4 are done (4's acceptance test: Debian's `apt-get install`
 from a local mirror). Phase E (scalability) is done except the vDSO
-(blocked), the Mm-lock item (unblocked by ADR-0011's user-copy fix), and
-the per-CPU page lists, held back on `pcp-page-lists`.
+(blocked) and the per-CPU page lists, held back on `pcp-page-lists`.
 
 - User copies (ADR-0011): `VmSpace::copy_to_user`/`copy_from_user` copy
   through the linear map one page at a time under the space lock, after
   checking the PTE (writes need it writable), so they stop where a user
-  access would fault. The kernel's `Mm::copy_*` fault that page (demand
-  paging, copy-on-write break) and copy on; `LinuxProcess::copy_*` and the
-  loader use them. `copytest.rs` checks it on every boot: the frame API
-  under a concurrent unmap, `read`/`stat` into read-only and
-  page-cache-backed pages, a second cell, and a read/munmap stress race.
+  access would fault. `umem::copy_user` faults that page (demand paging,
+  copy-on-write break) and copies on. `LinuxProcess::copy_*` run without
+  the `Mm` lock (amended ADR-0011): the space is an `Arc` shared by `Mm`
+  and `Group::space`, and `Mm` is locked only for a fault plus that one
+  page's copy. The loader and native processes use `Mm::copy_*`, which
+  hold the `Mm` throughout. io_uring helpers stay on the kernel address
+  space. `copytest.rs` checks it on every boot: the frame API under a
+  concurrent unmap, `read`/`stat` into read-only and page-cache-backed
+  pages, a second cell, a copy running while the `Mm` lock is held
+  (`mm_unlocked`), and a read/munmap stress race.
 
 - M4 so far: Alpine 3.20.3's own userland runs unmodified in a cell. xtask
   fetches the minirootfs (pinned SHA-256, `artifact.rs`), gunzips and reads
@@ -377,8 +501,9 @@ the per-CPU page lists, held back on `pcp-page-lists`.
   ISIG to the foreground group, MIN/TIME, ONLCR), termios/winsize/job
   control/ptmx ioctls, controlling terminals and `/dev/tty`, hangup on
   master close. Debian's perl drives a session through dash, `tty` and
-  `stty` on every boot. Partial: no SIGTTIN/SIGTTOU, flow control or
-  packet mode; the console is still not a tty.
+  `stty` on every boot. Partial: no flow control or packet mode; the
+  console is still not a tty, and `/dev/tty` without a controlling terminal
+  is ENXIO.
 - Page-sharing opt-out (ADR-0004 §4): `Vfs::mount_disk_private` gives a
   cell's root a private page-cache namespace (`pagecache::View`), charged
   to the cell's account, evicting only its own pages, freed with the root.
@@ -480,12 +605,16 @@ report at the end of each phase. Do not rewrite `main`.
   are already kicked when a task is enqueued on them (`sched.rs`).
   Per-CPU single-page lists are on the local branch `pcp-page-lists`,
   held back: one unexplained user page fault (dpkg's decompressor) in 20
-  one-CPU boots, against 0 in 20 without it. Baseline in `docs/benchmarks.md`; Linux reference
+  one-CPU boots, against 0 in 20 without it (worth retrying: the
+  direction-flag bug fixed on 2026-11-21, `docs/reports/direction-flag-fix.md`,
+  corrupted memory past interrupted backward copies, and decompressors
+  memmove a lot). Baseline in `docs/benchmarks.md`; Linux reference
   numbers come from `cargo xtask bench` (Alpine `linux-virt` booted with
-  the same `testprog::bench` programs; CI job summary). Frame's user
-  copies now check the PTE and copy each page under the space lock
-  (ADR-0011, `docs/reports/user-copy-fix.md`), so the Mm-lock item is
-  unblocked.]
+  the same `testprog::bench` programs; CI job summary). Mm lock not held
+  across whole user copies: done. Frame's copies check the PTE and copy
+  each page under the space lock (ADR-0011,
+  `docs/reports/user-copy-fix.md`), and Linux copies take the `Mm` lock
+  only to fault a page (ADR-0011's amendment, `copytest::mm_unlocked`).]
 
 Carried over from milestone 3: per-cell pid namespaces (paging the root
 image in on demand, copy-on-write `fork`, `FD_CLOEXEC` and shared offsets
@@ -503,16 +632,19 @@ Suggested order for milestone 4:
    Next: Alpine `apk` and debian-slim `apt` against a local mirror (needs
    sockets or a file-backed mirror, more `/proc`, and glibc's `ld-linux`).
 
-ADR-0004 records the side-channel posture; its per-CPU mitigations (VERW,
-IBPB on cross-cell switch, page-table isolation for Meltdown-affected CPUs)
-are owed as multi-cell scheduling lands in milestone 4. Boot logs which apply.
+ADR-0004 records the side-channel posture. Built: VERW, IBPB on cross-cell
+switch, page-table isolation for Meltdown-affected CPUs, and enhanced IBRS
+with BHI_DIS_S where enumerated (not yet run on hardware that has it: no
+test machine reports it). Owed: BHB clearing, IBRS on entry without eIBRS,
+RSB filling, masked indices, AMD's measures. Boot logs which apply.
 
 Frame budget: ADR-0005 sets the milestone 3 ceiling at 8,500 lines / 380
 sites; ADR-0007 raises it to 9,500 / 420 for milestone 4 (TLB shootdown,
-atomic user ops for futexes, PCID). `audit.toml` is at step 6 (5,800 / 250);
-frame is at 5,630 / 244 (A5 added RDSEED/RDRAND and UEFI GetTime; B
-added XSAVE; C the frames tree and request tracking; M6 reading
-`\ichor\roots.pem`; ADR-0011 the checked user copy). `services/rt` has
+atomic user ops for futexes, PCID). `audit.toml` is at step 7 (6,250 / 265,
+ADR-0004's isolation amendment); frame is at 6,236 / 261 (A5 added
+RDSEED/RDRAND and UEFI GetTime; B added XSAVE; C the frames tree and
+request tracking; M6 reading `\ichor\roots.pem`; ADR-0011 the checked user
+copy; ADR-0004 VERW/IBPB, page-table isolation and eIBRS). `services/rt` has
 its own budget (`services/rt/audit.toml`: 500 / 40; at 402 / 29).
 
 The goal set for this effort is milestone 8, whose acceptance test needs
@@ -530,8 +662,16 @@ calibrates from CPUID, the hypervisor leaf, the ACPI PM timer or the PIT
 controller, allows 30 s per command and logs failures. `--size-gib N` pads
 the disk and `--gcp` writes GCP's import archive; `cargo xtask run --disk
 FILE` boots any such image. Runbook for a first real-cloud boot:
-`docs/cloud.md`. Not yet: a network driver (AWS ENA / GCP gVNIC /
-virtio-net), Hyper-V VMBus for Azure, Secure Boot.
+`docs/cloud.md`. `kernel/drivers/virtio-scsi` reads the disks of GCP's
+general-purpose machine types (`cloud_disk_boots_from_virtio_scsi`);
+with their virtio-net NIC those can network: the uplink takes its
+address, router and DNS server from DHCP (`net::dhcp`, host-tested;
+QEMU's slirp hands out 10.0.2.15, so the tests see the same address),
+and the control plane resolves through the lease's DNS server unless
+`dns=` is given. The uplink renews the lease at half its time, and moves
+address if the server says so (published ports stay, connections are
+cut); unrenewed past its end, it keeps the address and asks on. Not yet:
+the clouds' metadata servers, AWS ENA and GCP gVNIC, Hyper-V VMBus for Azure, Secure Boot.
 
 ## Commands
 
@@ -547,6 +687,9 @@ cargo xtask bench --accel kvm --smp 4   # Ichor vs Linux, same machine and progr
 cargo xtask disk-image     # target/ichor-disk.img: bootable GPT disk (ESP + Ichor root) for clouds/bare metal
 cargo xtask fuzz [TARGET] --iterations N   # mutation-fuzz the parsers (failing inputs: target/fuzz/)
 cargo xtask x509-limbo     # certificate validation vs x509-limbo -> docs/x509-limbo.md (fails below floors)
+cargo xtask workloads python   # CPython's own suite through the control plane -> docs/workloads.md (fails below workloads.toml's floor)
+cargo xtask workloads python --tests "test_os test_json"   # a subset (printed, not recorded)
+cargo xtask workloads python --cmdline trace_errors --cmd "python3 -c ..."   # explore; guest log in target/workloads-python.serial.log
 cargo deny check           # licenses, advisories, sources
 ```
 
@@ -581,17 +724,22 @@ comment.
 | `memmap` | print the full memory map |
 | `test_panic` | panic after boot (exercises the panic path) |
 | `test_stack_overflow` | recurse until the kernel stack hits its guard page |
+| `force_verw` | VERW before every return to ring 3 on any CPU (ADR-0004; tests) |
+| `force_pti` | page-table isolation on any CPU, Meltdown-affected or not (ADR-0004; tests) |
 | `trace_errors` | log every failing Linux syscall (pid, number, first arguments, errno) |
 | `trace_pid=N` | log every Linux syscall of pid N with its result |
 | `bench` | run the Phase E benchmarks (`bench.rs`) after the root disk's self-tests and print them |
 | `net_echo_port=N` | the kernel's TCP, then a Debian cell through NAT, echo 256 KiB with the host's echo server at 10.0.2.2:N |
 | `net_publish=N` | publish uplink port N to a Debian cell's port 80 and serve one HTTP request from the host (QEMU forwards a host port to N) |
-| `control=PORT` | after the self-tests, run the control plane serving gRPC on PORT, on the system cell's loopback only (the API has no authentication yet) |
-| `control_listen=ADDR` | the address the API listens on (`0.0.0.0`: all of the system cell's, reachable from other cells) |
-| `control_publish=PORT` | publish the API on uplink port PORT (without `control_listen`, listens on all addresses) |
+| `control=PORT` | after the self-tests, run the control plane serving gRPC on PORT, on the system cell's loopback only, over TLS if there is `\ichor\apitls.pem` |
+| `control_listen=ADDR` | the address the API listens on (`0.0.0.0`: all of the system cell's, reachable from other cells); needs what `control_publish` needs |
+| `control_publish=PORT` | publish the API on uplink port PORT (without `control_listen`, listens on all addresses); needs an API token in `\ichor\apitoken` (`RunConfig::api_token`, `disk-image --api-token-file`) and a certificate and Ed25519 key in `\ichor\apitls.pem` (`RunConfig::api_tls`, `disk-image --api-tls-file`), else the API stays on loopback |
+| `control_plaintext` | let `control_listen`/`control_publish` do without a certificate (a network you trust) |
 | `control_exit` | with `control`: stop when the first API client hangs up, then shut down (tests) |
 | `control_exit_after=SECONDS` | with `control`: stop after that long once no client is connected (tests) |
-| `dns=A.B.C.D` | the control plane's DNS resolver (default `10.0.2.3`, QEMU's) |
+| `uplink_mtu=N` | the uplink network's MTU, over the DHCP lease's (default: the lease's, else 1500); every TCP SYN crossing the uplink is clamped to MTU - 40 |
+| `dhcp_lease=SECONDS` | the longest the uplink's DHCP lease is taken to last (tests: renewed sooner) |
+| `dns=A.B.C.D` | the control plane's DNS resolver (default: the uplink's DHCP lease's first DNS server, else `10.0.2.3`, QEMU's) |
 
 ## Layout
 
@@ -628,14 +776,15 @@ kernel/drivers/virtio-net  safe virtio-net driver (polled, MAC feature only)
 kernel/net       network protocols, sans-I/O: Ethernet, ARP, IPv4, ICMP, UDP, TCP (host-tested; ADR-0010)
 kernel/uring     io_uring's ABI, ring layout and submission ordering, sans-I/O (host-tested; ADR-0013)
 kernel/drivers/nvme        safe NVMe driver (polled, DMA-trusted)
+kernel/drivers/virtio-scsi safe virtio-scsi driver: every target's disk, read-only, polled (GCP's E2/N1/N2 disks)
 xtask/src/artifact.rs      pinned downloads (busybox, Alpine): SHA-256, cache, never committed
 xtask/src/inflate.rs       gzip/DEFLATE decoder; rootfs.rs: tar -> Ichor image
 xtask/src/disk.rs, fat.rs  bootable GPT disk image (FAT32 ESP + Ichor root partition)
 xtask/src/linuxref.rs      Linux reference boot for `cargo xtask bench` (Alpine linux-virt + initramfs)
 kernel/ichor     the kernel binary; frame::main!(kmain); kcell/nativeabi tie it together
-services/crypto  SHA-2, HMAC/HKDF, ChaCha20-Poly1305, X25519, RSA/ECDSA verify (host-tested; ADR-0012)
+services/crypto  SHA-2, HMAC/HKDF, ChaCha20-Poly1305, X25519, Ed25519, RSA/ECDSA verify (host-tested; ADR-0012)
 services/x509    DER, X.509, PEM root stores, chain verification (host-tested)
-services/tls     sans-I/O TLS 1.3 + 1.2 client (host-tested, recorded sessions)
+services/tls     sans-I/O TLS 1.3 + 1.2 client, TLS 1.3 server (host-tested, recorded sessions; `testdata/api.pem` is a public test key)
 services/http    sans-I/O HTTP/1.1 client messages (host-tested)
 services/layer   gzip/DEFLATE + tar layers (OCI whiteouts) into images; xtask uses it (host-tested)
 services/oci     image references, the registry pull protocol, conversion, image config (host-tested)
@@ -648,7 +797,7 @@ fuzz/            mutation fuzzing of every untrusted-input parser (host-only)
 xtask/           build/run/test/lint tooling (lib + bin, no dependencies)
 tests/           QEMU integration tests (host crate using xtask's runner)
 docs/adr/        architecture decision records
-docs/reports/    write-ups of fixes and investigations (user-copy-fix.md)
+docs/reports/    write-ups of fixes and investigations (user-copy-fix.md, direction-flag-fix.md)
 ```
 
 Planned crates (create as milestones need them): `kernel/{mm,sched,cap,cell,

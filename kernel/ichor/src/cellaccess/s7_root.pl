@@ -1,8 +1,8 @@
 # Section 7: uid 0 in A has no authority outside A (ADR-0009 §3). The
-# calls a host superuser would use fail: mount and umount2 with EPERM,
-# the rest with ENOSYS today (recorded: ADR-0009 expects EPERM once they
-# exist). Ownership and mode changes cannot reach B's files, and uid 0
-# signals none of B's processes.
+# calls a host superuser would use fail with EPERM, or ENOSYS where they
+# do not exist (ADR-0009: "already EPERM or absent"; recorded). Ownership
+# and mode changes cannot reach B's files, and uid 0 signals none of B's
+# processes.
 $RULE = "uid_0_in_a_cell_has_no_authority_outside_it";
 my %B = kv(@ARGV);
 same("A runs as uid 0", syscall(102) . " " . syscall(107), "0 0"); # getuid, geteuid
@@ -12,18 +12,28 @@ want("mount", "EPERM", syscall(165, $src, $dst, $fs, 0, 0));
 my $root = "/";
 want("umount2(/)", "EPERM", syscall(166, $root, 0));
 my $node = "/tmp/ichor-node";
-want("mknod [ENOSYS today]", "ENOSYS", syscall(133, $node, 0020000 | 0600, (1 << 8) | 1)); # /dev/mem's numbers
-want("mknodat [ENOSYS today]", "ENOSYS", syscall(259, -100, $node, 0060000 | 0600, (254 << 8)));
+# Device nodes (a character and a block device) are refused; a node
+# without a device behind it is not.
+want("mknod(character device)", "EPERM", syscall(133, $node, 0020000 | 0600, (1 << 8) | 1));
+want("mknodat(block device)", "EPERM", syscall(259, -100, $node, 0060000 | 0600, (254 << 8)));
+control("mknod (a FIFO)", syscall(133, $node, 0010000 | 0600, 0));
+my $node2 = "/tmp/ichor-node2";
+control("mknodat (a FIFO)", syscall(259, -100, $node2, 0010000 | 0600, 0));
 want("reboot [ENOSYS today]", "ENOSYS", syscall(169, 0xfee1dead, 672274793, 0, 0)); # CAD_OFF
 my $ts = pack("qq", 0, 0);
-want("clock_settime(CLOCK_REALTIME) [ENOSYS today]", "ENOSYS", syscall(227, 0, $ts));
+want("clock_settime(CLOCK_REALTIME)", "EPERM", syscall(227, 0, $ts));
 my $tv = pack("qq", 0, 0);
-want("settimeofday [ENOSYS today]", "ENOSYS", syscall(164, $tv, 0));
+want("settimeofday", "EPERM", syscall(164, $tv, 0));
+my $now = pack("qq", 0, 0);
+control("clock_gettime (A may read the clock it may not set)", syscall(228, 0, $now));
+same("the clock did not move", (unpack("qq", $now))[0] > 1_600_000_000 ? "kept" : "set", "kept");
 my $tx = "\0" x 208;
 want("adjtimex [ENOSYS today]", "ENOSYS", syscall(159, $tx));
+want("clock_adjtime [ENOSYS today]", "ENOSYS", syscall(305, 0, $tx));
 want("chroot [ENOSYS today]", "ENOSYS", syscall(161, my $c = "/tmp"));
-want("unshare(CLONE_NEWNS) [ENOSYS today]", "ENOSYS", syscall(272, 0x20000));
-want("setns [ENOSYS today]", "ENOSYS", syscall(308, 0, 0));
+want("unshare(CLONE_NEWNS)", "EPERM", syscall(272, 0x20000));
+control("unshare (nothing)", syscall(272, 0));
+want("setns", "EPERM", syscall(308, 0, 0));
 my $img = "";
 want("init_module [ENOSYS today]", "ENOSYS", syscall(175, $img, 0, $img));
 want("iopl(3) [ENOSYS today]", "ENOSYS", syscall(172, 3));

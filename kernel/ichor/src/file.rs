@@ -3,10 +3,12 @@
 //! verified page for a file page, which they map copy-on-write instead of
 //! copying.
 
+use alloc::string::String;
 use alloc::sync::Arc;
 
 use frame::mm::UFrame;
 
+use crate::page::Page;
 use crate::vfs::{Ino, Vfs};
 
 /// A file's bytes.
@@ -21,10 +23,22 @@ pub(crate) trait File: Send + Sync {
     fn cached_page(&self, _index: u64) -> Option<UFrame> {
         None
     }
+    /// The file's own page `index`, for a shared mapping (`write`: to be
+    /// written through it). `None`: the file is the image's and unwritten,
+    /// or cannot be shared at all. `Err`: there is no such page (past the
+    /// end of the file), or no memory for it.
+    fn shared_page(&self, _index: u64, _write: bool) -> Result<Option<Page>, i64> {
+        Ok(None)
+    }
     /// A reference to this file that a mapping can keep for as long as it
     /// lives, so its pages can be filled on demand (`None`: the caller must
     /// copy what it needs now, as for bytes it holds).
     fn mappable(&self) -> Option<Arc<dyn File>> {
+        None
+    }
+    /// Its inode number, and a path of it (none once it has been removed),
+    /// for `/proc/<pid>/maps`.
+    fn identity(&self) -> Option<(u64, Option<String>)> {
         None
     }
 }
@@ -63,6 +77,11 @@ impl VfsFile {
             ino,
         })
     }
+
+    /// A path of the file in its root.
+    pub(crate) fn path(&self) -> Option<String> {
+        self.vfs.lock().path(self.ino).ok()
+    }
 }
 
 impl Drop for VfsFile {
@@ -84,11 +103,21 @@ impl File for VfsFile {
         self.vfs.cached_page(self.ino, index)
     }
 
+    fn shared_page(&self, index: u64, write: bool) -> Result<Option<Page>, i64> {
+        let page = self.vfs.lock().page(self.ino, index, write)?;
+        Ok(page.map(|p| p.0))
+    }
+
     fn mappable(&self) -> Option<Arc<dyn File>> {
         // A new open reference: the mapping keeps the file alive (even
         // after an unlink) independently of this handle.
         VfsFile::open(&self.vfs, self.ino)
             .ok()
             .map(|f| Arc::new(f) as Arc<dyn File>)
+    }
+
+    fn identity(&self) -> Option<(u64, Option<String>)> {
+        let fs = self.vfs.lock();
+        Some((fs.stat(self.ino).ok()?.ino, fs.path(self.ino).ok()))
     }
 }

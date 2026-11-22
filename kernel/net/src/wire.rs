@@ -43,15 +43,26 @@ fn mac(b: &[u8], at: usize) -> Option<Mac> {
 
 /// Adds `data` to a running one's-complement sum (big-endian 16-bit
 /// words, an odd last byte padded with zero).
-pub fn sum(mut acc: u32, data: &[u8]) -> u32 {
-    let (words, rest) = data.as_chunks::<2>();
+pub fn sum(acc: u32, data: &[u8]) -> u32 {
+    // Eight bytes at a time: 2^16 is 1 modulo 2^16 - 1, so 32-bit words add
+    // up to the same as their halves.
+    let (blocks, rest) = data.as_chunks::<8>();
+    let mut wide = u64::from(acc);
+    for b in blocks {
+        let v = u64::from_be_bytes(*b);
+        wide += (v >> 32) + (v & 0xffff_ffff);
+    }
+    let (words, rest) = rest.as_chunks::<2>();
     for w in words {
-        acc += u32::from(u16::from_be_bytes(*w));
+        wide += u64::from(u16::from_be_bytes(*w));
     }
     if let [last] = rest {
-        acc += u32::from(*last) << 8;
+        wide += u64::from(*last) << 8;
     }
-    acc
+    while wide > 0xffff {
+        wide = (wide & 0xffff) + (wide >> 16);
+    }
+    wide as u32
 }
 
 /// Folds a running sum into the 16-bit one's-complement checksum.
@@ -332,6 +343,28 @@ mod tests {
         let mut with = d.to_vec();
         with.extend_from_slice(&checksum(&d).to_be_bytes());
         assert_eq!(checksum(&with), 0);
+        // Against the sum of 16-bit words, at every length; two parts (the
+        // first of even length) sum to the whole.
+        for fill in [0xffu8, 0, 0x5a] {
+            for n in 0..70usize {
+                let d: Vec<u8> = (0..n)
+                    .map(|i| {
+                        if fill == 0x5a {
+                            (i * 89 + n) as u8
+                        } else {
+                            fill
+                        }
+                    })
+                    .collect();
+                let mut plain = 0u32;
+                for w in d.chunks(2) {
+                    plain += u32::from(w[0]) << 8 | u32::from(*w.get(1).unwrap_or(&0));
+                }
+                assert_eq!(fold(sum(0, &d)), fold(plain), "{n} bytes of {fill}");
+                let (a, b) = d.split_at(n / 4 * 2);
+                assert_eq!(fold(sum(sum(0, a), b)), fold(plain));
+            }
+        }
     }
 
     #[test]

@@ -1,0 +1,11 @@
+flowchart LR
+  dev["Block device<br/>virtio-blk, NVMe, GPT partition,<br/>or an image in memory"]
+  img["Ichor image<br/>read-only, content-addressed,<br/>BLAKE3 chunks, root hash checked at mount"]
+  pc["Page cache<br/>pages keyed by verified hash,<br/>shared across disks and cells"]
+  ov["Overlay root, one per cell<br/>image below, copy-on-write upper layer<br/>in the cell's memory"]
+  procs["Processes<br/>open, read, write, mmap, exec"]
+  dev --> img
+  img --> pc
+  pc --> ov
+  ov --> procs
+  pc -. "pages mapped copy-on-write" .-> procs

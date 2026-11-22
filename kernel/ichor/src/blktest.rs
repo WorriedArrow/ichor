@@ -71,6 +71,25 @@ pub(crate) fn run() {
             Arc::new(Vfs::mount_disk(&m).unwrap_or_else(|_| fail("disk is not an Ichor image")));
         exercise("nvme", &m, vfs);
     }
+    // Every disk behind a virtio-scsi controller (GCP's general-purpose
+    // machine types attach their persistent disks so).
+    for d in virtio_scsi::probe_all() {
+        let d = d.unwrap_or_else(|e| {
+            println!("ichor: blk: virtio-scsi init failed: {e:?}");
+            fail("virtio-scsi init")
+        });
+        println!(
+            "ichor: blk: virtio-scsi target {}, block size {} bytes",
+            d.target(),
+            d.block_size()
+        );
+        let Some(m) = mount("virtio-scsi", d) else {
+            continue;
+        };
+        let vfs =
+            Arc::new(Vfs::mount_disk(&m).unwrap_or_else(|_| fail("disk is not an Ichor image")));
+        exercise("virtio-scsi", &m, vfs);
+    }
     if !FIRST_DONE.load(core::sync::atomic::Ordering::Relaxed) {
         fail("no Ichor root disk found");
     }
@@ -120,11 +139,7 @@ fn mount_image(name: &str, disk: impl BlockDevice + Send + 'static) -> Option<Mo
             fail("mounting the root disk")
         }
     };
-    let image = Image::mount(m.metadata).unwrap_or_else(|e| {
-        println!("ichor: blk: {name}: image rejected: {e:?}");
-        fail("root disk image rejected")
-    });
-    let h = image.root_hash();
+    let h = m.image.root_hash();
     println!(
         "ichor: blk: {name} disk, {} KiB; root hash {:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}.. verified over {} KiB of metadata; data paged in on demand",
         bytes / 1024,
@@ -136,7 +151,7 @@ fn mount_image(name: &str, disk: impl BlockDevice + Send + 'static) -> Option<Mo
         h[5],
         h[6],
         h[7],
-        m.metadata.len() / 1024
+        m.image.metadata_len() / 1024
     );
     Some(m)
 }
@@ -154,6 +169,7 @@ fn exercise(name: &str, m: &Mounted, vfs: Arc<Vfs>) {
         // Before anything else reads the disk, so the opted-out root can
         // be the first to read a chunk.
         opt_out(m);
+        root_charges(m);
     }
     check_pattern(name, m);
     println!("ichor: blk: mounted the root image from the {name} disk");
@@ -202,7 +218,7 @@ fn opt_out(m: &Mounted) {
     let system = System::new(4096).unwrap_or_else(|| fail("no system cell"));
     let cell =
         |limit| Cell::new(&system.root_account, limit).unwrap_or_else(|| fail("opt-out: no cell"));
-    let (a, b, tiny) = (cell(128), cell(128), cell(1));
+    let (a, b, tiny) = (cell(128), cell(128), cell(8));
     let mount = |acc: Option<&Arc<Cell>>| {
         let v = match acc {
             None => Vfs::mount_disk(m),
@@ -219,6 +235,11 @@ fn opt_out(m: &Mounted) {
         .unwrap_or_else(|| fail("opt-out: no private namespace"));
     if shared.private_ns().is_some() {
         fail("opt-out: a sharing root has a private namespace");
+    }
+    // What a root is charged before anything is read (its `/dev`).
+    let base = a.account().used();
+    if tiny.account().set_limit(base + 1) != base + 1 {
+        fail("opt-out: limit");
     }
 
     // The sharing root reads first, then the opted-out one.
@@ -238,7 +259,10 @@ fn opt_out(m: &Mounted) {
     if o_motd == s_motd || o_motd == p_motd {
         fail("opt-out: two opted-out cells share a page");
     }
-    if pagecache::private_pages(ns) != 2 || a.account().used() != 2 || b.account().used() != 1 {
+    if pagecache::private_pages(ns) != 2
+        || a.account().used() != base + 2
+        || b.account().used() != base + 1
+    {
         fail("opt-out: private pages are not charged to their cell");
     }
 
@@ -252,14 +276,14 @@ fn opt_out(m: &Mounted) {
     if status != 0 {
         fail("opt-out: cat in an opted-out cell failed");
     }
-    if a.account().used() != pagecache::private_pages(ns) as u64 {
+    if a.account().used() != base + pagecache::private_pages(ns) as u64 {
         fail("opt-out: charge does not match the private pages after a process ran");
     }
 
-    // A one-page cell keeps one page and evicts its own to read another.
+    // A cell with one page left keeps one and evicts its own to read another.
     let t1 = page0(&small, "/usr/share/motd");
     let t2 = page0(&small, "/usr/share/pattern");
-    if t1 == s_motd || t2 == s_pat || tiny.account().used() != 1 {
+    if t1 == s_motd || t2 == s_pat || tiny.account().used() != base + 1 {
         fail("opt-out: a cell at its limit did not evict its own page");
     }
 
@@ -278,6 +302,67 @@ fn opt_out(m: &Mounted) {
     println!(
         "ichor: pagecache: opted-out cells read private copies charged to their own account; sharing cells share"
     );
+}
+
+/// What a cell writes to its root is charged to the cell: a page at a time,
+/// up to its limit (a write that only partly fits is short, the next is
+/// ENOSPC), and returned as files go, down to nothing with the root.
+fn root_charges(m: &Mounted) {
+    const PAGE: usize = 4096;
+    let system = System::new(4096).unwrap_or_else(|| fail("no system cell"));
+    let cell = Cell::new(&system.root_account, 64).unwrap_or_else(|| fail("root: no cell"));
+    let vfs = Vfs::mount_disk_for(m, cell.account()).unwrap_or_else(|_| fail("root: mount"));
+    let mut fs = vfs.lock();
+    let f = fs
+        .create(crate::vfs::ROOT, "big", 0o644)
+        .unwrap_or_else(|_| fail("root: create"));
+    // A root starts with its `/dev` nodes; what it has beyond them counts
+    // from here.
+    let base = cell.account().used();
+    if base == 0 || base > 8 || cell.account().set_limit(base + 16) != base + 16 {
+        fail("root: a fresh root's charge");
+    }
+    let used = || cell.account().used() - base;
+    let data = alloc::vec![7u8; 10 * PAGE];
+    if fs.write(f, 100, &data) != Ok(data.len()) || used() != 11 {
+        fail("root: ten pages across eleven were not charged as eleven");
+    }
+    if fs.write(f, 11 * PAGE as u64, &data) != Ok(5 * PAGE) || used() != 16 {
+        fail("root: a write past the limit was not short");
+    }
+    if fs.write(f, 16 * PAGE as u64, &data) != Err(crate::vfs::errno::ENOSPC) {
+        fail("root: a write in a full cell was not ENOSPC");
+    }
+    if fs.truncate(f, PAGE as u64) != Ok(()) || used() != 1 {
+        fail("root: truncating did not return the charge");
+    }
+    // Empty files are memory too.
+    let name = |i: usize| alloc::format!("f{i}");
+    let mut made = 0;
+    while fs.create(crate::vfs::ROOT, &name(made), 0o644).is_ok() {
+        made += 1;
+    }
+    if used() != 16 || !(100..200).contains(&made) {
+        fail("root: empty files were not charged");
+    }
+    for i in 0..made {
+        if fs.unlink(crate::vfs::ROOT, &name(i)).is_err() {
+            fail("root: unlink");
+        }
+    }
+    if used() != 1 {
+        fail("root: removed files are still charged");
+    }
+    drop(fs);
+    let (total, taken) = vfs.space();
+    if (total, taken) != ((base as usize + 16) * PAGE, (base as usize + 1) * PAGE) {
+        fail("root: statfs does not show the cell's account");
+    }
+    drop(vfs);
+    if cell.account().used() != 0 {
+        fail("root: file pages outlived their root");
+    }
+    println!("ichor: vfs: a root's files are charged to its cell, up to its limit");
 }
 
 /// A disk in memory, for the tampering checks.
@@ -306,7 +391,7 @@ fn tampering() {
     };
     let mut meta_bad = padded(good.to_vec());
     meta_bad[200] ^= 1;
-    if pagecache::mount_disk(MemDisk(meta_bad)).is_ok_and(|m| Image::mount(m.metadata).is_ok()) {
+    if pagecache::mount_disk(MemDisk(meta_bad)).is_ok() {
         fail("tampered metadata mounted");
     }
     let image = Image::mount(good).unwrap_or_else(|_| fail("root image"));
@@ -339,7 +424,7 @@ fn pattern_byte(i: usize) -> u8 {
 /// Checks every byte of `/usr/share/pattern`, which spans many chunks, so
 /// a misordered or short read shows up (and each chunk is hash-verified).
 fn check_pattern(name: &str, m: &Mounted) {
-    let img = Image::mount(m.metadata).unwrap_or_else(|_| fail("root disk is not an Ichor image"));
+    let img = m.image;
     let src: &dyn ChunkSource = m.disk;
     let node = img
         .lookup("/usr/share/pattern")

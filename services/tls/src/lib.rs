@@ -7,21 +7,26 @@
 //! and [`Client::read`] carry application data. Randomness and the time
 //! come from the caller, so a session is reproducible from its inputs.
 //!
-//! Offered: TLS_CHACHA20_POLY1305_SHA256 (1.3) and
-//! TLS_ECDHE_{ECDSA,RSA}_WITH_CHACHA20_POLY1305_SHA256 (1.2), X25519 only,
-//! ECDSA P-256/P-384, RSA-PSS and (1.2 only) RSA PKCS#1 v1.5 signatures.
+//! Offered: ChaCha20-Poly1305 and, for servers without it, AES-128-GCM,
+//! both with SHA-256, in 1.3 and (with ECDHE, by an ECDSA or RSA key) in
+//! 1.2; X25519 and P-256; ECDSA P-256/P-384, RSA-PSS and (1.2 only) RSA
+//! PKCS#1 v1.5 signatures. Both groups' shares go with the ClientHello, so
+//! a server has no reason for a HelloRetryRequest.
 //! The server's chain is verified to the caller's roots for the host name
 //! (`services/x509`). 1.2 uses the extended master secret when the server
 //! offers it and refuses a downgrade signalled by a 1.3-capable server.
 //!
 //! Not supported: session resumption and 0-RTT, HelloRetryRequest,
-//! renegotiation, client certificates, AES-GCM suites.
+//! renegotiation, client certificates, suites with SHA-384.
+//!
+//! [`server`] is the other end, for the control API.
 
 #![no_std]
 #![forbid(unsafe_code)]
 
 extern crate alloc;
 
+use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -29,9 +34,12 @@ use alloc::vec::Vec;
 use crypto::HashAlg;
 use crypto::aead::{ChaCha20Poly1305, TAG};
 use crypto::ecdsa::{self, Curve};
+use crypto::gcm::Aes128Gcm;
 use crypto::hmac::{Hmac, hkdf_expand, hkdf_extract, tls12_prf};
 use crypto::sha2::Sha256;
-use crypto::x25519;
+use crypto::{p256, x25519};
+
+pub mod server;
 
 /// Why a connection failed.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -70,9 +78,61 @@ const HS_FINISHED: u8 = 20;
 const HS_KEY_UPDATE: u8 = 24;
 
 const TLS13_CHACHA: u16 = 0x1303;
+const TLS13_AES128: u16 = 0x1301;
 const ECDHE_ECDSA_CHACHA: u16 = 0xcca9;
 const ECDHE_RSA_CHACHA: u16 = 0xcca8;
+const ECDHE_ECDSA_AES128: u16 = 0xc02b;
+const ECDHE_RSA_AES128: u16 = 0xc02f;
+
+/// The suites offered, the preferred first (ChaCha20 costs less in software
+/// than constant-time AES).
+const SUITES: [u16; 6] = [
+    TLS13_CHACHA,
+    TLS13_AES128,
+    ECDHE_ECDSA_CHACHA,
+    ECDHE_RSA_CHACHA,
+    ECDHE_ECDSA_AES128,
+    ECDHE_RSA_AES128,
+];
+
 const X25519: u16 = 0x001d;
+const SECP256R1: u16 = 0x0017;
+
+/// A suite's cipher.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Cipher {
+    ChaCha,
+    Aes128,
+}
+
+impl Cipher {
+    /// The cipher of a suite we offer, for TLS 1.3 or 1.2.
+    fn of(suite: u16, tls13: bool) -> Option<Cipher> {
+        match suite {
+            TLS13_CHACHA if tls13 => Some(Cipher::ChaCha),
+            TLS13_AES128 if tls13 => Some(Cipher::Aes128),
+            ECDHE_ECDSA_CHACHA | ECDHE_RSA_CHACHA if !tls13 => Some(Cipher::ChaCha),
+            ECDHE_ECDSA_AES128 | ECDHE_RSA_AES128 if !tls13 => Some(Cipher::Aes128),
+            _ => None,
+        }
+    }
+
+    fn key_len(self) -> usize {
+        match self {
+            Cipher::ChaCha => 32,
+            Cipher::Aes128 => 16,
+        }
+    }
+
+    /// How much of a nonce TLS 1.2 derives; the rest goes with the record
+    /// (RFC 5288, RFC 7905).
+    fn fixed_iv12(self) -> usize {
+        match self {
+            Cipher::ChaCha => 12,
+            Cipher::Aes128 => 4,
+        }
+    }
+}
 
 const SIG_SCHEMES: [u16; 8] = [
     0x0403, // ecdsa_secp256r1_sha256
@@ -84,6 +144,9 @@ const SIG_SCHEMES: [u16; 8] = [
     0x0501, // rsa_pkcs1_sha384
     0x0601, // rsa_pkcs1_sha512
 ];
+
+/// The ed25519 signature scheme.
+const ED25519: u16 = 0x0807;
 
 /// The ServerHello random of a HelloRetryRequest (RFC 8446 §4.1.3).
 const HRR_RANDOM: [u8; 32] = [
@@ -101,29 +164,69 @@ pub struct Config {
     pub roots: Arc<x509::RootStore>,
     /// Unix seconds, for certificate validity.
     pub now: u64,
-    /// 96 random bytes: the client random, the X25519 secret and the
-    /// legacy session id.
-    pub random: [u8; 96],
+    /// 128 random bytes: the client random, the X25519 secret, the legacy
+    /// session id and the P-256 secret.
+    pub random: [u8; 128],
+    /// Offer Ed25519 signatures too (the control API's server makes them;
+    /// public CAs do not issue such certificates).
+    pub ed25519: bool,
+    /// The application protocol to offer, if any.
+    pub alpn: Option<&'static [u8]>,
 }
+
+enum Aead {
+    ChaCha(ChaCha20Poly1305),
+    Aes128(Box<Aes128Gcm>),
+}
+
+impl Aead {
+    fn seal(&self, nonce: &[u8; 12], aad: &[u8], data: &mut Vec<u8>) {
+        match self {
+            Aead::ChaCha(a) => a.seal(nonce, aad, data),
+            Aead::Aes128(a) => a.seal(nonce, aad, data),
+        }
+    }
+
+    fn open(&self, nonce: &[u8; 12], aad: &[u8], data: &mut Vec<u8>) -> bool {
+        match self {
+            Aead::ChaCha(a) => a.open(nonce, aad, data),
+            Aead::Aes128(a) => a.open(nonce, aad, data),
+        }
+    }
+}
+
+/// Bytes of nonce a record carries where part of it does (TLS 1.2, GCM).
+const EXPLICIT: usize = 8;
 
 /// One direction's record protection.
 struct Protect {
-    aead: ChaCha20Poly1305,
+    aead: Aead,
     iv: [u8; 12],
     seq: u64,
     tls13: bool,
+    /// Records start with the last 8 bytes of their nonce.
+    explicit: bool,
 }
 
 impl Protect {
-    fn new(key: &[u8], iv: &[u8], tls13: bool) -> Option<Protect> {
+    /// `iv` is as long as the version and the cipher have it.
+    fn new(cipher: Cipher, key: &[u8], iv: &[u8], tls13: bool) -> Option<Protect> {
+        let mut whole = [0u8; 12];
+        whole.get_mut(..iv.len())?.copy_from_slice(iv);
         Some(Protect {
-            aead: ChaCha20Poly1305::new(key.try_into().ok()?),
-            iv: iv.try_into().ok()?,
+            aead: match cipher {
+                Cipher::ChaCha => Aead::ChaCha(ChaCha20Poly1305::new(key.try_into().ok()?)),
+                Cipher::Aes128 => Aead::Aes128(Box::new(Aes128Gcm::new(key.try_into().ok()?))),
+            },
+            iv: whole,
             seq: 0,
             tls13,
+            explicit: !tls13 && cipher == Cipher::Aes128,
         })
     }
 
+    /// The next record's nonce: the sequence number over the IV (which ends
+    /// in zeros where the nonce is explicit).
     fn nonce(&self) -> [u8; 12] {
         let mut n = self.iv;
         for (i, b) in self.seq.to_be_bytes().iter().enumerate() {
@@ -150,18 +253,32 @@ impl Protect {
             (ty, data.to_vec(), aad)
         };
         self.aead.seal(&nonce, &aad, &mut body);
+        let explicit = if self.explicit {
+            &nonce[12 - EXPLICIT..]
+        } else {
+            &[]
+        };
         let mut rec = alloc::vec![outer, 3, 3];
-        rec.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        rec.extend_from_slice(&((explicit.len() + body.len()) as u16).to_be_bytes());
+        rec.extend_from_slice(explicit);
         rec.extend_from_slice(&body);
         rec
     }
 
     /// Opens a record: its real content type and plaintext.
     fn open(&mut self, header: &[u8; 5], body: &[u8]) -> Result<(u8, Vec<u8>), Error> {
+        let mut nonce = self.nonce();
+        let mut body = body;
+        if self.explicit {
+            let (theirs, rest) = body
+                .split_first_chunk::<EXPLICIT>()
+                .ok_or(Error::BadRecordMac)?;
+            nonce[12 - EXPLICIT..].copy_from_slice(theirs);
+            body = rest;
+        }
         if body.len() < TAG {
             return Err(Error::BadRecordMac);
         }
-        let nonce = self.nonce();
         let mut data = body.to_vec();
         let ty = if self.tls13 {
             if !self.aead.open(&nonce, header, &mut data) {
@@ -224,8 +341,10 @@ pub struct Client {
     s_ap: Vec<u8>,
     // TLS 1.2.
     ems: bool,
-    server_key: [u8; 32],
+    server_group: u16,
+    server_key: Vec<u8>,
     master: Vec<u8>,
+    cipher: Cipher,
 }
 
 impl core::fmt::Debug for Client {
@@ -302,11 +421,13 @@ fn expand_label(secret: &[u8], label: &str, ctx: &[u8], len: usize) -> Vec<u8> {
     hkdf_expand::<Sha256>(secret, &info, len)
 }
 
-fn traffic(secret: &[u8], tls13: bool) -> Option<Protect> {
+/// TLS 1.3 record protection from a traffic secret.
+fn traffic(cipher: Cipher, secret: &[u8]) -> Option<Protect> {
     Protect::new(
-        &expand_label(secret, "key", &[], 32),
+        cipher,
+        &expand_label(secret, "key", &[], cipher.key_len()),
         &expand_label(secret, "iv", &[], 12),
-        tls13,
+        true,
     )
 }
 
@@ -315,6 +436,9 @@ fn verify_sig(leaf: &[u8], scheme: u16, msg: &[u8], sig: &[u8], tls13: bool) -> 
     let Ok(cert) = x509::parse(leaf) else {
         return false;
     };
+    if let (ED25519, x509::PublicKey::Ed25519(k)) = (scheme, cert.key) {
+        return crypto::ed25519::verify(k, msg, sig);
+    }
     let hash = match scheme {
         0x0403 | 0x0804 | 0x0401 => HashAlg::Sha256,
         0x0503 | 0x0805 | 0x0501 => HashAlg::Sha384,
@@ -364,8 +488,10 @@ impl Client {
             c_ap: Vec::new(),
             s_ap: Vec::new(),
             ems: false,
-            server_key: [0; 32],
+            server_group: X25519,
+            server_key: Vec::new(),
             master: Vec::new(),
+            cipher: Cipher::ChaCha,
         };
         let hello = handshake_msg(HS_CLIENT_HELLO, &c.client_hello());
         c.transcript.extend_from_slice(&hello);
@@ -378,10 +504,37 @@ impl Client {
         &self.cfg.random[..32]
     }
 
-    fn secret(&self) -> [u8; 32] {
+    /// Our secret in `group`.
+    fn secret(&self, group: u16) -> [u8; 32] {
+        let at = if group == X25519 { 32 } else { 96 };
         let mut s = [0u8; 32];
-        s.copy_from_slice(&self.cfg.random[32..64]);
+        s.copy_from_slice(&self.cfg.random[at..at + 32]);
         s
+    }
+
+    /// Our public key in `group`.
+    fn public(&self, group: u16) -> Vec<u8> {
+        let s = self.secret(group);
+        if group == X25519 {
+            x25519::public_key(&s).to_vec()
+        } else {
+            p256::public_key(&s).to_vec()
+        }
+    }
+
+    /// The secret shared with the server's key `theirs` in `group` (one of
+    /// ours).
+    fn agree(&self, group: u16, theirs: &[u8]) -> Result<[u8; 32], Error> {
+        let s = self.secret(group);
+        if group == X25519 {
+            let shared = x25519::x25519(&s, theirs.try_into().map_err(|_| Error::Decode)?);
+            if shared == [0; 32] {
+                return Err(Error::Decode);
+            }
+            Ok(shared)
+        } else {
+            p256::agree(&s, theirs).ok_or(Error::Decode)
+        }
     }
 
     fn client_hello(&self) -> Vec<u8> {
@@ -389,7 +542,7 @@ impl Client {
         b.extend_from_slice(self.client_random());
         put_vec(&mut b, 1, &self.cfg.random[64..96]);
         let mut suites = Vec::new();
-        for s in [TLS13_CHACHA, ECDHE_ECDSA_CHACHA, ECDHE_RSA_CHACHA] {
+        for s in SUITES {
             suites.extend_from_slice(&s.to_be_bytes());
         }
         put_vec(&mut b, 2, &suites);
@@ -401,22 +554,35 @@ impl Client {
         put_vec(&mut sni_list, 2, &sni);
         ext(&mut exts, 0, &sni_list);
         ext(&mut exts, 43, &[4, 3, 4, 3, 3]);
-        ext(&mut exts, 10, &[0, 2, 0, 0x1d]);
+        ext(&mut exts, 10, &[0, 4, 0, 0x1d, 0, 0x17]);
         let mut algs = Vec::new();
         for s in SIG_SCHEMES {
             algs.extend_from_slice(&s.to_be_bytes());
         }
+        if self.cfg.ed25519 {
+            algs.extend_from_slice(&ED25519.to_be_bytes());
+        }
         let mut sa = Vec::new();
         put_vec(&mut sa, 2, &algs);
         ext(&mut exts, 13, &sa);
-        let mut share = X25519.to_be_bytes().to_vec();
-        put_vec(&mut share, 2, &x25519::public_key(&self.secret()));
+        let mut shares = Vec::new();
+        for group in [X25519, SECP256R1] {
+            shares.extend_from_slice(&group.to_be_bytes());
+            put_vec(&mut shares, 2, &self.public(group));
+        }
         let mut ks = Vec::new();
-        put_vec(&mut ks, 2, &share);
+        put_vec(&mut ks, 2, &shares);
         ext(&mut exts, 51, &ks);
         ext(&mut exts, 11, &[1, 0]);
         ext(&mut exts, 23, &[]);
         ext(&mut exts, 0xff01, &[0]);
+        if let Some(p) = self.cfg.alpn {
+            let mut name = Vec::new();
+            put_vec(&mut name, 1, p);
+            let mut list = Vec::new();
+            put_vec(&mut list, 2, &name);
+            ext(&mut exts, 16, &list);
+        }
         put_vec(&mut b, 2, &exts);
         b
     }
@@ -601,7 +767,8 @@ impl Client {
                 Ok(())
             }
             (Stage::ServerKeyExchange, HS_SERVER_KEY_EXCHANGE) => {
-                if body.first() != Some(&3) || u16_at(body, 1)? != X25519 {
+                let group = u16_at(body, 1)?;
+                if body.first() != Some(&3) || ![X25519, SECP256R1].contains(&group) {
                     return Err(Error::Unsupported("key exchange group"));
                 }
                 let mut at = 3;
@@ -616,7 +783,8 @@ impl Client {
                 if !verify_sig(&self.chain[0], scheme, &signed, sig, false) {
                     return Err(Error::BadSignature);
                 }
-                self.server_key = key.try_into().map_err(|_| Error::Decode)?;
+                self.server_group = group;
+                self.server_key = key.to_vec();
                 self.transcript.extend_from_slice(msg);
                 self.stage = Stage::ServerHelloDone;
                 Ok(())
@@ -642,7 +810,7 @@ impl Client {
             (Stage::Connected, HS_NEW_SESSION_TICKET) if self.tls13 => Ok(()),
             (Stage::Connected, HS_KEY_UPDATE) if self.tls13 => {
                 self.s_ap = expand_label(&self.s_ap, "traffic upd", &[], 32);
-                self.read = traffic(&self.s_ap, true);
+                self.read = traffic(self.cipher, &self.s_ap);
                 if body.first() == Some(&1) {
                     // update_requested: answer, then move our own keys on.
                     if let Some(w) = self.write.as_mut() {
@@ -650,7 +818,7 @@ impl Client {
                         self.out.extend_from_slice(&rec);
                     }
                     self.c_ap = expand_label(&self.c_ap, "traffic upd", &[], 32);
-                    self.write = traffic(&self.c_ap, true);
+                    self.write = traffic(self.cipher, &self.c_ap);
                 }
                 Ok(())
             }
@@ -697,11 +865,12 @@ impl Client {
                 match ty {
                     43 => selected = Some(u16_at(data, 0)?),
                     51 => {
-                        if u16_at(data, 0)? != X25519 {
+                        let group = u16_at(data, 0)?;
+                        if ![X25519, SECP256R1].contains(&group) {
                             return Err(Error::Unsupported("key share group"));
                         }
                         let mut j = 2;
-                        share = Some(vec_at(data, &mut j, 2)?.to_vec());
+                        share = Some((group, vec_at(data, &mut j, 2)?));
                     }
                     23 => ems = true,
                     _ => {}
@@ -710,18 +879,13 @@ impl Client {
         }
         self.server_random = random;
         self.transcript.extend_from_slice(msg);
-        if selected == Some(0x0304) {
-            if suite != TLS13_CHACHA {
-                return Err(Error::Unsupported("cipher suite"));
-            }
-            let theirs: [u8; 32] = share
-                .ok_or(Error::Decode)?
-                .try_into()
-                .map_err(|_| Error::Decode)?;
-            let shared = x25519::x25519(&self.secret(), &theirs);
-            if shared == [0; 32] {
-                return Err(Error::Decode);
-            }
+        let tls13 = selected == Some(0x0304);
+        let cipher = Cipher::of(suite, tls13).ok_or(Error::Unsupported("cipher suite"));
+        if tls13 {
+            self.cipher = cipher?;
+            let (group, theirs) = share.ok_or(Error::Decode)?;
+            let shared = self.agree(group, theirs)?;
+            self.server_group = group;
             self.tls13 = true;
             let early = hkdf_extract::<Sha256>(&[], &[0u8; 32]);
             let empty = Sha256::hash(&[]);
@@ -730,8 +894,8 @@ impl Client {
             let th = Sha256::hash(&self.transcript);
             self.c_hs = expand_label(&self.hs_secret, "c hs traffic", &th, 32);
             self.s_hs = expand_label(&self.hs_secret, "s hs traffic", &th, 32);
-            self.read = traffic(&self.s_hs, true);
-            self.write = traffic(&self.c_hs, true);
+            self.read = traffic(self.cipher, &self.s_hs);
+            self.write = traffic(self.cipher, &self.c_hs);
             self.stage = Stage::EncryptedExtensions;
             return Ok(());
         }
@@ -743,9 +907,7 @@ impl Client {
         if random[24..] == *b"DOWNGRD\x01" {
             return Err(Error::Unsupported("downgrade"));
         }
-        if suite != ECDHE_ECDSA_CHACHA && suite != ECDHE_RSA_CHACHA {
-            return Err(Error::Unsupported("cipher suite"));
-        }
+        self.cipher = cipher?;
         self.ems = ems;
         self.stage = Stage::Certificate12;
         Ok(())
@@ -775,21 +937,18 @@ impl Client {
             self.out.extend_from_slice(&rec);
         }
         self.transcript.extend_from_slice(&fin);
-        self.read = traffic(&self.s_ap, true);
-        self.write = traffic(&self.c_ap, true);
+        self.read = traffic(self.cipher, &self.s_ap);
+        self.write = traffic(self.cipher, &self.c_ap);
         self.connected();
         Ok(())
     }
 
     fn client_flight12(&mut self) -> Result<(), Error> {
         let mut cke = Vec::new();
-        put_vec(&mut cke, 1, &x25519::public_key(&self.secret()));
+        put_vec(&mut cke, 1, &self.public(self.server_group));
         let cke = handshake_msg(HS_CLIENT_KEY_EXCHANGE, &cke);
         self.transcript.extend_from_slice(&cke);
-        let pms = x25519::x25519(&self.secret(), &self.server_key);
-        if pms == [0; 32] {
-            return Err(Error::Decode);
-        }
+        let pms = self.agree(self.server_group, &self.server_key)?;
         let mut randoms = self.client_random().to_vec();
         randoms.extend_from_slice(&self.server_random);
         self.master = if self.ems {
@@ -802,10 +961,7 @@ impl Client {
         } else {
             tls12_prf::<Sha256>(&pms, b"master secret", &randoms, 48)
         };
-        let mut sr_cr = self.server_random.to_vec();
-        sr_cr.extend_from_slice(self.client_random());
-        let kb = tls12_prf::<Sha256>(&self.master, b"key expansion", &sr_cr, 88);
-        self.write = Protect::new(&kb[..32], &kb[64..76], false);
+        self.write = self.protect12(false);
         self.out
             .extend_from_slice(&plain_record(CT_HANDSHAKE, 0x0303, &cke));
         self.out
@@ -827,11 +983,24 @@ impl Client {
     }
 
     fn install_tls12_read(&mut self) -> Result<(), Error> {
+        self.read = Some(self.protect12(true).ok_or(Error::Decode)?);
+        Ok(())
+    }
+
+    /// TLS 1.2 record protection by the key block: the server's direction,
+    /// or ours.
+    fn protect12(&self, server: bool) -> Option<Protect> {
         let mut sr_cr = self.server_random.to_vec();
         sr_cr.extend_from_slice(self.client_random());
-        let kb = tls12_prf::<Sha256>(&self.master, b"key expansion", &sr_cr, 88);
-        self.read = Some(Protect::new(&kb[32..64], &kb[76..88], false).ok_or(Error::Decode)?);
-        Ok(())
+        let (key, iv) = (self.cipher.key_len(), self.cipher.fixed_iv12());
+        let side = usize::from(server);
+        let kb = tls12_prf::<Sha256>(&self.master, b"key expansion", &sr_cr, 2 * (key + iv));
+        Protect::new(
+            self.cipher,
+            kb.get(side * key..)?.get(..key)?,
+            kb.get(2 * key + side * iv..)?.get(..iv)?,
+            false,
+        )
     }
 
     fn connected(&mut self) {
@@ -843,5 +1012,7 @@ impl Client {
     }
 }
 
+#[cfg(test)]
+mod server_tests;
 #[cfg(test)]
 mod tests;

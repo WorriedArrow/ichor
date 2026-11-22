@@ -86,10 +86,13 @@ Status: [ ] to do, [x] done and committed.
 - [x] **7. uid_0_in_a_cell_has_no_authority_outside_it** (45 checks): mount/umount2
   EPERM, mknod/reboot/clock_settime/settimeofday/adjtimex (ENOSYS today),
   chown/chmod of B's paths ENOENT, signals ESRCH.
-- [ ] **8. resource_limits_are_per_cell**: A at its memory limit and
-  unable to fork; B allocates and forks.
-- [ ] **9. cells_clean_up_after_themselves**: B alive and correct after
-  each section; memory returned for every run.
+- [x] **8. resource_limits_are_per_cell**: A at its memory limit and
+  unable to fork; B allocates and forks. (`testprog` programs, ended by a
+  signal: at a full account perl cannot run and no file can be made.)
+- [x] **9. cells_clean_up_after_themselves**: B alive and correct after
+  each section; memory returned for every run. Plus
+  `a_destroyed_cell_leaves_no_shared_memory`, which **fails**: a
+  documented bug (see notes).
 - [ ] **Scoping removal** (sections 1, 2, 3, futex in 4): each edit, the
   failure seen, the restore checked with `git diff` (never committed).
 - [ ] **Review, report, AGENTS.md, push.**
@@ -112,6 +115,30 @@ Status: [ ] to do, [x] done and committed.
   meminfo shows A's account (65536 kB = its 16384 pages). cpuinfo,
   `/sys` cpu lists, uptime and version are host-wide, the same for every
   cell. mounts and hostname are fixed strings.
+- 2026-11-22: main merged (52 commits). Counts and errnos above are from
+  before it. What changed: rt_sigqueueinfo, rt_tgsigqueueinfo,
+  pidfd_open/send_signal, waitid, sched_setaffinity, get/setpriority,
+  shmget/shmat/shmctl, mknod, clock_settime, settimeofday, unshare, setns
+  and sethostname exist, and have real checks (146, 115, 51 checks in
+  sections 1, 2, 7); SOCK_RAW is EPERM; /proc shows all the cell's
+  processes; roots are charged to their cell (`Vfs::mount_disk_for`,
+  which A and B now use); a MAP_SHARED file mapping maps the cache page,
+  so B has a shared futex waiter, kept by (cell, physical page), besides
+  the private one. Still ENOSYS: ptrace, process_vm_readv/writev, kcmp,
+  pidfd_getfd, semget, msgget, mq_open, reboot, adjtimex, clock_adjtime,
+  chroot, init_module, iopl, ioperm, kexec_load, swapon.
+- **Bug**: System V segments (`linuxabi/shm.rs`, `SEGMENTS`, keyed by cell
+  id) are freed only by IPC_RMID; a destroyed cell's stay, with their
+  charge on every ancestor account, against ADR-0002 §7.
+- Correction: section 7's commit message says ADR-0009 expects EPERM where
+  calls are ENOSYS. ADR-0009 §3 says "already EPERM or absent", so ENOSYS
+  agrees with it. The real conflict is MKNOD and SYS_CHROOT, which its
+  bounding set holds and the kernel refuses (device nodes EPERM, chroot
+  ENOSYS).
+- `cargo xtask test` builds the kernel after the host unit tests, so do
+  not edit sources until its QEMU tests start. It starts every boot at
+  once; with other VMs on the host QEMU may fail to allocate ("paging
+  file too small"): run the boot file with `--test-threads=2`.
 - Section 4 copies up `/usr/bin/dash` in A's root, so later A scripts
   must not run `/bin/sh` (perl's `system`).
 - Section 5: ADR-0010 has no cell-to-cell deny policy, so the denied case

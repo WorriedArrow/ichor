@@ -3,8 +3,10 @@
 //! A [`VmSpace`] owns the lower (user) half of a page table. Its upper half
 //! shares the kernel's pre-allocated PML4 entries (ADR-0001 §4.3), so the
 //! kernel stays mapped in every address space and a switch is just a CR3
-//! load. Mappings take [`UFrame`]s only, so a typed (kernel-owned) page can
-//! never reach user space by construction.
+//! load. Under page-table isolation (ADR-0004 §2) ring 3 runs on a shadow
+//! root next to it that maps only the entry area of the kernel half and
+//! shares the user tables. Mappings take [`UFrame`]s only, so a typed
+//! (kernel-owned) page can never reach user space by construction.
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
@@ -23,6 +25,8 @@ use crate::sync::SpinLock;
 pub struct VmSpace {
     inner: SpinLock<Inner>,
     root: PhysAddr,
+    /// 1 if `root` has a shadow root above it (page-table isolation).
+    order: u8,
 }
 
 #[derive(Debug)]
@@ -41,18 +45,39 @@ fn alloc_table_page() -> Option<PhysAddr> {
 }
 
 impl VmSpace {
-    /// Creates an empty user address space sharing the kernel half.
+    /// Creates an empty user address space sharing the kernel half. Under
+    /// page-table isolation (ADR-0004 §2) its root is the first page of an
+    /// 8 KiB block whose second page is the shadow root ring 3 runs on:
+    /// the entry area for a kernel half, and the same user tables.
     pub fn new() -> Option<VmSpace> {
-        let root = alloc_table_page()?;
+        let order = u8::from(arch::entry::isolating());
+        let root = page_alloc::alloc(order, kind::PAGE_TABLE)?;
+        let kernel = PhysAddr::new(crate::mm::kspace::kernel_root());
+        for i in 0..1u64 << order {
+            // SAFETY: fresh pages from the allocator, reachable via the
+            // linear map, becoming this space's root(s).
+            unsafe { paging::zero_page(PhysAddr::new(root.as_u64() + i * super::PAGE_SIZE)) };
+        }
         // SAFETY: both are page-table pages reachable via the linear map;
         // `root` is fresh, the kernel root is live and only read.
-        unsafe { paging::copy_upper_half(PhysAddr::new(crate::mm::kspace::kernel_root()), root) };
+        unsafe { paging::copy_upper_half(kernel, root) };
+        if order == 1 {
+            let slot = paging::slot_of(super::ENTRY_BASE);
+            // SAFETY: as above, for the shadow root.
+            unsafe { paging::copy_entry(kernel, arch::entry::shadow_of(root), slot) };
+        }
         Some(VmSpace {
             inner: SpinLock::new(Inner {
                 frames: BTreeMap::new(),
             }),
             root,
+            order,
         })
+    }
+
+    /// The (full) root.
+    pub(crate) fn root(&self) -> PhysAddr {
+        self.root
     }
 
     /// Maps `frame` at user address `va` with `prot`. Replacing an existing
@@ -68,6 +93,14 @@ impl VmSpace {
         let r = unsafe { paging::user_map(self.root, va, pa, prot, &mut alloc) };
         match r {
             Ok(()) => {
+                if self.order == 1 {
+                    // The shadow root shares this slot's tables (a no-op
+                    // unless `user_map` just created them).
+                    let shadow = arch::entry::shadow_of(self.root);
+                    // SAFETY: both roots are this space's own, reachable via
+                    // the linear map; the entry is a user slot's.
+                    unsafe { paging::copy_entry(self.root, shadow, paging::slot_of(va)) };
+                }
                 inner.frames.insert(va, frame.clone());
                 Ok(())
             }
@@ -86,14 +119,29 @@ impl VmSpace {
         self.unmap_range(va, va.saturating_add(super::PAGE_SIZE));
     }
 
-    /// Removes every mapping in `[start, end)` with one TLB shootdown (of
-    /// that page, or of the whole space for more than one). The pages are
-    /// released only after every CPU running this space has forgotten
-    /// them. Must not be called in atomic mode.
+    /// Removes every mapping in `[start, end)`, in batches of at most
+    /// `UNMAP_BATCH` pages with one TLB shootdown each (of that page, or of
+    /// the whole space for more than one), so the bookkeeping never needs
+    /// a large contiguous allocation (a 2 GiB process would need 8 MiB at
+    /// once). Each batch's pages are released only after every CPU running
+    /// this space has forgotten them. Must not be called in atomic mode.
     pub fn unmap_range(&self, start: u64, end: u64) {
-        let (unmapped, frames) = {
+        const UNMAP_BATCH: usize = 4096;
+        let mut from = start;
+        while from < end {
+            let next = self.unmap_batch(from, end, UNMAP_BATCH);
+            from = next.unwrap_or(end);
+        }
+    }
+
+    /// One batch of `unmap_range` from `start`: where the next one starts,
+    /// or `None` once the range is clear.
+    fn unmap_batch(&self, start: u64, end: u64, max: usize) -> Option<u64> {
+        let (unmapped, frames, next) = {
             let mut inner = self.inner.lock();
-            let vas: Vec<u64> = inner.frames.range(start..end).map(|(&v, _)| v).collect();
+            let mut it = inner.frames.range(start..end).map(|(&v, _)| v);
+            let vas: Vec<u64> = it.by_ref().take(max).collect();
+            let next = it.next();
             let mut unmapped = Vec::with_capacity(vas.len());
             // Keep the `UFrame`s alive until the shootdown is done.
             let mut kept = Vec::with_capacity(vas.len());
@@ -105,7 +153,7 @@ impl VmSpace {
                 }
                 kept.extend(inner.frames.remove(&va));
             }
-            (unmapped, kept)
+            (unmapped, kept, next)
         };
         match unmapped.as_slice() {
             [] => {}
@@ -116,6 +164,7 @@ impl VmSpace {
             frame::drop_untyped(pa);
         }
         drop(frames);
+        next
     }
 
     /// How many pages are mapped.
@@ -289,6 +338,8 @@ impl Drop for VmSpace {
         // own pages.
         unsafe { paging::user_teardown(self.root, &mut leaf, &mut table_page) };
         frames.clear();
-        page_alloc::free(self.root, 0, kind::PAGE_TABLE);
+        // The shadow root (if any) goes with it: it is active nowhere
+        // either, and its user entries named the tables freed above.
+        page_alloc::free(self.root, self.order, kind::PAGE_TABLE);
     }
 }

@@ -36,6 +36,10 @@ pub(crate) const MAX_REGIONS: usize = 1638;
 pub(crate) const CMDLINE_MAX: usize = 4096;
 /// Room for `\ichor\roots.pem` (Mozilla's bundle is about 200 KiB).
 pub(crate) const ROOTS_MAX: usize = 512 * 1024;
+/// Room for `\ichor\apitoken` (the control plane's API credential).
+pub(crate) const TOKEN_MAX: usize = 256;
+/// Room for `\ichor\apitls.pem` (the API's TLS certificates and key).
+pub(crate) const TLS_MAX: usize = 16 * 1024;
 pub(crate) const VENDOR_MAX: usize = 64;
 
 /// What boot learns from firmware, kept in `.bss` and handed from the
@@ -49,6 +53,12 @@ pub(crate) struct BootState {
     /// `\ichor\roots.pem`, the control plane's CA bundle (ADR-0012 §4).
     pub(crate) roots: [u8; ROOTS_MAX],
     pub(crate) roots_len: usize,
+    /// `\ichor\apitoken`, the control plane's API credential.
+    pub(crate) token: [u8; TOKEN_MAX],
+    pub(crate) token_len: usize,
+    /// `\ichor\apitls.pem`, the API's TLS certificates and key.
+    pub(crate) tls: [u8; TLS_MAX],
+    pub(crate) tls_len: usize,
     pub(crate) vendor: [u8; VENDOR_MAX],
     pub(crate) vendor_len: usize,
     pub(crate) acpi_rsdp: Option<PhysAddr>,
@@ -87,6 +97,10 @@ static BOOT_STATE: BootStateCell = BootStateCell(UnsafeCell::new(BootState {
     cmdline_len: 0,
     roots: [0; ROOTS_MAX],
     roots_len: 0,
+    token: [0; TOKEN_MAX],
+    token_len: 0,
+    tls: [0; TLS_MAX],
+    tls_len: 0,
     vendor: [0; VENDOR_MAX],
     vendor_len: 0,
     acpi_rsdp: None,
@@ -149,10 +163,10 @@ pub(crate) fn init_cpu(id: CpuId) {
         fatal(e);
     }
     arch::apic::init_timer();
-    // Syscall entry and a fallback ring-3 fault stack for this CPU. Per-task
-    // RSP0 is set on each `UserMode::execute`; this is only a safety net.
-    let fault_stack = crate::mm::kspace::alloc_stack().unwrap_or(0);
-    arch::usermode::init_cpu(fault_stack);
+    // Syscall entry, and the mitigations the boot CPU chose (none yet when
+    // this is the boot CPU: `kernel_space_entry` turns them on after).
+    arch::usermode::init_cpu();
+    arch::usermode::enable_cpu_mitigations();
     crate::task::register_cpu();
     let _ = id;
     crate::cpu::mark_online();
@@ -198,7 +212,9 @@ pub(crate) extern "sysv64" fn kernel_space_entry() -> ! {
     *ACPI_RSDP.lock() = state.acpi_rsdp;
     println!("ichor: frame: running in the higher half");
 
-    arch::trap::init_idt();
+    if arch::trap::init_idt().is_none() {
+        fatal("cannot map the entry area");
+    }
     arch::apic::mask_legacy_pic();
     let Some((hz, source)) = arch::apic::init_tsc() else {
         fatal("cannot determine the TSC frequency (no CPUID leaf, PM timer or PIT)");
@@ -218,7 +234,7 @@ pub(crate) extern "sysv64" fn kernel_space_entry() -> ! {
     let v = arch::cpu::vulnerabilities();
     let yn = |b: bool| if b { "affected" } else { "no" };
     println!(
-        "ichor: frame: cpu0 speculation (ADR-0004): meltdown {}, mds {}, taa {}, bhi {}, gds {}; eibrs {}, ibpb {}, md_clear {}{}",
+        "ichor: frame: cpu0 speculation (ADR-0004): meltdown {}, mds {}, taa {}, bhi {}, gds {}; eibrs {}, ibpb {}, md_clear {}",
         yn(v.meltdown),
         yn(v.mds),
         yn(v.taa),
@@ -227,38 +243,49 @@ pub(crate) extern "sysv64" fn kernel_space_entry() -> ! {
         v.eibrs,
         v.ibpb,
         v.md_clear,
-        if v.meltdown {
-            " -- not safe for untrusted cells until page-table isolation lands"
-        } else {
-            ""
-        },
     );
-    let force_verw = cmdline::Cmdline::new(state.cmdline()).flag("force_verw");
-    let m = arch::usermode::enable_mitigations(&v, force_verw);
+    let cmdline = cmdline::Cmdline::new(state.cmdline());
+    let (force_verw, force_pti) = (cmdline.flag("force_verw"), cmdline.flag("force_pti"));
+    let m = match arch::usermode::enable_mitigations(&v, force_verw, force_pti) {
+        Ok(m) => m,
+        Err(e) => fatal(e),
+    };
     let on = |b: bool| if b { "on" } else { "off (not needed)" };
+    let pcid = if m.pcid { "PCID" } else { "no PCID" };
     println!(
-        "ichor: frame: mitigations (ADR-0004): VERW on return to ring 3 {}, IBPB between cells {}, page-table isolation {}",
-        if m.verw_missing {
-            "MISSING (no MD_CLEAR microcode)"
-        } else if force_verw && !(v.mds || v.taa) {
-            "on (forced)"
-        } else {
-            on(m.verw)
+        "ichor: frame: mitigations (ADR-0004): VERW on return to ring 3 {}, IBPB between cells {}, page-table isolation {}, Spectre v2 in the kernel {}",
+        // Forced, VERW runs whatever the CPU; it clears the buffers only
+        // with MD_CLEAR microcode.
+        match (m.verw, m.verw_missing, force_verw) {
+            (true, true, _) => "on (forced; clears nothing without MD_CLEAR microcode)",
+            (false, true, _) => "MISSING (no MD_CLEAR microcode)",
+            (true, false, true) if !(v.mds || v.taa) => "on (forced)",
+            (verw, _, _) => on(verw),
         },
         if m.ibpb {
             "on"
         } else {
             "off (IBPB not enumerated)"
         },
-        if v.meltdown {
-            "MISSING (Meltdown-affected CPU)"
+        if !m.pti {
+            "off (not needed)".into()
+        } else if v.meltdown {
+            alloc::format!("on ({pcid})")
         } else {
-            "off (not needed)"
+            alloc::format!("on (forced, {pcid})")
+        },
+        match (m.eibrs, m.bhi_dis_s) {
+            (true, true) => "eIBRS + BHI_DIS_S",
+            (true, false) if v.bhi => "eIBRS (BHI NOT MITIGATED: no BHI_DIS_S)",
+            (true, false) => "eIBRS",
+            (false, _) => "NOT MITIGATED (no enhanced IBRS)",
         },
     );
     enter_kernel(BootInfo {
         cmdline: state.cmdline(),
         roots: &state.roots[..state.roots_len],
+        api_token: Secret(&state.token[..state.token_len]),
+        api_tls: Secret(&state.tls[..state.tls_len]),
         memory_map: state.regions(),
         acpi_rsdp: state.acpi_rsdp,
         firmware_vendor: core::str::from_utf8(&state.vendor[..state.vendor_len]).unwrap_or(""),
@@ -316,6 +343,8 @@ fn enter_kernel(info: BootInfo) -> ! {
 pub struct BootInfo {
     cmdline: &'static str,
     roots: &'static [u8],
+    api_token: Secret,
+    api_tls: Secret,
     memory_map: &'static [MemoryRegion],
     acpi_rsdp: Option<PhysAddr>,
     firmware_vendor: &'static str,
@@ -336,6 +365,29 @@ impl BootInfo {
         self.roots
     }
 
+    /// The contents of `\ichor\apitoken` on the boot volume (empty if
+    /// there is none): the control plane's API credential.
+    pub fn api_token(&self) -> &'static [u8] {
+        self.api_token.0
+    }
+
+    /// The contents of `\ichor\apitls.pem` on the boot volume (empty if
+    /// there is none): the control plane's TLS certificates and key.
+    pub fn api_tls(&self) -> &'static [u8] {
+        self.api_tls.0
+    }
+}
+
+/// Bytes that `Debug` does not print.
+struct Secret(&'static [u8]);
+
+impl fmt::Debug for Secret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "<{} bytes, redacted>", self.0.len())
+    }
+}
+
+impl BootInfo {
     /// The firmware memory map, captured at the moment boot services exited.
     pub fn memory_map(&self) -> &'static [MemoryRegion] {
         self.memory_map

@@ -8,6 +8,7 @@
 //! | `0x0000_0000_0000_0000..0x0000_8000_0000_0000` | user (empty until milestone 2) |
 //! | `0xffff_8000_0000_0000..+64 TiB` | linear map of all RAM, RW, NX |
 //! | `0xffff_e000_0000_0000..` | kernel stacks, each below an unmapped guard page |
+//! | `0xffff_f000_0000_0000..` | the entry area: aliases of entry code, IDT, per-CPU entry state |
 //! | `0xffff_ffff_8000_0000..` | the kernel image, per-section permissions |
 //!
 //! All 256 upper-half PML4 slots get their PDPT at boot, so every future
@@ -52,6 +53,10 @@ pub(crate) const LINEAR_BASE: u64 = 0xffff_8000_0000_0000;
 pub(crate) const LINEAR_LIMIT: u64 = 1 << 46;
 /// Base of the kernel stack region.
 pub(crate) const STACKS_BASE: u64 = 0xffff_e000_0000_0000;
+/// The entry area (ADR-0004 §2): aliases of the entry code, the IDT and
+/// each CPU's entry state, the only kernel slot user roots map under
+/// page-table isolation.
+pub(crate) const ENTRY_BASE: u64 = 0xffff_f000_0000_0000;
 /// Where the kernel image is mapped.
 pub(crate) const KERNEL_BASE: u64 = 0xffff_ffff_8000_0000;
 

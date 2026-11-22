@@ -1,16 +1,22 @@
-//! The Linux x86-64 syscall personality (ADR-0002 §5), milestone 3 slice:
-//! console I/O, the root file system (an image with a copy-on-write upper
-//! layer; file calls live in [`fs`]), memory (`mmap`, `brk`, demand paging),
-//! TLS, process identity, and exit. Signals are accepted but never delivered
-//! yet. The number is in `rax`, arguments in `rdi, rsi, rdx, r10, r8, r9`,
-//! and the result in `rax`; on error `rax` is `-errno`.
+//! The Linux x86-64 syscall personality (ADR-0002 §5): dispatch, and the
+//! calls that have no module of their own (the root's files are in [`fs`],
+//! sockets in [`socket`] and [`unix`], signals in [`crate::signal`], ...).
+//! The number is in `rax`, arguments in `rdi, rsi, rdx, r10, r8, r9`, and
+//! the result in `rax`; on error `rax` is `-errno`.
 //!
 //! User memory is only ever copied (`VmSpace::copy_{from,to}_user`), never
 //! borrowed. Coverage is tracked in `docs/linux-abi.md`.
 
 pub(crate) mod exec;
 mod fs;
+pub(crate) mod inotify;
+mod misc;
+pub(crate) mod netlink;
+pub(crate) mod pidfd;
+pub(crate) mod shm;
 pub(crate) mod socket;
+mod splice;
+pub(crate) mod timerfd;
 pub(crate) mod unix;
 pub(crate) mod uring;
 
@@ -37,7 +43,7 @@ mod nr {
     pub(super) const LSTAT: u64 = 6;
     pub(super) const POLL: u64 = 7;
     pub(super) const LSEEK: u64 = 8;
-    pub(super) const MMAP: u64 = 9; // partial: shared file mappings are read-only and see a page as of its first touch
+    pub(super) const MMAP: u64 = 9; // partial: a shared file mapping does not see later writes to an image page it has touched, or to a page truncated away; touching past the end of the file is SIGSEGV, not SIGBUS
     pub(super) const MPROTECT: u64 = 10;
     pub(super) const MUNMAP: u64 = 11;
     pub(super) const BRK: u64 = 12;
@@ -54,30 +60,31 @@ mod nr {
     pub(super) const SELECT: u64 = 23;
     pub(super) const SCHED_YIELD: u64 = 24;
     pub(super) const MREMAP: u64 = 25; // partial: no MREMAP_DONTUNMAP; old_len 0 is EINVAL
+    pub(super) const MSYNC: u64 = 26;
     pub(super) const MADVISE: u64 = 28; // partial: DONTNEED on the loaded image's own segments zero-fills
     pub(super) const PAUSE: u64 = 34;
     pub(super) const NANOSLEEP: u64 = 35;
-    pub(super) const GETITIMER: u64 = 36; // partial: ITIMER_REAL only
+    pub(super) const GETITIMER: u64 = 36; // partial: ITIMER_PROF counts user time only
     pub(super) const ALARM: u64 = 37;
-    pub(super) const SETITIMER: u64 = 38; // partial: ITIMER_REAL only
+    pub(super) const SETITIMER: u64 = 38; // partial: ITIMER_PROF counts user time only
     pub(super) const DUP: u64 = 32;
     pub(super) const DUP2: u64 = 33;
     pub(super) const GETPID: u64 = 39;
     pub(super) const SENDFILE: u64 = 40;
-    pub(super) const SOCKET: u64 = 41; // partial: AF_INET (TCP, UDP) and AF_UNIX (stream, dgram, seqpacket); no AF_INET6 or AF_NETLINK
+    pub(super) const SOCKET: u64 = 41; // partial: AF_INET (TCP, UDP) and AF_UNIX (stream, dgram, seqpacket); AF_NETLINK (NETLINK_ROUTE reads); no AF_INET6
     pub(super) const CONNECT: u64 = 42; // partial: no ICMP errors, so a connected UDP socket never sees ECONNREFUSED
     pub(super) const ACCEPT: u64 = 43;
     pub(super) const SENDTO: u64 = 44; // partial: no out-of-band data
-    pub(super) const RECVFROM: u64 = 45; // partial: no MSG_PEEK, no out-of-band data
+    pub(super) const RECVFROM: u64 = 45; // partial: no out-of-band data
     pub(super) const SENDMSG: u64 = 46; // partial: control messages (SCM_RIGHTS, SCM_CREDENTIALS) on AF_UNIX only
-    pub(super) const RECVMSG: u64 = 47; // partial: no MSG_PEEK; control messages on AF_UNIX only
+    pub(super) const RECVMSG: u64 = 47; // partial: control messages on AF_UNIX only; MSG_WAITALL on TCP only
     pub(super) const SHUTDOWN: u64 = 48;
     pub(super) const BIND: u64 = 49; // partial: the cell's own IPv4 addresses (loopback, its switch address, INADDR_ANY)
     pub(super) const LISTEN: u64 = 50;
     pub(super) const GETSOCKNAME: u64 = 51;
     pub(super) const GETPEERNAME: u64 = 52;
     pub(super) const SOCKETPAIR: u64 = 53;
-    pub(super) const SETSOCKOPT: u64 = 54; // partial: SO_REUSEADDR and SO_PASSCRED act; other known options are recorded only
+    pub(super) const SETSOCKOPT: u64 = 54; // partial: SO_REUSEADDR, SO_REUSEPORT, SO_PASSCRED, SO_RCVTIMEO, SO_SNDTIMEO and SO_LINGER with no time act; other known options are recorded only
     pub(super) const GETSOCKOPT: u64 = 55; // partial: SO_ERROR, SO_TYPE, SO_ACCEPTCONN, SO_REUSEADDR, SO_PEERCRED, SO_PASSCRED; others echo what was set
     pub(super) const CLONE: u64 = 56; // partial: fork, vfork-style and thread clones
     pub(super) const FORK: u64 = 57;
@@ -110,9 +117,9 @@ mod nr {
     pub(super) const FCHOWN: u64 = 93;
     pub(super) const LCHOWN: u64 = 94;
     pub(super) const UMASK: u64 = 95;
-    pub(super) const GETRUSAGE: u64 = 98; // partial: no CPU-time accounting (times are zero; maxrss is the current rss)
+    pub(super) const GETRUSAGE: u64 = 98; // partial: user CPU time only (system time and children are zero); maxrss is the current rss
     pub(super) const SYSINFO: u64 = 99; // partial: the cell's memory; no load averages or swap
-    pub(super) const TIMES: u64 = 100; // partial: no CPU-time accounting (zeros; returns ticks since boot)
+    pub(super) const TIMES: u64 = 100; // partial: user CPU time only (system and children's times are zero)
     pub(super) const GETTIMEOFDAY: u64 = 96; // firmware clock at boot plus monotonic time (no NTP)
     pub(super) const GETRLIMIT: u64 = 97;
     pub(super) const SETRLIMIT: u64 = 160; // partial: NOFILE and STACK enforced, others stored
@@ -149,20 +156,37 @@ mod nr {
     pub(super) const GETTID: u64 = 186;
     pub(super) const TIME: u64 = 201; // firmware clock at boot plus monotonic time (no NTP)
     pub(super) const TKILL: u64 = 200;
-    pub(super) const SCHED_GETAFFINITY: u64 = 204;
+    pub(super) const SCHED_GETAFFINITY: u64 = 204; // partial: the mask sched_setaffinity recorded
+    pub(super) const SCHED_SETAFFINITY: u64 = 203; // partial: the caller's process only; recorded, not applied by the scheduler
+    pub(super) const SCHED_GET_PRIORITY_MAX: u64 = 146;
+    pub(super) const SCHED_GET_PRIORITY_MIN: u64 = 147;
+    pub(super) const SCHED_RR_GET_INTERVAL: u64 = 148; // partial: always Linux's 100 ms slice
+    pub(super) const RT_SIGPENDING: u64 = 127;
+    pub(super) const EXECVEAT: u64 = 322; // partial: an fd's file is found again by name (ENOENT once unlinked); AT_SYMLINK_NOFOLLOW not applied
+    pub(super) const WAITID: u64 = 247; // partial: rusage is all zero (no accounting yet)
+    pub(super) const PREADV: u64 = 295;
+    pub(super) const PWRITEV: u64 = 296;
+    pub(super) const PREADV2: u64 = 327; // partial: no RWF_* flags (EOPNOTSUPP)
+    pub(super) const PWRITEV2: u64 = 328; // partial: no RWF_* flags (EOPNOTSUPP)
+    pub(super) const CLOCK_SETTIME: u64 = 227; // partial: always EPERM (no CAP_SYS_TIME in cells)
+    pub(super) const SETTIMEOFDAY: u64 = 164; // partial: always EPERM (no CAP_SYS_TIME in cells)
     pub(super) const FUTEX: u64 = 202; // partial: shared only within shared anonymous memory; no PI, no FUTEX_FD
     pub(super) const EPOLL_CREATE: u64 = 213;
     pub(super) const GETDENTS64: u64 = 217;
     pub(super) const SET_TID_ADDRESS: u64 = 218;
-    pub(super) const CLOCK_GETTIME: u64 = 228; // partial: CPU-time clocks report time since the process started
-    pub(super) const CLOCK_NANOSLEEP: u64 = 230; // partial: relative sleeps only
+    pub(super) const SET_ROBUST_LIST: u64 = 273;
+    pub(super) const GET_ROBUST_LIST: u64 = 274; // partial: the caller's own list only (others are EPERM)
+    pub(super) const CLOCK_GETTIME: u64 = 228; // partial: CPU-time clocks count user time only; other processes' CPU clocks are EINVAL
+    pub(super) const CLOCK_NANOSLEEP: u64 = 230; // partial: CPU-time clocks are ENOTSUP; an absolute realtime sleep does not follow clock steps
     pub(super) const UTIMES: u64 = 235;
     pub(super) const EXIT_GROUP: u64 = 231;
-    pub(super) const EPOLL_WAIT: u64 = 232; // partial: interest list fixed for the wait; nested epoll never ready
+    pub(super) const EPOLL_WAIT: u64 = 232;
     pub(super) const EPOLL_CTL: u64 = 233;
     pub(super) const TGKILL: u64 = 234;
     pub(super) const OPENAT: u64 = 257;
     pub(super) const MKDIRAT: u64 = 258;
+    pub(super) const MKNOD: u64 = 133; // partial: FIFOs, regular files, sockets; device nodes are EPERM (no CAP_MKNOD in cells)
+    pub(super) const MKNODAT: u64 = 259; // partial: FIFOs, regular files, sockets; device nodes are EPERM (no CAP_MKNOD in cells)
     pub(super) const FCHOWNAT: u64 = 260;
     pub(super) const NEWFSTATAT: u64 = 262;
     pub(super) const UNLINKAT: u64 = 263;
@@ -178,16 +202,91 @@ mod nr {
     pub(super) const FACCESSAT2: u64 = 439;
     pub(super) const UTIMENSAT: u64 = 280;
     pub(super) const ACCEPT4: u64 = 288;
-    pub(super) const EPOLL_PWAIT: u64 = 281; // partial: interest list fixed for the wait; nested epoll never ready
+    pub(super) const EPOLL_PWAIT: u64 = 281;
+    pub(super) const EPOLL_PWAIT2: u64 = 441;
     pub(super) const EVENTFD: u64 = 284;
     pub(super) const EVENTFD2: u64 = 290;
     pub(super) const EPOLL_CREATE1: u64 = 291;
     pub(super) const DUP3: u64 = 292;
     pub(super) const PIPE2: u64 = 293;
+    pub(super) const GETPRIORITY: u64 = 140; // partial: PRIO_PROCESS of the caller only; the nice value does not affect scheduling
+    pub(super) const SETPRIORITY: u64 = 141; // partial: PRIO_PROCESS of the caller only; the nice value does not affect scheduling
+    pub(super) const FADVISE64: u64 = 221; // partial: advice is checked and ignored
+    pub(super) const CLOSE_RANGE: u64 = 436; // partial: CLOSE_RANGE_UNSHARE is EINVAL
+    pub(super) const CLOCK_GETRES: u64 = 229;
+    pub(super) const SETXATTR: u64 = 188; // partial: no extended attributes (ENOTSUP)
+    pub(super) const LSETXATTR: u64 = 189; // partial: no extended attributes (ENOTSUP)
+    pub(super) const FSETXATTR: u64 = 190; // partial: no extended attributes (ENOTSUP)
+    pub(super) const GETXATTR: u64 = 191; // partial: no extended attributes (ENODATA)
+    pub(super) const LGETXATTR: u64 = 192; // partial: no extended attributes (ENODATA)
+    pub(super) const FGETXATTR: u64 = 193; // partial: no extended attributes (ENODATA)
+    pub(super) const LISTXATTR: u64 = 194; // partial: no extended attributes (empty list)
+    pub(super) const LLISTXATTR: u64 = 195; // partial: no extended attributes (empty list)
+    pub(super) const FLISTXATTR: u64 = 196; // partial: no extended attributes (empty list)
+    pub(super) const REMOVEXATTR: u64 = 197; // partial: no extended attributes (ENODATA)
+    pub(super) const LREMOVEXATTR: u64 = 198; // partial: no extended attributes (ENODATA)
+    pub(super) const FREMOVEXATTR: u64 = 199; // partial: no extended attributes (ENODATA)
+    pub(super) const FALLOCATE: u64 = 285; // partial: mode 0 extends the size (nothing is reserved); KEEP_SIZE is a no-op; holes and ranges are EOPNOTSUPP
+    pub(super) const SYNC_FILE_RANGE: u64 = 277; // partial: nothing to write back (the upper layer is memory)
+    pub(super) const MEMBARRIER: u64 = 324; // partial: CMD_QUERY reports no commands
+    pub(super) const MEMFD_CREATE: u64 = 319; // partial: no sealing (F_ADD_SEALS); /proc/self/fd shows anon_inode:[file], not /memfd:NAME
     pub(super) const STATX: u64 = 332;
-    pub(super) const PRLIMIT64: u64 = 302; // partial: own process only; NOFILE and STACK enforced, others stored
+    pub(super) const PRLIMIT64: u64 = 302; // partial: NOFILE, STACK and FSIZE enforced, others stored
     pub(super) const GETRANDOM: u64 = 318; // ChaCha20 seeded from RDSEED/RDRAND and virtio-rng
     pub(super) const RENAMEAT2: u64 = 316; // partial: RENAME_NOREPLACE only
+    pub(super) const MINCORE: u64 = 27;
+    pub(super) const CAPGET: u64 = 125; // partial: nothing is inheritable; other processes' are the caller's
+    pub(super) const CAPSET: u64 = 126; // partial: nothing is inheritable
+    pub(super) const PERSONALITY: u64 = 135; // partial: Linux's, with or without ADDR_NO_RANDOMIZE
+    pub(super) const SCHED_SETPARAM: u64 = 142; // partial: priority 0 only
+    pub(super) const SCHED_GETPARAM: u64 = 143;
+    pub(super) const SCHED_SETSCHEDULER: u64 = 144; // partial: SCHED_OTHER only
+    pub(super) const SCHED_GETSCHEDULER: u64 = 145;
+    pub(super) const MLOCK: u64 = 149; // partial: makes the pages resident; nothing is ever paged out
+    pub(super) const MUNLOCK: u64 = 150; // partial: checks the range; nothing is ever paged out
+    pub(super) const MLOCKALL: u64 = 151; // partial: nothing is ever paged out; does not make pages resident
+    pub(super) const MUNLOCKALL: u64 = 152; // partial: nothing is ever paged out
+    pub(super) const SYNC: u64 = 162; // partial: the upper layer is memory
+    pub(super) const SETHOSTNAME: u64 = 170; // partial: always EPERM (no CAP_SYS_ADMIN in cells)
+    pub(super) const SETDOMAINNAME: u64 = 171; // partial: always EPERM (no CAP_SYS_ADMIN in cells)
+    pub(super) const READAHEAD: u64 = 187; // partial: advice, checked and ignored
+    pub(super) const UNSHARE: u64 = 272; // partial: namespaces are EPERM (no CAP_SYS_ADMIN in cells)
+    pub(super) const SYNCFS: u64 = 306; // partial: the upper layer is memory
+    pub(super) const SETNS: u64 = 308; // partial: always EPERM (no CAP_SYS_ADMIN in cells)
+    pub(super) const GETCPU: u64 = 309;
+    pub(super) const MLOCK2: u64 = 325; // partial: as mlock
+    pub(super) const RSEQ: u64 = 334; // partial: always ENOSYS (libcs go without)
+    pub(super) const FCHMODAT2: u64 = 452;
+    pub(super) const TIMERFD_CREATE: u64 = 283;
+    pub(super) const TIMERFD_SETTIME: u64 = 286;
+    pub(super) const TIMERFD_GETTIME: u64 = 287;
+    pub(super) const SIGNALFD: u64 = 282; // partial: takes the signals of the process that made it
+    pub(super) const SIGNALFD4: u64 = 289; // partial: takes the signals of the process that made it
+    pub(super) const INOTIFY_INIT: u64 = 253;
+    pub(super) const INOTIFY_ADD_WATCH: u64 = 254; // partial: a file with several names reports to one of its directories
+    pub(super) const INOTIFY_RM_WATCH: u64 = 255;
+    pub(super) const INOTIFY_INIT1: u64 = 294;
+    pub(super) const SHMGET: u64 = 29; // partial: no huge pages
+    pub(super) const SHMAT: u64 = 30; // partial: no SHM_REMAP
+    pub(super) const SHMCTL: u64 = 31; // partial: STAT, SET, RMID and INFO
+    pub(super) const SHMDT: u64 = 67;
+    pub(super) const TIMER_CREATE: u64 = 222; // partial: CPU-time clocks count user time only; no alarm clocks or other processes' clocks
+    pub(super) const TIMER_SETTIME: u64 = 223;
+    pub(super) const TIMER_GETTIME: u64 = 224;
+    pub(super) const TIMER_GETOVERRUN: u64 = 225;
+    pub(super) const TIMER_DELETE: u64 = 226;
+    pub(super) const RT_SIGTIMEDWAIT: u64 = 128;
+    pub(super) const RT_SIGQUEUEINFO: u64 = 129;
+    pub(super) const RT_TGSIGQUEUEINFO: u64 = 297;
+    pub(super) const PIDFD_SEND_SIGNAL: u64 = 424; // partial: no flags
+    pub(super) const PIDFD_OPEN: u64 = 434; // partial: processes only (no PIDFD_THREAD)
+    pub(super) const CLONE3: u64 = 435; // partial: as clone; no CLONE_CLEAR_SIGHAND, CLONE_INTO_CGROUP or set_tid
+    pub(super) const SPLICE: u64 = 275;
+    pub(super) const TEE: u64 = 276;
+    pub(super) const VMSPLICE: u64 = 278; // partial: copies (SPLICE_F_GIFT is accepted and ignored)
+    pub(super) const COPY_FILE_RANGE: u64 = 326;
+    pub(super) const SENDMMSG: u64 = 307; // partial: as sendmsg
+    pub(super) const RECVMMSG: u64 = 299; // partial: as recvmsg
     pub(super) const IO_URING_SETUP: u64 = 425; // partial: no SQPOLL/IOPOLL rings
     pub(super) const IO_URING_ENTER: u64 = 426; // partial: the EXT_ARG signal mask is not applied; the worker completes armed pipe and socket operations but CONNECT runs on the submitter (it may block it); a forked child's submissions run on the parent's worker
     pub(super) const IO_URING_REGISTER: u64 = 427; // partial: probe and eventfd only (no registered files or buffers)
@@ -195,7 +294,7 @@ mod nr {
 
 const EPERM: i64 = 1;
 const EBADF: i64 = 9;
-const ENOMEM: i64 = 12;
+const EAGAIN: i64 = 11;
 const EACCES: i64 = 13;
 const EFAULT: i64 = 14;
 const ENODEV: i64 = 19;
@@ -260,6 +359,8 @@ pub(crate) fn dispatch(p: &mut LinuxProcess, ctx: &mut frame::user::UserContext)
         nr::GETDENTS64 => fs::getdents64(p, a[0], a[1], a[2] as usize),
         nr::MKDIR => fs::mkdir(p, AT_FDCWD, a[0], a[1]),
         nr::MKDIRAT => fs::mkdir(p, i(a[0]), a[1], a[2]),
+        nr::MKNOD => fs::mknod(p, AT_FDCWD, a[0], a[1], a[2]),
+        nr::MKNODAT => fs::mknod(p, i(a[0]), a[1], a[2], a[3]),
         nr::RMDIR => fs::unlink(p, AT_FDCWD, a[0], 0x200),
         nr::UNLINK => fs::unlink(p, AT_FDCWD, a[0], 0),
         nr::LINK => fs::link(p, AT_FDCWD, a[0], AT_FDCWD, a[1], 0),
@@ -321,6 +422,12 @@ pub(crate) fn dispatch(p: &mut LinuxProcess, ctx: &mut frame::user::UserContext)
         nr::RECVFROM => socket::recvfrom(p, &a),
         nr::SENDMSG => socket::sendmsg(p, a[0], a[1], a[2] & 0xffff_ffff),
         nr::RECVMSG => socket::recvmsg(p, a[0], a[1], a[2] & 0xffff_ffff),
+        nr::SENDMMSG => socket::sendmmsg(p, a[0], a[1], a[2] & 0xffff_ffff, a[3] & 0xffff_ffff),
+        nr::RECVMMSG => socket::recvmmsg(p, &a),
+        nr::SPLICE => splice::splice(p, &a),
+        nr::TEE => splice::tee(p, a[0], a[1], a[2], a[3] & 0xffff_ffff),
+        nr::VMSPLICE => splice::vmsplice(p, a[0], a[1], a[2] as usize, a[3] & 0xffff_ffff),
+        nr::COPY_FILE_RANGE => splice::copy_file_range(p, &a),
         nr::SHUTDOWN => socket::shutdown(p, a[0], a[1] & 0xffff_ffff),
         nr::FLOCK => fs::flock(p, a[0], a[1]),
         nr::STATFS => fs::statfs(p, a[0], a[1]),
@@ -336,6 +443,7 @@ pub(crate) fn dispatch(p: &mut LinuxProcess, ctx: &mut frame::user::UserContext)
         nr::EPOLL_CTL => crate::poll::epoll_ctl(p, a[0], a[1], a[2], a[3]),
         nr::EPOLL_WAIT => crate::poll::epoll_wait(p, a[0], a[1], a[2], i(a[3])),
         nr::EPOLL_PWAIT => crate::poll::epoll_pwait(p, &a),
+        nr::EPOLL_PWAIT2 => crate::poll::epoll_pwait2(p, &a),
         nr::EVENTFD => crate::poll::eventfd(p, a[0], 0),
         nr::EVENTFD2 => crate::poll::eventfd(p, a[0], a[1]),
         nr::PIPE => fs::pipe2(p, a[0], 0),
@@ -357,11 +465,74 @@ pub(crate) fn dispatch(p: &mut LinuxProcess, ctx: &mut frame::user::UserContext)
         nr::MPROTECT => p.mm().mprotect(a[0], a[1], a[2]),
         nr::MUNMAP => p.mm().munmap(a[0], a[1]),
         nr::BRK => Ok(p.mm().brk(a[0])),
+        nr::MSYNC => p.mm().msync(a[0], a[1], a[2]),
         nr::MADVISE => p.mm().madvise(a[0], a[1], a[2]),
+        nr::GETCPU => misc::getcpu(p, a[0], a[1]),
+        nr::PERSONALITY => misc::personality(p, a[0]),
+        nr::SYNC => Ok(0),
+        nr::SYNCFS | nr::READAHEAD => misc::on_file(p, a[0]),
+        nr::MINCORE => misc::mincore(p, a[0], a[1], a[2]),
+        nr::MLOCK => misc::mlock(p, a[0], a[1], 0),
+        nr::MLOCK2 => misc::mlock(p, a[0], a[1], a[2] & 0xffff_ffff),
+        nr::MUNLOCK => misc::munlock(p, a[0], a[1]),
+        nr::MLOCKALL => misc::mlockall(a[0] & 0xffff_ffff),
+        nr::MUNLOCKALL => Ok(0),
+        nr::SCHED_GETSCHEDULER => misc::getscheduler(p, a[0]),
+        nr::SCHED_SETSCHEDULER => misc::setscheduler(p, a[0], a[1] & 0xffff_ffff, a[2]),
+        nr::SCHED_GETPARAM => misc::getparam(p, a[0], a[1]),
+        nr::SCHED_SETPARAM => misc::setparam(p, a[0], a[1]),
+        nr::CAPGET => misc::capget(p, a[0], a[1]),
+        nr::CAPSET => misc::capset(p, a[0], a[1]),
+        nr::UNSHARE => misc::unshare(a[0] & 0xffff_ffff),
+        // CAP_SYS_ADMIN, outside the cell bounding set.
+        nr::SETNS | nr::SETHOSTNAME | nr::SETDOMAINNAME => Err(EPERM),
+        nr::FCHMODAT2 => fs::fchmodat2(p, i(a[0]), a[1], a[2], a[3] & 0xffff_ffff),
+        // glibc asks every thread and goes without.
+        nr::RSEQ => Err(ENOSYS),
+        nr::TIMERFD_CREATE => timerfd::create(p, a[0], a[1] & 0xffff_ffff),
+        nr::TIMERFD_SETTIME => timerfd::settime(p, a[0], a[1] & 0xffff_ffff, a[2], a[3]),
+        nr::TIMERFD_GETTIME => timerfd::gettime(p, a[0], a[1]),
+        nr::SIGNALFD => timerfd::signalfd(p, i(a[0]), a[1], a[2], 0),
+        nr::SIGNALFD4 => timerfd::signalfd(p, i(a[0]), a[1], a[2], a[3] & 0xffff_ffff),
+        nr::INOTIFY_INIT => inotify::init(p, 0),
+        nr::INOTIFY_INIT1 => inotify::init(p, a[0] & 0xffff_ffff),
+        nr::INOTIFY_ADD_WATCH => inotify::add(p, a[0], a[1], a[2]),
+        nr::INOTIFY_RM_WATCH => inotify::remove(p, a[0], a[1]),
+        nr::SHMGET => shm::get(p, a[0], a[1], a[2] & 0xffff_ffff),
+        nr::SHMAT => shm::attach(p, a[0], a[1], a[2] & 0xffff_ffff),
+        nr::SHMDT => shm::detach(p, a[0]),
+        nr::SHMCTL => shm::control(p, a[0], a[1], a[2]),
         nr::MREMAP => p.mm().mremap(a[0], a[1], a[2], a[3], a[4]),
         // Identity, time, limits, signals, threads.
         nr::UNAME => uname(p, a[0]),
         nr::CLOCK_GETTIME => clock_gettime(p, a[0], a[1]),
+        nr::CLOCK_GETRES => clock_getres(p, a[0], a[1]),
+        nr::SETXATTR
+        | nr::LSETXATTR
+        | nr::FSETXATTR
+        | nr::GETXATTR
+        | nr::LGETXATTR
+        | nr::FGETXATTR
+        | nr::LISTXATTR
+        | nr::LLISTXATTR
+        | nr::FLISTXATTR
+        | nr::REMOVEXATTR
+        | nr::LREMOVEXATTR
+        | nr::FREMOVEXATTR => {
+            use fs::Xattr::*;
+            // Numbered in threes from 188: path, lpath, fd forms of set,
+            // get, list and remove.
+            let op = [Set, Get, List, Remove][((nr - nr::SETXATTR) / 3) as usize];
+            let form = (nr - nr::SETXATTR) % 3;
+            fs::xattr(p, op, a[0], form == 2, form == 0)
+        }
+        nr::FALLOCATE => fs::fallocate(p, a[0], a[1], a[2], a[3]),
+        nr::SYNC_FILE_RANGE => fs::sync_file_range(p, a[0], a[1], a[2], a[3]),
+        nr::MEMBARRIER => {
+            // MEMBARRIER_CMD_QUERY: no commands are offered (callers fall
+            // back to their own fences); any other command is EINVAL.
+            if a[0] == 0 { Ok(0) } else { Err(EINVAL) }
+        }
         nr::GETTIMEOFDAY => gettimeofday(p, a[0]),
         nr::TIME => {
             let secs = crate::vfs::wall_clock().as_secs();
@@ -387,8 +558,14 @@ pub(crate) fn dispatch(p: &mut LinuxProcess, ctx: &mut frame::user::UserContext)
         nr::GETITIMER => getitimer(p, a[0], a[1]),
         nr::ALARM => alarm(p, a[0]),
         nr::SETITIMER => setitimer(p, a[0], a[1], a[2]),
-        nr::CLOCK_NANOSLEEP if a[1] == 0 => signal::nanosleep(p, a[2], a[3]),
-        nr::CLOCK_NANOSLEEP => Err(EINVAL), // TIMER_ABSTIME
+        nr::TIMER_CREATE => timer_create(p, a[0], a[1], a[2]),
+        nr::TIMER_SETTIME => timer_settime(p, a[0], a[1], a[2], a[3]),
+        nr::TIMER_GETTIME => timer_gettime(p, a[0], a[1]),
+        nr::TIMER_GETOVERRUN => {
+            timer_id(a[0]).and_then(|id| crate::itimer::overrun(p, id).map(u64::from))
+        }
+        nr::TIMER_DELETE => timer_id(a[0]).and_then(|id| crate::itimer::delete(p, id).map(|()| 0)),
+        nr::CLOCK_NANOSLEEP => signal::clock_nanosleep(p, a[0], a[1], a[2], a[3]),
         nr::KILL => signal::kill(p, i(a[0]), a[1]),
         nr::TKILL => signal::tkill(p, None, a[0], a[1]),
         nr::TGKILL => signal::tkill(p, Some(a[0]), a[1], a[2]),
@@ -405,7 +582,46 @@ pub(crate) fn dispatch(p: &mut LinuxProcess, ctx: &mut frame::user::UserContext)
         }
         nr::GETPID => Ok(p.group.tgid),
         nr::PRCTL => prctl(p, a[0], a[1], a[2]),
+        nr::GETPRIORITY => priority(p, i(a[0]), a[1], None),
+        nr::SETPRIORITY => priority(p, i(a[0]), a[1], Some(i(a[2]))),
+        nr::MEMFD_CREATE => fs::memfd_create(p, a[0], a[1]),
+        nr::FADVISE64 => {
+            // POSIX_FADV_NORMAL..=POSIX_FADV_NOREUSE on an open descriptor.
+            if p.fd(a[0]).is_none() {
+                Err(EBADF)
+            } else if a[3] > 5 {
+                Err(EINVAL)
+            } else {
+                Ok(0)
+            }
+        }
+        nr::CLOSE_RANGE => {
+            const CLOSE_RANGE_CLOEXEC: u64 = 4;
+            let (first, last, flags) = (a[0] as u32, a[1] as u32, a[2]);
+            if first > last || flags & !CLOSE_RANGE_CLOEXEC != 0 {
+                Err(EINVAL)
+            } else {
+                p.close_range(
+                    u64::from(first),
+                    u64::from(last),
+                    flags & CLOSE_RANGE_CLOEXEC != 0,
+                );
+                Ok(0)
+            }
+        }
         nr::SCHED_GETAFFINITY => sched_getaffinity(p, a[0], a[1], a[2]),
+        nr::SCHED_SETAFFINITY => sched_setaffinity(p, a[0], a[1], a[2]),
+        nr::SCHED_GET_PRIORITY_MAX => sched_priority_bound(a[0], true),
+        nr::SCHED_GET_PRIORITY_MIN => sched_priority_bound(a[0], false),
+        nr::SCHED_RR_GET_INTERVAL => sched_rr_get_interval(p, a[0], a[1]),
+        nr::RT_SIGPENDING => signal::sigpending(p, a[0], a[1]),
+        nr::WAITID => waitid(p, a[0], a[1], a[2], a[3], a[4]),
+        nr::PREADV => fs::vector_at(p, a[0], a[1], a[2] as usize, a[3], 0, false),
+        nr::PWRITEV => fs::vector_at(p, a[0], a[1], a[2] as usize, a[3], 0, true),
+        nr::PREADV2 => fs::vector_at(p, a[0], a[1], a[2] as usize, a[3], a[5], false),
+        nr::PWRITEV2 => fs::vector_at(p, a[0], a[1], a[2] as usize, a[3], a[5], true),
+        // Setting a clock needs CAP_SYS_TIME, outside the cell bounding set.
+        nr::CLOCK_SETTIME | nr::SETTIMEOFDAY => Err(EPERM),
         nr::SYSINFO => sysinfo(p, a[0]),
         nr::GETRUSAGE => getrusage(p, i(a[0]), a[1]),
         nr::TIMES => times(p, a[0]),
@@ -433,12 +649,22 @@ pub(crate) fn dispatch(p: &mut LinuxProcess, ctx: &mut frame::user::UserContext)
         nr::GETGROUPS => getgroups(p, a[0], a[1]),
         nr::SETGROUPS => setgroups(p, a[0], a[1]),
         // Processes.
-        nr::FORK => clone(p, ctx, 17, 0, 0, 0, 0), // SIGCHLD
-        nr::VFORK => clone(p, ctx, 0x4000 | 0x100 | 17, 0, 0, 0, 0), // CLONE_VFORK | CLONE_VM
-        nr::CLONE => clone(p, ctx, a[0], a[1], a[2], a[3], a[4]),
+        nr::FORK => clone(p, ctx, 17, 0, 0, 0, 0, None), // SIGCHLD
+        nr::VFORK => clone(p, ctx, 0x4000 | 0x100 | 17, 0, 0, 0, 0, None), // CLONE_VFORK | CLONE_VM
+        nr::CLONE => clone(p, ctx, a[0], a[1], a[2], a[3], a[4], None),
+        nr::CLONE3 => clone3(p, ctx, a[0], a[1]),
+        nr::PIDFD_OPEN => pidfd::open(p, i(a[0]), a[1]),
+        nr::PIDFD_SEND_SIGNAL => pidfd::send_signal(p, a[0], a[1], a[2], a[3]),
+        nr::RT_SIGTIMEDWAIT => signal::sigtimedwait(p, a[0], a[1], a[2], a[3]),
+        nr::RT_SIGQUEUEINFO => signal::sigqueueinfo(p, a[0], a[1], a[2]),
+        nr::RT_TGSIGQUEUEINFO => signal::tgsigqueueinfo(p, a[0], a[1], a[2], a[3]),
         nr::WAIT4 => wait4(p, i(a[0]), a[1], a[2], a[3]),
         nr::EXECVE => match exec::execve(p, ctx, a[0], a[1], a[2]) {
             // The context now starts the new program: no return value.
+            Ok(()) => return Outcome::Continue,
+            Err(e) => Err(e),
+        },
+        nr::EXECVEAT => match exec::execveat(p, ctx, i(a[0]), a[1], a[2], a[3], a[4]) {
             Ok(()) => return Outcome::Continue,
             Err(e) => Err(e),
         },
@@ -446,6 +672,29 @@ pub(crate) fn dispatch(p: &mut LinuxProcess, ctx: &mut frame::user::UserContext)
         nr::SET_TID_ADDRESS => {
             p.clear_tid = a[0];
             Ok(p.entry.pid)
+        }
+        nr::SET_ROBUST_LIST => {
+            if a[1] != crate::futex::ROBUST_HEAD_LEN {
+                Err(EINVAL)
+            } else {
+                p.robust_list = a[0];
+                Ok(0)
+            }
+        }
+        nr::GET_ROBUST_LIST => {
+            // Another thread's list would need ptrace rights; only the
+            // caller's (pid 0 or its own tid) is answered.
+            if a[0] != 0 && a[0] != p.entry.pid {
+                Err(EPERM)
+            } else {
+                let head = p.robust_list.to_le_bytes();
+                let len = crate::futex::ROBUST_HEAD_LEN.to_le_bytes();
+                if p.copy_to_user(a[1], &head) != 8 || p.copy_to_user(a[2], &len) != 8 {
+                    Err(EFAULT)
+                } else {
+                    Ok(0)
+                }
+            }
         }
         nr::EXIT => return Outcome::Exit(a[0] as i32),
         nr::EXIT_GROUP => {
@@ -460,9 +709,15 @@ pub(crate) fn dispatch(p: &mut LinuxProcess, ctx: &mut frame::user::UserContext)
             Err(ENOSYS)
         }
     };
+    // A path into what is not the root's, where nothing else serves it.
+    let result = match result {
+        Err(crate::vfs::errno::ELSEWHERE) => Err(2), // ENOENT
+        r => r,
+    };
+    inotify::flush(&p.vfs);
     let traced = TRACE_PID.load(core::sync::atomic::Ordering::Relaxed) == p.entry.pid
         || (TRACE_ERRORS.load(core::sync::atomic::Ordering::Relaxed)
-            && result.is_err_and(|e| e != signal::ERESTARTSYS));
+            && result.is_err_and(|e| e < signal::ERESTARTSYS));
     if traced {
         // Name the path argument of path syscalls, so traces are readable.
         let path_arg = match nr {
@@ -534,7 +789,6 @@ fn getrandom(p: &mut LinuxProcess, buf: u64, len: usize, flags: u64) -> Result<u
     const GRND_NONBLOCK: u64 = 1;
     const GRND_RANDOM: u64 = 2;
     const GRND_INSECURE: u64 = 4;
-    const EAGAIN: i64 = 11;
     if flags & !(GRND_NONBLOCK | GRND_RANDOM | GRND_INSECURE) != 0
         || flags & (GRND_RANDOM | GRND_INSECURE) == GRND_RANDOM | GRND_INSECURE
     {
@@ -557,7 +811,7 @@ fn console_bytes(b: &[u8]) {
     frame::console::write_bytes(b);
 }
 
-fn le_u64(b: &[u8]) -> u64 {
+pub(crate) fn le_u64(b: &[u8]) -> u64 {
     let mut a = [0u8; 8];
     a.copy_from_slice(&b[..8]);
     u64::from_le_bytes(a)
@@ -570,6 +824,7 @@ fn ioctl(p: &mut LinuxProcess, fd: u64, request: u64, arg: u64) -> Result<u64, i
     const FIONCLEX: u64 = 0x5450;
     const FIOCLEX: u64 = 0x5451;
     const FIONBIO: u64 = 0x5421;
+    const FIONREAD: u64 = 0x541b;
     const FIOASYNC: u64 = 0x5452;
     let desc = p.desc(fd).ok_or(EBADF)?;
     if request == FIOASYNC {
@@ -594,6 +849,30 @@ fn ioctl(p: &mut LinuxProcess, fd: u64, request: u64, arg: u64) -> Result<u64, i
         if let Some(end) = obj.as_deref().and_then(|o| o.tty()) {
             return crate::pty::ioctl(p, end, request, arg);
         }
+    }
+    if request == FIONREAD {
+        let n = match &*desc.state() {
+            Fd::Pipe(e) => e.pipe.buffered(),
+            Fd::Object(o) => o.obj.readable().ok_or(ENOTTY)?,
+            Fd::File(f) => {
+                let s = p.vfs.lock().stat(f.ino)?;
+                if s.kind != crate::vfs::Kind::File {
+                    return Err(ENOTTY);
+                }
+                usize::try_from(s.size.saturating_sub(f.offset)).unwrap_or(usize::MAX)
+            }
+            Fd::Console | Fd::Dev(_) => return Err(ENOTTY),
+        };
+        let n = u32::try_from(n).unwrap_or(i32::MAX as u32);
+        if p.copy_to_user(arg, &n.to_le_bytes()) != 4 {
+            return Err(EFAULT);
+        }
+        return Ok(0);
+    }
+    let is_socket = matches!(&*desc.state(),
+        Fd::Object(o) if o.obj.mode() & 0o170_000 == 0o140_000);
+    if is_socket && let Some(r) = netlink::ioctl(p, request, arg) {
+        return r;
     }
     match request {
         FIOCLEX | FIONCLEX => {
@@ -637,6 +916,8 @@ fn fcntl(p: &mut LinuxProcess, fd: u64, cmd: u64, arg: u64) -> Result<u64, i64> 
     const F_OFD_SETLK: u64 = 37;
     const F_OFD_SETLKW: u64 = 38;
     const F_DUPFD_CLOEXEC: u64 = 1030;
+    const F_SETPIPE_SZ: u64 = 1031;
+    const F_GETPIPE_SZ: u64 = 1032;
     const F_SETOWN: u64 = 8;
     const F_GETOWN: u64 = 9;
     const FD_CLOEXEC: u64 = 1;
@@ -659,7 +940,13 @@ fn fcntl(p: &mut LinuxProcess, fd: u64, cmd: u64, arg: u64) -> Result<u64, i64> 
         F_GETFL => Ok(match &*desc.state() {
             Fd::Console | Fd::Dev(_) => O_RDWR,
             Fd::File(of) => of.flags,
-            Fd::Pipe(e) => u64::from(e.write) | if e.nonblock { fs::O_NONBLOCK } else { 0 },
+            Fd::Pipe(e) => {
+                let acc = match (e.read, e.write) {
+                    (true, true) => O_RDWR,
+                    (_, write) => u64::from(write),
+                };
+                acc | if e.nonblock { fs::O_NONBLOCK } else { 0 }
+            }
             Fd::Object(o) => {
                 let asy = o.obj.unix().is_some_and(|u| u.is_async());
                 O_RDWR | if o.nonblock { fs::O_NONBLOCK } else { 0 } | if asy { O_ASYNC } else { 0 }
@@ -706,6 +993,12 @@ fn fcntl(p: &mut LinuxProcess, fd: u64, cmd: u64, arg: u64) -> Result<u64, i64> 
         F_GETLK | F_SETLK | F_SETLKW | F_OFD_GETLK | F_OFD_SETLK | F_OFD_SETLKW => {
             fs::record_lock(p, &desc, cmd, arg)
         }
+        // Pipe capacity: Linux answers EBADF for anything but a pipe.
+        F_SETPIPE_SZ | F_GETPIPE_SZ => match &*desc.state() {
+            Fd::Pipe(e) if cmd == F_GETPIPE_SZ => Ok(e.pipe.capacity() as u64),
+            Fd::Pipe(e) => e.pipe.set_capacity(arg).map(|n| n as u64),
+            _ => Err(EBADF),
+        },
         _ => Err(EINVAL),
     }
 }
@@ -730,22 +1023,25 @@ fn mmap(p: &mut LinuxProcess, a: &[u64; 6]) -> Result<u64, i64> {
         }
         _ => return Err(ENODEV),
     }
-    if map_flags & umem::flags::MAP_SHARED != 0 && prot & 2 != 0 {
-        // A shared writable mapping would need writes to reach the file.
-        return Err(EACCES);
-    }
-    let _ = len;
-    let ino = match p.fd(fd).ok_or(EBADF)? {
-        Fd::File(f) => f.ino,
+    let (ino, mode) = match p.fd(fd).ok_or(EBADF)? {
+        Fd::File(f) => (f.ino, f.flags & fs::O_ACCMODE),
         _ => return Err(ENODEV),
     };
     if p.vfs.lock().stat(ino)?.kind != crate::vfs::Kind::File {
         return Err(ENODEV);
     }
+    // Reading through the mapping needs a descriptor that can read; writing
+    // the file through it, one that can do both.
+    let writable = mode == fs::O_RDWR;
+    let shared = map_flags & umem::flags::MAP_SHARED != 0;
+    if mode == fs::O_WRONLY || (shared && prot & 2 != 0 && !writable) {
+        return Err(EACCES);
+    }
     let file = crate::file::VfsFile::open(&p.vfs, ino)?;
     let src = umem::FileSource {
         file: alloc::sync::Arc::new(file),
         offset,
+        writable,
     };
     p.mm().mmap(addr, len, prot, map_flags, Some(src))
 }
@@ -760,6 +1056,67 @@ fn mmap(p: &mut LinuxProcess, a: &[u64; 6]) -> Result<u64, i64> {
 /// child only execs or exits). With `CLONE_VFORK` the caller waits until
 /// the child has exec'd or exited. With `CLONE_THREAD` it is a new thread in the
 /// caller's process, on `stack`, with TLS `tls` if `CLONE_SETTLS`.
+/// `clone3(args, size)`: `clone` with its arguments in a `clone_args`.
+fn clone3(
+    p: &mut LinuxProcess,
+    ctx: &frame::user::UserContext,
+    args: u64,
+    size: u64,
+) -> Result<u64, i64> {
+    /// `CLONE_ARGS_SIZE_VER0` and the size with everything since.
+    const MIN: u64 = 64;
+    const FULL: usize = 88;
+    const E2BIG: i64 = 7;
+    /// CLONE_CLEAR_SIGHAND and CLONE_INTO_CGROUP.
+    const EXTENDED: u64 = !0xffff_ffff;
+    if size < MIN {
+        return Err(EINVAL);
+    }
+    if size > 4096 {
+        return Err(E2BIG);
+    }
+    let mut b = [0u8; 4096];
+    let n = size as usize;
+    if p.copy_from_user(args, &mut b[..n]) != n {
+        return Err(EFAULT);
+    }
+    if b[FULL..].iter().any(|&x| x != 0) {
+        return Err(E2BIG); // a newer caller's, asking for something
+    }
+    let word = |i: usize| le_u64(&b[i * 8..i * 8 + 8]);
+    let [
+        flags,
+        pidfd,
+        child_tid,
+        parent_tid,
+        exit_signal,
+        stack,
+        stack_size,
+        tls,
+        set_tid,
+    ] = core::array::from_fn(word);
+    if flags & (EXTENDED | 0xff) != 0 || exit_signal > 64 || (stack == 0) != (stack_size == 0) {
+        return Err(EINVAL);
+    }
+    if set_tid != 0 {
+        return Err(EPERM); // CAP_CHECKPOINT_RESTORE
+    }
+    let top = stack.checked_add(stack_size).ok_or(EINVAL)?;
+    clone(
+        p,
+        ctx,
+        flags | exit_signal,
+        top,
+        parent_tid,
+        child_tid,
+        tls,
+        Some(pidfd),
+    )
+}
+
+/// `clone`, and the rest of the family. `pidfd_at`: where `CLONE_PIDFD`
+/// puts the descriptor, if not in `parent_tid`'s place.
+#[allow(clippy::too_many_arguments)] // the syscall's own
 fn clone(
     p: &mut LinuxProcess,
     ctx: &frame::user::UserContext,
@@ -768,13 +1125,16 @@ fn clone(
     parent_tid: u64,
     child_tid: u64,
     tls: u64,
+    pidfd_at: Option<u64>,
 ) -> Result<u64, i64> {
     const CSIGNAL: u64 = 0xff;
     const CLONE_VM: u64 = 0x100;
     const CLONE_FS: u64 = 0x200;
     const CLONE_FILES: u64 = 0x400;
     const CLONE_SIGHAND: u64 = 0x800;
+    const CLONE_PIDFD: u64 = 0x1000;
     const CLONE_VFORK: u64 = 0x4000;
+    const CLONE_PARENT: u64 = 0x8000;
     const CLONE_THREAD: u64 = 0x1_0000;
     const CLONE_SYSVSEM: u64 = 0x4_0000;
     const CLONE_SETTLS: u64 = 0x8_0000;
@@ -782,12 +1142,18 @@ fn clone(
     const CLONE_CHILD_CLEARTID: u64 = 0x20_0000;
     const CLONE_DETACHED: u64 = 0x40_0000;
     const CLONE_CHILD_SETTID: u64 = 0x100_0000;
+    /// NEWTIME, NEWNS, NEWCGROUP, NEWUTS, NEWIPC, NEWUSER, NEWPID, NEWNET.
+    const CLONE_NEW: u64 = 0x7e02_0080;
     let thread = flags & CLONE_THREAD != 0;
+    if flags & CLONE_NEW & !CSIGNAL != 0 {
+        return Err(EPERM); // a cell makes no namespaces (CAP_SYS_ADMIN)
+    }
     let allowed = CSIGNAL
         | CLONE_VM
         | CLONE_FS
         | CLONE_FILES
         | CLONE_SIGHAND
+        | CLONE_PIDFD
         | CLONE_VFORK
         | CLONE_THREAD
         | CLONE_SYSVSEM
@@ -796,8 +1162,11 @@ fn clone(
         | CLONE_CHILD_CLEARTID
         | CLONE_DETACHED
         | CLONE_CHILD_SETTID;
-    if flags & !allowed != 0 {
+    if flags & CLONE_PARENT != 0 || flags & !allowed != 0 {
         return Err(ENOSYS);
+    }
+    if flags & CLONE_PIDFD != 0 && thread {
+        return Err(EINVAL);
     }
     if thread {
         // A thread shares memory and signal handlers (Linux requires both).
@@ -815,7 +1184,7 @@ fn clone(
         let mut c = ctx.clone();
         c.set_return(0);
         c.rsp = stack;
-        (p.new_thread(), c)
+        (p.new_thread().ok_or(EAGAIN)?, c)
     } else {
         proc::fork(p, ctx, stack)?
     };
@@ -823,14 +1192,24 @@ fn clone(
         cctx.fs_base = tls;
     }
     let tid = (child.entry.pid as u32).to_le_bytes();
-    if flags & CLONE_PARENT_SETTID != 0 && p.copy_to_user(parent_tid, &tid) != tid.len() {
-        return Err(EFAULT);
+    // An address that cannot be written is passed over, as on Linux.
+    if flags & CLONE_PARENT_SETTID != 0 {
+        let _ = p.copy_to_user(parent_tid, &tid);
     }
-    if flags & CLONE_CHILD_SETTID != 0 && child.copy_to_user(child_tid, &tid) != tid.len() {
-        return Err(EFAULT);
+    if flags & CLONE_CHILD_SETTID != 0 {
+        let _ = child.copy_to_user(child_tid, &tid);
     }
     if flags & CLONE_CHILD_CLEARTID != 0 {
         child.clear_tid = child_tid;
+    }
+    if flags & CLONE_PIDFD != 0 {
+        // `clone` puts it where the parent's tid would go.
+        let at = pidfd_at.unwrap_or(parent_tid);
+        let entry = child.entry.clone();
+        if let Err(e) = pidfd::install(p, entry, false, Some(at)) {
+            proc::discard(child);
+            return Err(e);
+        }
     }
     signal::sync(&child);
     let vfork = (flags & CLONE_VFORK != 0 && !thread).then(|| {
@@ -853,11 +1232,26 @@ fn wait4(
     rusage: u64,
 ) -> Result<u64, i64> {
     const WNOHANG: u64 = 1;
+    const WUNTRACED: u64 = 2;
+    const WCONTINUED: u64 = 8;
+    /// `__WNOTHREAD`, `__WALL`, `__WCLONE`: every child is waited for here.
+    const KNOWN: u64 = WNOHANG | WUNTRACED | WCONTINUED | 0xe000_0000;
     /// `sizeof(struct rusage)` on x86-64.
     const RUSAGE_SIZE: usize = 144;
-    match proc::wait(&p.group.leader, &p.entry, pid, options & WNOHANG != 0)? {
+    let options = options & 0xffff_ffff;
+    if options & !KNOWN != 0 {
+        return Err(EINVAL);
+    }
+    let want = proc::Wanted {
+        exited: true,
+        stopped: options & WUNTRACED != 0,
+        continued: options & WCONTINUED != 0,
+        nohang: options & WNOHANG != 0,
+        keep: false,
+    };
+    match proc::wait(&p.group.leader, &p.entry, pid, want)? {
         None => Ok(0),
-        Some((cpid, status)) => {
+        Some((cpid, status, _)) => {
             if wstatus != 0 && p.copy_to_user(wstatus, &status.to_le_bytes()) != 4 {
                 return Err(EFAULT);
             }
@@ -869,6 +1263,78 @@ fn wait4(
             Ok(cpid)
         }
     }
+}
+
+/// `waitid(idtype, id, infop, options, rusage)`: the child's state is a
+/// `siginfo_t`.
+fn waitid(
+    p: &mut LinuxProcess,
+    idtype: u64,
+    id: u64,
+    infop: u64,
+    options: u64,
+    rusage: u64,
+) -> Result<u64, i64> {
+    const WNOHANG: u64 = 1;
+    const WSTOPPED: u64 = 2;
+    const WEXITED: u64 = 4;
+    const WCONTINUED: u64 = 8;
+    const WNOWAIT: u64 = 0x0100_0000;
+    const KNOWN: u64 = WNOHANG | WSTOPPED | WEXITED | WCONTINUED | WNOWAIT | 0xe000_0000;
+    const SIGCHLD: u32 = 17;
+    const CLD_EXITED: u32 = 1;
+    const CLD_KILLED: u32 = 2;
+    const CLD_DUMPED: u32 = 3;
+    const CLD_STOPPED: u32 = 5;
+    const CLD_CONTINUED: u32 = 6;
+    if options & !KNOWN != 0 || options & (WEXITED | WSTOPPED | WCONTINUED) == 0 {
+        return Err(EINVAL);
+    }
+    let pid = match idtype {
+        0 => -1,                                           // P_ALL
+        1 if id > 0 && id <= i32::MAX as u64 => id as i64, // P_PID
+        2 if id <= i32::MAX as u64 => -(id as i64),        // P_PGID (0: the caller's)
+        3 => pidfd::pid_of(p, id)?.cast_signed(),          // P_PIDFD
+        _ => return Err(EINVAL),
+    };
+    let want = proc::Wanted {
+        exited: options & WEXITED != 0,
+        stopped: options & WSTOPPED != 0,
+        continued: options & WCONTINUED != 0,
+        nohang: options & WNOHANG != 0 || (idtype == 3 && pidfd::nonblocking(p, id)),
+        keep: options & WNOWAIT != 0,
+    };
+    let found = proc::wait(&p.group.leader, &p.entry, pid, want)?;
+    if found.is_none() && options & WNOHANG == 0 {
+        return Err(EAGAIN); // a non-blocking pidfd
+    }
+    // struct siginfo (128 bytes): signo, errno, code, then pid, uid, status.
+    let mut si = [0u8; 128];
+    if let Some((cpid, st, uid)) = found {
+        let (code, status) = if st == proc::CONTINUED {
+            (CLD_CONTINUED, signal::SIGCONT)
+        } else if st & 0xff == 0x7f {
+            (CLD_STOPPED, st >> 8)
+        } else if st & 0x7f == 0 {
+            (CLD_EXITED, (st >> 8) & 0xff)
+        } else if st & 0x80 != 0 {
+            (CLD_DUMPED, st & 0x7f)
+        } else {
+            (CLD_KILLED, st & 0x7f)
+        };
+        si[0..4].copy_from_slice(&SIGCHLD.to_le_bytes());
+        si[8..12].copy_from_slice(&code.to_le_bytes());
+        si[16..20].copy_from_slice(&(cpid as u32).to_le_bytes());
+        si[20..24].copy_from_slice(&uid.to_le_bytes());
+        si[24..28].copy_from_slice(&status.to_le_bytes());
+    }
+    if infop != 0 && p.copy_to_user(infop, &si) != si.len() {
+        return Err(EFAULT);
+    }
+    if rusage != 0 && p.copy_to_user(rusage, &[0u8; 144]) != 144 {
+        return Err(EFAULT);
+    }
+    Ok(0)
 }
 
 // ---------------------------------------------------------------------------
@@ -924,13 +1390,49 @@ fn clock_gettime(p: &mut LinuxProcess, clock: u64, tp: u64) -> Result<u64, i64> 
     let t = match clock {
         REALTIME | REALTIME_COARSE => crate::vfs::wall_clock(),
         MONOTONIC | MONOTONIC_RAW | MONOTONIC_COARSE | BOOTTIME => frame::time::now(),
-        PROCESS_CPUTIME | THREAD_CPUTIME => {
-            let started = core::time::Duration::from_millis(p.group.leader.started * 10);
-            frame::time::now().saturating_sub(started)
+        PROCESS_CPUTIME => core::time::Duration::from_nanos(p.group.cpu_ns()),
+        THREAD_CPUTIME => core::time::Duration::from_nanos(
+            p.entry.cpu_ns.load(core::sync::atomic::Ordering::Relaxed),
+        ),
+        // A CPU-time clock id for a pid or tid (clock_getcpuclockid,
+        // pthread_getcpuclockid): `~id << 3 | type`, bit 2 for a thread.
+        // The caller's own process and threads are answered.
+        c if (c as i32) < 0 => {
+            let c = c as i32;
+            let id = u64::from((!c >> 3) as u32);
+            if c & 3 == 3 {
+                return Err(EINVAL);
+            }
+            let ns = if c & 4 != 0 {
+                p.group
+                    .threads()
+                    .iter()
+                    .find(|e| e.pid == id || (id == 0 && e.pid == p.entry.pid))
+                    .ok_or(EINVAL)?
+                    .cpu_ns
+                    .load(core::sync::atomic::Ordering::Relaxed)
+            } else if id == 0 || id == p.group.tgid {
+                p.group.cpu_ns()
+            } else {
+                return Err(EINVAL);
+            };
+            core::time::Duration::from_nanos(ns)
         }
         _ => return Err(EINVAL),
     };
     put_pair(p, tp, t.as_secs(), u64::from(t.subsec_nanos()))
+}
+
+/// `clock_getres`: every clock `clock_gettime` answers reads the TSC-based
+/// time in nanoseconds (the coarse ones too), so the resolution is 1 ns.
+fn clock_getres(p: &mut LinuxProcess, clock: u64, res: u64) -> Result<u64, i64> {
+    if clock > 7 {
+        return Err(EINVAL);
+    }
+    if res == 0 {
+        return Ok(0);
+    }
+    put_pair(p, res, 0, 1)
 }
 
 fn gettimeofday(p: &mut LinuxProcess, tv: u64) -> Result<u64, i64> {
@@ -939,6 +1441,37 @@ fn gettimeofday(p: &mut LinuxProcess, tv: u64) -> Result<u64, i64> {
     }
     let now = crate::vfs::wall_clock();
     put_pair(p, tv, now.as_secs(), u64::from(now.subsec_micros()))
+}
+
+/// `getpriority` (`value` None) and `setpriority`: the caller's nice value.
+/// The raw syscall returns `20 - nice` so that it is never negative. Raising
+/// the nice value is always allowed; lowering it needs CAP_SYS_NICE, which
+/// is outside the cell bounding set, so it is EACCES as for an unprivileged
+/// Linux process.
+fn priority(p: &mut LinuxProcess, which: i64, who: u64, value: Option<i64>) -> Result<u64, i64> {
+    const PRIO_USER: i64 = 2;
+    const ESRCH: i64 = 3;
+    const EACCES: i64 = 13;
+    if !(0..=PRIO_USER).contains(&which) {
+        return Err(EINVAL);
+    }
+    // PRIO_PROCESS names a pid; PRIO_PGRP and PRIO_USER only themselves (0).
+    let me = who == 0 || (which == 0 && who == p.group.tgid);
+    if !me {
+        return Err(ESRCH);
+    }
+    let mut prctl = p.group.prctl.lock();
+    match value {
+        None => Ok((20 - prctl.nice) as u64),
+        Some(v) => {
+            let nice = v.clamp(-20, 19) as i32;
+            if nice < prctl.nice {
+                return Err(EACCES);
+            }
+            prctl.nice = nice;
+            Ok(0)
+        }
+    }
 }
 
 /// `prctl(option, arg2, ...)`: the options libc, apt and service managers
@@ -1045,14 +1578,64 @@ fn sched_getaffinity(p: &mut LinuxProcess, pid: u64, len: u64, mask: u64) -> Res
     if (len as usize) < bytes || !len.is_multiple_of(8) {
         return Err(EINVAL);
     }
+    let set = p.group.prctl.lock().affinity;
     let mut v = alloc::vec![0u8; bytes];
     for cpu in 0..n {
-        v[cpu / 8] |= 1 << (cpu % 8);
+        if set.is_none_or(|m| cpu < 64 && m & (1 << cpu) != 0) {
+            v[cpu / 8] |= 1 << (cpu % 8);
+        }
     }
     if p.copy_to_user(mask, &v) != v.len() {
         return Err(EFAULT);
     }
     Ok(bytes as u64)
+}
+
+/// `sched_setaffinity(pid, len, mask)`: the caller's process (pid 0 or
+/// one of its own) records the mask, which must name an online CPU; the
+/// scheduler does not apply it yet (partial). Another process: EPERM, as
+/// for an unprivileged caller without CAP_SYS_NICE.
+fn sched_setaffinity(p: &mut LinuxProcess, pid: u64, len: u64, mask: u64) -> Result<u64, i64> {
+    const ESRCH: i64 = 3;
+    let pid = u64::from(pid as u32);
+    if pid != 0 && pid != p.group.tgid && pid != p.entry.pid {
+        crate::proc::uids_of(p.entry.cell, pid).map_err(|_| ESRCH)?;
+        return Err(EPERM);
+    }
+    let n = frame::cpu::online_count().min(64);
+    let mut b = [0u8; 8];
+    let take = (len as usize).min(8);
+    if p.copy_from_user(mask, &mut b[..take]) != take {
+        return Err(EFAULT);
+    }
+    let online = if n == 64 { u64::MAX } else { (1u64 << n) - 1 };
+    let m = u64::from_le_bytes(b) & online;
+    if m == 0 {
+        return Err(EINVAL);
+    }
+    p.group.prctl.lock().affinity = (m != online).then_some(m);
+    Ok(0)
+}
+
+/// `sched_get_priority_max`/`min`: 1..=99 for the real-time policies
+/// (FIFO, RR, DEADLINE has none), 0 for the others, as on Linux.
+fn sched_priority_bound(policy: u64, max: bool) -> Result<u64, i64> {
+    match policy {
+        1 | 2 => Ok(if max { 99 } else { 1 }), // SCHED_FIFO, SCHED_RR
+        0 | 3 | 5 | 6 => Ok(0),                // OTHER, BATCH, IDLE, DEADLINE
+        _ => Err(EINVAL),
+    }
+}
+
+/// `sched_rr_get_interval`: the round-robin time slice Linux reports
+/// (100 ms); the caller's process only.
+fn sched_rr_get_interval(p: &mut LinuxProcess, pid: u64, tp: u64) -> Result<u64, i64> {
+    const ESRCH: i64 = 3;
+    let pid = u64::from(pid as u32);
+    if pid != 0 && crate::proc::uids_of(p.entry.cell, pid).is_err() {
+        return Err(ESRCH);
+    }
+    put_pair(p, tp, 0, 100_000_000)
 }
 
 /// `sysinfo`: uptime, the cell's memory (its account, as `/proc/meminfo`
@@ -1084,6 +1667,15 @@ fn getrusage(p: &mut LinuxProcess, who: i64, buf: u64) -> Result<u64, i64> {
     let mut b = [0u8; 144];
     match who {
         RUSAGE_SELF | RUSAGE_THREAD => {
+            // ru_utime: user CPU time (a timeval); system time is not
+            // accounted yet.
+            let ns = if who == RUSAGE_SELF {
+                p.group.cpu_ns()
+            } else {
+                p.entry.cpu_ns.load(core::sync::atomic::Ordering::Relaxed)
+            };
+            b[0..8].copy_from_slice(&(ns / 1_000_000_000).to_le_bytes());
+            b[8..16].copy_from_slice(&((ns % 1_000_000_000) / 1000).to_le_bytes());
             let rss_kb = p.mm().resident_pages() as u64 * 4;
             b[32..40].copy_from_slice(&rss_kb.to_le_bytes());
         }
@@ -1096,10 +1688,13 @@ fn getrusage(p: &mut LinuxProcess, who: i64, buf: u64) -> Result<u64, i64> {
     Ok(0)
 }
 
-/// `times(buf)`: no CPU-time accounting yet (all zero); returns clock
-/// ticks (`USER_HZ`, 100/s) since boot.
+/// `times(buf)`: the process's user CPU time in clock ticks (`USER_HZ`,
+/// 100/s); system and children's times are not accounted yet (zero).
+/// Returns clock ticks since boot.
 fn times(p: &mut LinuxProcess, buf: u64) -> Result<u64, i64> {
-    if buf != 0 && p.copy_to_user(buf, &[0u8; 32]) != 32 {
+    let mut t = [0u8; 32];
+    t[0..8].copy_from_slice(&(p.group.cpu_ns() / 10_000_000).to_le_bytes());
+    if buf != 0 && p.copy_to_user(buf, &t) != 32 {
         return Err(EFAULT);
     }
     Ok((frame::time::now().as_millis() / 10) as u64)
@@ -1163,14 +1758,19 @@ fn setgroups(p: &mut LinuxProcess, size: u64, list: u64) -> Result<u64, i64> {
 fn prlimit(p: &mut LinuxProcess, pid: u64, resource: u64, new: u64, old: u64) -> Result<u64, i64> {
     use crate::process::{MAX_FDS, RLIM_NLIMITS, RLIMIT_NOFILE};
     const ESRCH: i64 = 3;
-    if pid != 0 && pid != p.group.tgid {
-        return Err(ESRCH);
-    }
+    let group = if pid == 0 || pid == p.group.tgid {
+        p.group.clone()
+    } else {
+        let e = proc::find(p.entry.cell, pid).ok_or(ESRCH)?;
+        signal::may_signal(p, pid, 0)?; // the same rights as to signal it
+        let leader = proc::find(p.entry.cell, e.tgid).ok_or(ESRCH)?;
+        leader.process().ok_or(ESRCH)?
+    };
     let r = usize::try_from(resource)
         .ok()
         .filter(|&r| r < RLIM_NLIMITS)
         .ok_or(EINVAL)?;
-    let (cur, max) = p.group.limits()[r];
+    let (cur, max) = group.limits()[r];
     if new != 0 {
         let mut b = [0u8; 16];
         if p.copy_from_user(new, &mut b) != 16 {
@@ -1187,15 +1787,13 @@ fn prlimit(p: &mut LinuxProcess, pid: u64, resource: u64, new: u64, old: u64) ->
         if hard > max || (r == RLIMIT_NOFILE && hard > MAX_FDS as u64) {
             return Err(EPERM);
         }
-        p.group.set_limit(r, soft, hard);
+        group.set_limit(r, soft, hard);
     }
     if old != 0 {
         put_pair(p, old, cur, max)?;
     }
     Ok(0)
 }
-
-const ITIMER_REAL: u64 = 0;
 
 /// A user `struct itimerval` (interval, then value; `timeval`s).
 fn put_itimerval(
@@ -1214,26 +1812,25 @@ fn put_itimerval(
     Ok(())
 }
 
-/// Only the real-time timer exists: `ITIMER_VIRTUAL` and `ITIMER_PROF`
-/// (CPU time) are `EINVAL` (partial).
-fn which_real(which: u64) -> Result<(), i64> {
-    if which == ITIMER_REAL {
-        Ok(())
-    } else {
-        Err(EINVAL)
-    }
+/// An interval timer's number in the timer table.
+fn which_itimer(which: u64) -> Result<i32, i64> {
+    use crate::itimer::{PROF, REAL, VIRTUAL};
+    [REAL, VIRTUAL, PROF]
+        .get(usize::try_from(which).unwrap_or(usize::MAX))
+        .copied()
+        .ok_or(EINVAL)
 }
 
 /// `getitimer(which, curr)`.
 fn getitimer(p: &mut LinuxProcess, which: u64, curr: u64) -> Result<u64, i64> {
-    which_real(which)?;
-    let v = crate::itimer::get(p.cell.id(), p.group.tgid);
+    let v = crate::itimer::get(p, which_itimer(which)?).unwrap_or_default();
     put_itimerval(p, curr, v).map(|()| 0)
 }
 
-/// `setitimer(which, new, old)`: arms `ITIMER_REAL` (`SIGALRM`).
+/// `setitimer(which, new, old)`: arms `ITIMER_REAL` (`SIGALRM`),
+/// `ITIMER_VIRTUAL` (`SIGVTALRM`) or `ITIMER_PROF` (`SIGPROF`).
 fn setitimer(p: &mut LinuxProcess, which: u64, new: u64, old: u64) -> Result<u64, i64> {
-    which_real(which)?;
+    let id = which_itimer(which)?;
     let mut b = [0u8; 32];
     if new != 0 && p.copy_from_user(new, &mut b) != 32 {
         return Err(EFAULT);
@@ -1248,9 +1845,9 @@ fn setitimer(p: &mut LinuxProcess, which: u64, new: u64, old: u64) -> Result<u64
     };
     let (interval, value) = (tv(0)?, tv(16)?);
     let prev = if new == 0 {
-        crate::itimer::get(p.cell.id(), p.group.tgid)
+        crate::itimer::get(p, id).unwrap_or_default()
     } else {
-        crate::itimer::set(p.cell.id(), p.group.tgid, value, interval).ok_or(ENOMEM)?
+        crate::itimer::set_itimer(p, id, value, interval)?
     };
     if old != 0 {
         put_itimerval(p, old, prev)?;
@@ -1258,17 +1855,120 @@ fn setitimer(p: &mut LinuxProcess, which: u64, new: u64, old: u64) -> Result<u64
     Ok(0)
 }
 
+/// `timer_create(clock, sigevent, id)`.
+fn timer_create(p: &mut LinuxProcess, clock: u64, event: u64, id: u64) -> Result<u64, i64> {
+    use crate::itimer::{Clock, Notify};
+    const SIGEV_SIGNAL: u32 = 0;
+    const SIGEV_NONE: u32 = 1;
+    const SIGEV_THREAD: u32 = 2; // libc's own; the kernel just signals
+    const SIGEV_THREAD_ID: u32 = 4;
+    let clock = match clock {
+        0 => Clock::Real,
+        1 | 7 => Clock::Mono,
+        2 => Clock::Process,
+        3 => Clock::Thread(p.entry.pid),
+        _ => return Err(EINVAL),
+    };
+    let notify = if event == 0 {
+        None
+    } else {
+        // struct sigevent: value, signo, notify, then the thread id.
+        let mut b = [0u8; 64];
+        if p.copy_from_user(event, &mut b) != 64 {
+            return Err(EFAULT);
+        }
+        let word = |at: usize| u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]);
+        let (value, sig, how) = (le_u64(&b[..8]), word(8), word(12));
+        if how != SIGEV_NONE && !(1..=signal::NSIG).contains(&sig) {
+            return Err(EINVAL);
+        }
+        let thread = match how {
+            SIGEV_SIGNAL | SIGEV_NONE | SIGEV_THREAD => None,
+            SIGEV_THREAD_ID => {
+                let tid = u64::from(word(16));
+                let mine = p.group.threads().iter().any(|t| t.pid == tid);
+                Some(mine.then_some(tid).ok_or(EINVAL)?)
+            }
+            _ => return Err(EINVAL),
+        };
+        Some(Notify {
+            sig: if how == SIGEV_NONE { 0 } else { sig },
+            thread,
+            value,
+        })
+    };
+    let n = crate::itimer::create(p, clock, |n| {
+        notify.unwrap_or(Notify {
+            sig: signal::SIGALRM,
+            thread: None,
+            value: n as u64,
+        })
+    })?;
+    if p.copy_to_user(id, &n.to_le_bytes()) != 4 {
+        let _ = crate::itimer::delete(p, n);
+        return Err(EFAULT);
+    }
+    Ok(0)
+}
+
+/// A POSIX timer's number.
+fn timer_id(id: u64) -> Result<i32, i64> {
+    i32::try_from(id & 0xffff_ffff).map_err(|_| EINVAL)
+}
+
+/// Writes a `struct itimerspec`: interval, then value.
+fn put_itimerspec(
+    p: &mut LinuxProcess,
+    at: u64,
+    (left, interval): (Duration, Duration),
+) -> Result<(), i64> {
+    let mut b = [0u8; 32];
+    for (i, d) in [interval, left].iter().enumerate() {
+        b[i * 16..i * 16 + 8].copy_from_slice(&d.as_secs().to_le_bytes());
+        let ns = u64::from(d.subsec_nanos());
+        b[i * 16 + 8..i * 16 + 16].copy_from_slice(&ns.to_le_bytes());
+    }
+    if p.copy_to_user(at, &b) != 32 {
+        return Err(EFAULT);
+    }
+    Ok(())
+}
+
+/// `timer_settime(id, flags, new, old)`.
+fn timer_settime(
+    p: &mut LinuxProcess,
+    id: u64,
+    flags: u64,
+    new: u64,
+    old: u64,
+) -> Result<u64, i64> {
+    const TIMER_ABSTIME: u64 = 1;
+    let interval = crate::poll::read_timespec(p, new)?;
+    let value = crate::poll::read_timespec(p, new + 16)?;
+    let absolute = flags & TIMER_ABSTIME != 0;
+    let prev = crate::itimer::set(p, timer_id(id)?, value, interval, absolute)?;
+    if old != 0 {
+        put_itimerspec(p, old, prev)?;
+    }
+    Ok(0)
+}
+
+/// `timer_gettime(id, curr)`.
+fn timer_gettime(p: &mut LinuxProcess, id: u64, curr: u64) -> Result<u64, i64> {
+    let v = crate::itimer::get(p, timer_id(id)?).ok_or(EINVAL)?;
+    put_itimerspec(p, curr, v).map(|()| 0)
+}
+
 /// `alarm(seconds)`: a one-shot `ITIMER_REAL`; returns the seconds the
 /// previous alarm had left, rounded as Linux does.
 fn alarm(p: &mut LinuxProcess, secs: u64) -> Result<u64, i64> {
     let secs = secs & 0xffff_ffff;
-    let (left, _) = crate::itimer::set(
-        p.cell.id(),
-        p.group.tgid,
+    let (left, _) = crate::itimer::set_itimer(
+        p,
+        crate::itimer::REAL,
         Duration::from_secs(secs),
         Duration::ZERO,
-    )
-    .ok_or(ENOMEM)?;
+    )?;
     if left.is_zero() {
         return Ok(0);
     }

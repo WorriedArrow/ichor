@@ -56,6 +56,8 @@ const S7_ROOT: &str = include_str!("cellaccess/s7_root.pl");
 /// The file both cells map (B's helper reports it too); the checks use its
 /// page 1.
 const SHARED_FILE: &str = "/usr/bin/dash";
+/// A second such file, which A writes through a shared mapping.
+const STORED_FILE: &str = "/usr/bin/bash";
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
 /// Set once the harness has ended B's futex wait (section 4); until then
@@ -96,6 +98,8 @@ const SECTIONS: &[Section] = &[
     ("uid_0_in_a_cell_has_no_authority_outside_it", |c| {
         in_a(c, S7_ROOT)
     }),
+    ("resource_limits_are_per_cell", s8),
+    ("a_destroyed_cell_leaves_no_shared_memory", segments_go),
 ];
 
 /// One cell with its own root.
@@ -139,7 +143,8 @@ pub(crate) fn run(m: &Mounted) {
         let cell = Cell::new(&system.root_account, CELL_PAGES)
             .unwrap_or_else(|| fail("cellaccess: no cell"));
         let root = Arc::new(
-            Vfs::mount_disk(m).unwrap_or_else(|_| fail("cellaccess: could not mount a root")),
+            Vfs::mount_disk_for(m, cell.account())
+                .unwrap_or_else(|_| fail("cellaccess: could not mount a root")),
         );
         prepare(&root);
         let ip = match crate::netstack::stack_for(&cell).addr() {
@@ -171,7 +176,7 @@ pub(crate) fn run(m: &Mounted) {
         helper,
         view0: String::new(),
         disk: Mounted {
-            metadata: m.metadata,
+            image: m.image,
             disk: m.disk,
         },
         accounts: system.root_account.clone(),
@@ -197,19 +202,29 @@ pub(crate) fn run(m: &Mounted) {
             failed.push("B's helper exit");
         }
     }
-    // run_linux checked each program's memory came back; nothing else in
-    // either cell may still hold any.
-    for (name, s) in [("A", &ctx.a), ("B", &ctx.b)] {
-        let used = s.cell.account().used();
-        if used != 0 {
-            println!("ichor: cellaccess FAILED: cell {name} still has {used} pages charged");
+    // run_linux checked each program's memory came back. What is left is
+    // what the cells' roots hold, which goes with them.
+    let Ctx { a, b, .. } = ctx;
+    let mut returned = true;
+    for (name, s) in [("A", a), ("B", b)] {
+        let account = s.cell.account().clone();
+        let (used, root) = (account.used(), s.root.charged());
+        drop(s);
+        let gone = wait_until(30, || account.used() == 0);
+        if used != root || !gone {
+            println!(
+                "ichor: cellaccess FAILED: cell {name} had {used} pages charged ({root} of them its root's), and {} without its root",
+                account.used()
+            );
             failed.push("memory returned");
+            returned = false;
         }
     }
+    if returned {
+        println!("ichor: cellaccess: both cells exited and their memory returned");
+    }
     if failed.is_empty() {
-        println!(
-            "ichor: cellaccess: every section passed; both cells exited and their memory returned"
-        );
+        println!("ichor: cellaccess: every section passed");
     } else {
         println!("ichor: cellaccess FAILED: {failed:?}");
         fail("cellaccess");
@@ -367,7 +382,9 @@ fn b_intact(ctx: &Ctx, after: &str) -> bool {
         && word(&s, "hostname") == ctx.id("hostname")
         && word(&s, "secret") == "intact"
         && word(&s, "pts") == ctx.id("pts")
-        && (FUTEX_RELEASED.load(Ordering::Relaxed) || word(&s, "futex") == "waiting")
+        && word(&s, "shm") == "intact"
+        && (FUTEX_RELEASED.load(Ordering::Relaxed)
+            || (word(&s, "futex") == "waiting" && word(&s, "futex2") == "waiting"))
         && word(&s, "view") == ctx.view0
         && word(&s, "file") == ctx.view0;
     if ok {
@@ -401,24 +418,25 @@ fn hex(bytes: &[u8]) -> String {
     s
 }
 
-/// A static ELF that maps page 0-1 of [`SHARED_FILE`] `MAP_PRIVATE`
-/// writable, stores a word at the start of page 1 with an ordinary CPU
-/// store, and reads it back. Exits 0 if the store landed in its copy (1:
-/// it did not read back, 2: the page already held that word).
-fn store_program() -> Vec<u8> {
+/// A static ELF that opens `path` (with `open` flags) and maps its pages
+/// 0-1 writable (with `map` flags), loads and then stores a word at the
+/// start of page 1 with ordinary CPU instructions, and reads it back.
+/// Exits 0 if the store landed (1: it did not read back, 2: the page
+/// already held that word).
+fn store_program(path: &str, open: u64, map: u64) -> Vec<u8> {
     use testprog::{Asm, BLOB_VADDR, Reg, static_elf};
     let word = u64::from_le_bytes(*b"A-store!");
     let mut a = Asm::new();
-    let path = a.data(b"/usr/bin/dash\0");
+    let path = a.data(alloc::format!("{path}\0").as_bytes());
     let bad = a.label();
     a.mov_data(Reg::Rdi, path);
-    a.mov_imm(Reg::Rsi, 0);
+    a.mov_imm(Reg::Rsi, open);
     a.sys(2); // open
     a.mov(Reg::R13, Reg::Rax);
     a.mov_imm(Reg::Rdi, 0);
     a.mov_imm(Reg::Rsi, 8192);
     a.mov_imm(Reg::Rdx, 3); // PROT_READ | PROT_WRITE
-    a.mov_imm(Reg::R10, 2); // MAP_PRIVATE
+    a.mov_imm(Reg::R10, map);
     a.mov(Reg::R8, Reg::R13);
     a.mov_imm(Reg::R9, 0);
     a.sys(9); // mmap
@@ -443,6 +461,15 @@ fn store_program() -> Vec<u8> {
     )
 }
 
+/// The start of the page-cache page `root` has for page 1 of `path` (hex).
+fn cache_bytes(root: &Vfs, path: &str) -> Option<String> {
+    let ino = root.lock().resolve(ROOT, path, true).ok()?;
+    let page = root.cached_page(ino, 1)?;
+    let mut b = [0u8; 16];
+    page.reader().read(&mut b);
+    Some(hex(&b))
+}
+
 /// Section 4: shared page-cache pages.
 fn s4(ctx: &Ctx) -> bool {
     const RULE: &str = "shared_cache_pages_never_carry_writes_between_cells";
@@ -458,10 +485,14 @@ fn s4(ctx: &Ctx) -> bool {
         )
     };
 
+    let in_a_elf = |elf: &[u8]| {
+        let p = LinuxProcess::new(ctx.a.cell.clone(), ctx.a.root.clone())
+            .unwrap_or_else(|| fail("cellaccess: no process"));
+        run_linux(p, elf, None, &["/cellaccess-store"]).0
+    };
+
     // A CPU store into A's private mapping of the shared page.
-    let p = LinuxProcess::new(ctx.a.cell.clone(), ctx.a.root.clone())
-        .unwrap_or_else(|| fail("cellaccess: no process"));
-    let (code, _) = run_linux(p, &store_program(), None, &["/cellaccess-store"]);
+    let code = in_a_elf(&store_program(SHARED_FILE, 0, 2)); // O_RDONLY, MAP_PRIVATE
     ok &= report(
         RULE,
         "A's CPU store through MAP_PRIVATE landed in A's own copy",
@@ -470,18 +501,48 @@ fn s4(ctx: &Ctx) -> bool {
     );
     ok &= b_view("A's CPU store");
 
+    // A CPU store through a shared mapping of a file both roots have: it
+    // reaches A's file, and neither B's file nor the cache page.
+    let page1 = |root: &Vfs| {
+        let ino = root.lock().resolve(ROOT, STORED_FILE, true).ok()?;
+        let mut b = [0u8; 16];
+        (root.read(ino, 4096, &mut b) == Ok(16)).then(|| hex(&b))
+    };
+    let (a0, b0) = (page1(&ctx.a.root), page1(&ctx.b.root));
+    let code = in_a_elf(&store_program(STORED_FILE, 2, 1)); // O_RDWR, MAP_SHARED
+    let (a1, b1) = (page1(&ctx.a.root), page1(&ctx.b.root));
+    ok &= report(
+        RULE,
+        "A's CPU store through MAP_SHARED reached A's own file",
+        code == 0 && a0 == b0 && a1 != a0 && a1.is_some(),
+        &alloc::format!("exited {code}; A's file {a0:?} -> {a1:?}"),
+    );
+    ok &= report(
+        RULE,
+        "B's file is unchanged after A's store through MAP_SHARED",
+        b1 == b0 && b1.is_some() && cache_bytes(&ctx.b.root, STORED_FILE) == b0,
+        &alloc::format!("B's file {b0:?} -> {b1:?}"),
+    );
+
+    // The futex checks need both roots on the same physical page.
+    let phys = |root: &Vfs| {
+        let ino = root.lock().resolve(ROOT, SHARED_FILE, true).ok()?;
+        Some(root.cached_page(ino, 1)?.phys().as_u64())
+    };
+    let (pa, pb) = (phys(&ctx.a.root), phys(&ctx.b.root));
+    ok &= report(
+        RULE,
+        "both roots' page 1 of the file is the same physical page",
+        pa.is_some() && pa == pb,
+        &alloc::format!("{pa:x?} and {pb:x?}"),
+    );
+
     // A's futex wake, read() into its mappings, and copy-up (perl).
     ok &= in_a(ctx, S4_PAGES);
     ok &= b_view("A's read() into its private mapping and its copy-up write");
 
     // The cache page itself, as B's root reads it, kept its bytes.
-    let ino = ctx.b.root.lock().resolve(ROOT, SHARED_FILE, true);
-    let page = ino.ok().and_then(|i| ctx.b.root.cached_page(i, 1));
-    let bytes = page.map(|f| {
-        let mut b = [0u8; 16];
-        f.reader().read(&mut b);
-        hex(&b)
-    });
+    let bytes = cache_bytes(&ctx.b.root, SHARED_FILE);
     ok &= report(
         RULE,
         "the shared cache page B's root maps kept its bytes",
@@ -497,33 +558,36 @@ fn s4(ctx: &Ctx) -> bool {
         "A's root still maps the lower file",
     );
 
-    // B's futex waiter is still waiting; the harness ends the wait with a
-    // signal, and B reports how it ended.
-    let s = b_status(ctx);
-    ok &= report(
-        RULE,
-        "B's futex waiter was not woken by A",
-        word(&s, "futex") == "waiting",
-        &alloc::format!("B's waiter: {}", word(&s, "futex")),
-    );
-    let pid: u64 = ctx.id("futex_pid").parse().unwrap_or(0);
-    let sent = crate::proc::send(ctx.b.cell.id(), pid, 10).is_ok(); // SIGUSR1
-    let deadline = frame::time::now() + Duration::from_secs(30);
-    let ended = loop {
+    // B's futex waiters are still waiting; the harness ends the waits with
+    // a signal, and B reports how they ended.
+    for (kind, key, pid) in [
+        ("shared", "futex", "futex_pid"),
+        ("private", "futex2", "futex2_pid"),
+    ] {
         let s = b_status(ctx);
-        let f = String::from(word(&s, "futex"));
-        if f != "waiting" || frame::time::now() > deadline {
-            break f;
-        }
-        frame::task::sleep_until(frame::time::now() + Duration::from_millis(50));
-    };
-    FUTEX_RELEASED.store(true, Ordering::Relaxed);
-    ok &= report(
-        RULE,
-        "B's futex wait ended only when the harness signalled it (EINTR)",
-        sent && ended == "EINTR",
-        &alloc::format!("signal sent: {sent}; the wait ended with {ended}"),
-    );
+        ok &= report(
+            RULE,
+            &alloc::format!("B's futex waiter ({kind} mapping) was not woken by A"),
+            word(&s, key) == "waiting",
+            &alloc::format!("B's waiter: {}", word(&s, key)),
+        );
+        let pid: u64 = ctx.id(pid).parse().unwrap_or(0);
+        let sent = crate::proc::send(ctx.b.cell.id(), pid, 10).is_ok(); // SIGUSR1
+        FUTEX_RELEASED.store(true, Ordering::Relaxed);
+        let mut ended = String::new();
+        wait_until(30, || {
+            ended = word(&b_status(ctx), key).to_string();
+            ended != "waiting"
+        });
+        ok &= report(
+            RULE,
+            &alloc::format!(
+                "B's futex wait ({kind} mapping) ended only when the harness signalled it (EINTR)"
+            ),
+            sent && ended == "EINTR",
+            &alloc::format!("signal sent: {sent}; the wait ended with {ended}"),
+        );
+    }
 
     ok &= opted_out(ctx);
     ok
@@ -563,18 +627,19 @@ fn opted_out(ctx: &Ctx) -> bool {
     let used = cell.account().used();
     ok &= report(
         RULE,
-        "B' is charged for its own private cache pages",
-        pages > 0 && used == pages as u64,
+        "B' is charged for its own private cache pages (and what it wrote)",
+        pages > 0 && used >= pages as u64 && used == root.charged(),
         &alloc::format!("{pages} private pages, {used} charged"),
     );
+    // More pages coming in than the cache then holds means it evicted.
     let (_, _, misses0, _, _) = crate::pagecache::stats();
     ok &= in_a(ctx, S4_FILL);
-    let (_, _, misses1, _, _) = crate::pagecache::stats();
+    let (cached, _, misses1, _, _) = crate::pagecache::stats();
     ok &= report(
         RULE,
-        "A's reads went through more pages than the shared cache holds",
-        misses1 - misses0 > 8192,
-        &alloc::format!("{} chunks read", misses1 - misses0),
+        "A's reads brought in more pages than the shared cache holds",
+        misses1 - misses0 > cached as u64,
+        &alloc::format!("{} chunks read, {cached} pages cached", misses1 - misses0),
     );
     let after = phys(&root);
     ok &= report(
@@ -582,7 +647,7 @@ fn opted_out(ctx: &Ctx) -> bool {
         "A filling the shared cache evicted none of the opted-out cell's pages",
         after == before
             && crate::pagecache::private_pages(ns) == pages
-            && cell.account().used() == pages as u64,
+            && cell.account().used() == used,
         &alloc::format!(
             "pages {before:x?} -> {after:x?}, {pages} -> {} private pages, {} charged",
             crate::pagecache::private_pages(ns),
@@ -597,6 +662,245 @@ fn opted_out(ctx: &Ctx) -> bool {
         &alloc::format!("{} still charged", cell.account().used()),
     );
     ok
+}
+
+/// Runs `f` on a task of its own; the slot gets what it returns.
+fn spawn(f: impl FnOnce() -> i32 + Send + 'static) -> Arc<SpinLock<Option<i32>>> {
+    let done = Arc::new(SpinLock::new(None));
+    let slot = done.clone();
+    TaskOptions::new(move || {
+        let code = f();
+        *slot.lock() = Some(code);
+    })
+    .spawn()
+    .unwrap_or_else(|| fail("cellaccess: no task"));
+    done
+}
+
+/// Section 8: resource limits. A program in A uses up A's memory and then
+/// cannot fork; another forks until A's account refuses a child. Each then
+/// sleeps at its limit, the harness has B allocate 8 MiB and fork, and
+/// SIGTERM ends the program. (They are `testprog` programs, which need no
+/// page they have not touched yet, so they run at a full account.)
+fn s8(ctx: &Ctx) -> bool {
+    const RULE: &str = "resource_limits_are_per_cell";
+    let (cell, root) = (&ctx.a.cell, &ctx.a.root);
+    let mut ok = true;
+    for (limit, fill) in [("memory", true), ("process", false)] {
+        let (c, r) = (cell.clone(), root.clone());
+        let done = spawn(move || {
+            let p = LinuxProcess::new(c, r).unwrap_or_else(|| fail("cellaccess: no process"));
+            run_linux(p, &limit_program(fill), None, &["/cellaccess-limit"]).0
+        });
+        // At its limit once the account is (nearly) full and has stopped
+        // changing for a second.
+        let (mut last, mut since) = (u64::MAX, frame::time::now());
+        let at_limit = wait_until(240, || {
+            let used = cell.account().used();
+            if used != last {
+                (last, since) = (used, frame::time::now());
+            }
+            let still = frame::time::now().saturating_sub(since) > Duration::from_secs(1);
+            (still && used + 64 >= CELL_PAGES) || done.lock().is_some()
+        });
+        let (_, procs, _) = crate::proc::census(cell.id());
+        let used = cell.account().used();
+        ok &= report(
+            RULE,
+            &alloc::format!("A is at its {limit} limit"),
+            at_limit && used + 64 >= CELL_PAGES && used <= CELL_PAGES && (fill || procs > 10),
+            &alloc::format!("{used} of {CELL_PAGES} pages, {procs} processes"),
+        );
+        put(&ctx.b.root, "alloc", "");
+        let r = take(&ctx.b.root, "alloc", &ctx.helper);
+        println!(
+            "cellaccess: {RULE}: A at its {limit} limit: {used} of {CELL_PAGES} pages, {procs} processes; B: {r}"
+        );
+        ok &= report(
+            RULE,
+            &alloc::format!("B allocates 8 MiB and forks while A is at its {limit} limit"),
+            r == "filled=8388608 fork=7",
+            &r,
+        );
+        crate::proc::signal_cell(cell.id(), 15);
+        let code = wait_for(&done, 120);
+        ok &= report(
+            RULE,
+            &alloc::format!("A's fork at its {limit} limit failed with EAGAIN"),
+            code == Some(-15),
+            &alloc::format!(
+                "the program ended with {code:?} (1: fork failed otherwise, 2: fork worked)"
+            ),
+        );
+    }
+    ok
+}
+
+/// A static ELF that, with `fill`, reads /dev/zero into twice A's budget of
+/// fresh memory until a read stops short, then forks once; without it,
+/// forks until that fails. A fork that fails with EAGAIN is what is
+/// wanted: it then sleeps until a signal ends it (as its children do).
+/// Exits 1 on another errno, 2 if the fork worked at a full account.
+fn limit_program(fill: bool) -> Vec<u8> {
+    use testprog::{Asm, BLOB_VADDR, Reg, static_elf};
+    let mut a = Asm::new();
+    let zero = a.data(b"/dev/zero\0");
+    let (filling, full, sleep, bad) = (a.label(), a.label(), a.label(), a.label());
+    if fill {
+        a.mov_imm(Reg::Rdi, 0);
+        a.mov_imm(Reg::Rsi, 2 * CELL_PAGES * 4096);
+        a.mov_imm(Reg::Rdx, 3); // PROT_READ | PROT_WRITE
+        a.mov_imm(Reg::R10, 0x22); // MAP_PRIVATE | MAP_ANONYMOUS
+        a.mov_imm(Reg::R8, u64::MAX);
+        a.mov_imm(Reg::R9, 0);
+        a.sys(9); // mmap
+        a.mov(Reg::Rbx, Reg::Rax);
+        a.mov_data(Reg::Rdi, zero);
+        a.mov_imm(Reg::Rsi, 0);
+        a.sys(2); // open
+        a.mov(Reg::R13, Reg::Rax);
+        a.bind(filling);
+        a.mov(Reg::Rdi, Reg::R13);
+        a.mov(Reg::Rsi, Reg::Rbx);
+        a.mov_imm(Reg::Rdx, 4096);
+        a.sys(0); // read
+        a.add_imm(Reg::Rbx, 4096);
+        a.cmp_imm(Reg::Rax, 4096);
+        a.je(filling);
+    }
+    a.bind(full);
+    a.sys(57); // fork
+    a.cmp_imm(Reg::Rax, -11); // EAGAIN
+    a.je(sleep);
+    a.cmp_imm(Reg::Rax, 0);
+    a.je(sleep); // the child
+    a.mov_imm(Reg::R15, 1);
+    a.cmp_imm(Reg::Rax, 0x7fff_ffff);
+    a.ja(bad); // another errno
+    if fill {
+        a.mov_imm(Reg::R15, 2); // it worked
+        a.jmp(bad);
+    } else {
+        a.jmp(full);
+    }
+    a.bind(sleep);
+    a.sys(34); // pause
+    a.jmp(sleep);
+    a.bind(bad);
+    a.mov(Reg::Rdi, Reg::R15);
+    a.sys(231); // exit_group
+    static_elf(
+        &a.finish(BLOB_VADDR)
+            .unwrap_or_else(|| fail("cellaccess: assembler")),
+    )
+}
+
+/// What a cell leaves behind (ADR-0002 §7: "nothing the cell created
+/// survives"): a cell whose program makes a System V segment is destroyed,
+/// and its account must end at zero. The control removes its segment
+/// before it exits.
+fn segments_go(ctx: &Ctx) -> bool {
+    const RULE: &str = "a_destroyed_cell_leaves_no_shared_memory";
+    const PAGES: u64 = 64;
+    let run = |remove: bool| {
+        let cell =
+            Cell::new(&ctx.accounts, CELL_PAGES).unwrap_or_else(|| fail("cellaccess: no cell"));
+        let root = Arc::new(
+            Vfs::mount_disk_for(&ctx.disk, cell.account())
+                .unwrap_or_else(|_| fail("cellaccess: could not mount a root")),
+        );
+        let p = LinuxProcess::new(cell.clone(), root.clone())
+            .unwrap_or_else(|| fail("cellaccess: no process"));
+        let elf = segment_program(PAGES, remove);
+        let argv: &[&str] = &["/cellaccess-shm"];
+        let loaded = loader::load(
+            &mut p.mm(),
+            &crate::file::Bytes(&elf),
+            None,
+            argv,
+            &[] as &[&str],
+            8 << 20,
+            [0; 4],
+        )
+        .unwrap_or_else(|_| fail("cellaccess: load"));
+        p.group
+            .set_exec("/cellaccess-shm", "cellaccess-shm", loaded.args);
+        let leader = p.group.leader.clone();
+        let ctx = frame::user::UserContext::new(loaded.entry, loaded.stack_pointer);
+        crate::proc::run(p, ctx);
+        wait_until(30, || crate::proc::exit_status(&leader).is_some());
+        let status = crate::proc::exit_status(&leader);
+        drop(leader);
+        let account = cell.account().clone();
+        let expected = root.charged() + if remove { 0 } else { PAGES };
+        wait_until(30, || account.used() == expected);
+        let alive = account.used();
+        drop(root);
+        let gone = Arc::downgrade(&cell);
+        drop(cell);
+        wait_until(10, || account.used() == 0 && gone.upgrade().is_none());
+        (
+            status == Some(0),
+            alive == expected,
+            gone.upgrade().is_none(),
+            account.used(),
+        )
+    };
+    let (exited, held, destroyed, left) = run(true);
+    let mut ok = report(
+        RULE,
+        "a cell that removed its segment is destroyed with nothing charged: control",
+        exited && held && destroyed && left == 0,
+        &alloc::format!("exited {exited}, held {held}, destroyed {destroyed}, {left} pages left"),
+    );
+    let (exited, held, destroyed, left) = run(false);
+    ok &= report(
+        RULE,
+        "a System V segment outlives its program while the cell lives",
+        exited && held && destroyed,
+        &alloc::format!("exited {exited}, held {held}, destroyed {destroyed}"),
+    );
+    ok &= report(
+        RULE,
+        "a destroyed cell's System V segments are freed",
+        left == 0,
+        &alloc::format!(
+            "BUG (linuxabi/shm.rs SEGMENTS): {left} pages of a destroyed cell are still charged; nothing removes its segments"
+        ),
+    );
+    ok
+}
+
+/// A static ELF: `shmget(IPC_PRIVATE, pages)`, then `IPC_RMID` if `remove`;
+/// exits 0 if both worked.
+fn segment_program(pages: u64, remove: bool) -> Vec<u8> {
+    use testprog::{Asm, BLOB_VADDR, Reg, static_elf};
+    let mut a = Asm::new();
+    let bad = a.label();
+    a.mov_imm(Reg::Rdi, 0); // IPC_PRIVATE
+    a.mov_imm(Reg::Rsi, pages * 4096);
+    a.mov_imm(Reg::Rdx, 0o1600); // IPC_CREAT | 0600
+    a.sys(29); // shmget
+    a.mov_imm(Reg::R15, 1);
+    a.cmp_imm(Reg::Rax, 0x7fff_ffff);
+    a.ja(bad);
+    if remove {
+        a.mov(Reg::Rdi, Reg::Rax);
+        a.mov_imm(Reg::Rsi, 0); // IPC_RMID
+        a.mov_imm(Reg::Rdx, 0);
+        a.sys(31); // shmctl
+        a.mov_imm(Reg::R15, 2);
+        a.cmp_imm(Reg::Rax, 0);
+        a.jne(bad);
+    }
+    a.mov_imm(Reg::R15, 0);
+    a.bind(bad);
+    a.mov(Reg::Rdi, Reg::R15);
+    a.sys(231); // exit_group
+    static_elf(
+        &a.finish(BLOB_VADDR)
+            .unwrap_or_else(|| fail("cellaccess: assembler")),
+    )
 }
 
 /// Waits up to `secs` for `cond`; true if it came true.

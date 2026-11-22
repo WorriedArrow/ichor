@@ -22,6 +22,7 @@ http.workspace = true
 grpc.workspace = true
 oci.workspace = true
 dns.workspace = true
+net.workspace = true
 layer.workspace = true
 image.workspace = true
 

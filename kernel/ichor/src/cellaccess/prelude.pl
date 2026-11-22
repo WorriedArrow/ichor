@@ -6,6 +6,7 @@ no warnings 'portable'; # 64-bit hexadecimal addresses
 # root. put(NAME, TEXT) writes out-NAME (via a temporary name and a
 # rename, so the harness never reads half of it); get(NAME) waits for
 # in-NAME from the harness, removes it and returns its text.
+$| = 1; # each line is one write, so kernel messages cannot split it
 our $RULE = "harness";
 our ($PASSES, $FAILS) = (0, 0);
 sub put {

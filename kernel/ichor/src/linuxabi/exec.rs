@@ -15,7 +15,7 @@ use alloc::vec::Vec;
 use frame::user::UserContext;
 
 use super::EFAULT;
-use super::fs::user_path;
+use super::fs::{AT_FDCWD, user_path};
 use crate::file::{File, VfsFile};
 use crate::loader::{self, LoadError};
 use crate::process::LinuxProcess;
@@ -24,18 +24,23 @@ use crate::vfs::Kind;
 
 const E2BIG: i64 = 7;
 const ENOEXEC: i64 = 8;
+const EAGAIN: i64 = 11;
 const ENOMEM: i64 = 12;
 const EACCES: i64 = 13;
 const ENOENT: i64 = 2;
 const ELOOP: i64 = 40;
 
 /// Most argv or envp entries.
-const MAX_STRINGS: usize = 4096;
-/// Most bytes of argv plus envp strings.
-const MAX_STRING_BYTES: usize = 128 * 1024;
+const MAX_STRINGS: usize = 1 << 17;
 
-/// Reads a NULL-terminated array of string pointers (argv, envp).
-fn user_strings(p: &mut LinuxProcess, addr: u64, total: &mut usize) -> Result<Vec<String>, i64> {
+/// Longest single argv or envp string, with its NUL (Linux's
+/// `MAX_ARG_STRLEN`, 32 pages).
+const MAX_ARG_STRLEN: usize = 32 * 4096;
+
+/// Reads a NULL-terminated array of string pointers (argv, envp). The
+/// strings are bytes: Linux requires nothing of them but the NUL, and
+/// programs pass non-UTF-8 (CPython's test runner does on purpose).
+fn user_strings(p: &mut LinuxProcess, addr: u64, total: &mut usize) -> Result<Vec<Vec<u8>>, i64> {
     let mut out = Vec::new();
     if addr == 0 {
         return Ok(out);
@@ -52,13 +57,32 @@ fn user_strings(p: &mut LinuxProcess, addr: u64, total: &mut usize) -> Result<Ve
         if ptr == 0 {
             return Ok(out);
         }
-        let s = user_path(p, ptr).map_err(|e| if e == EFAULT { EFAULT } else { E2BIG })?;
-        *total += s.len() + 1;
-        if *total > MAX_STRING_BYTES {
+        let s = user_bytes(p, ptr)?;
+        *total += s.len() + 1 + 8;
+        if *total > loader::MAX_ARGS {
             return Err(E2BIG);
         }
         out.push(s);
     }
+}
+
+/// One NUL-terminated string from user memory, as bytes: E2BIG past
+/// `MAX_ARG_STRLEN`, EFAULT if it runs into memory the process cannot read.
+fn user_bytes(p: &mut LinuxProcess, addr: u64) -> Result<Vec<u8>, i64> {
+    let mut out = Vec::new();
+    let mut chunk = [0u8; 256];
+    while out.len() < MAX_ARG_STRLEN {
+        let got = p.copy_from_user(addr + out.len() as u64, &mut chunk);
+        if got == 0 {
+            return Err(EFAULT);
+        }
+        if let Some(nul) = chunk[..got].iter().position(|&b| b == 0) {
+            out.extend_from_slice(&chunk[..nul]);
+            return Ok(out);
+        }
+        out.extend_from_slice(&chunk[..got]);
+    }
+    Err(E2BIG)
 }
 
 pub(super) fn execve(
@@ -75,14 +99,62 @@ pub(super) fn execve(
     exec(p, ctx, path, argv, envp)
 }
 
+/// `execveat(dirfd, path, argv, envp, flags)`: `path` relative to the
+/// directory `dirfd`, or with AT_EMPTY_PATH and an empty path the file
+/// `dirfd` itself is open on (`fexecve`). The file is found again by its
+/// name, so one unlinked since it was opened is ENOENT (partial);
+/// AT_SYMLINK_NOFOLLOW is accepted and not applied.
+pub(super) fn execveat(
+    p: &mut LinuxProcess,
+    ctx: &mut UserContext,
+    dirfd: i64,
+    path: u64,
+    argv: u64,
+    envp: u64,
+    flags: u64,
+) -> Result<(), i64> {
+    const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+    const AT_EMPTY_PATH: u64 = 0x1000;
+    const EBADF: i64 = 9;
+    const EINVAL: i64 = 22;
+    if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+        return Err(EINVAL);
+    }
+    let rel = user_path(p, path)?;
+    let at = |p: &LinuxProcess| -> Result<String, i64> {
+        match p.fd(dirfd as u64).ok_or(EBADF)? {
+            crate::process::Fd::File(f) => p.fs().path(f.ino),
+            _ => Err(EBADF),
+        }
+    };
+    let full = if rel.is_empty() {
+        if flags & AT_EMPTY_PATH == 0 {
+            return Err(ENOENT);
+        }
+        at(p)?
+    } else if rel.starts_with('/') || dirfd == AT_FDCWD {
+        rel
+    } else {
+        let mut d = at(p)?;
+        if !d.ends_with('/') {
+            d.push('/');
+        }
+        d + &rel
+    };
+    let mut total = 0;
+    let argv = user_strings(p, argv, &mut total)?;
+    let envp = user_strings(p, envp, &mut total)?;
+    exec(p, ctx, full, argv, envp)
+}
+
 /// `execve` with its arguments already in the kernel (also how the native
 /// personality's `CELL_SPAWN` starts a process's first program).
 pub(crate) fn exec(
     p: &mut LinuxProcess,
     ctx: &mut UserContext,
     path: String,
-    mut argv: Vec<String>,
-    envp: Vec<String>,
+    mut argv: Vec<Vec<u8>>,
+    envp: Vec<Vec<u8>>,
 ) -> Result<(), i64> {
     // `#!` scripts: run the interpreter with the script as an argument, as
     // Linux does (`interp [arg] script argv[1..]`). An interpreter may itself
@@ -93,9 +165,9 @@ pub(crate) fn exec(
         let Some((interp, arg)) = shebang(&image) else {
             break;
         };
-        let mut new_argv = alloc::vec![interp.clone()];
-        new_argv.extend(arg);
-        new_argv.push(exe_path.clone());
+        let mut new_argv = alloc::vec![interp.clone().into_bytes()];
+        new_argv.extend(arg.map(String::into_bytes));
+        new_argv.push(exe_path.clone().into_bytes());
         new_argv.extend(argv.iter().skip(1).cloned());
         argv = new_argv;
         exe_path = interp;
@@ -109,28 +181,16 @@ pub(crate) fn exec(
         None => None,
     };
 
-    // Every other thread of the process goes away first.
-    let others: Vec<_> = p
-        .group
-        .threads()
-        .into_iter()
-        .filter(|t| t.pid != p.entry.pid)
-        .collect();
-    for t in &others {
-        crate::proc::post(t, crate::signal::SIGKILL);
-    }
-    p.group.wait_threads(1);
-
     let mut mm = Mm::new(p.cell.account()).ok_or(ENOMEM)?;
-    let argv_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
-    let envp_refs: Vec<&str> = envp.iter().map(String::as_str).collect();
+    let c = p.group.creds();
     let loaded = loader::load(
         &mut mm,
         &image,
         interp.as_ref().map(|f| f as &dyn File),
-        &argv_refs,
-        &envp_refs,
+        &argv,
+        &envp,
         p.group.limits()[crate::process::RLIMIT_STACK].0,
+        [c.ruid, c.euid, c.rgid, c.egid],
     )
     .map_err(|e| match e {
         LoadError::OutOfMemory => ENOMEM,
@@ -138,6 +198,14 @@ pub(crate) fn exec(
         _ => ENOEXEC,
     })?;
 
+    // Robust futexes held in the old image are released (and the list
+    // forgotten) while that memory is still the process's, as Linux does.
+    crate::futex::exit_robust_list(p);
+    // Every other thread of the process goes away, and this one becomes its
+    // first. Nothing fails from here on.
+    p.entry = p.group.sole_thread(&p.entry).ok_or(EAGAIN)?;
+    p.clear_tid = 0;
+    crate::itimer::exec(p);
     // Switch to the new space, then drop the old one (no longer active).
     mm.space().bind_to_current_task();
     drop(p.replace_mm(mm));
@@ -151,7 +219,10 @@ pub(crate) fn exec(
         v.release(); // the vfork parent goes on
     }
     p.sig.clear_alt_stack();
-    p.group.set_exec(&exe_path, &argv_refs);
+    // `/proc/self/exe` is the file's own path; the name is the one given.
+    let real = image.path().unwrap_or_else(|| exe_path.clone());
+    let name = path.rsplit('/').next().unwrap_or("");
+    p.group.set_exec(&real, name, loaded.args);
     crate::signal::sync(p);
     *ctx = UserContext::new(loaded.entry, loaded.stack_pointer);
     Ok(())
@@ -161,8 +232,11 @@ pub(crate) fn exec(
 fn read_executable(p: &LinuxProcess, path: &str) -> Result<VfsFile, i64> {
     let cwd = p.cwd();
     let ino = {
-        let mut fs = p.fs();
-        let ino = fs.resolve(cwd, path, true)?;
+        let ino = match super::fs::executable(p, cwd, path)? {
+            super::fs::Exec::Path(target) => p.fs().resolve(cwd, &target, true)?,
+            super::fs::Exec::File(ino) => ino,
+        };
+        let fs = p.fs();
         if fs.stat(ino)?.kind != Kind::File {
             return Err(EACCES);
         }

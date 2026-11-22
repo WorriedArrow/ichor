@@ -169,3 +169,88 @@ above:
   before boot services exit.
 - The acceptance test pulls `hello-world` and Alpine 3.20.3 by digest
   from Docker Hub (so it needs the internet) and runs a command in each.
+
+## Amendment (2026-11-16): exposure and authentication
+
+§4's "no authentication in milestone 6" is narrowed before any cloud
+boot:
+
+- The API listens on the system cell's loopback by default; other cells
+  and the uplink cannot reach it. `control_listen=` and
+  `control_publish=` expose it explicitly.
+- **Bearer token.** The operator puts a token in `\ichor\apitoken` on the
+  boot volume (`cargo xtask disk-image --api-token-file F`). Frame reads
+  it with the command line (never logged), and the kernel hands it to the
+  service as a read-only Blob. When a token is configured, every call
+  must carry `authorization: Bearer <token>`, compared in constant time;
+  anything else gets `UNAUTHENTICATED`. Without a token the service
+  refuses to listen beyond loopback or to publish, whatever the command
+  line asks.
+- **The missing calls.** `Signal(cell, signal)` posts a signal to every
+  process of a cell (native `CELL_SIGNAL`), `Inspect(cell)` reports its
+  address, image, memory used and limit, processes and threads
+  (`CELL_INSPECT`), and `Destroy(cell)` kills every process and forgets
+  the cell, whose memory and root the kernel frees once they have exited.
+- **Still owed before Ichor runs anywhere reachable from the internet:**
+  TLS for the API. The token travels in the clear over h2c, so today it
+  protects only on a network the operator controls (a private subnet or
+  an SSH tunnel). TLS needs a server side in `services/tls` and signing
+  in `services/crypto`. (Built since: the next amendment.)
+
+## Amendment (2026-11-21): TLS for the API
+
+- **The server.** `services/tls::server`: TLS 1.3 only, with one suite
+  (ChaCha20-Poly1305), X25519, ALPN `h2` and an **Ed25519** certificate.
+  Current gRPC clients' TLS stacks offer all of these; OpenSSL's client
+  completes a verified handshake with it (a test, run by hand). It refuses
+  everything else with the matching alert. It does not do
+  HelloRetryRequest, session tickets, 0-RTT, client certificates or a
+  choice of certificate by SNI. `fuzz/` has a target for it.
+- **Why Ed25519.** Signing is new to `services/crypto`, and it handles a
+  long-lived secret next to hostile cells, so it must not leak through
+  timing. Ed25519 has a complete addition formula over the field X25519
+  already uses, so constant-time code is short and needs no per-signature
+  randomness; ECDSA P-256 would need constant-time scalar and field
+  arithmetic the verifier does not have. The cost is that public CAs do
+  not issue Ed25519 certificates: the operator runs their own CA (or
+  self-signs) and gives its certificate to the clients, as cluster APIs
+  usually do. P-256 signing can be added later without changing the API.
+- **Verification.** `services/x509` now accepts Ed25519 keys and
+  signatures, so our own client can verify the API's certificate. The
+  registry client does not offer Ed25519 in its handshake, and its
+  ClientHello is unchanged.
+- **The identity** is `\ichor\apitls.pem` on the boot volume: the
+  certificate chain and a PKCS #8 key (`cargo xtask disk-image
+  --api-tls-file F` checks it and puts it there). Frame reads it with the
+  token, never logs it, and the kernel hands it to the service as a
+  read-only Blob. One that does not parse, or whose key is not the
+  certificate's, stops the service: falling back to cleartext would be a
+  surprise. The boot volume holds the key unencrypted, as it holds the
+  token; disk encryption is the cloud's for now.
+- **The rule.** Listening beyond loopback, or publishing, needs a token
+  and a certificate. `control_plaintext` waives the certificate, for a
+  network the operator trusts.
+- **Limits.** At most 64 connections, and 15 s for a handshake. A
+  connection that ends takes its calls with it: a slot reused by the next
+  client can no longer receive the last one's output (it could before,
+  for a `Run` whose caller had left).
+- **Not done:** rotating the certificate without a reboot, client
+  certificates, rate limiting of failed tokens.
+
+## Amendment (2026-11-22): AES-128-GCM and P-256
+
+The client could not reach servers without ChaCha20-Poly1305 or X25519:
+Amazon ECR and Microsoft's registry take P-256 and AES, Quay AES, and the
+server with OpenJDK's test tools TLS 1.2 with AES-GCM. It now offers
+AES-128-GCM after ChaCha20-Poly1305, and P-256 after X25519, in TLS 1.3
+and 1.2, with SHA-256 only. The ClientHello carries a key share for both
+groups, so a server has no reason for a HelloRetryRequest, which we still
+do not follow; that costs a P-256 key generation per connection.
+
+Both handle secrets and are constant-time as the rest of `services/crypto`
+is: AES is bitsliced (Boyar and Peralta's S-box circuit, four blocks at a
+time; no AES-NI, since services hold no `unsafe`), GHASH multiplies without
+tables, and P-256 uses complete addition formulas with every scalar bit the
+same work (`p256.rs`; the verifier's variable-time arithmetic is not used).
+The control API's server is unchanged. Layers may now name one archive
+several times: it is fetched and unpacked once.

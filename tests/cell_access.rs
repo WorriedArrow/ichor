@@ -10,8 +10,10 @@
 
 use std::sync::OnceLock;
 
-use ichor_tests::{Exit, Outcome};
+use ichor_tests::Outcome;
 
+/// Sections the kernel runs (`SECTIONS` in cellaccess.rs).
+const SECTIONS: usize = 9;
 /// B's uplink-facing port inside the guest (`B_UPLINK_PORT` in
 /// cellaccess.rs).
 const B_UPLINK_PORT: u16 = 7300;
@@ -110,27 +112,33 @@ fn process_ids_and_signals_are_scoped_to_their_cell() {
 fn proc_and_sys_show_only_their_cell() {
     assert_rule("proc_and_sys_show_only_their_cell");
     suite().0.assert_in_order(&[
-        "/proc lists only A's process: ok",
+        "/proc lists only A's processes: ok",
         "cellaccess: global: /proc/loadavg: ",
         "ichor: cellaccess: proc_and_sys_show_only_their_cell passed",
         "ichor: cellaccess: B alive and unchanged after proc_and_sys_show_only_their_cell",
     ]);
 }
 
-/// Section 4: A and B map the same cache page. A's CPU store, its read()
-/// into a private mapping and its copy-up write leave B's mapping, B's
-/// file and the cache page unchanged; read() into PROT_READ is EFAULT; a
-/// FUTEX_WAKE at B's futex (same page, offset and address) wakes nobody;
-/// an opted-out root keeps and pays for its own pages while A fills the
-/// shared cache.
+/// Section 4: A and B map the same cache page. A's CPU stores (private and
+/// shared mappings), its read() into a private mapping and its copy-up
+/// write leave B's mapping, B's file and the cache page unchanged; read()
+/// into PROT_READ is EFAULT; a FUTEX_WAKE at B's futexes (same physical
+/// page, offset and address, through shared and private mappings) wakes
+/// nobody; an opted-out root keeps and pays for its own pages while A
+/// fills the shared cache.
 #[test]
 fn shared_cache_pages_never_carry_writes_between_cells() {
     assert_rule("shared_cache_pages_never_carry_writes_between_cells");
     suite().0.assert_in_order(&[
         "B's mapping and file are unchanged after A's CPU store: ok",
-        "FUTEX_WAKE at B's futex wakes nobody: ok",
+        "B's file is unchanged after A's store through MAP_SHARED: ok",
+        "both roots' page 1 of the file is the same physical page: ok",
+        "FUTEX_WAKE at B's futex (shared mapping) wakes nobody: ok",
+        "FUTEX_WAKE at B's futex (private mapping) wakes nobody: ok",
         "the shared cache page B's root maps kept its bytes: ok",
-        "B's futex wait ended only when the harness signalled it (EINTR): ok",
+        "B's futex wait (shared mapping) ended only when the harness signalled it (EINTR): ok",
+        "B's futex wait (private mapping) ended only when the harness signalled it (EINTR): ok",
+        "A's reads brought in more pages than the shared cache holds: ok",
         "evicted none of the opted-out cell's pages: ok",
         "ichor: cellaccess: shared_cache_pages_never_carry_writes_between_cells passed",
     ]);
@@ -157,14 +165,18 @@ fn networks_are_scoped_to_their_cell() {
     assert!(*answers >= 1, "the host never got B's answer");
 }
 
-/// Section 6: io_uring operations from A that name B's path, abstract
-/// socket or descriptor number fail as the plain syscalls do; SysV IPC,
-/// mq_open and sethostname are ENOSYS today (recorded), and B's hostname
-/// is unchanged.
+/// Section 6: B's System V segment is not there for A under its key
+/// (ENOENT) or id (EINVAL), and A's segment under the same key is another
+/// one; io_uring operations from A that name B's path, abstract socket or
+/// descriptor number fail as the plain syscalls do; sethostname is EPERM
+/// and B's hostname unchanged; semaphores and message queues are ENOSYS
+/// today (recorded).
 #[test]
 fn other_kernel_state_is_per_cell() {
     assert_rule("other_kernel_state_is_per_cell");
     suite().0.assert_in_order(&[
+        "shmget(B's key) (ENOENT): ok",
+        "A's segment under B's key is another one: ok",
         "IORING_OP_OPENAT(B's path) (ENOENT): ok",
         "IORING_OP_CONNECT(B's abstract name) (ECONNREFUSED): ok",
         "ichor: cellaccess: other_kernel_state_is_per_cell passed",
@@ -172,9 +184,10 @@ fn other_kernel_state_is_per_cell() {
     ]);
 }
 
-/// Section 7: uid 0 in A cannot mount (EPERM), has none of the host
-/// superuser's calls (ENOSYS today, recorded), cannot chown or chmod B's
-/// files (ENOENT) and signals none of B's processes (ESRCH).
+/// Section 7: uid 0 in A cannot mount, make device nodes, set the clock or
+/// unshare namespaces (EPERM); the host superuser's other calls do not
+/// exist (ENOSYS, recorded); it cannot chown or chmod B's files (ENOENT)
+/// and signals none of B's processes (ESRCH).
 #[test]
 fn uid_0_in_a_cell_has_no_authority_outside_it() {
     assert_rule("uid_0_in_a_cell_has_no_authority_outside_it");
@@ -187,11 +200,47 @@ fn uid_0_in_a_cell_has_no_authority_outside_it() {
     ]);
 }
 
+/// Section 8: with A's memory used up its fork is EAGAIN, and its forks
+/// stop at its account's limit; meanwhile B allocates and forks.
+#[test]
+fn resource_limits_are_per_cell() {
+    assert_rule("resource_limits_are_per_cell");
+    suite().0.assert_in_order(&[
+        "A is at its memory limit: ok",
+        "B allocates 8 MiB and forks while A is at its memory limit: ok",
+        "A's fork at its memory limit failed with EAGAIN: ok",
+        "A is at its process limit: ok",
+        "B allocates 8 MiB and forks while A is at its process limit: ok",
+        "A's fork at its process limit failed with EAGAIN: ok",
+        "ichor: cellaccess: resource_limits_are_per_cell passed",
+    ]);
+}
+
+/// Section 9: B's helper was alive and unchanged after every section, and
+/// both cells' memory came back once they exited.
 #[test]
 fn cells_clean_up_after_themselves() {
     let out = &suite().0;
-    out.assert_in_order(&[
-        "ichor: cellaccess: every section passed; both cells exited and their memory returned",
-    ]);
-    out.assert_exit(Exit::Success);
+    let failed: Vec<&str> = out
+        .serial
+        .lines()
+        .filter(|l| {
+            l.contains("cellaccess FAILED: B after ") || l.contains("cellaccess FAILED: cell ")
+        })
+        .collect();
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
+    let alive = out
+        .serial
+        .matches("ichor: cellaccess: B alive and unchanged after ")
+        .count();
+    assert_eq!(alive, SECTIONS, "sections after which B was alive");
+    out.assert_in_order(&["ichor: cellaccess: both cells exited and their memory returned"]);
+}
+
+/// A destroyed cell's System V segments go with it (ADR-0002 §7). Fails
+/// until `linuxabi/shm.rs` frees them: a documented bug
+/// (`docs/reports/cell-access-tests.md`).
+#[test]
+fn a_destroyed_cell_leaves_no_shared_memory() {
+    assert_rule("a_destroyed_cell_leaves_no_shared_memory");
 }

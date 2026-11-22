@@ -491,16 +491,23 @@ pub fn convert_with(p: &Pulled, extras: &[Extra<'_>]) -> Result<Vec<u8>, Error> 
         };
         t.add_tar(&tar).map_err(|e| Error::Unsupported(e.0))?;
     }
+    // Extras in a row from one archive: it is unpacked once.
+    let mut last: (&[u8], Vec<u8>) = (&[], Vec::new());
     for x in extras {
-        let tar = if x.data.starts_with(&[0x1f, 0x8b]) {
-            layer::gunzip_all(x.data).map_err(|e| Error::Unsupported(e.0))?
+        let tar = if !x.data.starts_with(&[0x1f, 0x8b]) {
+            x.data
         } else {
-            x.data.to_vec()
+            if !core::ptr::eq(last.0, x.data) {
+                drop(core::mem::take(&mut last.1)); // before the next is made
+                let tar = layer::gunzip_all(x.data).map_err(|e| Error::Unsupported(e.0))?;
+                last = (x.data, tar);
+            }
+            &last.1
         };
         let r = if x.from.is_empty() && x.to.is_empty() {
-            t.add_tar(&tar)
+            t.add_tar(tar)
         } else {
-            t.add_tar_at(&tar, x.from, x.to)
+            t.add_tar_at(tar, x.from, x.to)
         };
         r.map_err(|e| Error::Unsupported(e.0))?;
     }

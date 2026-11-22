@@ -264,6 +264,53 @@ pub(crate) unsafe fn copy_upper_half(from: PhysAddr, to: PhysAddr) {
     }
 }
 
+/// Copies PML4 entry `index` from `from` into `to`, so both roots share
+/// that slot's tables (page-table isolation: the entry area, and each
+/// user slot of a shadow root).
+///
+/// # Safety
+///
+/// Both must satisfy [`table`]'s contract.
+pub(crate) unsafe fn copy_entry(from: PhysAddr, to: PhysAddr, index: usize) {
+    // SAFETY: caller contract.
+    let (from, to) = (unsafe { table(from) }, unsafe { table(to) });
+    if let (Some(f), Some(t)) = (from.get(index), to.get(index)) {
+        t.store(f.load(Relaxed), Relaxed);
+    }
+}
+
+/// The PML4 slot of `va`.
+pub(crate) fn slot_of(va: u64) -> usize {
+    pml4_index(va)
+}
+
+/// The physical address `va` translates to in the tables under `root`,
+/// following huge pages; `None` if unmapped.
+///
+/// # Safety
+///
+/// `root` and every table reachable from it must satisfy [`table`]'s
+/// contract (frame-built page tables do).
+pub(crate) unsafe fn translate(root: PhysAddr, va: u64) -> Option<u64> {
+    // SAFETY: caller contract.
+    let mut t = unsafe { table(root) };
+    let mut shift = 39u32;
+    loop {
+        let e = t[((va >> shift) & 511) as usize].load(Relaxed);
+        if e & PRESENT == 0 {
+            return None;
+        }
+        if shift == 12 || (shift < 39 && e & HUGE != 0) {
+            let size = 1u64 << shift;
+            return Some((e & ADDR_MASK & !(size - 1)) + (va & (size - 1)));
+        }
+        // SAFETY: a present non-leaf entry points at a table of the same
+        // page table (caller contract).
+        t = unsafe { table(PhysAddr::new(e & ADDR_MASK)) };
+        shift -= 9;
+    }
+}
+
 /// Writes one raw entry of the table at `pa`.
 ///
 /// # Safety

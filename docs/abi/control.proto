@@ -1,7 +1,7 @@
 // The control plane's API (ADR-0012 §5), served by services/control as
-// gRPC over h2c on a published port. services/grpc implements these
-// messages by hand (no code generation); this file is the reference for
-// other clients.
+// gRPC over TLS 1.3 (ALPN h2) when the boot volume has a certificate, in
+// the clear (h2c) otherwise. services/grpc implements these messages by
+// hand (no code generation); this file is the reference for other clients.
 
 syntax = "proto3";
 
@@ -15,6 +15,45 @@ service Control {
   rpc CreateCell(CreateCellRequest) returns (CreateCellResponse);
   // Runs a process in a cell; streams its output, then its exit status.
   rpc Run(RunRequest) returns (stream RunEvent);
+  // Posts a signal to every process in a cell.
+  rpc Signal(SignalRequest) returns (SignalResponse);
+  // A cell's address, image, memory and processes.
+  rpc Inspect(CellRequest) returns (InspectResponse);
+  // Kills every process in a cell and forgets it; its memory and root are
+  // freed once they have exited. Later calls naming it get NOT_FOUND.
+  rpc Destroy(CellRequest) returns (Empty);
+}
+
+// Every call needs `authorization: Bearer <token>` when the boot volume
+// has an API token (\ichor\apitoken). Without one, or without a
+// certificate (\ichor\apitls.pem), the API is on the system cell's
+// loopback only.
+
+message Empty {}
+
+message CellRequest {
+  string cell_id = 1;
+}
+
+message SignalRequest {
+  string cell_id = 1;
+  // A Linux signal number (15: SIGTERM, 9: SIGKILL).
+  uint32 signal = 2;
+}
+
+message SignalResponse {
+  // How many processes it reached.
+  uint64 processes = 1;
+}
+
+message InspectResponse {
+  string cell_id = 1;
+  string address = 2;
+  string image_id = 3;
+  uint64 memory_used_bytes = 4;
+  uint64 memory_limit_bytes = 5;
+  uint64 processes = 6;
+  uint64 threads = 7;
 }
 
 message PullImageRequest {

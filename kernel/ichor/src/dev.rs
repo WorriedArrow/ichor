@@ -9,10 +9,10 @@
 //! ([`crate::random`]), as `getrandom` does. `ptmx`, the `pts/` nodes and
 //! `tty` (with a controlling terminal) are pseudo-terminals ([`crate::pty`]).
 
-use overlay::{Overlay, ROOT};
+use overlay::ROOT;
 
 use crate::process::{Fd, LinuxProcess};
-use crate::vfs::Ino;
+use crate::vfs::{Ino, Tree};
 
 const ENOSPC: i64 = 28;
 const ENXIO: i64 = 6;
@@ -55,7 +55,7 @@ pub(crate) enum Device {
 
 /// Creates `/dev` and its nodes in a freshly mounted root (keeping any the
 /// image already has).
-pub(crate) fn populate(fs: &mut Overlay<'static>) {
+pub(crate) fn populate(fs: &mut Tree) {
     let dev = match fs.lookup(ROOT, "dev") {
         Ok(d) => d,
         Err(_) => match fs.mkdir(ROOT, "dev", 0o755) {
@@ -65,6 +65,29 @@ pub(crate) fn populate(fs: &mut Overlay<'static>) {
     };
     for &(name, num) in NODES {
         let _ = fs.mknod(dev, name, 0o666, num);
+    }
+    for (name, target) in [
+        ("fd", "/proc/self/fd"),
+        ("stdin", "/proc/self/fd/0"),
+        ("stdout", "/proc/self/fd/1"),
+        ("stderr", "/proc/self/fd/2"),
+    ] {
+        let _ = fs.symlink(dev, name, target);
+    }
+    // What `procfs` serves.
+    for name in ["proc", "sys"] {
+        if let Ok(d) = fs
+            .lookup(ROOT, name)
+            .or_else(|_| fs.mkdir(ROOT, name, 0o555))
+        {
+            fs.set_elsewhere(d);
+        }
+    }
+    // POSIX shared memory and semaphores (`shm_open`, `sem_open`) live in
+    // /dev/shm: a world-writable sticky directory of the root's upper
+    // layer, so its files are the cell's memory, as tmpfs would be.
+    if let Ok(shm) = fs.mkdir(dev, "shm", 0o777) {
+        let _ = fs.chmod(shm, 0o1777);
     }
     crate::pty::populate(fs, dev);
 }
@@ -78,10 +101,7 @@ pub(crate) fn open(p: &mut LinuxProcess, num: u32, ino: Ino, flags: u64) -> Resu
         FULL => Fd::Dev(Device::Full),
         RANDOM | URANDOM => Fd::Dev(Device::Random),
         PTMX => return crate::pty::open_master(p, ino, nonblock),
-        TTY => match crate::pty::open_controlling(p, nonblock) {
-            Some(r) => return r,
-            None => Fd::Console,
-        },
+        TTY => return crate::pty::open_controlling(p, nonblock).unwrap_or(Err(ENXIO)),
         CONSOLE => Fd::Console,
         n if (crate::pty::PTS_MAJOR..crate::pty::PTS_MAJOR + 8).contains(&(n >> 8)) => {
             return crate::pty::open_slave(p, n, ino, flags & O_NOCTTY != 0, nonblock);

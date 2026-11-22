@@ -1,21 +1,40 @@
-# Section 6: other per-cell state. SysV IPC, POSIX message queues and
-# sethostname do not exist yet (ENOSYS, recorded; B's hostname is checked
-# after the section). io_uring operations from A that name B's path, B's
+# Section 6: other per-cell state. B's System V segment is not there for
+# A under its key or its id, and A's own segment under the same key is a
+# different one (B checks its own afterwards). Semaphores, message queues
+# and POSIX message queues do not exist yet (ENOSYS, recorded);
+# sethostname is EPERM. io_uring operations from A that name B's path, B's
 # abstract socket and B's descriptor number fail the way the plain
 # syscalls do, and the same operations on A's own objects work.
 $RULE = "other_kernel_state_is_per_cell";
 my %B = kv(@ARGV);
 
+my ($KEY, $BID) = ($B{shmkey}, $B{shmid});
+my $ds = "\0" x 112;
+want("shmget(B's key)", "ENOENT", syscall(29, $KEY, 0, 0));
+want("shmat(B's id)", "EINVAL", syscall(30, $BID, 0, 0));
+want("shmctl(B's id, IPC_STAT)", "EINVAL", syscall(31, $BID, 2, $ds));
+want("shmctl(B's id, IPC_SET)", "EINVAL", syscall(31, $BID, 1, $ds));
+want("shmctl(B's id, IPC_RMID)", "EINVAL", syscall(31, $BID, 0, 0));
+# The same key, exclusively created: A's own new segment, empty.
+my $id = syscall(29, $KEY, 4096, 01000 | 02000 | 0600); # IPC_CREAT|IPC_EXCL
+control("shmget(B's key)", $id);
+same("A's segment under B's key is another one", $id == $BID ? "B's" : "A's own", "A's own");
+my $at = syscall(30, $id, 0, 0);
+control("shmat(B's id)", $at);
+same("A's segment does not hold B's words", unpack("H*", peek($at, 17)), "00" x 17);
+control("shmctl(B's id, IPC_STAT)", syscall(31, $id, 2, $ds));
+control("shmctl(B's id, IPC_SET)", syscall(31, $id, 1, $ds));
+syscall(67, $at);
+control("shmctl(B's id, IPC_RMID)", syscall(31, $id, 0, 0));
 for my $key (0, 0x1c0ffee) { # IPC_PRIVATE and a fixed key
     my $k = sprintf("%#x", $key);
-    want("shmget($k) [ENOSYS today]", "ENOSYS", syscall(29, $key, 4096, 01000 | 0600));
     want("semget($k) [ENOSYS today]", "ENOSYS", syscall(64, $key, 1, 01000 | 0600));
     want("msgget($k) [ENOSYS today]", "ENOSYS", syscall(68, $key, 01000 | 0600));
 }
 want("mq_open [ENOSYS today]", "ENOSYS", syscall(240, my $q = "ichor-b", O_CREAT | O_RDWR, 0600, 0));
 my $name = "cell-a";
-want("sethostname [ENOSYS today]", "ENOSYS", syscall(170, $name, length($name)));
-want("setdomainname [ENOSYS today]", "ENOSYS", syscall(171, $name, length($name)));
+want("sethostname", "EPERM", syscall(170, $name, length($name)));
+want("setdomainname", "EPERM", syscall(171, $name, length($name)));
 same("A's uname nodename", (POSIX::uname())[1], $B{hostname});
 
 # io_uring: one ring, one SQE at a time.

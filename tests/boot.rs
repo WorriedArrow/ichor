@@ -74,6 +74,15 @@ fn m1_boots_on_four_cpus() {
         "ichor: linux: copy-on-write fork isolated parent and child",
         "ichor: linux: thread clone, futex wait/wake and join via CHILD_CLEARTID ok",
         "ichor: linux: munmap shot down a page another thread was reading",
+        "ichor: linux: a backward rep movsq resumed backward across 16 page faults",
+        "ichor: linux: sendfile into a full non-blocking socket reports what it sent, then EAGAIN",
+        "ichor: linux: fork charges only what is copied (80 shared pages in a 162-page cell)",
+        "ichor: linux: mappings are limited to 65530, and threads charged to their cell",
+        "ichor: linux: 4200 pages moved, protected and unmapped in batches",
+        "ichor: linux: waitid, preadv, rt_sigpending, sched priorities and affinity, F_SETPIPE_SZ ok",
+        "ichor: linux: a robust futex held by an exiting process is marked FUTEX_OWNER_DIED",
+        "ichor: linux: mknod FIFO: ENXIO without a reader, EOF after the writer, blocking opens meet",
+        "ichor: linux: close_range, fadvise64, get/setpriority, memfd_create, absolute clock_nanosleep, non-UTF-8 names ok",
         "ichor: linux: poll timeout and wakeup, epoll, eventfd ok",
         "ichor: linux: io_uring: linked write and read, armed read woken by a child, timeout, probe ok",
         "ichor: linux: io_uring: armed reads completed with nobody in io_uring_enter (registered eventfd, epoll on the ring)",
@@ -115,6 +124,7 @@ fn m1_boots_on_four_cpus() {
         "sh: fork, exec and wait ok",
         "ichor: busybox: all applets passed",
         "sh: CLOEXEC descriptors did not survive exec",
+        "sh: exec passed a 5000-byte argument and a non-UTF-8 environment",
         "ichor: alpine: root disk holds Alpine 3.20.3",
         "ichor: alpine: /bin/busybox is dynamic, interpreter /lib/ld-musl-x86_64.so.1",
         "alpine: apk installed tree and jq from the local mirror",
@@ -149,6 +159,8 @@ fn m1_boots_on_four_cpus() {
         "debian: udp: datagrams keep boundaries and sources, truncate, connect filters, ports are per protocol",
         "debian: alarm and setitimer deliver SIGALRM, getitimer reads back",
         "debian: unix: socketpair, path servers, abstract datagrams, SO_PEERCRED and end of file work",
+        "debian: signals: stop and continue, senders, queues, timers and process descriptors work",
+        "debian: moves: splice, tee, copy_file_range, MSG_PEEK, timeouts, netlink, inotify and shared memory work",
         "Hello, world!",
         "debian: apt-get installed hello and jq from the local repository",
         "through the switch; loopback is per cell",
@@ -212,6 +224,15 @@ fn m1_boots_on_one_cpu() {
         "ichor: linux: copy-on-write fork isolated parent and child",
         "ichor: linux: thread clone, futex wait/wake and join via CHILD_CLEARTID ok",
         "ichor: linux: munmap shot down a page another thread was reading",
+        "ichor: linux: a backward rep movsq resumed backward across 16 page faults",
+        "ichor: linux: sendfile into a full non-blocking socket reports what it sent, then EAGAIN",
+        "ichor: linux: fork charges only what is copied (80 shared pages in a 162-page cell)",
+        "ichor: linux: mappings are limited to 65530, and threads charged to their cell",
+        "ichor: linux: 4200 pages moved, protected and unmapped in batches",
+        "ichor: linux: waitid, preadv, rt_sigpending, sched priorities and affinity, F_SETPIPE_SZ ok",
+        "ichor: linux: a robust futex held by an exiting process is marked FUTEX_OWNER_DIED",
+        "ichor: linux: mknod FIFO: ENXIO without a reader, EOF after the writer, blocking opens meet",
+        "ichor: linux: close_range, fadvise64, get/setpriority, memfd_create, absolute clock_nanosleep, non-UTF-8 names ok",
         "ichor: linux: poll timeout and wakeup, epoll, eventfd ok",
         "ichor: linux: io_uring: linked write and read, armed read woken by a child, timeout, probe ok",
         "ichor: linux: io_uring: armed reads completed with nobody in io_uring_enter (registered eventfd, epoll on the ring)",
@@ -252,6 +273,7 @@ fn m1_boots_on_one_cpu() {
         "sh: fork, exec and wait ok",
         "ichor: busybox: all applets passed",
         "sh: CLOEXEC descriptors did not survive exec",
+        "sh: exec passed a 5000-byte argument and a non-UTF-8 environment",
         "ichor: alpine: root disk holds Alpine 3.20.3",
         "ichor: alpine: /bin/busybox is dynamic, interpreter /lib/ld-musl-x86_64.so.1",
         "alpine: apk installed tree and jq from the local mirror",
@@ -286,6 +308,8 @@ fn m1_boots_on_one_cpu() {
         "debian: udp: datagrams keep boundaries and sources, truncate, connect filters, ports are per protocol",
         "debian: alarm and setitimer deliver SIGALRM, getitimer reads back",
         "debian: unix: socketpair, path servers, abstract datagrams, SO_PEERCRED and end of file work",
+        "debian: signals: stop and continue, senders, queues, timers and process descriptors work",
+        "debian: moves: splice, tee, copy_file_range, MSG_PEEK, timeouts, netlink, inotify and shared memory work",
         "Hello, world!",
         "debian: apt-get installed hello and jq from the local repository",
         "through the switch; loopback is per cell",
@@ -304,8 +328,17 @@ fn m1_boots_on_one_cpu() {
 
 #[test]
 fn m2_scheduler_on_eight_cpus() {
-    let out = boot("m2-smp8", "", 8);
+    // Page-table isolation, forced (ADR-0004): everything below runs with
+    // ring 3 on shadow roots, entries switching CR3, and TLB shootdowns
+    // across 8 CPUs (with PCID where the CPU has it, as under KVM).
+    let out = boot("m2-smp8", "force_pti", 8);
     out.assert_exit(Exit::Success);
+    out.assert_in_order(&[
+        "ichor: frame: mitigations (ADR-0004): VERW on return to ring 3 ",
+        "page-table isolation on (", // "forced, " unless the host is affected
+        "ichor: pti: user roots map only the entry area and user pages",
+        "ichor: boot complete",
+    ]);
     out.assert_in_order(&[
         "ichor: smp: 8 CPUs online, every CPU took 5 timer interrupts",
         "ichor: random: ChaCha20 seeded",
@@ -329,6 +362,15 @@ fn m2_scheduler_on_eight_cpus() {
         "ichor: linux: copy-on-write fork isolated parent and child",
         "ichor: linux: thread clone, futex wait/wake and join via CHILD_CLEARTID ok",
         "ichor: linux: munmap shot down a page another thread was reading",
+        "ichor: linux: a backward rep movsq resumed backward across 16 page faults",
+        "ichor: linux: sendfile into a full non-blocking socket reports what it sent, then EAGAIN",
+        "ichor: linux: fork charges only what is copied (80 shared pages in a 162-page cell)",
+        "ichor: linux: mappings are limited to 65530, and threads charged to their cell",
+        "ichor: linux: 4200 pages moved, protected and unmapped in batches",
+        "ichor: linux: waitid, preadv, rt_sigpending, sched priorities and affinity, F_SETPIPE_SZ ok",
+        "ichor: linux: a robust futex held by an exiting process is marked FUTEX_OWNER_DIED",
+        "ichor: linux: mknod FIFO: ENXIO without a reader, EOF after the writer, blocking opens meet",
+        "ichor: linux: close_range, fadvise64, get/setpriority, memfd_create, absolute clock_nanosleep, non-UTF-8 names ok",
         "ichor: linux: poll timeout and wakeup, epoll, eventfd ok",
         "ichor: linux: io_uring: linked write and read, armed read woken by a child, timeout, probe ok",
         "ichor: linux: io_uring: armed reads completed with nobody in io_uring_enter (registered eventfd, epoll on the ring)",
@@ -369,6 +411,7 @@ fn m2_scheduler_on_eight_cpus() {
         "sh: fork, exec and wait ok",
         "ichor: busybox: all applets passed",
         "sh: CLOEXEC descriptors did not survive exec",
+        "sh: exec passed a 5000-byte argument and a non-UTF-8 environment",
         "ichor: alpine: root disk holds Alpine 3.20.3",
         "ichor: alpine: /bin/busybox is dynamic, interpreter /lib/ld-musl-x86_64.so.1",
         "alpine: apk installed tree and jq from the local mirror",
@@ -403,6 +446,8 @@ fn m2_scheduler_on_eight_cpus() {
         "debian: udp: datagrams keep boundaries and sources, truncate, connect filters, ports are per protocol",
         "debian: alarm and setitimer deliver SIGALRM, getitimer reads back",
         "debian: unix: socketpair, path servers, abstract datagrams, SO_PEERCRED and end of file work",
+        "debian: signals: stop and continue, senders, queues, timers and process descriptors work",
+        "debian: moves: splice, tee, copy_file_range, MSG_PEEK, timeouts, netlink, inotify and shared memory work",
         "Hello, world!",
         "debian: apt-get installed hello and jq from the local repository",
         "through the switch; loopback is per cell",
@@ -484,6 +529,42 @@ fn cloud_disk_tolerates_blank_volumes_and_small_transfers() {
     ]);
 }
 
+/// GCP's general-purpose machine types (E2, N2, ...): the boot disk is a
+/// target of a virtio-scsi controller, not NVMe. Here a blank disk is
+/// target 0 and the Ichor disk target 2, on one controller; OVMF boots
+/// from it, the kernel scans the targets, skips the blank one and mounts
+/// the root partition, with no NVMe controller at all.
+#[test]
+fn cloud_disk_boots_from_virtio_scsi() {
+    let blank = std::env::temp_dir().join(format!("ichor-scsi-blank-{}.img", std::process::id()));
+    std::fs::write(&blank, vec![0u8; 8 << 20]).unwrap();
+    let out = boot_disk_with("cloud-disk-scsi", "", 2, |cfg| {
+        cfg.disk_scsi_target = Some(2);
+        cfg.disk_devices_before = vec![
+            "-device".into(),
+            "virtio-scsi-pci,id=scsi0,disable-legacy=on".into(),
+            "-drive".into(),
+            format!(
+                "if=none,id=blank,format=raw,readonly=on,file={}",
+                blank.display()
+            ),
+            "-device".into(),
+            "scsi-hd,drive=blank,bus=scsi0.0,scsi-id=0".into(),
+        ];
+    });
+    let _ = std::fs::remove_file(&blank);
+    out.assert_exit(Exit::Success);
+    out.assert_in_order(&[
+        "ichor: blk: no nvme controller",
+        "ichor: blk: virtio-scsi target 0, block size 512 bytes",
+        "ichor: blk: virtio-scsi: 8192 KiB, no Ichor image; skipped",
+        "ichor: blk: virtio-scsi target 2, block size 512 bytes",
+        "ichor: blk: virtio-scsi: GPT disk, Ichor root partition at sector ",
+        "ichor: busybox: all applets passed",
+        "ichor: boot complete; halting",
+    ]);
+}
+
 /// A cloud-shaped machine: no PIT and no HPET (the TSC must calibrate from
 /// the ACPI PM timer), two sockets of three cores (sparse APIC ids, as
 /// multi-socket hosts give), 2 GiB, booting the GPT disk from NVMe.
@@ -560,9 +641,10 @@ fn tcp_through_virtio_net_to_a_host_echo_server() {
     out.assert_exit(Exit::Success);
     out.assert_in_order(&[
         "ichor: net: virtio-net ",
+        "ichor: net: DHCP lease 10.0.2.15/24 via 10.0.2.2 from 10.0.2.2, DNS 10.0.2.3",
         "ichor: net: gateway 10.0.2.2 is at ",
         "ichor: net: tcp echo of 256 KiB through slirp ok",
-        "ichor: net: uplink 10.0.2.15 is the cell switch's",
+        "ichor: net: uplink 10.0.2.15 on virtio-net is the cell switch's",
         "through the switch; loopback is per cell",
         &format!("debian: nat: a cell echoed 256 KiB with 10.0.2.2:{port} through the uplink"),
         "debian: nat: a datagram went through the uplink and came back",
@@ -653,7 +735,11 @@ fn a_published_port_serves_the_host_from_a_cell() {
         );
         (got, log)
     });
-    let out = ichor_tests::boot_with("net-publish", "net_publish=8080", 2, |c| {
+    // A 1400-byte uplink MTU: the host's SYNs (MSS 1460) are clamped to
+    // 1360 on the way in, and the cells' replies must still arrive whole.
+    // A 6 s DHCP lease: the uplink renews it every 3 s meanwhile.
+    let cmdline = "net_publish=8080 uplink_mtu=1400 dhcp_lease=6";
+    let out = ichor_tests::boot_with("net-publish", cmdline, 2, |c| {
         c.net_user_opts = format!("hostfwd=tcp:127.0.0.1:{host_port}-:8080");
         c.timeout = Some(Duration::from_secs(420)); // two servers wait for the host
     });
@@ -662,11 +748,13 @@ fn a_published_port_serves_the_host_from_a_cell() {
     eprintln!("host client: {log}");
     out.assert_exit(Exit::Success);
     out.assert_in_order(&[
-        "ichor: net: uplink 10.0.2.15 is the cell switch's",
+        "ichor: net: uplink 10.0.2.15 on virtio-net is the cell switch's (NAT for 10.88.0.0/16, MTU 1400)",
         "debian: published: listening on port 80",
         "debian: published: served a request from 10.0.2.2",
     ]);
     out.assert_in_order(&["alpine: nginx served the host through the published port"]);
+    out.assert_in_order(&["ichor: net: DHCP lease renewed (10.0.2.15/24 from 10.0.2.2)"]);
+    assert!(!out.serial.contains("DHCP moved the uplink"));
     for (resp, body) in got.iter().zip(BODIES) {
         let resp = resp
             .as_deref()

@@ -7,21 +7,30 @@
 //! files, devices and the console are always ready. A waiter registers with
 //! the [`Watchers`] of each object it polls and sleeps on its own queue, so
 //! a state change wakes only the tasks polling that object; a deadline ends
-//! it for timeouts, a signal with `EINTR`. The condition is checked while
-//! the task is marked blocked, so it only takes spinlocks: the descriptors
-//! are looked up once, before waiting.
+//! it for timeouts, a signal with `EINTR`. The descriptors are looked up
+//! once, before waiting.
 //!
 //! `EPOLLET` entries report an object once per change: pipes and eventfds
 //! count their state changes ([`Object::changes`]), and an edge-triggered
 //! entry stays quiet until the count moves past the one it last reported.
 //! `ppoll`, `pselect6` and `epoll_pwait` install their signal mask for the
-//! wait. Partial: the epoll interest list is fixed at the start of an
-//! `epoll_wait`, and a nested epoll instance never polls ready.
+//! wait.
+//!
+//! An epoll instance is one [`Poller`], registered once with every object
+//! it watches, and counts the changes it is told of. `epoll_wait` looks,
+//! and sleeps until the count moves past what it was before the look: so it
+//! holds nothing while asleep (a descriptor another thread closes really
+//! closes, and its peer sees end-of-file), and descriptors another thread
+//! adds meanwhile are watched from then on. One epoll instance may watch
+//! another (not in circles: ELOOP), and is ready when something it watches
+//! is; looking then takes sleeping locks, so every wait looks outside its
+//! sleep's condition.
 
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::fmt::Debug;
+use core::sync::atomic::{AtomicU64, Ordering};
 use core::time::Duration;
 
 use frame::sync::{Mutex, SpinLock};
@@ -29,15 +38,16 @@ use frame::task::WaitQueue;
 
 use crate::proc;
 use crate::process::{Description, Fd, LinuxProcess};
+use crate::signal::ERESTARTNOHAND;
 
 const EAGAIN: i64 = 11;
 const EFAULT: i64 = 14;
 const EEXIST: i64 = 17;
 const EINVAL: i64 = 22;
 const EBADF: i64 = 9;
-const EINTR: i64 = 4;
 const ENOENT: i64 = 2;
 const EMFILE: i64 = 24;
+const ELOOP: i64 = 40;
 const EPERM: i64 = 1;
 
 pub(crate) const POLLIN: u16 = 0x001;
@@ -66,6 +76,12 @@ pub(crate) trait Object: Send + Sync + Debug {
         nonblock: bool,
         interrupted: &dyn Fn() -> bool,
     ) -> Result<usize, i64>;
+    /// `lseek`, for what has a position.
+    fn seek(&self, offset: i64, whence: u64) -> Result<u64, i64> {
+        const ESPIPE: i64 = 29;
+        let _ = (offset, whence);
+        Err(ESPIPE)
+    }
     /// Current readiness (`POLL*` bits).
     fn poll(&self) -> u16;
     /// A count of state changes, for edge-triggered epoll.
@@ -93,6 +109,10 @@ pub(crate) trait Object: Send + Sync + Debug {
     fn dir(&self) -> Option<(&[DirEntry], &SpinLock<u64>)> {
         None
     }
+    /// The path of this `/proc` directory.
+    fn proc_dir(&self) -> Option<&str> {
+        None
+    }
     /// This object as a socket.
     fn socket(&self) -> Option<&crate::linuxabi::socket::Socket> {
         None
@@ -101,17 +121,67 @@ pub(crate) trait Object: Send + Sync + Debug {
     fn unix(&self) -> Option<&crate::linuxabi::unix::UnixSocket> {
         None
     }
+    /// This object as an `AF_NETLINK` socket.
+    fn netlink(&self) -> Option<&crate::linuxabi::netlink::Netlink> {
+        None
+    }
+    /// This object as a timer descriptor.
+    fn timerfd(&self) -> Option<&crate::linuxabi::timerfd::TimerFd> {
+        None
+    }
+    /// This object as a signal descriptor.
+    fn signalfd(&self) -> Option<&crate::linuxabi::timerfd::SignalFd> {
+        None
+    }
+    /// This object as an inotify instance.
+    fn inotify(&self) -> Option<&crate::linuxabi::inotify::Inotify> {
+        None
+    }
+    /// This object as a process descriptor.
+    fn pidfd(&self) -> Option<&crate::linuxabi::pidfd::PidFd> {
+        None
+    }
+    /// How many bytes a read would give (`FIONREAD`); `None` if that is not
+    /// something to ask of it.
+    fn readable(&self) -> Option<usize> {
+        None
+    }
     /// This object as an io_uring instance.
     fn uring(&self) -> Option<&crate::linuxabi::uring::Ring> {
         None
     }
 }
 
-/// One task sleeping in `poll`/`select`/`epoll_wait`, registered with each
-/// object it watches.
+/// One task sleeping in `poll` or `select`, or an epoll instance and the
+/// tasks waiting on it, registered with each object it watches.
 #[derive(Debug)]
 struct Poller {
     queue: WaitQueue,
+    /// Changes it has been told of.
+    told: AtomicU64,
+    /// Who watches the epoll instance itself (nested epoll; a task's
+    /// sleep is watched by nobody).
+    onward: Watchers,
+}
+
+impl Poller {
+    fn new() -> Arc<Poller> {
+        Arc::new(Poller {
+            queue: WaitQueue::new(),
+            told: AtomicU64::new(0),
+            onward: Watchers::new(),
+        })
+    }
+
+    fn told(&self) -> u64 {
+        self.told.load(Ordering::SeqCst)
+    }
+
+    fn tell(&self) {
+        self.told.fetch_add(1, Ordering::SeqCst);
+        self.queue.wake_all();
+        self.onward.notify();
+    }
 }
 
 /// The pollers watching one object. An object whose readiness can change
@@ -133,12 +203,16 @@ impl Watchers {
             v.iter().filter_map(Weak::upgrade).collect()
         };
         for p in live {
-            p.queue.wake_all();
+            p.tell();
         }
     }
 
+    /// Registers `p` (once).
     fn watch(&self, p: &Arc<Poller>) {
-        self.0.lock().push(Arc::downgrade(p));
+        let mut v = self.0.lock();
+        if !v.iter().any(|w| core::ptr::eq(w.as_ptr(), Arc::as_ptr(p))) {
+            v.push(Arc::downgrade(p));
+        }
     }
 
     fn unwatch(&self, p: &Arc<Poller>) {
@@ -167,7 +241,7 @@ pub(crate) fn watchers(fd: &Fd) -> Option<&Watchers> {
 pub(crate) fn readiness(fd: &Fd) -> u16 {
     match fd {
         Fd::Console | Fd::File(_) | Fd::Dev(_) => POLLIN | POLLOUT,
-        Fd::Pipe(e) => e.pipe.poll(e.write),
+        Fd::Pipe(e) => e.poll(),
         Fd::Object(o) => o.obj.poll(),
     }
 }
@@ -183,21 +257,32 @@ fn changes(fd: &Fd) -> u64 {
 
 /// Sleeps until `check` returns `Some` or the deadline passes (`None`),
 /// woken only by changes to the objects behind `watched` (the native
-/// personality's `OBJECT_WAIT`). `check` runs with interrupts off.
+/// personality's `OBJECT_WAIT`).
 pub(crate) fn wait_watchers<T>(
     watched: &[&Watchers],
     deadline: Option<Duration>,
     mut check: impl FnMut() -> Option<T>,
 ) -> Option<T> {
-    let poller = Arc::new(Poller {
-        queue: WaitQueue::new(),
-    });
+    let poller = Poller::new();
     for w in watched {
         w.watch(&poller);
     }
-    let r = match deadline {
-        Some(d) => poller.queue.wait_until_deadline(d, &mut check),
-        None => Some(poller.queue.wait_until(&mut check)),
+    let r = loop {
+        // As in `wait_ready`.
+        let told = poller.told();
+        let v = check();
+        if v.is_some() {
+            break v;
+        }
+        let woken = || (poller.told() != told).then_some(());
+        match deadline {
+            Some(d) => {
+                if poller.queue.wait_until_deadline(d, woken).is_none() {
+                    break None;
+                }
+            }
+            None => poller.queue.wait_until(woken),
+        }
     };
     for w in watched {
         w.unwatch(&poller);
@@ -206,41 +291,54 @@ pub(crate) fn wait_watchers<T>(
 }
 
 /// Sleeps until `check` returns `Some`, the deadline passes (`Ok(None)`),
-/// or a signal arrives (`EINTR`; posting a signal wakes the task directly).
+/// or a signal arrives (`ERESTARTNOHAND`: EINTR if a handler runs, else the
+/// call goes on to its deadline; posting a signal wakes the task directly).
 /// The task is woken only by changes to the objects behind `fds`.
 pub(crate) fn wait_ready<'f, T>(
-    p: &LinuxProcess,
+    p: &mut LinuxProcess,
     fds: impl Iterator<Item = &'f Fd>,
     deadline: Option<Duration>,
     mut check: impl FnMut() -> Option<T>,
 ) -> Result<Option<T>, i64> {
+    let deadline = deadline.map(|d| p.resume_until.take().unwrap_or(d));
     let entry = p.entry.clone();
-    let mut cond = || {
-        if let Some(v) = check() {
-            return Some(Ok(v));
-        }
-        proc::interrupted(&entry).then_some(Err(EINTR))
-    };
     // Registered before the first check, so a change after it wakes us.
-    let poller = Arc::new(Poller {
-        queue: WaitQueue::new(),
-    });
+    let poller = Poller::new();
     let watched: Vec<&Watchers> = fds.filter_map(watchers).collect();
     for w in &watched {
         w.watch(&poller);
     }
-    let r = match deadline {
-        Some(d) => poller.queue.wait_until_deadline(d, &mut cond),
-        None => Some(poller.queue.wait_until(&mut cond)),
+    let r = loop {
+        // Counted before the look, so a change after it ends the sleep. (The
+        // look may take sleeping locks: a nested epoll's does.)
+        let told = poller.told();
+        if let Some(v) = check() {
+            break Ok(Some(v));
+        }
+        let woken = || {
+            if poller.told() != told {
+                Some(Ok(()))
+            } else {
+                proc::interrupted(&entry).then_some(Err(ERESTARTNOHAND))
+            }
+        };
+        let r = match deadline {
+            Some(d) => poller.queue.wait_until_deadline(d, woken),
+            None => Some(poller.queue.wait_until(woken)),
+        };
+        match r {
+            Some(Ok(())) => {}
+            Some(Err(e)) => {
+                p.resume_until = deadline;
+                break Err(e);
+            }
+            None => break Ok(None),
+        }
     };
     for w in &watched {
         w.unwatch(&poller);
     }
-    match r {
-        Some(Ok(v)) => Ok(Some(v)),
-        Some(Err(e)) => Err(e),
-        None => Ok(None),
-    }
+    r
 }
 
 pub(crate) fn read_timespec(p: &mut LinuxProcess, addr: u64) -> Result<Duration, i64> {
@@ -639,6 +737,75 @@ impl Interest {
 #[derive(Debug)]
 pub(crate) struct Epoll {
     interest: Mutex<BTreeMap<u64, Interest>>,
+    /// What the watched objects tell of changes, and waiters sleep on.
+    hub: Arc<Poller>,
+}
+
+impl Epoll {
+    /// What is ready now, at most `max` of it, as (events, data); one-shot
+    /// entries that fired are disarmed, and edge-triggered ones remember
+    /// what they reported, in the same step. Entries whose description has
+    /// been closed are forgotten.
+    fn take_ready(&self, max: u64) -> Vec<(u32, u64)> {
+        let mut hits = Vec::new();
+        // Descriptions are let go of after the lock: a last one closes what
+        // it names.
+        let mut held = Vec::new();
+        let mut set = self.interest.lock();
+        set.retain(|_, i| i.desc.strong_count() > 0);
+        for i in set.values_mut() {
+            if hits.len() as u64 == max {
+                break;
+            }
+            if i.events & !EPOLLET == 0 {
+                continue; // a disarmed EPOLLONESHOT entry
+            }
+            let Some(d) = i.desc.upgrade() else {
+                continue;
+            };
+            let f = d.state().clone();
+            // Read the count first: a change after it is reported next time.
+            let n = changes(&f);
+            if i.events & EPOLLET == 0 || i.seen != Some(n) {
+                let r = u32::from(readiness(&f)) & (i.events | u32::from(POLLERR | POLLHUP));
+                if r != 0 {
+                    hits.push((r, i.data));
+                    if i.events & EPOLLONESHOT != 0 {
+                        i.events = 0;
+                    }
+                    if i.events & EPOLLET != 0 {
+                        i.seen = Some(n);
+                    }
+                }
+            }
+            held.push((f, d));
+        }
+        drop(set);
+        hits
+    }
+
+    /// The descriptions watched.
+    fn watched(&self) -> Vec<(u32, Arc<Description>)> {
+        self.interest
+            .lock()
+            .values()
+            .filter_map(|i| Some((i.events, i.desc.upgrade()?)))
+            .collect()
+    }
+
+    /// Whether watching `target` from here would go round in circles, or
+    /// nest deeper than Linux allows.
+    fn loops(&self, target: &Epoll, depth: usize) -> bool {
+        const DEPTH_MAX: usize = 5;
+        if depth == DEPTH_MAX || Arc::ptr_eq(&self.hub, &target.hub) {
+            return true;
+        }
+        target.watched().into_iter().any(|(_, d)| {
+            let f = d.state().clone();
+            matches!(&f, Fd::Object(o)
+                if o.obj.as_epoll().is_some_and(|e| self.loops(e, depth + 1)))
+        })
+    }
 }
 
 impl Object for Epoll {
@@ -649,9 +816,18 @@ impl Object for Epoll {
         Err(EINVAL)
     }
     fn poll(&self) -> u16 {
-        // Nested epoll readiness needs the interest list (a sleeping lock);
-        // report nothing rather than block (partial).
-        0
+        let ready = self.watched().into_iter().any(|(events, d)| {
+            let f = d.state().clone();
+            let want = events | u32::from(POLLERR | POLLHUP);
+            events & !EPOLLET != 0 && u32::from(readiness(&f)) & want != 0
+        });
+        if ready { POLLIN } else { 0 }
+    }
+    fn changes(&self) -> u64 {
+        self.hub.told()
+    }
+    fn watchers(&self) -> Option<&Watchers> {
+        Some(&self.hub.onward)
     }
     fn as_epoll(&self) -> Option<&Epoll> {
         Some(self)
@@ -666,6 +842,7 @@ pub(crate) fn epoll_create(p: &mut LinuxProcess, flags: u64) -> Result<u64, i64>
     }
     let obj = Arc::new(Epoll {
         interest: Mutex::new(BTreeMap::new()),
+        hub: Poller::new(),
     });
     install(p, obj, false, flags & EPOLL_CLOEXEC != 0)
 }
@@ -713,6 +890,12 @@ pub(crate) fn epoll_ctl(
     let Some(epoll) = ep.as_epoll() else {
         return Err(EINVAL);
     };
+    if op == ADD
+        && let Fd::Object(o) = &target
+        && o.obj.as_epoll().is_some_and(|t| epoll.loops(t, 0))
+    {
+        return Err(ELOOP);
+    }
     let mut set = epoll.interest.lock();
     // An entry at this number for a description that has been closed (or
     // another one, the number having been reused) is gone.
@@ -731,6 +914,12 @@ pub(crate) fn epoll_ctl(
                     seen: None,
                 },
             );
+            drop(set);
+            if let Some(w) = watchers(&target) {
+                w.watch(&epoll.hub);
+            }
+            // It may be ready already: whoever is waiting looks again.
+            epoll.hub.tell();
             Ok(0)
         }
         MOD => Err(ENOENT),
@@ -747,6 +936,18 @@ pub(crate) fn epoll_pwait(p: &mut LinuxProcess, a: &[u64; 6]) -> Result<u64, i64
     r
 }
 
+/// `epoll_pwait2(epfd, events, maxevents, timeout, sigmask, size)`.
+pub(crate) fn epoll_pwait2(p: &mut LinuxProcess, a: &[u64; 6]) -> Result<u64, i64> {
+    let timeout = match a[3] {
+        0 => None,
+        t => Some(read_timespec(p, t)?),
+    };
+    crate::signal::begin_wait_mask(p, a[4], a[5])?;
+    let r = epoll_wait_for(p, a[0], a[1], a[2], timeout);
+    crate::signal::end_wait_mask(p, &r);
+    r
+}
+
 /// `epoll_wait(epfd, events, maxevents, timeout_ms)`.
 pub(crate) fn epoll_wait(
     p: &mut LinuxProcess,
@@ -754,6 +955,17 @@ pub(crate) fn epoll_wait(
     out: u64,
     max: u64,
     timeout: i64,
+) -> Result<u64, i64> {
+    let timeout = (timeout >= 0).then(|| Duration::from_millis(timeout as u64));
+    epoll_wait_for(p, epfd, out, max, timeout)
+}
+
+fn epoll_wait_for(
+    p: &mut LinuxProcess,
+    epfd: u64,
+    out: u64,
+    max: u64,
+    timeout: Option<Duration>,
 ) -> Result<u64, i64> {
     // Linux's EP_MAX_EVENTS: servers size the array to their client limit
     // (redis asks for 10,128). Hits are bounded by the interest list.
@@ -765,64 +977,39 @@ pub(crate) fn epoll_wait(
     let Some(epoll) = ep.as_epoll() else {
         return Err(EINVAL);
     };
-    // (fd, entry, what it names, the description held for the wait).
-    // Entries whose description has been closed are forgotten.
-    let watch: Vec<(u64, Interest, Fd, Arc<Description>)> = {
-        let mut set = epoll.interest.lock();
-        set.retain(|_, i| i.desc.strong_count() > 0);
-        set.iter()
-            .filter_map(|(&fd, i)| {
-                let d = i.desc.upgrade()?;
-                let f = d.state().clone();
-                Some((fd, i.clone(), f, d))
-            })
-            .collect()
-    };
-    // (fd, events, data, change count)
-    let scan = || -> Vec<(u64, u32, u64, u64)> {
-        let mut hits = Vec::new();
-        for (fd, i, f, _) in &watch {
-            if i.events & !EPOLLET == 0 {
-                continue; // a disarmed EPOLLONESHOT entry
-            }
-            // Read the count first: a change after it is reported next time.
-            let n = changes(f);
-            if i.events & EPOLLET != 0 && i.seen == Some(n) {
-                continue;
-            }
-            let r = u32::from(readiness(f)) & (i.events | u32::from(POLLERR | POLLHUP));
-            if r != 0 {
-                hits.push((*fd, r, i.data, n));
-                if hits.len() as u64 == max {
-                    break;
-                }
-            }
+    let deadline = timeout.map(|t| {
+        let until = p.resume_until.take();
+        until.unwrap_or_else(|| frame::time::now().saturating_add(t))
+    });
+    let entry = p.entry.clone();
+    let hits = loop {
+        // Counted before the look, so a change after it ends the sleep.
+        let told = epoll.hub.told();
+        let hits = epoll.take_ready(max);
+        if !hits.is_empty() || timeout.is_some_and(|t| t.is_zero()) {
+            break hits;
         }
-        hits
-    };
-    let fds = watch.iter().map(|(_, _, f, _)| f);
-    let hits = wait_ready(p, fds, deadline_ms(timeout), || {
-        let h = scan();
-        (!h.is_empty()).then_some(h)
-    })?
-    .unwrap_or_default();
-    // Disarm one-shot entries that fired; remember what edge-triggered
-    // entries reported.
-    {
-        let mut set = epoll.interest.lock();
-        for (fd, _, _, n) in &hits {
-            if let Some(e) = set.get_mut(fd) {
-                if e.events & EPOLLONESHOT != 0 {
-                    e.events = 0;
-                }
-                if e.events & EPOLLET != 0 {
-                    e.seen = Some(*n);
-                }
+        let woken = || {
+            if epoll.hub.told() != told {
+                Some(Ok(()))
+            } else {
+                proc::interrupted(&entry).then_some(Err(ERESTARTNOHAND))
             }
+        };
+        let r = match deadline {
+            None => epoll.hub.queue.wait_until(woken),
+            Some(d) => match epoll.hub.queue.wait_until_deadline(d, woken) {
+                Some(r) => r,
+                None => break epoll.take_ready(max), // out of time
+            },
+        };
+        if let Err(e) = r {
+            p.resume_until = deadline;
+            return Err(e);
         }
-    }
+    };
     let mut buf = Vec::with_capacity(hits.len() * 12);
-    for (_, r, data, _) in &hits {
+    for (r, data) in &hits {
         buf.extend_from_slice(&r.to_le_bytes());
         buf.extend_from_slice(&data.to_le_bytes());
     }

@@ -33,6 +33,7 @@ mod nativeabi;
 mod nativetest;
 mod netstack;
 mod nettest;
+mod page;
 mod pagecache;
 mod partition;
 mod pipe;
@@ -91,6 +92,12 @@ fn kmain(info: BootInfo) -> ! {
     }
     if let Some(port) = cmdline.get("net_publish").and_then(|v| v.parse().ok()) {
         nettest::set_publish_port(port);
+    }
+    if let Some(mtu) = cmdline.get("uplink_mtu").and_then(|v| v.parse().ok()) {
+        nettest::set_mtu(mtu);
+    }
+    if let Some(secs) = cmdline.get("dhcp_lease").and_then(|v| v.parse().ok()) {
+        nettest::set_lease_cap(secs);
     }
 
     let image = info.kernel_image();
@@ -173,6 +180,19 @@ fn kmain(info: BootInfo) -> ! {
         }
     }
 
+    // ADR-0004: under page-table isolation, user roots map the entry area
+    // and user pages, and nothing else of the kernel.
+    match frame::user::isolation_selftest() {
+        Ok(true) => println!(
+            "ichor: pti: user roots map only the entry area and user pages (kernel text, stack, heap, linear map unmapped)"
+        ),
+        Ok(false) => {}
+        Err(e) => {
+            println!("ichor: FAILED: page-table isolation: {e}");
+            shutdown(ExitStatus::Failure);
+        }
+    }
+
     // ADR-0004: how often user code of one cell followed another's on a
     // CPU that needs a predictor barrier between them.
     println!(
@@ -196,7 +216,7 @@ fn kmain(info: BootInfo) -> ! {
     // say otherwise; `control_exit` and `control_exit_after` end it (and
     // the machine with it), for tests.
     if let Some(options) = control::options(&cmdline) {
-        let code = control::run(info.roots(), &options);
+        let code = control::run(info.roots(), info.api_token(), info.api_tls(), &options);
         println!("ichor: control: exited with {code:?}");
         if code != Some(0) {
             shutdown(ExitStatus::Failure);

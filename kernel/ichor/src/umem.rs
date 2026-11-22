@@ -21,14 +21,24 @@
 //! across `fork`: before the copy, every page of them is made resident,
 //! and parent and child then map the same frames writable, never
 //! copy-on-write. Their contents survive `MADV_DONTNEED`, as shmem's do.
-//! (Making a large shared mapping resident at fork is eager; a page cache
-//! will let it stay lazy.)
+//! (Making a large shared mapping resident at fork is eager.)
+//!
+//! Shared file mappings map the file's own pages, the ones `read` and
+//! `write` copy from and to ([`crate::page`]), so everyone mapping,
+//! reading or writing the file sees one copy. A file of the image nobody
+//! has written yet is mapped from the page cache, read-only; the first
+//! write through a mapping copies the file up. Partial: a mapping that has
+//! touched such a page, or a page since truncated away, does not see what
+//! others write to the file afterwards until it touches the page anew.
 //!
 //! `fork` is copy-on-write: parent and child map the same pages read-only
 //! and mark them shared; the first write on either side (a fault, or a
-//! kernel copy into user memory) gives that side its own copy. The child
-//! is charged for every page up front, so breaking a share never fails on
-//! the account.
+//! kernel copy into user memory) gives that side its own copy. A page is
+//! charged to the cell once, however many address spaces hold it (it is
+//! a shared `Charged` handle), and the copy a write makes is charged when
+//! it is made: so a forked child costs what it copies, as on Linux, and a
+//! write that breaks a share can fail on a full account (the fault then
+//! kills the writer, as Linux's OOM handling would).
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
@@ -37,17 +47,24 @@ use alloc::vec::Vec;
 use cell::Account;
 
 use crate::file::File;
+use crate::linuxabi::shm::Attached;
+use crate::page::{Page, charged};
 use frame::mm::{PAGE_SIZE, UFrame, UserProt, VmSpace};
-use vma::{Prot, RegionMap};
+use vma::{Prot, Region, RegionMap};
 
 const EINVAL: i64 = 22;
 const ENOMEM: i64 = 12;
+const EACCES: i64 = 13;
 const EEXIST: i64 = 17;
 const ENODEV: i64 = 19;
 
 /// Where `mmap` places mappings that do not ask for an address.
 pub(crate) const MMAP_LO: u64 = 0x1000_0000_0000;
 pub(crate) const MMAP_HI: u64 = 0x7fff_0000_0000;
+/// Pages handled per step when a range is walked (free, protect, move):
+/// a list of every page of a big region would be an allocation larger than
+/// the largest contiguous block (MAX_ORDER), and the kernel panics on that.
+const PAGE_BATCH: usize = 4096;
 /// Largest program break, relative to its start.
 const BRK_MAX: u64 = 1 << 30;
 
@@ -65,17 +82,75 @@ pub(crate) mod flags {
 pub(crate) struct FileSource {
     pub(crate) file: Arc<dyn File>,
     pub(crate) offset: u64,
+    /// The descriptor it was mapped through allows writing.
+    pub(crate) writable: bool,
 }
 
-/// `[start, end)` of the address space shows `file` from `offset` (at
-/// `base`) on.
+/// A mapping of a file.
 #[derive(Clone)]
-struct FileRange {
-    start: u64,
-    end: u64,
-    base: u64,
-    offset: u64,
+struct FileMap {
     file: Arc<dyn File>,
+    /// What to add to an address for its place in the file (wrapping).
+    shift: u64,
+    /// `MAP_SHARED`: the mapping shows the file's own pages.
+    shared: bool,
+    /// A shared mapping may be (made) writable.
+    writable: bool,
+}
+
+impl FileMap {
+    /// The offset in the file of address `va`.
+    fn at(&self, va: u64) -> u64 {
+        va.wrapping_add(self.shift)
+    }
+}
+
+impl PartialEq for FileMap {
+    fn eq(&self, other: &FileMap) -> bool {
+        Arc::ptr_eq(&self.file, &other.file)
+            && self.shift == other.shift
+            && self.shared == other.shared
+            && self.writable == other.writable
+    }
+}
+
+/// What is behind a region.
+#[derive(Clone, PartialEq)]
+enum Backing {
+    /// The process's own pages.
+    Private,
+    /// The same, named in `/proc/<pid>/maps`.
+    Named(&'static str),
+    /// Pages shared across `fork`: shared anonymous memory, System V
+    /// segments, kernel pages.
+    Shared,
+    File(FileMap),
+}
+
+impl Backing {
+    fn shared(&self) -> bool {
+        match self {
+            Backing::Shared => true,
+            Backing::File(f) => f.shared,
+            Backing::Private | Backing::Named(_) => false,
+        }
+    }
+
+    /// Whether dropping its pages leaves zeros, and nothing else.
+    fn anonymous(&self) -> bool {
+        matches!(self, Backing::Private | Backing::Named(_))
+    }
+
+    /// The backing of the same memory moved from `old` to `new`.
+    fn moved(self, old: u64, new: u64) -> Backing {
+        match self {
+            Backing::File(f) => Backing::File(FileMap {
+                shift: f.shift.wrapping_add(old).wrapping_sub(new),
+                ..f
+            }),
+            other => other,
+        }
+    }
 }
 
 /// Linux `madvise` advice values.
@@ -108,22 +183,29 @@ fn page_up(v: u64) -> Option<u64> {
 }
 
 /// A process's address space and its bookkeeping. Pages are charged to
-/// `account` (the cell's) and released when unmapped or when the `Mm` is
-/// dropped. Drop it only while its space is not active (switch to the
-/// kernel space first).
+/// `account` (the cell's) once each (`Charged`), and released when no
+/// address space holds them any more. Drop it only while its space is not
+/// active (switch to the kernel space first).
+///
+/// The space is shared so a copy can run without the `Mm` lock
+/// ([`copy_user`], ADR-0011 as amended): such a copy holds its own
+/// reference for its duration, so the space outlives an `execve` that
+/// replaces this `Mm` mid-copy. That last reference is dropped by the
+/// copying task, which is never bound to the space: `execve` and the last
+/// thread out wait for every other thread of the process to leave first,
+/// and helper threads (the only ones not waited for) run on the kernel
+/// space (`proc::start_helper`).
 pub(crate) struct Mm {
-    space: VmSpace,
+    space: Arc<VmSpace>,
     account: Arc<Account>,
-    regions: RegionMap,
-    /// Every page the process owns, mapped or not (`PROT_NONE`).
-    pages: BTreeMap<u64, UFrame>,
+    regions: RegionMap<Backing>,
+    /// Every page the process holds, mapped or not (`PROT_NONE`).
+    pages: BTreeMap<u64, Page>,
     /// Pages possibly shared with another process after `fork`: mapped
     /// read-only, copied on the first write.
     cow: BTreeSet<u64>,
-    /// File mappings, for filling their pages.
-    files: Vec<FileRange>,
-    /// Shared anonymous mappings: `[start, end)`.
-    shared: Vec<(u64, u64)>,
+    /// System V segments attached: `[start, end)` each.
+    attached: Vec<(u64, u64, Attached)>,
     brk_start: u64,
     brk: u64,
 }
@@ -132,13 +214,12 @@ impl Mm {
     /// An empty address space charging `account`.
     pub(crate) fn new(account: &Arc<Account>) -> Option<Mm> {
         Some(Mm {
-            space: VmSpace::new()?,
+            space: Arc::new(VmSpace::new()?),
             account: account.clone(),
             regions: RegionMap::new(MMAP_LO, MMAP_HI),
             pages: BTreeMap::new(),
             cow: BTreeSet::new(),
-            files: Vec::new(),
-            shared: Vec::new(),
+            attached: Vec::new(),
             brk_start: 0,
             brk: 0,
         })
@@ -149,31 +230,56 @@ impl Mm {
         &self.space
     }
 
+    /// A reference to the address space for a copy that runs without the
+    /// `Mm` lock ([`copy_user`]).
+    pub(crate) fn shared_space(&self) -> Arc<VmSpace> {
+        self.space.clone()
+    }
+
+    /// Whether `space` is this `Mm`'s address space (not one an `execve`
+    /// has since replaced).
+    pub(crate) fn owns(&self, space: &Arc<VmSpace>) -> bool {
+        Arc::ptr_eq(&self.space, space)
+    }
+
     /// A copy-on-write copy of this address space for `fork`: same
     /// regions and break; every page is shared read-only and marked
     /// copy-on-write on both sides. `None` if memory or the account runs out.
     pub(crate) fn fork(&mut self) -> Option<Mm> {
         // Shared memory must exist before the copy, so both sides hold it.
-        for (s, e) in self.shared.clone() {
+        let mut from = 0;
+        while let Some((s, e)) = self.next_shared(from, u64::MAX) {
             let mut va = s;
             while va < e {
                 self.frame(va)?;
                 va += PAGE_SIZE;
             }
+            from = e;
         }
         let mut child = Mm::new(&self.account)?;
         child.regions = self.regions.clone();
-        child.files = self.files.clone();
-        child.shared = self.shared.clone();
+        child.attached = self.attached.clone();
         child.brk_start = self.brk_start;
         child.brk = self.brk;
-        self.account.charge(self.pages.len() as u64).ok()?;
+        // The child shares every page (no new charge): what either side
+        // copies on write is charged then.
+        let mut region: Option<Region<Backing>> = None;
         for (&va, f) in &self.pages {
             child.pages.insert(va, f.clone());
-            if self.is_shared(va) {
-                let prot = self.regions.find(va).map(|r| r.prot);
-                if let Some(prot) = prot.filter(|p| p.accessible())
-                    && child.space.map(va, f, user_prot(prot)).is_err()
+            if !region.as_ref().is_some_and(|r| r.start <= va && va < r.end) {
+                region = self.regions.find(va);
+            }
+            if let Some(r) = region.as_ref().filter(|r| r.backing.shared()) {
+                // An image page in a shared mapping stays read-only until
+                // a write copies the file up.
+                if self.cow.contains(&va) {
+                    child.cow.insert(va);
+                }
+                if r.prot.accessible()
+                    && child
+                        .space
+                        .map(va, f, self.mapped_prot(va, r.prot))
+                        .is_err()
                 {
                     return None;
                 }
@@ -199,9 +305,25 @@ impl Mm {
         Some(child)
     }
 
-    /// Whether `va` lies in a shared anonymous mapping.
+    /// Whether `va` lies in a shared mapping.
     fn is_shared(&self, va: u64) -> bool {
-        self.shared.iter().any(|&(s, e)| s <= va && va < e)
+        self.regions.find(va).is_some_and(|r| r.backing.shared())
+    }
+
+    /// The next stretch of shared anonymous memory in `[from, to)`.
+    fn next_shared(&self, from: u64, to: u64) -> Option<(u64, u64)> {
+        self.regions
+            .overlapping(from, to)
+            .find(|r| r.backing == Backing::Shared)
+            .map(|r| (r.start.max(from), r.end.min(to)))
+    }
+
+    /// The file mapped at `va`.
+    fn file_at(&self, va: u64) -> Option<FileMap> {
+        match self.regions.find(va)?.backing {
+            Backing::File(f) => Some(f),
+            _ => None,
+        }
     }
 
     /// The physical address behind `addr` if it lies in shared memory (so a
@@ -221,10 +343,13 @@ impl Mm {
     /// Maps `frame` (a page cache page) at `va`, copy-on-write: read-only
     /// until written. Charged as one page.
     pub(crate) fn map_cow(&mut self, va: u64, frame: UFrame, prot: Prot) -> bool {
-        if self.pages.contains_key(&va) || self.account.charge(1).is_err() {
+        if self.pages.contains_key(&va) {
             return false;
         }
-        self.pages.insert(va, frame.clone());
+        let Some(page) = charged(&self.account, frame.clone()) else {
+            return false;
+        };
+        self.pages.insert(va, page);
         self.cow.insert(va);
         let p = self.mapped_prot(va, prot);
         !prot.accessible() || self.space.map(va, &frame, p).is_ok()
@@ -236,7 +361,9 @@ impl Mm {
         let Some(shared) = self.pages.get(&va).cloned() else {
             return false;
         };
-        let Some(copy) = UFrame::alloc_zeroed() else {
+        // The copy is charged; the shared page's charge goes with its last
+        // holder (this one, if the other side already copied or left).
+        let Some(copy) = UFrame::alloc_zeroed().and_then(|f| charged(&self.account, f)) else {
             return false;
         };
         let mut buf = alloc::vec![0u8; PAGE_SIZE as usize];
@@ -277,31 +404,53 @@ impl Mm {
         self.pages.len()
     }
 
-    /// `/proc/<pid>/maps`: one line per region.
-    pub(crate) fn maps(&self) -> alloc::string::String {
+    /// How many regions there are.
+    pub(crate) fn mappings(&self) -> usize {
+        self.regions.len()
+    }
+
+    /// `/proc/<pid>/maps`: one line per region from `from` on, some of them
+    /// at a time, and where the next ones start (`None`: that was all).
+    pub(crate) fn maps(&self, from: u64) -> (alloc::string::String, Option<u64>) {
         use core::fmt::Write;
+        const SOME: usize = 16 << 10;
         let mut s = alloc::string::String::new();
-        let brk_end = page_up(self.brk).unwrap_or(self.brk);
-        for r in self.regions.regions() {
-            let share = if self.is_shared(r.start) { 's' } else { 'p' };
-            let label = if r.start >= self.brk_start && r.end <= brk_end && self.brk_start != 0 {
-                "[heap]"
-            } else if r.end == 0x7fff_f000_0000 {
-                "[stack]"
-            } else {
-                ""
-            };
-            let _ = writeln!(
+        for r in self.regions.overlapping(from, u64::MAX) {
+            if s.len() >= SOME {
+                return (s, Some(r.start));
+            }
+            let share = if r.backing.shared() { 's' } else { 'p' };
+            let (mut offset, mut dev, mut ino) = (0, 0, 0);
+            let mut label = alloc::string::String::new();
+            match &r.backing {
+                Backing::File(f) => {
+                    offset = f.at(r.start);
+                    if let Some((n, path)) = f.file.identity() {
+                        (dev, ino) = (1, n); // as `fstat` has it
+                        label = path.unwrap_or_else(|| "(deleted)".into());
+                    }
+                }
+                Backing::Named(name) => label.push_str(name),
+                Backing::Private | Backing::Shared => {}
+            }
+            let line = s.len();
+            let _ = write!(
                 s,
-                "{:08x}-{:08x} {}{}{}{share} 00000000 00:00 0 {label}",
+                "{:08x}-{:08x} {}{}{}{share} {offset:08x} 00:{dev:02x} {ino} ",
                 r.start,
                 r.end,
                 if r.prot.read { 'r' } else { '-' },
                 if r.prot.write { 'w' } else { '-' },
                 if r.prot.exec { 'x' } else { '-' },
             );
+            if !label.is_empty() {
+                // Names line up, as on Linux.
+                let pad = 73usize.saturating_sub(s.len() - line);
+                let _ = write!(s, "{:pad$}{label}", "");
+            }
+            s.push('\n');
         }
-        s
+        (s, None)
     }
 
     /// A free, page-aligned range of `len` bytes in the mmap area.
@@ -311,7 +460,13 @@ impl Mm {
 
     /// Reserves `[start, end)` with `prot` without allocating pages.
     pub(crate) fn reserve(&mut self, start: u64, end: u64, prot: Prot) -> bool {
-        self.regions.insert(start, end, prot)
+        self.regions.insert(start, end, prot, Backing::Private)
+    }
+
+    /// Reserves `[start, end)` as the first thread's stack.
+    pub(crate) fn reserve_stack(&mut self, start: u64, end: u64) -> bool {
+        let stack = Backing::Named("[stack]");
+        self.regions.insert(start, end, Prot::RW, stack)
     }
 
     /// Reserves `[start, end)` (page-aligned) as a private mapping of
@@ -325,17 +480,13 @@ impl Mm {
         offset: u64,
         file: Arc<dyn File>,
     ) -> bool {
-        if !self.regions.insert(start, end, prot) {
-            return false;
-        }
-        self.files.push(FileRange {
-            start,
-            end,
-            base: start,
-            offset,
+        let map = FileMap {
             file,
-        });
-        true
+            shift: offset.wrapping_sub(start),
+            shared: false,
+            writable: false,
+        };
+        self.regions.insert(start, end, prot, Backing::File(map))
     }
 
     /// The page the process owns at `va`, allocating (and charging) one if
@@ -343,87 +494,89 @@ impl Mm {
     /// map it.
     pub(crate) fn frame(&mut self, va: u64) -> Option<UFrame> {
         if let Some(f) = self.pages.get(&va) {
-            return Some(f.clone());
+            return Some((***f).clone());
         }
-        self.account.charge(1).ok()?;
-        let file = self.files.iter().find(|r| r.start <= va && va < r.end);
-        let at = file.map(|r| r.offset + (va - r.base));
+        let map = self.file_at(va);
         // A cache page needs no fresh frame (or zeroing one to throw away).
-        if let (Some(r), Some(at)) = (file, at)
-            && let Some(cached) = r.file.cached_page(at / PAGE_SIZE)
+        if let Some(m) = &map
+            && let Some(cached) = m.file.cached_page(m.at(va) / PAGE_SIZE)
         {
             // Shared with the cache: read-only until written.
-            self.pages.insert(va, cached.clone());
+            self.pages
+                .insert(va, charged(&self.account, cached.clone())?);
             self.cow.insert(va);
             return Some(cached);
         }
-        let Some(f) = UFrame::alloc_zeroed() else {
-            self.account.release(1);
-            return None;
-        };
-        if let (Some(r), Some(at)) = (self.files.iter().find(|r| r.start <= va && va < r.end), at) {
-            let mut page = alloc::vec![0u8; PAGE_SIZE as usize];
-            let n = r.file.read_at(at, &mut page);
-            f.writer().write(&page[..n]);
+        let page = charged(&self.account, UFrame::alloc_zeroed()?)?;
+        if let Some(m) = &map {
+            let mut buf = alloc::vec![0u8; PAGE_SIZE as usize];
+            let n = m.file.read_at(m.at(va), &mut buf);
+            page.writer().write(&buf[..n]);
         }
-        self.pages.insert(va, f.clone());
+        let f = (**page).clone();
+        self.pages.insert(va, page);
         Some(f)
     }
 
-    /// Forgets the shared anonymous ranges over `[start, end)`.
-    fn trim_shared(&mut self, start: u64, end: u64) {
-        let mut kept = Vec::with_capacity(self.shared.len());
-        for &(s, e) in &self.shared {
-            if e <= start || s >= end {
-                kept.push((s, e));
-                continue;
-            }
-            if s < start {
-                kept.push((s, start));
-            }
-            if e > end {
-                kept.push((end, e));
-            }
+    /// A fault in a shared file mapping: maps the file's own page. A hole
+    /// is given one; past the end of the file there is none (the fault
+    /// fails; Linux sends SIGBUS).
+    fn fault_shared(
+        &mut self,
+        map: &FileMap,
+        va: u64,
+        prot: Prot,
+        write: bool,
+        exec: bool,
+    ) -> bool {
+        if let Some((_, p)) = self.space.translate(va)
+            && (!write || p.write)
+            && (!exec || p.exec)
+        {
+            return true; // another thread took this fault first
         }
-        self.shared = kept;
+        match map.file.shared_page(map.at(va) / PAGE_SIZE, write) {
+            Ok(Some(page)) => {
+                // Takes the place of the image's page, if that was mapped.
+                self.space.unmap(va);
+                self.cow.remove(&va);
+                let mapped = self.space.map(va, &page, user_prot(prot)).is_ok();
+                self.pages.insert(va, page);
+                mapped
+            }
+            // Nobody has written this file: the image's page will do, until
+            // somebody writes it through here.
+            Ok(None) if !write => {
+                let Some(f) = self.frame(va) else {
+                    return false;
+                };
+                self.cow.insert(va);
+                let p = self.mapped_prot(va, prot);
+                self.space.map(va, &f, p).is_ok()
+            }
+            _ => false,
+        }
     }
 
     /// Drops the private pages of `[start, end)` (`MADV_DONTNEED`);
     /// shared memory keeps its contents.
     fn drop_private(&mut self, start: u64, end: u64) {
-        let shared: Vec<(u64, u64)> = self
-            .shared
-            .iter()
-            .filter(|&&(s, e)| s < end && start < e)
-            .map(|&(s, e)| (s.max(start), e.min(end)))
-            .collect();
         let mut at = start;
-        for (s, e) in shared {
-            self.free_range(at, s.max(at));
-            at = at.max(e);
+        while let Some((s, e)) = self.next_shared(at, end) {
+            self.free_range(at, s);
+            at = e;
         }
         self.free_range(at, end);
     }
 
-    /// Forgets the file mappings over `[start, end)`.
-    fn trim_files(&mut self, start: u64, end: u64) {
-        let mut kept = Vec::with_capacity(self.files.len());
-        for r in self.files.drain(..) {
-            if r.end <= start || r.start >= end {
-                kept.push(r);
-                continue;
-            }
-            if r.start < start {
-                kept.push(FileRange {
-                    end: start,
-                    ..r.clone()
-                });
-            }
-            if r.end > end {
-                kept.push(FileRange { start: end, ..r });
-            }
-        }
-        self.files = kept;
+    /// Whether all of `[start, end)` is mapped (with whatever permissions).
+    pub(crate) fn all_mapped(&self, start: u64, end: u64) -> bool {
+        self.regions.covered(start, end)
+    }
+
+    /// Whether anything is mapped at `addr` (with whatever permissions).
+    pub(crate) fn mapped(&self, addr: u64) -> bool {
+        self.regions.find(addr).is_some()
     }
 
     /// Handles a user page fault at `addr`. Returns false if the access is
@@ -435,6 +588,11 @@ impl Mm {
         };
         if !region.prot.permits(write, exec) {
             return false;
+        }
+        if let Backing::File(map) = &region.backing
+            && map.shared
+        {
+            return self.fault_shared(map, va, region.prot, write, exec);
         }
         if write && self.cow.contains(&va) {
             return self.break_cow(va, region.prot);
@@ -458,55 +616,25 @@ impl Mm {
         self.space.map(va, &f, prot).is_ok()
     }
 
-    /// Copies `data` to user memory at `va` as user stores would: frame
-    /// copies up to the first page not mapped writable, that page is
-    /// faulted as a user write would fault it (demand paging, or breaking
-    /// copy-on-write), and the copy goes on. Stops at the first page the
-    /// process may not write. Returns the bytes copied.
+    /// Copies `data` to user memory at `va` as user stores would (see
+    /// [`copy_user`]), holding this `Mm` throughout: for spaces no other
+    /// thread can reach (the loader's new image, a native process).
+    /// Returns the bytes copied.
     pub(crate) fn copy_to_user(&mut self, va: u64, data: &[u8]) -> usize {
-        self.copy_user(va, data.len(), true, |space, at, done| {
-            space.copy_to_user(at, &data[done..])
+        let space = self.space.clone();
+        copy_user(&space, va, UserBuf::To(data), |at, write| {
+            self.fault(at, write, false).then_some(())
         })
     }
 
-    /// Copies user memory at `va` into `out` as user loads would (unmapped
-    /// pages are faulted in). Stops at the first page the process may not
-    /// read. Returns the bytes copied.
+    /// Copies user memory at `va` into `out` as user loads would (see
+    /// [`copy_user`]), holding this `Mm` throughout. Returns the bytes
+    /// copied.
     pub(crate) fn copy_from_user(&mut self, va: u64, out: &mut [u8]) -> usize {
-        self.copy_user(va, out.len(), false, |space, at, done| {
-            space.copy_from_user(at, &mut out[done..])
+        let space = self.space.clone();
+        copy_user(&space, va, UserBuf::From(out), |at, write| {
+            self.fault(at, write, false).then_some(())
         })
-    }
-
-    /// The fault-and-retry loop behind both copies. `copy(space, at, done)`
-    /// copies from byte `done` (user address `at`) on and returns how far
-    /// it got. A page is faulted at most once in a row, so a fault that
-    /// does not make it accessible can never loop.
-    fn copy_user(
-        &mut self,
-        va: u64,
-        len: usize,
-        write: bool,
-        mut copy: impl FnMut(&VmSpace, u64, usize) -> usize,
-    ) -> usize {
-        let mut done = 0usize;
-        let mut faulted = None;
-        loop {
-            let Some(at) = va.checked_add(done as u64) else {
-                return done;
-            };
-            done += copy(&self.space, at, done);
-            if done >= len {
-                return done;
-            }
-            let Some(at) = va.checked_add(done as u64) else {
-                return done;
-            };
-            if faulted == Some(at) || !self.fault(at, write, false) {
-                return done;
-            }
-            faulted = Some(at);
-        }
     }
 
     /// Faults in `[va, va+len)` ahead of a kernel copy, stopping at the
@@ -527,15 +655,27 @@ impl Mm {
 
     /// Frees every page in `[start, end)` (one TLB shootdown for all).
     fn free_range(&mut self, start: u64, end: u64) {
-        let vas: Vec<u64> = self.pages.range(start..end).map(|(&v, _)| v).collect();
-        if vas.is_empty() {
+        if self.pages.range(start..end).next().is_none() {
             return;
         }
         self.space.unmap_range(start, end);
-        for va in vas {
-            self.pages.remove(&va);
-            self.cow.remove(&va);
-            self.account.release(1);
+        // Forget the pages a batch at a time: a list of every resident
+        // page of a large process would itself be a large allocation.
+        loop {
+            let vas: Vec<u64> = self
+                .pages
+                .range(start..end)
+                .map(|(&v, _)| v)
+                .take(PAGE_BATCH)
+                .collect();
+            if vas.is_empty() {
+                return;
+            }
+            for va in vas {
+                // The charge goes with the page's last holder.
+                self.pages.remove(&va);
+                self.cow.remove(&va);
+            }
         }
     }
 
@@ -587,23 +727,20 @@ impl Mm {
                 self.regions.find_free(len).ok_or(ENOMEM)?
             }
         };
-        if !self.regions.insert(start, start + len, prot) {
-            return Err(ENOMEM);
-        }
-        // A file mapping fills pages from the file as they are touched. A
-        // shared mapping is only allowed read-only, so it cannot miss a
-        // write to the file it would have made; it can miss later writes by
-        // others (partial).
-        match file {
-            Some(f) => self.files.push(FileRange {
-                start,
-                end: start + len,
-                base: start,
-                offset: f.offset,
+        // A file mapping takes its pages from the file as they are touched.
+        let shared = map_flags & MAP_SHARED != 0;
+        let backing = match file {
+            Some(f) => Backing::File(FileMap {
                 file: f.file,
+                shift: f.offset.wrapping_sub(start),
+                shared,
+                writable: f.writable,
             }),
-            None if map_flags & MAP_SHARED != 0 => self.shared.push((start, start + len)),
-            None => {}
+            None if shared => Backing::Shared,
+            None => Backing::Private,
+        };
+        if !self.regions.insert(start, start + len, prot, backing) {
+            return Err(ENOMEM);
         }
         Ok(start)
     }
@@ -620,23 +757,66 @@ impl Mm {
         prot: u64,
         map_flags: u64,
     ) -> Result<u64, i64> {
+        let account = self.account.clone();
+        let pages: Option<Vec<Page>> = frames
+            .iter()
+            .map(|f| charged(&account, f.clone()))
+            .collect();
+        self.map_pages(addr, &pages.ok_or(ENOMEM)?, prot, map_flags)
+    }
+
+    /// [`Self::map_frames`] with pages that are charged already.
+    fn map_pages(
+        &mut self,
+        addr: u64,
+        pages: &[Page],
+        prot: u64,
+        map_flags: u64,
+    ) -> Result<u64, i64> {
         use flags::*;
-        let len = frames.len() as u64 * PAGE_SIZE;
+        let len = pages.len() as u64 * PAGE_SIZE;
         let place = map_flags & (MAP_FIXED | MAP_FIXED_NOREPLACE);
         let start = self.mmap(addr, len, prot, MAP_SHARED | MAP_ANONYMOUS | place, None)?;
         let user = Prot::from_linux(prot).ok_or(EINVAL)?;
-        for (i, f) in frames.iter().enumerate() {
+        for (i, page) in pages.iter().enumerate() {
             let va = start + i as u64 * PAGE_SIZE;
-            let mapped = self.account.charge(1).is_ok() && {
-                self.pages.insert(va, f.clone());
-                !user.accessible() || self.space.map(va, f, user_prot(user)).is_ok()
-            };
-            if !mapped {
+            self.pages.insert(va, page.clone());
+            if user.accessible() && self.space.map(va, page, user_prot(user)).is_err() {
                 let _ = self.munmap(start, len);
                 return Err(ENOMEM);
             }
         }
         Ok(start)
+    }
+
+    /// `shmat`: maps a System V segment's `pages`, and holds `hold` until
+    /// they are detached.
+    pub(crate) fn attach(
+        &mut self,
+        addr: u64,
+        pages: &[Page],
+        prot: u64,
+        place: u64,
+        hold: Attached,
+    ) -> Result<u64, i64> {
+        if self.attached.len() >= vma::MAX_REGIONS {
+            return Err(ENOMEM);
+        }
+        let at = self.map_pages(addr, pages, prot, place)?;
+        let end = at + pages.len() as u64 * PAGE_SIZE;
+        self.attached.push((at, end, hold));
+        Ok(at)
+    }
+
+    /// `shmdt`: unmaps the segment attached at `addr`.
+    pub(crate) fn detach(&mut self, addr: u64) -> Result<u64, i64> {
+        let (start, end) = self
+            .attached
+            .iter()
+            .find(|a| a.0 == addr)
+            .map(|a| (a.0, a.1))
+            .ok_or(EINVAL)?;
+        self.munmap(start, end - start)
     }
 
     /// `munmap`.
@@ -646,11 +826,10 @@ impl Mm {
             return Err(EINVAL);
         }
         let end = addr.checked_add(len).ok_or(EINVAL)?;
-        for (s, e) in self.regions.remove(addr, end) {
+        for (s, e) in self.regions.remove(addr, end).ok_or(ENOMEM)? {
             self.free_range(s, e);
         }
-        self.trim_files(addr, end);
-        self.trim_shared(addr, end);
+        self.attached.retain(|a| a.0 < addr || a.1 > end);
         Ok(0)
     }
 
@@ -666,12 +845,14 @@ impl Mm {
         }
         let len = vma::page_len(len).ok_or(EINVAL)?;
         let end = addr.checked_add(len).ok_or(EINVAL)?;
-        let file = self.files.iter().any(|r| r.start < end && addr < r.end)
-            || self.shared.iter().any(|&(s, e)| s < end && addr < e);
+        let anonymous = |m: &Mm| {
+            let mut regions = m.regions.overlapping(addr, end);
+            regions.all(|r| r.backing.anonymous())
+        };
         match advice {
             NORMAL..=WILLNEED | MERGEABLE..=DODUMP | KEEPONFORK..=PAGEOUT => {}
             DONTNEED => self.drop_private(addr, end),
-            FREE if !file => self.free_range(addr, end),
+            FREE if anonymous(self) => self.free_range(addr, end),
             POPULATE_READ | POPULATE_WRITE => {
                 self.populate(addr, len as usize, advice == POPULATE_WRITE)
             }
@@ -709,17 +890,11 @@ impl Mm {
         let old_len = vma::page_len(old_len).filter(|&l| l > 0).ok_or(EINVAL)?;
         let new_len = vma::page_len(new_len).filter(|&l| l > 0).ok_or(EINVAL)?;
         let old_end = old.checked_add(old_len).ok_or(EINVAL)?;
-        // The range may span adjacent regions (an earlier in-place grow adds
-        // one), as long as they have one protection: Linux merges those.
         let region = self.regions.find(old).ok_or(EFAULT)?;
-        let prot = region.prot;
-        let mut at = region.end;
-        while at < old_end {
-            match self.regions.find(at) {
-                Some(r) if r.prot == prot => at = r.end,
-                _ => return Err(EFAULT),
-            }
+        if region.end < old_end {
+            return Err(EFAULT);
         }
+        let prot = region.prot;
         if flags & FIXED == 0 && new_len <= old_len {
             if new_len < old_len {
                 self.munmap(old + new_len, old_len - new_len)?;
@@ -731,13 +906,18 @@ impl Mm {
             && new_end_here <= USER_TOP
             && self.regions.is_free(old_end, new_end_here)
         {
-            if !self.regions.insert(old_end, new_end_here, prot) {
+            // Joins the region it continues.
+            if !self
+                .regions
+                .insert(old_end, new_end_here, prot, region.backing)
+            {
                 return Err(ENOMEM);
             }
-            self.extend_ranges(old_end, new_end_here);
             return Ok(old);
         }
-        if flags & MAYMOVE == 0 {
+        // The move adds a region, and may split those it takes from and
+        // goes over.
+        if flags & MAYMOVE == 0 || self.regions.len() + 3 > vma::MAX_REGIONS {
             return Err(ENOMEM);
         }
         let dst = if flags & FIXED != 0 {
@@ -753,83 +933,47 @@ impl Mm {
         } else {
             self.regions.find_free(new_len).ok_or(ENOMEM)?
         };
-        if !self.regions.insert(dst, dst + new_len, prot) {
+        let backing = region.backing.moved(old, dst);
+        if !self.regions.insert(dst, dst + new_len, prot, backing) {
             return Err(ENOMEM);
         }
         let moved = old_len.min(new_len);
-        // Pages move with their frames and copy-on-write state.
-        let vas: Vec<u64> = self
-            .pages
-            .range(old..old + moved)
-            .map(|(&v, _)| v)
-            .collect();
-        for va in vas {
-            let Some(f) = self.pages.remove(&va) else {
-                continue;
+        // Pages move with their frames and copy-on-write state, a batch at
+        // a time (the destination never overlaps the source).
+        let mut from = old;
+        loop {
+            let vas: Vec<u64> = self
+                .pages
+                .range(from..old + moved)
+                .map(|(&v, _)| v)
+                .take(PAGE_BATCH)
+                .collect();
+            let Some(&last) = vas.last() else {
+                break;
             };
-            let to = dst + (va - old);
-            let cow = self.cow.remove(&va);
-            let mapped = self.space.translate(va).map(|(_, p)| p);
-            if cow {
-                self.cow.insert(to);
+            from = last + PAGE_SIZE;
+            for va in vas {
+                let Some(f) = self.pages.remove(&va) else {
+                    continue;
+                };
+                let to = dst + (va - old);
+                let cow = self.cow.remove(&va);
+                let mapped = self.space.translate(va).map(|(_, p)| p);
+                if cow {
+                    self.cow.insert(to);
+                }
+                if let Some(p) = mapped
+                    && self.space.map(to, &f, p).is_err()
+                {
+                    return Err(ENOMEM);
+                }
+                self.pages.insert(to, f);
             }
-            if let Some(p) = mapped
-                && self.space.map(to, &f, p).is_err()
-            {
-                return Err(ENOMEM);
-            }
-            self.pages.insert(to, f);
         }
         self.space.unmap_range(old, old + moved);
-        // File and shared ranges follow; a grown tail continues them.
-        let shift = |v: u64| v.wrapping_sub(old).wrapping_add(dst);
-        let mut moved_files = Vec::new();
-        for r in &self.files {
-            if r.start < old_end && old < r.end {
-                let end = if r.end >= old_end {
-                    dst + new_len
-                } else {
-                    shift(r.end.min(old + moved))
-                };
-                moved_files.push(FileRange {
-                    start: shift(r.start.max(old)),
-                    end,
-                    base: shift(r.base),
-                    ..r.clone()
-                });
-            }
-        }
-        let mut moved_shared = Vec::new();
-        for &(s, e) in &self.shared {
-            if s < old_end && old < e {
-                let end = if e >= old_end {
-                    dst + new_len
-                } else {
-                    shift(e.min(old + moved))
-                };
-                moved_shared.push((shift(s.max(old)), end));
-            }
-        }
         // What is left of the old range (if shrinking) is freed here.
         self.munmap(old, old_len)?;
-        self.files.extend(moved_files);
-        self.shared.extend(moved_shared);
         Ok(dst)
-    }
-
-    /// File and shared ranges ending at `at` extend to `to` (`mremap`
-    /// growing in place).
-    fn extend_ranges(&mut self, at: u64, to: u64) {
-        for r in &mut self.files {
-            if r.end == at {
-                r.end = to;
-            }
-        }
-        for r in &mut self.shared {
-            if r.1 == at {
-                r.1 = to;
-            }
-        }
     }
 
     /// `mprotect`.
@@ -843,22 +987,64 @@ impl Mm {
         }
         let len = vma::page_len(len).ok_or(ENOMEM)?;
         let end = addr.checked_add(len).ok_or(ENOMEM)?;
+        // A shared mapping of a file opened for reading stays that.
+        let denied = |r: Region<Backing>| match r.backing {
+            Backing::File(f) => f.shared && !f.writable,
+            _ => false,
+        };
+        if prot.write && self.regions.overlapping(addr, end).any(denied) {
+            return Err(EACCES);
+        }
         if !self.regions.protect(addr, end, prot) {
             return Err(ENOMEM);
         }
-        let vas: Vec<u64> = self.pages.range(addr..end).map(|(&v, _)| v).collect();
-        for va in vas {
-            if self.space.translate(va).is_none() {
-                continue; // Faulted in with the new protection on next use.
-            }
-            if prot.accessible() {
-                let mapped = self.mapped_prot(va, prot);
-                self.space.protect(va, mapped);
-            } else {
-                self.space.unmap(va); // `pages` keeps the frame.
+        // A batch at a time: a list of every page of a large region would
+        // itself be a large allocation.
+        let mut from = addr;
+        loop {
+            let vas: Vec<u64> = self
+                .pages
+                .range(from..end)
+                .map(|(&v, _)| v)
+                .take(PAGE_BATCH)
+                .collect();
+            let Some(&last) = vas.last() else {
+                return Ok(0);
+            };
+            from = last + PAGE_SIZE;
+            for va in vas {
+                if self.space.translate(va).is_none() {
+                    continue; // Faulted in with the new protection on next use.
+                }
+                if prot.accessible() {
+                    let mapped = self.mapped_prot(va, prot);
+                    self.space.protect(va, mapped);
+                } else {
+                    self.space.unmap(va); // `pages` keeps the frame.
+                }
             }
         }
-        Ok(0)
+    }
+
+    /// `msync`: what a shared mapping writes is in the file already, and
+    /// nothing is behind the file to write it back to.
+    pub(crate) fn msync(&self, addr: u64, len: u64, flags: u64) -> Result<u64, i64> {
+        const ASYNC: u64 = 1;
+        const INVALIDATE: u64 = 2;
+        const SYNC: u64 = 4;
+        if !addr.is_multiple_of(PAGE_SIZE)
+            || flags & !(ASYNC | INVALIDATE | SYNC) != 0
+            || flags & (ASYNC | SYNC) == (ASYNC | SYNC)
+        {
+            return Err(EINVAL);
+        }
+        let len = vma::page_len(len).unwrap_or(0);
+        let end = addr.checked_add(len).ok_or(ENOMEM)?;
+        if len == 0 || self.regions.covered(addr, end) {
+            Ok(0)
+        } else {
+            Err(ENOMEM)
+        }
     }
 
     /// `brk`: returns the new break, or the old one if `addr` is refused.
@@ -870,25 +1056,98 @@ impl Mm {
             return self.brk;
         };
         if new_end > old_end {
-            if !self.regions.insert(old_end, new_end, Prot::RW) {
+            let heap = Backing::Named("[heap]");
+            if !self.regions.insert(old_end, new_end, Prot::RW, heap) {
                 return self.brk;
             }
-        } else if new_end < old_end {
-            for (s, e) in self.regions.remove(new_end, old_end) {
-                self.free_range(s, e);
-            }
+        } else if new_end < old_end && self.munmap(new_end, old_end - new_end).is_err() {
+            return self.brk;
         }
         self.brk = addr;
         addr
     }
 }
 
+/// The kernel side of a copy between kernel and user memory.
+pub(crate) enum UserBuf<'a> {
+    /// Bytes to store into user memory (`copy_to_user`).
+    To(&'a [u8]),
+    /// Where to load user memory into (`copy_from_user`).
+    From(&'a mut [u8]),
+}
+
+impl UserBuf<'_> {
+    fn len(&self) -> usize {
+        match self {
+            UserBuf::To(d) => d.len(),
+            UserBuf::From(o) => o.len(),
+        }
+    }
+
+    /// Whether the user side is written.
+    fn write(&self) -> bool {
+        matches!(self, UserBuf::To(_))
+    }
+
+    /// Frame's copy of bytes `from..to` at user address `at`, as far as
+    /// the pages are mapped with the access needed.
+    fn copy(&mut self, space: &VmSpace, at: u64, from: usize, to: usize) -> usize {
+        match self {
+            UserBuf::To(d) => space.copy_to_user(at, &d[from..to]),
+            UserBuf::From(o) => space.copy_from_user(at, &mut o[from..to]),
+        }
+    }
+}
+
+/// Copies between `buf` and user memory at `va` in `space` with the
+/// access a user load or store has. Frame copies as far as the pages are
+/// mapped that way (ADR-0011); where it stops, `fault(at, write)` handles
+/// the fault a user access would take there and, if the access is now
+/// allowed, returns a guard (the `Mm` lock) held while that one page is
+/// copied, so nothing can unmap or protect it between the fault and the
+/// copy. Then the guard is dropped and the copy goes on without it.
+///
+/// So the `Mm` lock is held only for faults, never across a copy of
+/// resident pages, and another thread's `mmap`, `munmap`, `mprotect` or
+/// page fault waits for at most one fault and one page copy. A page that
+/// is faulted and still cannot be copied ends the copy, so it never loops;
+/// a page unmapped by another thread before the fault ends it too (the
+/// fault fails). Returns the bytes copied.
+pub(crate) fn copy_user<G>(
+    space: &VmSpace,
+    va: u64,
+    mut buf: UserBuf<'_>,
+    mut fault: impl FnMut(u64, bool) -> Option<G>,
+) -> usize {
+    let len = buf.len();
+    let write = buf.write();
+    let mut done = 0usize;
+    loop {
+        let Some(at) = va.checked_add(done as u64) else {
+            return done;
+        };
+        done += buf.copy(space, at, done, len);
+        if done >= len {
+            return done;
+        }
+        let Some(at) = va.checked_add(done as u64) else {
+            return done;
+        };
+        let Some(guard) = fault(at, write) else {
+            return done;
+        };
+        let page_end = (PAGE_SIZE - (at & (PAGE_SIZE - 1))) as usize;
+        let n = buf.copy(space, at, done, done.saturating_add(page_end).min(len));
+        drop(guard);
+        if n == 0 {
+            return done;
+        }
+        done += n;
+    }
+}
+
 /// One past the highest user address.
 pub(crate) const USER_TOP: u64 = 0x0000_7fff_ffff_f000;
 
-impl Drop for Mm {
-    fn drop(&mut self) {
-        // The pages themselves are freed with `pages` and `space`.
-        self.account.release(self.pages.len() as u64);
-    }
-}
+// Dropping an `Mm` drops `pages` (each page's charge goes with its last
+// holder) and `space` (which clears the mappings).

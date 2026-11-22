@@ -26,7 +26,9 @@ const REQ_IN: u32 = 0;
 const MAX_QUEUE: u16 = 64;
 /// Largest single request (a power of two the DMA allocator can satisfy).
 const MAX_REQUEST: usize = 64 * 1024;
-const TIMEOUT: Duration = Duration::from_secs(5);
+/// How long one request may take (as NVMe's commands: a busy host, or a
+/// cloud disk, can be slow).
+const TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A virtio-blk device.
 #[derive(Debug)]
@@ -104,6 +106,15 @@ impl VirtioBlk {
                 continue;
             }
             if frame::time::now() >= deadline {
+                // The device still owns the buffers and may write them
+                // later: leak them rather than free memory it could
+                // scribble on once it is someone else's.
+                frame::println!(
+                    "ichor: virtio-blk: request for sector {sector} timed out after {} s",
+                    TIMEOUT.as_secs()
+                );
+                core::mem::forget(header);
+                core::mem::forget(data);
                 return Err(BlockError::Timeout);
             }
             core::hint::spin_loop();

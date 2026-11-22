@@ -7,13 +7,16 @@
 //! 10.0.2.3), so this test needs it; the host reaches the API through a
 //! forwarded port published on the uplink.
 
-use std::io::{ErrorKind, Read, Write};
+use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
+use grpc::Client;
 use grpc::control::{self, RunEvent};
-use grpc::{Client, Response};
 use ichor_tests::Exit;
+use xtask::api::{Session, TEST_IDENTITY, Trust, test_trust};
 
 /// Docker's `hello-world`, pinned by its index digest (the image the OCI
 /// crate's recorded pull is of).
@@ -23,90 +26,8 @@ const IMAGE: &str = "docker.io/library/hello-world@sha256:cf1b20a0c89a666b6950fe
 /// digest: ADR-0012's acceptance image.
 const ALPINE: &str = "docker.io/library/alpine@sha256:1e42bbe2508154c9126d48c2b8a75420c3544343bf86fd041fb7527e017a4b4a";
 
-/// One API session: the socket and the gRPC client over it.
-struct Session {
-    sock: TcpStream,
-    client: Client,
-}
-
-impl Session {
-    /// Connects once the guest serves: QEMU accepts forwarded connections
-    /// at once and drops them until the guest listens, so a session counts
-    /// only once the server's HTTP/2 SETTINGS arrive.
-    fn connect(port: u16, deadline: Instant) -> Result<Session, String> {
-        while Instant::now() < deadline {
-            if let Ok(mut sock) = TcpStream::connect(("127.0.0.1", port)) {
-                let mut client = Client::new("ichor");
-                sock.set_read_timeout(Some(Duration::from_secs(10)))
-                    .unwrap();
-                if sock.write_all(&client.conn.take_output()).is_ok() {
-                    let mut buf = [0u8; 4096];
-                    if let Ok(n) = sock.read(&mut buf)
-                        && n > 0
-                        && client.receive(&buf[..n]).is_ok()
-                    {
-                        return Ok(Session { sock, client });
-                    }
-                }
-            }
-            std::thread::sleep(Duration::from_millis(500));
-        }
-        Err("the control plane never answered".into())
-    }
-
-    /// Makes a call; returns its messages and final status.
-    fn call(
-        &mut self,
-        path: &str,
-        msg: &[u8],
-        timeout: Duration,
-    ) -> Result<(Vec<Vec<u8>>, u32, String), String> {
-        let id = self.client.call(path, msg);
-        let deadline = Instant::now() + timeout;
-        let mut messages = Vec::new();
-        self.sock
-            .set_read_timeout(Some(Duration::from_secs(1)))
-            .unwrap();
-        let mut buf = vec![0u8; 64 * 1024];
-        while Instant::now() < deadline {
-            let out = self.client.conn.take_output();
-            if !out.is_empty() {
-                self.sock
-                    .write_all(&out)
-                    .map_err(|e| format!("send: {e}"))?;
-            }
-            let n = match self.sock.read(&mut buf) {
-                Ok(0) => return Err("the server closed the connection".into()),
-                Ok(n) => n,
-                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
-                    continue;
-                }
-                Err(e) => return Err(format!("receive: {e}")),
-            };
-            for r in self
-                .client
-                .receive(&buf[..n])
-                .map_err(|e| format!("HTTP/2: {e:?}"))?
-            {
-                match r {
-                    Response::Message { stream, message } if stream == id => messages.push(message),
-                    Response::Status {
-                        stream,
-                        code,
-                        message,
-                    } if stream == id => {
-                        // Flush acknowledgements before the next call.
-                        let out = self.client.conn.take_output();
-                        let _ = self.sock.write_all(&out);
-                        return Ok((messages, code, message));
-                    }
-                    _ => {}
-                }
-            }
-        }
-        Err(format!("{path} timed out"))
-    }
-}
+/// The API token the pull-and-run boot gets on its boot volume.
+const API_TOKEN: &str = "test-token-3f9a1c2b7d4e";
 
 /// Pulls `reference`, makes a cell of it and runs `argv` (empty: the
 /// image's command); returns the pull, the cell's address, the output and
@@ -182,15 +103,26 @@ fn sha256(b: &[u8]) -> String {
 }
 
 /// Serves `body` to every HTTP request on 127.0.0.1 (the guest's
-/// 10.0.2.2) until the process ends; returns the port.
-fn serve(body: Vec<u8>) -> u16 {
+/// 10.0.2.2), by a redirect under `/moved/`, until the process ends;
+/// returns the port, and how often it was asked.
+fn serve(body: Vec<u8>) -> (u16, Arc<AtomicU32>) {
     let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = l.local_addr().unwrap().port();
+    let asked = Arc::new(AtomicU32::new(0));
+    let count = asked.clone();
     std::thread::spawn(move || {
         for mut s in l.incoming().flatten() {
+            count.fetch_add(1, Ordering::SeqCst);
             let mut req = [0u8; 4096];
             let _ = s.set_read_timeout(Some(Duration::from_secs(10)));
-            let _ = s.read(&mut req);
+            let n = s.read(&mut req).unwrap_or(0);
+            // What was asked for is elsewhere, as release files often are.
+            if req[..n].starts_with(b"GET /moved/") {
+                let _ = s.write_all(
+                    b"HTTP/1.1 302 Found\r\nLocation: /extra.tar.gz\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+                continue;
+            }
             let head = format!(
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/gzip\r\nConnection: close\r\n\r\n",
                 body.len()
@@ -199,13 +131,57 @@ fn serve(body: Vec<u8>) -> u16 {
             let _ = s.write_all(&body);
         }
     });
-    port
+    (port, asked)
 }
 
 /// The whole flow, from the host: hello-world, then Alpine with an extra
 /// layer (and, first, the same layer with a wrong digest, refused).
 fn session(port: u16, layer_port: u16) -> Result<(Ran, Ran), String> {
-    let mut s = Session::connect(port, Instant::now() + Duration::from_secs(600))?;
+    let trust = test_trust();
+    let trust = Some(&trust);
+    // Without the token, or with a wrong one, every call is refused. (The
+    // sessions stay open until the real one is: `control_exit` ends the
+    // service when no client is left.)
+    let mut refused = Vec::new();
+    for token in [None, Some("not-the-token")] {
+        let mut s = Session::connect(
+            port,
+            token,
+            trust,
+            Instant::now() + Duration::from_secs(600),
+        )?;
+        let req = control::PullImageRequest {
+            reference: IMAGE.into(),
+            layers: vec![],
+        };
+        let (_, code, _) = s.call(control::PULL_IMAGE, &req.encode(), Duration::from_secs(60))?;
+        if code != grpc::status::UNAUTHENTICATED {
+            return Err(format!("a call with token {token:?} gave status {code}"));
+        }
+        refused.push(s);
+    }
+    eprintln!("host: unauthenticated calls refused");
+    // In the clear, the API says nothing to anyone, token or not.
+    let soon = || Instant::now() + Duration::from_secs(5);
+    if Session::connect(port, Some(API_TOKEN), None, soon()).is_ok() {
+        return Err("the API answered in the clear".into());
+    }
+    // And a client that trusts someone else does not get as far as talking.
+    let stranger = Trust {
+        roots: Default::default(),
+        ..test_trust()
+    };
+    match Session::connect(port, Some(API_TOKEN), Some(&stranger), soon()) {
+        Err(e) if e.contains("UnknownIssuer") => {}
+        other => return Err(format!("an untrusted API: {other:?}")),
+    }
+    let mut s = Session::connect(
+        port,
+        Some(API_TOKEN),
+        trust,
+        Instant::now() + Duration::from_secs(60),
+    )?;
+    drop(refused);
     eprintln!("host: connected to the control plane");
 
     // An unknown method and a bad reference are errors, not hangs.
@@ -226,7 +202,7 @@ fn session(port: u16, layer_port: u16) -> Result<(Ran, Ran), String> {
 
     let body = extra_layer();
     let layer = |digest: String| control::LayerSource {
-        url: format!("http://10.0.2.2:{layer_port}/extra.tar.gz"),
+        url: format!("http://10.0.2.2:{layer_port}/moved/extra.tar.gz"),
         digest,
         from: "src/".into(),
         to: "/opt/extra/".into(),
@@ -245,27 +221,128 @@ fn session(port: u16, layer_port: u16) -> Result<(Ran, Ran), String> {
     }
     eprintln!("host: refused as it should be: {msg}");
 
+    // Two layers from one archive: it is fetched once.
+    let again = control::LayerSource {
+        to: "/opt/again/".into(),
+        ..layer(sha256(&body))
+    };
     let alpine = pull_and_run(
         &mut s,
         ALPINE,
-        vec![layer(sha256(&body))],
+        vec![layer(sha256(&body)), again],
         &[
             "sh",
             "-c",
-            "cat /etc/alpine-release; echo \"$((6 * 7)) from $(uname -s)\"; ls /bin/busybox; cat /opt/extra/greeting; exit 3",
+            "cat /etc/alpine-release; echo \"$((6 * 7)) from $(uname -s)\"; ls /bin/busybox; cat /opt/extra/greeting; \
+             cat /opt/again/greeting; head -1 /etc/hosts; cat /etc/hostname; exit 3",
         ],
     )?;
+    lifecycle(&mut s, "2")?;
     // Hanging up ends the control plane (`control_exit`) and the boot.
     drop(s);
     Ok((hello, alpine))
 }
 
-/// The API has no authentication yet, so by default it is local to the
-/// system cell: with only `control=PORT`, the port QEMU forwards from the
-/// host never answers HTTP/2, and the system cell's own switch address
-/// (where other cells could reach it) refuses connections.
+/// Signal, Inspect and Destroy on cell `id`: a long `sleep` runs, Inspect
+/// sees it, SIGTERM ends it (its Run ends with that signal), Destroy forgets
+/// the cell.
+fn lifecycle(s: &mut Session, id: &str) -> Result<(), String> {
+    let run = control::RunRequest {
+        cell_id: id.into(),
+        argv: vec!["sleep".into(), "600".into()],
+        env: vec![],
+    };
+    let sleeper = s.start(control::RUN, &run.encode());
+    let inspect = control::CellRequest { cell_id: id.into() }.encode();
+    // Wait until the sleeper is up (it starts asynchronously).
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let info = loop {
+        let (m, code, msg) = s.call(control::INSPECT, &inspect, Duration::from_secs(60))?;
+        if code != 0 {
+            return Err(format!("Inspect failed ({code}): {msg}"));
+        }
+        let info = control::InspectResponse::decode(m.first().ok_or("no Inspect reply")?)
+            .map_err(|_| "bad InspectResponse")?;
+        // Counted once registered; the cell is charged more than its root
+        // and the process's kernel stack once the program is loaded.
+        let loaded = info.processes >= 1 && info.memory_used_bytes > 100 << 10;
+        if loaded || Instant::now() > deadline {
+            break info;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    if info.processes < 1
+        || !info.address.starts_with("10.88.")
+        || info.memory_used_bytes == 0
+        || info.memory_limit_bytes != 64 << 20
+        || info.image_id.len() != 64
+    {
+        return Err(format!("Inspect saw {info:?}"));
+    }
+    eprintln!("host: inspect: {info:?}");
+    let sig = control::SignalRequest {
+        cell_id: id.into(),
+        signal: 15,
+    };
+    let (m, code, msg) = s.call(control::SIGNAL, &sig.encode(), Duration::from_secs(60))?;
+    let reached = m
+        .first()
+        .and_then(|b| control::SignalResponse::decode(b).ok())
+        .map_or(0, |r| r.processes);
+    if code != 0 || reached < 1 {
+        return Err(format!(
+            "Signal ({code}, {msg}) reached {reached} processes"
+        ));
+    }
+    let (m, code, msg) = s.wait(sleeper, Duration::from_secs(60))?;
+    let exit = m
+        .iter()
+        .filter_map(|e| RunEvent::decode(e).ok())
+        .find_map(|e| match e {
+            RunEvent::ExitStatus(st) => Some(st),
+            RunEvent::Output(_) => None,
+        });
+    if code != 0 || exit != Some(15) {
+        return Err(format!(
+            "the signalled Run ended ({code}, {msg}) with {exit:?}"
+        ));
+    }
+    eprintln!("host: SIGTERM ended the sleeper");
+    let (_, code, msg) = s.call(control::DESTROY, &inspect, Duration::from_secs(60))?;
+    if code != 0 {
+        return Err(format!("Destroy failed ({code}): {msg}"));
+    }
+    let (_, code, _) = s.call(control::INSPECT, &inspect, Duration::from_secs(60))?;
+    if code != grpc::status::NOT_FOUND {
+        return Err(format!("Inspect after Destroy gave status {code}"));
+    }
+    eprintln!("host: cell {id} destroyed");
+    Ok(())
+}
+
+/// The API is local to the system cell unless it is configured to be
+/// reachable: asked to publish without an API token, it stays there.
 #[test]
 fn the_control_api_is_local_unless_configured() {
+    stays_local("control-local", None, "no API token (\\ichor\\apitoken)");
+}
+
+/// Nor is a token enough: without a certificate it would travel in the
+/// clear.
+#[test]
+fn the_control_api_is_local_without_a_certificate() {
+    stays_local(
+        "control-no-cert",
+        Some(API_TOKEN),
+        "no API certificate (\\ichor\\apitls.pem)",
+    );
+}
+
+/// Boots with the API asked to publish and checks that it does not, for
+/// want of `missing`: the port QEMU forwards from the host never answers,
+/// and the system cell's own switch address (where other cells could reach
+/// it) refuses connections.
+fn stays_local(name: &str, token: Option<&str>, missing: &str) {
     let host_port = std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
@@ -293,18 +370,22 @@ fn the_control_api_is_local_unless_configured() {
         (tries, answers)
     });
     let out = ichor_tests::boot_with(
-        "control-local",
-        "control=50051 control_exit_after=30",
+        name,
+        "control=50051 control_publish=50051 control_exit_after=30",
         2,
         |c| {
             c.net_user_opts = format!("hostfwd=tcp:127.0.0.1:{host_port}-:50051");
             c.timeout = Some(Duration::from_secs(600));
+            c.api_token = token.map(String::from);
         },
     );
     stop.store(true, std::sync::atomic::Ordering::Release);
     let (tries, answers) = prober.join().unwrap();
     out.assert_exit(Exit::Success);
     out.assert_in_order(&[
+        "ichor: control: starting (",
+        "no API certificate)",
+        &format!("control: {missing}: serving on loopback only, not published"),
         "control: serving ichor.v1.Control on 127.0.0.1:50051 (",
         "not published)",
         "control: not reachable at 10.88.",
@@ -323,20 +404,29 @@ fn the_control_plane_pulls_and_runs_an_image_from_docker_hub() {
         .local_addr()
         .unwrap()
         .port();
-    let layer_port = serve(extra_layer());
-    let client = std::thread::spawn(move || session(host_port, layer_port));
+    let (layer_port, asked) = serve(extra_layer());
+    let client = std::thread::spawn(move || {
+        let r = session(host_port, layer_port);
+        if let Err(e) = &r {
+            eprintln!("host: FAILED: {e}");
+        }
+        r
+    });
     // Exposure is explicit: published on the uplink.
     let cmdline = "control=50051 control_publish=50051 control_exit";
     let out = ichor_tests::boot_with("control", cmdline, 2, |c| {
         c.net_user_opts = format!("hostfwd=tcp:127.0.0.1:{host_port}-:50051");
         c.timeout = Some(Duration::from_secs(900));
+        c.api_token = Some(API_TOKEN.into());
+        c.api_tls = Some(TEST_IDENTITY.into());
     });
     let result = client.join().unwrap();
     out.assert_exit(Exit::Success);
     out.assert_in_order(&[
         "ichor: control: starting (",
         "control: serving ichor.v1.Control on 0.0.0.0:50051 (",
-        "published on uplink port 50051)",
+        "TLS 1.3, published on uplink port 50051)",
+        "control: an API client broke the protocol: TLS: Unexpected(80)", // in the clear
         "control: pulling docker.io/library/hello-world@sha256:cf1b20a0",
         "control: pulled sha256:",
         "control: cell 1 at 10.88.",
@@ -347,6 +437,9 @@ fn the_control_plane_pulls_and_runs_an_image_from_docker_hub() {
         "control: layer http://10.0.2.2:",
         "verified (",
         "control: cell 2 at 10.88.",
+        "control: cell 2 runs [\"sleep\", \"600\"]",
+        "control: cell 2 signal 15 to 1 processes",
+        "control: cell 2 destroyed (",
         "control: the API client is gone; exiting",
         "ichor: control: exited with Some(0)",
     ]);
@@ -370,7 +463,10 @@ fn the_control_plane_pulls_and_runs_an_image_from_docker_hub() {
     let text = String::from_utf8_lossy(&output);
     assert_eq!(
         text,
-        "3.20.3\n42 from Linux\n/bin/busybox\nhello from an extra layer\n"
+        "3.20.3\n42 from Linux\n/bin/busybox\nhello from an extra layer\n\
+         hello from an extra layer\n127.0.0.1\tlocalhost\nichor\n"
     );
     assert_eq!(exit, 3 << 8);
+    // Once refused, once for both layers, each after a redirect.
+    assert_eq!(asked.load(Ordering::SeqCst), 4);
 }

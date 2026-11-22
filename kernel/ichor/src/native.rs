@@ -86,11 +86,15 @@ impl Drop for Process {
 }
 
 /// An image handed in by `IMAGE_CREATE`, held in pages: the block device
-/// the page cache reads (and verifies) its chunks from.
+/// the page cache reads (and verifies) its chunks from. The pages are in
+/// groups, so a large image needs no large table.
 struct PageDisk {
-    pages: Vec<UFrame>,
+    pages: Vec<Vec<UFrame>>,
     len: u64,
 }
+
+/// Pages in a [`PageDisk`] group.
+const GROUP: u64 = 4096;
 
 impl block::BlockDevice for PageDisk {
     fn sector_count(&self) -> u64 {
@@ -102,11 +106,13 @@ impl block::BlockDevice for PageDisk {
         let mut at = sector * block::SECTOR_SIZE as u64;
         let mut done = 0;
         while done < buf.len() {
-            let page = (at / PAGE_SIZE) as usize;
+            let page = at / PAGE_SIZE;
+            let page = (self.pages.get((page / GROUP) as usize))
+                .and_then(|g| g.get((page % GROUP) as usize));
             let off = (at % PAGE_SIZE) as usize;
             let n = (PAGE_SIZE as usize - off).min(buf.len() - done);
             let out = &mut buf[done..done + n];
-            match self.pages.get(page) {
+            match page {
                 Some(f) => {
                     let mut r = f.reader();
                     r.skip(off);
@@ -354,6 +360,29 @@ pub(crate) fn call(cell: &Arc<Cell>, mm: &mut Mm, nr: u64, a: [u64; 6]) -> Resul
             .exited()
             .map(u64::from)
             .ok_or(Error::WouldBlock),
+        sys::CELL_SIGNAL => {
+            let c = container(cell, a[0], rights::WRITE)?;
+            let sig = u32::try_from(a[1])
+                .ok()
+                .filter(|s| (1..=64).contains(s))
+                .ok_or(Error::Invalid)?;
+            Ok(crate::proc::signal_cell(c.cell.id(), sig))
+        }
+        sys::CELL_INSPECT => {
+            let c = container(cell, a[0], Rights::INSPECT)?;
+            let (threads, processes, _) = crate::proc::census(c.cell.id());
+            let info = ichor_abi::CellInfo {
+                memory_used: c.cell.account().used(),
+                memory_limit: c.cell.account().limit(),
+                processes: processes as u64,
+                threads: threads as u64,
+                address: crate::netstack::stack_for(&c.cell)
+                    .addr()
+                    .map_or(0, |ip| ip.to_bits()),
+            };
+            write_user(mm, a[1], &info.to_bytes())?;
+            Ok(ichor_abi::CELL_INFO_LEN as u64)
+        }
         sys::BLOB_READ => {
             let Object::Blob(b) = object(cell, a[0], rights::READ)? else {
                 return Err(Error::BadHandle);
@@ -435,18 +464,24 @@ fn object_wait(cell: &Cell, mm: &mut Mm, ptr: u64, n: u64, timeout: u64) -> Resu
 }
 
 /// `IMAGE_CREATE`: copies the image into pages charged to the caller's
-/// cell, checks its metadata and root hash, and keeps it as a disk for
-/// the life of the system (its chunks are verified as they are read).
+/// cell (as is the copy of its metadata the kernel keeps), checks its
+/// metadata and root hash, and keeps it as a disk for the life of the
+/// system (its chunks are verified as they are read).
 fn image_create(cell: &Cell, mm: &mut Mm, ptr: u64, len: u64) -> Result<u64, Error> {
     if !(image::HEADER_LEN as u64..=MAX_IMAGE).contains(&len) {
         return Err(Error::Invalid);
     }
-    let npages = len.div_ceil(PAGE_SIZE);
+    let head = read_user(mm, ptr, image::HEADER_LEN)?;
+    let meta_len = image::metadata_len(&head).map_err(|_| Error::Failed)? as u64;
+    if meta_len > len {
+        return Err(Error::Failed);
+    }
+    let npages = len.div_ceil(PAGE_SIZE) + meta_len.div_ceil(PAGE_SIZE);
     cell.account().charge(npages).map_err(|_| Error::NoMemory)?;
     let copied = (|| {
-        let mut pages = Vec::new();
+        let mut pages: Vec<Vec<UFrame>> = Vec::new();
         let mut buf = alloc::vec![0u8; PAGE_SIZE as usize];
-        for i in 0..npages {
+        for i in 0..len.div_ceil(PAGE_SIZE) {
             let at = i * PAGE_SIZE;
             let n = (len - at).min(PAGE_SIZE) as usize;
             if mm.copy_from_user(ptr + at, &mut buf[..n]) != n {
@@ -455,22 +490,18 @@ fn image_create(cell: &Cell, mm: &mut Mm, ptr: u64, len: u64) -> Result<u64, Err
             buf[n..].fill(0);
             let f = UFrame::alloc_zeroed().ok_or(Error::NoMemory)?;
             f.writer().write(&buf);
-            pages.push(f);
+            match pages.last_mut() {
+                Some(g) if g.len() < GROUP as usize => g.push(f),
+                _ => pages.push(alloc::vec![f]),
+            }
         }
-        let mut disk = PageDisk { pages, len };
-        // Check the metadata (and its root hash) before keeping anything.
-        let mut head = alloc::vec![0u8; image::HEADER_LEN.next_multiple_of(block::SECTOR_SIZE)];
-        block::BlockDevice::read(&mut disk, 0, &mut head[..]).map_err(|_| Error::Invalid)?;
-        let meta_len = image::metadata_len(&head).map_err(|_| Error::Failed)?;
-        if meta_len as u64 > len || meta_len > crate::pagecache::MAX_METADATA {
+        // Checks the metadata and its root hash (the process may have
+        // changed its copy since the charge: a longer metadata fails too).
+        let m = crate::pagecache::mount_disk(PageDisk { pages, len }).map_err(|_| Error::Failed)?;
+        if m.image.metadata_len() as u64 > meta_len {
             return Err(Error::Failed);
         }
-        let mut meta = alloc::vec![0u8; meta_len.next_multiple_of(block::SECTOR_SIZE)];
-        block::BlockDevice::read(&mut disk, 0, &mut meta).map_err(|_| Error::Failed)?;
-        meta.truncate(meta_len);
-        image::Image::mount(&meta).map_err(|_| Error::Failed)?;
-        drop(meta);
-        crate::pagecache::mount_disk(disk).map_err(|_| Error::Failed)
+        Ok(m)
     })();
     match copied {
         Ok(m) => {
@@ -488,8 +519,32 @@ fn image_create(cell: &Cell, mm: &mut Mm, ptr: u64, len: u64) -> Result<u64, Err
     }
 }
 
-/// `CELL_CREATE`: a cell under `parent` with `pages` of memory, rooted at
-/// the image, attached to the switch.
+/// A cell's host name (what `uname` reports as the node name).
+const HOSTNAME: &str = "ichor";
+
+/// Writes `/etc/<name>` in a new cell's root, replacing the image's (as a
+/// runtime's bind mount would). A root where that fails keeps the image's.
+fn write_etc(vfs: &crate::vfs::Vfs, name: &str, data: &[u8]) {
+    let mut fs = vfs.lock();
+    let root = crate::vfs::ROOT;
+    let Ok(etc) = fs
+        .lookup(root, "etc")
+        .or_else(|_| fs.mkdir(root, "etc", 0o755))
+    else {
+        return;
+    };
+    let ino = match fs.lookup(etc, name) {
+        Ok(ino) => fs.truncate(ino, 0).map(|()| ino),
+        Err(_) => fs.create(etc, name, 0o644),
+    };
+    if let Ok(ino) = ino {
+        let _ = fs.write(ino, 0, data);
+    }
+}
+
+/// `CELL_CREATE`: a cell under `parent` with `pages` of memory (what its
+/// processes use and what it writes to its root), rooted at the image,
+/// attached to the switch.
 fn cell_create(cell: &Cell, parent: u64, image: u64, pages: u64) -> Result<u64, Error> {
     let Object::Cell(parent) = object(cell, parent, rights::CREATE_CELL)? else {
         return Err(Error::BadHandle);
@@ -500,11 +555,22 @@ fn cell_create(cell: &Cell, parent: u64, image: u64, pages: u64) -> Result<u64, 
     if pages < 64 {
         return Err(Error::Invalid);
     }
-    let vfs = Arc::new(crate::vfs::Vfs::mount_disk(m).map_err(|_| Error::Failed)?);
     let new = Cell::new(parent.account(), pages).ok_or(Error::NoMemory)?;
-    if crate::netstack::stack_for(&new).addr().is_none() {
+    let vfs = Vfs::mount_disk_for(m, new.account()).map_err(|_| Error::Failed)?;
+    let vfs = Arc::new(vfs);
+    let addr = crate::netstack::stack_for(&new).addr();
+    if addr.is_none() {
         println!("ichor: native: cell {} has no switch address", new.id());
     }
+    // What a container runtime writes into every container (images do not
+    // carry them): `localhost` and the cell's own name resolve.
+    let mut hosts = alloc::string::String::from("127.0.0.1\tlocalhost\n");
+    if let Some(ip) = addr {
+        let o = ip.octets();
+        hosts += &alloc::format!("{}.{}.{}.{}\t{HOSTNAME}\n", o[0], o[1], o[2], o[3]);
+    }
+    write_etc(&vfs, "hosts", hosts.as_bytes());
+    write_etc(&vfs, "hostname", alloc::format!("{HOSTNAME}\n").as_bytes());
     install(
         cell,
         Object::Container(Arc::new(Container { cell: new, vfs })),
@@ -559,14 +625,10 @@ fn spawn(c: &Container, spec: &[u8]) -> Result<Arc<Process>, Error> {
     let (argv, envp) = parse_spec(spec)?;
     let path = find(&c.vfs, &argv[0], &envp).ok_or(Error::NotFound)?;
     let mut p = LinuxProcess::new(c.cell.clone(), c.vfs.clone()).ok_or(Error::NoMemory)?;
-    let output = Pipe::new();
+    let output = Pipe::new(c.cell.account());
     p.close(1);
     p.close(2);
-    let end = PipeEnd {
-        pipe: output.clone(),
-        write: true,
-        nonblock: false,
-    };
+    let end = PipeEnd::one(output.clone(), true, false);
     if p.install_flags(Fd::Pipe(end), false) != Some(1) || p.dup_to(1, 2, false).is_none() {
         crate::proc::discard(p);
         return Err(Error::NoMemory);
@@ -576,7 +638,10 @@ fn spawn(c: &Container, spec: &[u8]) -> Result<Arc<Process>, Error> {
         status: SpinLock::new(None),
     });
     let pid = p.entry.pid;
+    let sched = crate::sched::SchedInfo::of_cell(p.cell.id());
     let record = process.clone();
+    let argv: Vec<Vec<u8>> = argv.into_iter().map(String::into_bytes).collect();
+    let envp: Vec<Vec<u8>> = envp.into_iter().map(String::into_bytes).collect();
     let task = TaskOptions::new(move || {
         let leader = p.group.leader.clone();
         let mut ctx = UserContext::new(0, 0);
@@ -600,6 +665,7 @@ fn spawn(c: &Container, spec: &[u8]) -> Result<Arc<Process>, Error> {
         *record.status.lock() = Some(status);
         record.output.watchers().notify();
     })
+    .data(sched)
     .spawn();
     if task.is_none() {
         crate::proc::forget(pid);
@@ -613,14 +679,14 @@ fn spawn(c: &Container, spec: &[u8]) -> Result<Arc<Process>, Error> {
 /// or was killed by an exception.
 pub(crate) fn run(cell: &Arc<Cell>, elf: &[u8], argv: &[&str]) -> Option<u64> {
     let mut mm = Mm::new(cell.account())?;
-    let loaded =
-        match crate::loader::load(&mut mm, &crate::file::Bytes(elf), None, argv, &[], 1 << 20) {
-            Ok(l) => l,
-            Err(e) => {
-                println!("ichor: native: cannot load {:?}: {e:?}", argv.first());
-                return None;
-            }
-        };
+    let image = crate::file::Bytes(elf);
+    let loaded = match crate::loader::load(&mut mm, &image, None, argv, &[], 1 << 20, [0; 4]) {
+        Ok(l) => l,
+        Err(e) => {
+            println!("ichor: native: cannot load {:?}: {e:?}", argv.first());
+            return None;
+        }
+    };
     mm.space().bind_to_current_task();
     frame::task::set_current_domain(cell.id());
     let mut ctx = UserContext::new(loaded.entry, loaded.stack_pointer);
@@ -638,11 +704,21 @@ pub(crate) fn run(cell: &Arc<Cell>, elf: &[u8], argv: &[&str]) -> Option<u64> {
                 error,
                 cr2,
             } if mm.fault(cr2, error & 2 != 0, error & 16 != 0) => {}
-            UserEvent::Exception { vector, cr2, .. } => {
+            UserEvent::Exception { vector, error, cr2 } => {
                 println!(
-                    "ichor: native: cell {} killed: exception {vector} at rip {:#x} (cr2 {cr2:#x})",
+                    "ichor: native: cell {} killed: exception {vector} (error {error:#x}) at rip {:#x} (cr2 {cr2:#x})",
                     cell.id(),
                     ctx.rip
+                );
+                // The registers, so a crash seen once can be read off the
+                // disassembly (a corrupted pointer names what held it).
+                println!(
+                    "ichor: native:   rax {:#x} rbx {:#x} rcx {:#x} rdx {:#x} rsi {:#x} rdi {:#x} rbp {:#x} rsp {:#x}",
+                    ctx.rax, ctx.rbx, ctx.rcx, ctx.rdx, ctx.rsi, ctx.rdi, ctx.rbp, ctx.rsp
+                );
+                println!(
+                    "ichor: native:   r8 {:#x} r9 {:#x} r10 {:#x} r11 {:#x} r12 {:#x} r13 {:#x} r14 {:#x} r15 {:#x}",
+                    ctx.r8, ctx.r9, ctx.r10, ctx.r11, ctx.r12, ctx.r13, ctx.r14, ctx.r15
                 );
                 break None;
             }
