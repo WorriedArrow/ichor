@@ -53,6 +53,8 @@ const S4_PRIVATE: &str = include_str!("cellaccess/s4_private.pl");
 const S5_NET: &str = include_str!("cellaccess/s5_net.pl");
 const S6_STATE: &str = include_str!("cellaccess/s6_state.pl");
 const S7_ROOT: &str = include_str!("cellaccess/s7_root.pl");
+const S9_SERVE: &str = include_str!("cellaccess/s9_serve.pl");
+const S9_FETCH: &str = include_str!("cellaccess/s9_fetch.pl");
 /// The file both cells map (B's helper reports it too); the checks use its
 /// page 1.
 const SHARED_FILE: &str = "/usr/bin/dash";
@@ -100,6 +102,7 @@ const SECTIONS: &[Section] = &[
     }),
     ("resource_limits_are_per_cell", s8),
     ("a_destroyed_cell_leaves_no_shared_memory", segments_go),
+    ("a_destroyed_cell_leaves_no_network", network_goes),
 ];
 
 /// One cell with its own root.
@@ -314,6 +317,18 @@ fn wait_for(slot: &SpinLock<Option<i32>>, secs: u64) -> Option<i32> {
 /// cell and root, on this task. `run_linux` checks that the cell's memory
 /// came back once it exits.
 fn perl(side: (&Arc<Cell>, &Arc<Vfs>), script: &str, args: &[String]) -> i32 {
+    perl_with(side, script, args, |p, exe, interp, argv| {
+        run_linux(p, exe, interp, argv).0
+    })
+}
+
+/// [`perl`], run by `run`.
+fn perl_with(
+    side: (&Arc<Cell>, &Arc<Vfs>),
+    script: &str,
+    args: &[String],
+    run: impl FnOnce(LinuxProcess, &[u8], Option<&[u8]>, &[&str]) -> i32,
+) -> i32 {
     let (cell, root) = side;
     let exe = read(root, "/usr/bin/perl").unwrap_or_else(|| fail("cellaccess: no perl"));
     let interp = match loader::interp_path(&crate::file::Bytes(&exe)) {
@@ -327,7 +342,32 @@ fn perl(side: (&Arc<Cell>, &Arc<Vfs>), script: &str, args: &[String]) -> i32 {
     // argv[0] is also what /proc/self/exe names, so it is the full path.
     let mut argv: Vec<&str> = alloc::vec!["/usr/bin/perl", "-e", &text];
     argv.extend(args.iter().map(String::as_str));
-    run_linux(p, &exe, Some(&interp), &argv).0
+    run(p, &exe, Some(&interp), &argv)
+}
+
+/// Runs `p` as `run_linux` does, but without waiting for the cell's memory
+/// to come back: what it leaves behind is the check. Returns the wait
+/// status.
+fn run_bare(p: LinuxProcess, elf: &[u8], interp: Option<&[u8]>, argv: &[&str]) -> i32 {
+    let interp = interp.map(crate::file::Bytes);
+    let loaded = loader::load(
+        &mut p.mm(),
+        &crate::file::Bytes(elf),
+        interp.as_ref().map(|f| f as &dyn crate::file::File),
+        argv,
+        &[] as &[&str],
+        8 << 20,
+        [0; 4],
+    )
+    .unwrap_or_else(|_| fail("cellaccess: load"));
+    let path = argv.first().copied().unwrap_or("");
+    let name = path.rsplit('/').next().unwrap_or("");
+    p.group.set_exec(path, name, loaded.args);
+    let leader = p.group.leader.clone();
+    let ctx = frame::user::UserContext::new(loaded.entry, loaded.stack_pointer);
+    crate::proc::run(p, ctx);
+    wait_until(30, || crate::proc::exit_status(&leader).is_some());
+    crate::proc::exit_status(&leader).map_or(-1, u32::cast_signed)
 }
 
 /// [`perl`] on a task of its own; the slot gets the exit code.
@@ -346,9 +386,14 @@ fn spawn_perl(side: &Side, script: &'static str, args: Vec<String>) -> Arc<SpinL
 /// Runs `script` in A with B's identifiers and A's address as arguments;
 /// true if every check in it passed.
 fn in_a(ctx: &Ctx, script: &str) -> bool {
+    perl((&ctx.a.cell, &ctx.a.root), script, &a_args(ctx)) == 0
+}
+
+/// A's arguments: B's identifiers and A's own address.
+fn a_args(ctx: &Ctx) -> Vec<String> {
     let mut args = ctx.ids.clone();
     args.push(alloc::format!("self_ip={}", ctx.a.ip));
-    perl((&ctx.a.cell, &ctx.a.root), script, &args) == 0
+    args
 }
 
 /// B's helper's status words (see `status` in the helper).
@@ -795,6 +840,107 @@ fn limit_program(fill: bool) -> Vec<u8> {
     )
 }
 
+/// A third cell with a root of its own.
+fn another_cell(ctx: &Ctx) -> (Arc<Cell>, Arc<Vfs>) {
+    let cell = Cell::new(&ctx.accounts, CELL_PAGES).unwrap_or_else(|| fail("cellaccess: no cell"));
+    let root = Arc::new(
+        Vfs::mount_disk_for(&ctx.disk, cell.account())
+            .unwrap_or_else(|_| fail("cellaccess: could not mount a root")),
+    );
+    (cell, root)
+}
+
+/// What a cell leaves behind (ADR-0002 §7), its network: a destroyed
+/// cell's published port is free at once, and its stack, switch port and
+/// address go. A connection it closed with data still to send is let
+/// finish first, as Linux does for a network namespace's orphans.
+fn network_goes(ctx: &Ctx) -> bool {
+    const RULE: &str = "a_destroyed_cell_leaves_no_network";
+    const PORT: u16 = 7400;
+    use crate::{netstack, switch};
+    let (tcp, b) = (net::wire::PROTO_TCP, ctx.b.cell.id());
+
+    // An idle cell with an address and a published port.
+    let (cell, root) = another_cell(ctx);
+    let (id, account) = (cell.id(), cell.account().clone());
+    let stack = netstack::stack_for(&cell);
+    let (ip, weak) = (stack.addr(), Arc::downgrade(&stack));
+    drop(stack);
+    let up = switch::has_uplink();
+    let published = switch::publish(tcp, PORT, id, 80);
+    let taken = !switch::publish(tcp, PORT, b, B_UPLINK_PORT);
+    let mut ok = report(
+        RULE,
+        "a live cell has its address and its published port: control",
+        ip.is_some() && switch::addr_of(id) == ip && published == up && taken,
+        &alloc::format!("address {ip:?}, uplink {up}, published {published}, taken {taken}"),
+    );
+    drop((root, cell));
+    let free = switch::publish(tcp, PORT, b, B_UPLINK_PORT);
+    switch::unpublish(tcp, PORT);
+    ok &= report(
+        RULE,
+        "a destroyed cell's published port can be published again at once",
+        up && free,
+        &alloc::format!("uplink {up}; published again: {free}"),
+    );
+    let gone = wait_until(20, || {
+        switch::addr_of(id).is_none() && weak.upgrade().is_none() && account.used() == 0
+    });
+    ok &= report(
+        RULE,
+        "a destroyed cell's stack, switch port and address go",
+        gone,
+        &alloc::format!(
+            "address {:?}, stack kept: {}, {} pages charged",
+            switch::addr_of(id),
+            weak.upgrade().is_some(),
+            account.used()
+        ),
+    );
+
+    // A cell destroyed with data still to send.
+    let (cell, root) = another_cell(ctx);
+    prepare(&root);
+    let (id, account) = (cell.id(), cell.account().clone());
+    let Some(ip) = netstack::stack_for(&cell).addr() else {
+        return report(RULE, "the dying cell has an address", false, "none");
+    };
+    let (c, r) = (cell.clone(), root.clone());
+    let server = spawn(move || perl_with((&c, &r), S9_SERVE, &[], run_bare));
+    take(&root, "serving", &server);
+    let mut args = a_args(ctx);
+    args.push(alloc::format!("dying={ip}"));
+    let (c, r) = (ctx.a.cell.clone(), ctx.a.root.clone());
+    let client = spawn(move || perl((&c, &r), S9_FETCH, &args));
+    take(&ctx.a.root, "connected", &client);
+    let served = wait_for(&server, 60);
+    let weak = Arc::downgrade(&cell);
+    drop((root, cell));
+    let destroyed = wait_until(10, || weak.upgrade().is_none());
+    let held = account.used();
+    ok &= report(
+        RULE,
+        "a cell is destroyed with data still to send: control",
+        served == Some(0) && destroyed && held > 0 && switch::addr_of(id) == Some(ip),
+        &alloc::format!("server ended {served:?}, destroyed {destroyed}, {held} pages held"),
+    );
+    put(&ctx.a.root, "read", "");
+    ok &= wait_for(&client, 120) == Some(0); // the script reports its check
+    let gone = wait_until(20, || switch::addr_of(id).is_none() && account.used() == 0);
+    ok &= report(
+        RULE,
+        "its stack and address go once the data is delivered",
+        gone,
+        &alloc::format!(
+            "address {:?}, {} pages charged",
+            switch::addr_of(id),
+            account.used()
+        ),
+    );
+    ok
+}
+
 /// What a cell leaves behind (ADR-0002 §7: "nothing the cell created
 /// survives"): a cell whose program makes a System V segment is destroyed,
 /// and its account must end at zero. The control removes its segment
@@ -803,34 +949,15 @@ fn segments_go(ctx: &Ctx) -> bool {
     const RULE: &str = "a_destroyed_cell_leaves_no_shared_memory";
     const PAGES: u64 = 64;
     let run = |remove: bool| {
-        let cell =
-            Cell::new(&ctx.accounts, CELL_PAGES).unwrap_or_else(|| fail("cellaccess: no cell"));
-        let root = Arc::new(
-            Vfs::mount_disk_for(&ctx.disk, cell.account())
-                .unwrap_or_else(|_| fail("cellaccess: could not mount a root")),
-        );
+        let (cell, root) = another_cell(ctx);
         let p = LinuxProcess::new(cell.clone(), root.clone())
             .unwrap_or_else(|| fail("cellaccess: no process"));
-        let elf = segment_program(PAGES, remove);
-        let argv: &[&str] = &["/cellaccess-shm"];
-        let loaded = loader::load(
-            &mut p.mm(),
-            &crate::file::Bytes(&elf),
+        let status = run_bare(
+            p,
+            &segment_program(PAGES, remove),
             None,
-            argv,
-            &[] as &[&str],
-            8 << 20,
-            [0; 4],
-        )
-        .unwrap_or_else(|_| fail("cellaccess: load"));
-        p.group
-            .set_exec("/cellaccess-shm", "cellaccess-shm", loaded.args);
-        let leader = p.group.leader.clone();
-        let ctx = frame::user::UserContext::new(loaded.entry, loaded.stack_pointer);
-        crate::proc::run(p, ctx);
-        wait_until(30, || crate::proc::exit_status(&leader).is_some());
-        let status = crate::proc::exit_status(&leader);
-        drop(leader);
+            &["/cellaccess-shm"],
+        );
         let account = cell.account().clone();
         let expected = root.charged() + if remove { 0 } else { PAGES };
         wait_until(30, || account.used() == expected);
@@ -840,7 +967,7 @@ fn segments_go(ctx: &Ctx) -> bool {
         drop(cell);
         wait_until(10, || account.used() == 0 && gone.upgrade().is_none());
         (
-            status == Some(0),
+            status == 0,
             alive == expected,
             gone.upgrade().is_none(),
             account.used(),

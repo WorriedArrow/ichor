@@ -952,14 +952,15 @@ fn network(vfs: &Arc<Vfs>, system: &System) {
     let (server, client) = (new_cell(), new_cell());
     let (sa, ca) = (cell_addr(&server), cell_addr(&client));
     let port = String::from("7000");
+    // Held until the counters are read: they go with the cells.
     let (sid, cid) = (server.id(), client.id());
     let done = spawn_perl(
         vfs,
-        server,
+        server.clone(),
         CELL_SERVER,
         alloc::vec![sa.clone(), ca.clone(), port.clone()],
     );
-    if perl(vfs, client, CELL_CLIENT, &[ca, sa, port]) != 0 {
+    if perl(vfs, client.clone(), CELL_CLIENT, &[ca, sa, port]) != 0 {
         fail("debian: cross-cell client");
     }
     if wait_for(&done, "debian: the server cell never finished") != 0 {
@@ -968,6 +969,7 @@ fn network(vfs: &Arc<Vfs>, system: &System) {
     let (Some(s), Some(c)) = (crate::switch::stats(sid), crate::switch::stats(cid)) else {
         fail("debian: no switch counters");
     };
+    drop((server, client));
     println!(
         "ichor: debian: switch: server cell sent {} received {} dropped {}; client cell sent {} received {} dropped {}",
         s.0, s.1, s.2, c.0, c.1, c.2

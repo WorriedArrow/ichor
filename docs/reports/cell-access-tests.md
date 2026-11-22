@@ -27,6 +27,7 @@ own (the control). `cell_access` on the command line runs it;
 | 8 `resource_limits_are_per_cell` | 6 | pass |
 | 9 `cells_clean_up_after_themselves` | B after each section, memory | pass |
 | `a_destroyed_cell_leaves_no_shared_memory` | 3 | pass (bug 1, fixed) |
+| `a_destroyed_cell_leaves_no_network` | 6 | pass (bug 2, fixed) |
 
 **Section 3 has no coverage.** A safety classifier stopped the session
 while its script was being written, and it was not written again. So
@@ -56,13 +57,36 @@ exit, drops the root and the last reference to the cell, and expects
 nothing charged; the control removes its segment first. With the call to
 `free_cell` disabled it finds 64 pages. B's own segment is intact after it.
 
-## Bug 2 (open, found by reading): a destroyed cell's network stack stays
+## Bug 2 (fixed): a destroyed cell's network stack stayed
 
-`netstack::STACKS` holds every cell's `Stack` and nothing removes one;
-`net::switch`'s `detach` is never called by the kernel. So a destroyed
-cell keeps its stack, its switch port and its 10.88.0.0/16 address (which
-runs out), and ports published for it stay published. No check covers it
-yet.
+`netstack::STACKS` held every cell's `Stack` and nothing removed one;
+`net::switch`'s `detach` was never called by the kernel. So a destroyed
+cell kept its stack, its switch port and its 10.88.0.0/16 address (which
+runs out), and ports published for it stayed published. Found by reading
+while fixing bug 1; the owner asked for the fix.
+
+When a `Cell` drops (`netstack::end_cell`) its published ports are
+withdrawn at once, so they can be published again. Its stack then holds
+only connections its programs closed; those may finish delivering what
+they hold, for 60 s at most, as a Linux network namespace's orphans may.
+Then the net task detaches the port and, under the same uplink lock, the
+NAT forgets the address: its mappings (TCP ones live for days) and any
+published port. Otherwise a cell given the address later would receive the
+old one's traffic. A packet routed just before the detach makes no mapping
+after it (`switch::uplink_out` looks the port up again). What a stack's
+sockets still held is released from the account with it.
+
+`a_destroyed_cell_leaves_no_network`: a live cell's port is taken
+(control) and free once it is destroyed; the stack and address go; a cell
+destroyed with data still to send (control: pages held, address kept)
+delivers all 400 KiB and then its address goes. Before the fix the ports,
+stack and address checks failed and the delivery check passed; with no
+linger the delivery check fails. `net::nat` has a host test for forgetting
+an address. Address reuse itself is not reached in a boot: the switch hands
+out addresses round robin through 65,000.
+
+A destroyed cell's address and buffers may thus outlive it by up to 60 s.
+A peer reading from a connection cut at that limit is not told.
 
 Two smaller observations, not failing checks:
 
@@ -165,7 +189,7 @@ done.
 - ADR-0009 §3 puts MKNOD and SYS_CHROOT in the cell's bounding set. Device
   `mknod` is EPERM ("no CAP_MKNOD in cells") and `chroot` is ENOSYS. The
   task asks for `mknod` to fail, so EPERM is asserted.
-- Bug 1 was, and bug 2 is, against ADR-0002 §7.
+- Bugs 1 and 2 were against ADR-0002 §7.
 - ADR-0009 says `settimeofday`, `reboot` and module loading are "already
   EPERM or absent", so ENOSYS there agrees with it. Section 7's commit
   message says otherwise and is wrong.

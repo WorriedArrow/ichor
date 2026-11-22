@@ -53,11 +53,12 @@ boot [done: VERW, IBPB, and page-table isolation (ADR-0004's second
   in B owning one object of each kind, and A's real syscalls on them with
   exact errnos and controls (`tests/cell_access.rs`, one test per rule).
   Sections 1, 2 and 4 to 9 are done and pass; they found that a destroyed
-  cell's System V segments leaked (fixed: `shm::free_cell` when a `Cell`
-  drops). Open: section 3 (file systems) is **not written** (a safety
-  classifier stopped it; the owner decides), and a destroyed cell's
-  network stack, switch address and published ports stay
-  (`netstack::STACKS`; the report's bug 2). A syscall that stops being ENOSYS or changes errno there needs its check
+  cell's System V segments and network stack leaked (fixed: a `Cell` that
+  drops calls `shm::free_cell` and `netstack::end_cell`, which withdraws
+  its published ports, lets closed connections finish for up to 60 s, then
+  frees the address and its NAT mappings together; anything new keyed by
+  cell id needs the same). Open: section 3 (file systems) is **not
+  written** (a safety classifier stopped it; the owner decides). A syscall that stops being ENOSYS or changes errno there needs its check
   updated.
 
 - M7 page-table isolation (`kernel/frame/src/arch/x86_64/entry.rs`): the

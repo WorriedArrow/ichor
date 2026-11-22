@@ -13,7 +13,7 @@ use std::sync::OnceLock;
 use ichor_tests::{Exit, Outcome};
 
 /// Sections the kernel runs (`SECTIONS` in cellaccess.rs).
-const SECTIONS: usize = 9;
+const SECTIONS: usize = 10;
 /// B's uplink-facing port inside the guest (`B_UPLINK_PORT` in
 /// cellaccess.rs).
 const B_UPLINK_PORT: u16 = 7300;
@@ -249,5 +249,21 @@ fn a_destroyed_cell_leaves_no_shared_memory() {
     suite().0.assert_in_order(&[
         "a destroyed cell's System V segments are freed: ok",
         "ichor: cellaccess: B alive and unchanged after a_destroyed_cell_leaves_no_shared_memory",
+    ]);
+}
+
+/// A destroyed cell's published ports are free at once; its stack, switch
+/// port and address go (ADR-0002 §7), after what its closed connections
+/// had still to send has arrived.
+#[test]
+fn a_destroyed_cell_leaves_no_network() {
+    assert_rule("a_destroyed_cell_leaves_no_network");
+    suite().0.assert_in_order(&[
+        "a destroyed cell's published port can be published again at once: ok",
+        "a destroyed cell's stack, switch port and address go: ok",
+        "a cell is destroyed with data still to send: control: ok",
+        "all a destroyed cell had written arrives, then end of file: ok",
+        "its stack and address go once the data is delivered: ok",
+        "ichor: cellaccess: B alive and unchanged after a_destroyed_cell_leaves_no_network",
     ]);
 }

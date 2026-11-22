@@ -188,7 +188,14 @@ struct Inner {
     out: Vec<Packet>,
     /// Sockets to wake when the lock is released.
     touched: BTreeSet<u64>,
+    /// The cell is gone: the stack goes once its closed connections are
+    /// done sending, at this time at the latest.
+    ends: Option<Duration>,
 }
+
+/// Longest a destroyed cell's connections may take to deliver what they
+/// hold (Linux's timeout for orphans that wait for a FIN).
+const LINGER: Duration = Duration::from_secs(60);
 
 /// One cell's network stack.
 #[derive(Debug)]
@@ -196,6 +203,16 @@ pub(crate) struct Stack {
     pub(crate) cell: u64,
     addr: Option<Ipv4Addr>,
     inner: SpinLock<Inner>,
+}
+
+impl Drop for Stack {
+    fn drop(&mut self) {
+        let mut i = self.inner.lock();
+        let pages = core::mem::take(&mut i.charged);
+        if let Some(a) = &i.account {
+            a.release(pages);
+        }
+    }
 }
 
 /// Every stack, by cell.
@@ -232,6 +249,21 @@ pub(crate) fn stack_for(c: &crate::kcell::Cell) -> Arc<Stack> {
     };
     start_net_task();
     s
+}
+
+/// The end of `cell`, which is being destroyed (ADR-0002 §7). Its
+/// published ports are withdrawn at once. Its processes are gone, so its
+/// stack holds only connections they closed; those may finish sending, as
+/// the orphans of a Linux network namespace may, and then the net task
+/// removes the stack and gives up its address ([`Stack::ended`]).
+pub(crate) fn end_cell(cell: u64) {
+    let Some(s) = STACKS.lock().get(&cell).cloned() else {
+        return; // it never used the network
+    };
+    crate::switch::unpublish_cell(cell);
+    s.inner.lock().ends = Some(now() + LINGER);
+    drop(s);
+    kick();
 }
 
 fn kick() {
@@ -341,6 +373,11 @@ fn net_task() {
         for s in stacks.iter().filter_map(Weak::upgrade) {
             if let Some(n) = s.run_timers(t) {
                 next = Some(next.map_or(n, |m: Duration| m.min(n)));
+            }
+            if s.ended(t) {
+                crate::switch::detach(s.cell);
+                let gone = STACKS.lock().remove(&s.cell);
+                drop(gone);
             }
         }
         let t = now();
@@ -1307,6 +1344,19 @@ impl Stack {
     }
 
     /// Runs this stack's timers; returns when they next need to run.
+    /// Whether the stack of a destroyed cell is done: every connection has
+    /// delivered its data and seen the peer's end (TIME_WAIT is not waited
+    /// for), or the time to do so is up.
+    fn ended(&self, t: Duration) -> bool {
+        let i = self.inner.lock();
+        let sending = |s: &Sock| {
+            matches!(&s.kind, Kind::Conn { tcp, .. }
+                if !matches!(tcp.state(), tcp::State::TimeWait | tcp::State::Closed))
+        };
+        i.ends
+            .is_some_and(|end| t >= end || !i.socks.values().any(sending))
+    }
+
     fn run_timers(&self, t: Duration) -> Option<Duration> {
         let (next, woken, out) = {
             let mut i = self.inner.lock();

@@ -96,9 +96,9 @@ Status: [ ] to do, [x] done and committed.
 - [x] **Scoping removal** (sections 1, 2, futex in 4; not 3): each edit,
   the failure seen, the restore checked with `git diff` (never
   committed). Results in `cell-access-tests.md`.
-- [x] **Review, report, AGENTS.md, push.** Bug 1 is fixed (the owner
-  asked); open: section 3, and bug 2 (a destroyed cell's network stack),
-  which has no check.
+- [x] **Review, report, AGENTS.md, push.** Bugs 1 and 2 (a
+  destroyed cell's segments and network stack) are fixed, as the owner
+  asked; open: section 3.
 
 ## Notes as they come up
 
