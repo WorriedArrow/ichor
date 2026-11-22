@@ -247,12 +247,13 @@ pub(crate) extern "sysv64" fn kernel_space_entry() -> ! {
     let pcid = if m.pcid { "PCID" } else { "no PCID" };
     println!(
         "ichor: frame: mitigations (ADR-0004): VERW on return to ring 3 {}, IBPB between cells {}, page-table isolation {}",
-        if m.verw_missing {
-            "MISSING (no MD_CLEAR microcode)"
-        } else if force_verw && !(v.mds || v.taa) {
-            "on (forced)"
-        } else {
-            on(m.verw)
+        // Forced, VERW runs whatever the CPU; it clears the buffers only
+        // with MD_CLEAR microcode.
+        match (m.verw, m.verw_missing, force_verw) {
+            (true, true, _) => "on (forced; clears nothing without MD_CLEAR microcode)",
+            (false, true, _) => "MISSING (no MD_CLEAR microcode)",
+            (true, false, true) if !(v.mds || v.taa) => "on (forced)",
+            (verw, _, _) => on(verw),
         },
         if m.ibpb {
             "on"
