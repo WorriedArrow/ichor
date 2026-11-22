@@ -26,11 +26,11 @@
 //! is; looking then takes sleeping locks, so every wait looks outside its
 //! sleep's condition.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::fmt::Debug;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use core::time::Duration;
 
 use frame::sync::{Mutex, SpinLock};
@@ -113,6 +113,10 @@ pub(crate) trait Object: Send + Sync + Debug {
     fn proc_dir(&self) -> Option<&str> {
         None
     }
+    /// The path of this `/proc` file.
+    fn proc_file(&self) -> Option<&str> {
+        None
+    }
     /// This object as a socket.
     fn socket(&self) -> Option<&crate::linuxabi::socket::Socket> {
         None
@@ -146,6 +150,15 @@ pub(crate) trait Object: Send + Sync + Debug {
     fn readable(&self) -> Option<usize> {
         None
     }
+    /// This object as an eventfd.
+    fn eventfd(&self) -> Option<&EventFd> {
+        None
+    }
+    /// Whether it is ready because of an io_uring instance's completions:
+    /// one that polls it again and again would see its own for ever.
+    fn woken_by_ring(&self) -> bool {
+        false
+    }
     /// This object as an io_uring instance.
     fn uring(&self) -> Option<&crate::linuxabi::uring::Ring> {
         None
@@ -162,14 +175,26 @@ struct Poller {
     /// Who watches the epoll instance itself (nested epoll; a task's
     /// sleep is watched by nobody).
     onward: Watchers,
+    /// One operation's, of an io_uring instance: whom it is told for, and
+    /// what its process's threads look at between system calls.
+    of: Option<(Weak<Hub>, Waiter, Arc<AtomicBool>)>,
+    /// Such a one is told once and then off the list, until it is put on it
+    /// again ([`Watch::again`]): thousands may wait for one object.
+    listed: AtomicBool,
 }
 
 impl Poller {
     fn new() -> Arc<Poller> {
+        Poller::telling(None)
+    }
+
+    fn telling(of: Option<(Weak<Hub>, Waiter, Arc<AtomicBool>)>) -> Arc<Poller> {
         Arc::new(Poller {
             queue: WaitQueue::new(),
             told: AtomicU64::new(0),
             onward: Watchers::new(),
+            of,
+            listed: AtomicBool::new(false),
         })
     }
 
@@ -178,6 +203,13 @@ impl Poller {
     }
 
     fn tell(&self) {
+        if let Some((hub, waiter, flag)) = &self.of {
+            if let Some(h) = hub.upgrade() {
+                h.due(*waiter);
+                flag.store(true, Ordering::Release);
+            }
+            return;
+        }
         self.told.fetch_add(1, Ordering::SeqCst);
         self.queue.wake_all();
         self.onward.notify();
@@ -197,12 +229,17 @@ impl Watchers {
 
     /// Wakes every task polling this object, so it re-checks.
     pub(crate) fn notify(&self) {
-        let live: Vec<Arc<Poller>> = {
-            let mut v = self.0.lock();
-            v.retain(|w| w.strong_count() > 0);
-            v.iter().filter_map(Weak::upgrade).collect()
-        };
+        let mut live: Vec<Arc<Poller>> = Vec::new();
+        self.0.lock().retain(|w| match w.upgrade() {
+            Some(p) => {
+                let stays = p.of.is_none();
+                live.push(p);
+                stays
+            }
+            None => false,
+        });
         for p in live {
+            p.listed.store(false, Ordering::SeqCst);
             p.tell();
         }
     }
@@ -213,6 +250,18 @@ impl Watchers {
         if !v.iter().any(|w| core::ptr::eq(w.as_ptr(), Arc::as_ptr(p))) {
             v.push(Arc::downgrade(p));
         }
+    }
+
+    /// Registers `p`, an operation's, if it is not. It goes with `p`.
+    fn watch_once(&self, p: &Arc<Poller>) {
+        if p.listed.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let mut v = self.0.lock();
+        if v.len() == v.capacity() {
+            v.retain(|w| w.strong_count() > 0);
+        }
+        v.push(Arc::downgrade(p));
     }
 
     fn unwatch(&self, p: &Arc<Poller>) {
@@ -246,8 +295,108 @@ pub(crate) fn readiness(fd: &Fd) -> u16 {
     }
 }
 
+/// An operation of an io_uring instance, and the process it is of.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Waiter {
+    pub(crate) tgid: u64,
+    pub(crate) id: u64,
+}
+
+/// An operation's registration with the object it waits for; the object
+/// forgets it when it is dropped.
+#[derive(Clone, Debug)]
+pub(crate) struct Watch(Arc<Poller>);
+
+impl Watch {
+    /// Is told of the next change too (`fd` names the object). Look at it
+    /// after this: a change before it may have been told already.
+    pub(crate) fn again(&self, fd: &Fd) {
+        if let Some(on) = watchers(fd) {
+            on.watch_once(&self.0);
+        }
+    }
+}
+
+/// Where an io_uring instance waits for what its operations wait for, and
+/// learns which of them to look at again.
+#[derive(Debug)]
+pub(crate) struct Hub {
+    queue: WaitQueue,
+    told: AtomicU64,
+    /// Operations whose objects have changed, by process.
+    due: SpinLock<BTreeMap<u64, BTreeSet<u64>>>,
+}
+
+impl Hub {
+    pub(crate) fn new() -> Hub {
+        Hub {
+            queue: WaitQueue::new(),
+            told: AtomicU64::new(0),
+            due: SpinLock::new(BTreeMap::new()),
+        }
+    }
+
+    /// How much it was told. Read before looking: what comes after it ends
+    /// the wait.
+    pub(crate) fn told(&self) -> u64 {
+        self.told.load(Ordering::SeqCst)
+    }
+
+    /// Wakes whoever waits here.
+    pub(crate) fn tell(&self) {
+        self.told.fetch_add(1, Ordering::SeqCst);
+        self.queue.wake_all();
+    }
+
+    /// Is told that `w` is to be looked at.
+    pub(crate) fn due(&self, w: Waiter) {
+        self.due.lock().entry(w.tgid).or_default().insert(w.id);
+        self.tell();
+    }
+
+    /// Takes what of process `tgid`'s is to be looked at.
+    pub(crate) fn take(&self, tgid: u64) -> BTreeSet<u64> {
+        self.due.lock().remove(&tgid).unwrap_or_default()
+    }
+
+    /// What [`Self::take`] would take.
+    pub(crate) fn peek(&self, tgid: u64) -> BTreeSet<u64> {
+        self.due.lock().get(&tgid).cloned().unwrap_or_default()
+    }
+
+    /// Is told of changes to what `fd` names, for `w`, as long as the watch
+    /// is kept, and sets `flag` for its process.
+    pub(crate) fn watch(
+        self: &Arc<Self>,
+        fd: &Fd,
+        w: Waiter,
+        flag: &Arc<AtomicBool>,
+    ) -> Option<Watch> {
+        let on = watchers(fd)?;
+        let p = Poller::telling(Some((Arc::downgrade(self), w, flag.clone())));
+        on.watch_once(&p);
+        Some(Watch(p))
+    }
+
+    /// Sleeps until it is told more than `told`, or `until` passes; false
+    /// if a signal for `entry` came first.
+    pub(crate) fn wait(&self, entry: &proc::ProcEntry, told: u64, until: Option<Duration>) -> bool {
+        let woken = || {
+            if self.told() != told {
+                Some(true)
+            } else {
+                proc::interrupted(entry).then_some(false)
+            }
+        };
+        match until {
+            Some(d) => self.queue.wait_until_deadline(d, woken).unwrap_or(true),
+            None => self.queue.wait_until(woken),
+        }
+    }
+}
+
 /// How many times what `fd` names has changed state (for `EPOLLET`).
-fn changes(fd: &Fd) -> u64 {
+pub(crate) fn changes(fd: &Fd) -> u64 {
     match fd {
         Fd::Console | Fd::File(_) | Fd::Dev(_) => 0,
         Fd::Pipe(e) => e.pipe.changes(),
@@ -579,11 +728,33 @@ pub(crate) struct EventFd {
     semaphore: bool,
     queue: WaitQueue,
     watchers: Watchers,
+    /// An io_uring instance added to it last.
+    by_ring: AtomicBool,
+}
+
+impl EventFd {
+    /// Adds one, for an io_uring instance's completion.
+    pub(crate) fn signal(&self) {
+        {
+            let mut c = self.count.lock();
+            *c = c.saturating_add(1).min(u64::MAX - 1);
+        }
+        self.by_ring.store(true, Ordering::Release);
+        self.changed();
+    }
 }
 
 impl Object for EventFd {
     fn watchers(&self) -> Option<&Watchers> {
         Some(&self.watchers)
+    }
+
+    fn eventfd(&self) -> Option<&EventFd> {
+        Some(self)
+    }
+
+    fn woken_by_ring(&self) -> bool {
+        self.by_ring.load(Ordering::Acquire)
     }
 
     fn read(
@@ -641,6 +812,7 @@ impl Object for EventFd {
                 None
             }
         })?;
+        self.by_ring.store(false, Ordering::Release);
         self.changed();
         Ok(8)
     }
@@ -683,6 +855,7 @@ pub(crate) fn eventfd(p: &mut LinuxProcess, init: u64, flags: u64) -> Result<u64
         count: SpinLock::new(init & 0xffff_ffff),
         changes: core::sync::atomic::AtomicU64::new(0),
         semaphore: flags & EFD_SEMAPHORE != 0,
+        by_ring: AtomicBool::new(false),
         queue: WaitQueue::new(),
         watchers: Watchers::new(),
     });
@@ -825,6 +998,13 @@ impl Object for Epoll {
     }
     fn changes(&self) -> u64 {
         self.hub.told()
+    }
+    fn woken_by_ring(&self) -> bool {
+        self.watched().into_iter().any(|(events, d)| {
+            let f = d.state().clone();
+            matches!(&f, Fd::Object(o) if o.obj.woken_by_ring())
+                && u32::from(readiness(&f)) & events != 0
+        })
     }
     fn watchers(&self) -> Option<&Watchers> {
         Some(&self.hub.onward)

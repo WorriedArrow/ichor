@@ -313,6 +313,7 @@ const KERNEL_ONLY: &[&str] = &[
     "ichor-virtio-blk",
     "ichor-virtio-rng",
     "ichor-virtio-net",
+    "ichor-intel-gbe",
     "ichor-nvme",
     "ichor-virtio-scsi",
 ];
@@ -369,13 +370,15 @@ fn cmd_test(o: &Opts) -> Result<()> {
 }
 
 /// `cargo xtask workloads SUITE [--tests "a b"] [--cmd "shell command"]
-/// [--follow FILE] [--accel A] [--cmdline "kernel options"]`: a runtime's own test suite through the control plane
+/// [--follow FILE] [--accel A] [--cmdline "kernel options"] [--image REF]
+/// [--memory MiB]`: a runtime's own test suite through the control plane
 /// (ADR-0013 §2); prints the pass rate.
 fn cmd_workloads(args: &[String]) -> Result<()> {
     use xtask::workloads;
     let mut it = args.iter();
     let mut suite = None;
     let (mut tests, mut cmd, mut accel) = (None, None, None);
+    let (mut image, mut memory) = (None, None);
     let mut follow = None;
     let mut extra = String::new();
     while let Some(a) = it.next() {
@@ -384,6 +387,12 @@ fn cmd_workloads(args: &[String]) -> Result<()> {
             "--cmd" => cmd = Some(it.next().ok_or("--cmd needs a value")?.clone()),
             "--follow" => follow = Some(it.next().ok_or("--follow needs a value")?.into()),
             "--accel" => accel = Some(it.next().ok_or("--accel needs a value")?.clone()),
+            // For exploring on a machine too small for the suite's own.
+            "--image" => image = Some(it.next().ok_or("--image needs a value")?.clone()),
+            "--memory" => {
+                let mib = it.next().and_then(|m| m.parse::<u32>().ok());
+                memory = Some(mib.ok_or("--memory needs a number of MiB")?);
+            }
             // Extra kernel options (`trace_errors`, `trace_pid=N`).
             "--cmdline" => extra = it.next().ok_or("--cmdline needs a value")?.clone(),
             s if !s.starts_with('-') => {
@@ -397,10 +406,22 @@ fn cmd_workloads(args: &[String]) -> Result<()> {
             other => return Err(format!("workloads: unknown option {other:?}")),
         }
     }
-    let suite = suite.ok_or_else(|| {
+    let mut suite = *suite.ok_or_else(|| {
         let names: Vec<&str> = workloads::SUITES.iter().map(|s| s.name).collect();
         format!("which suite? ({})", names.join(", "))
     })?;
+    if (image.is_some() || memory.is_some()) && cmd.is_none() {
+        return Err("--image and --memory go with --cmd".into());
+    }
+    if let Some(i) = image {
+        // (The process ends with the run.)
+        suite.image = Box::leak(i.into_boxed_str());
+    }
+    if let Some(mib) = memory {
+        suite.memory_mib = mib;
+        suite.cell_bytes = u64::from(mib) << 19;
+    }
+    let suite = &suite;
     let argv: Vec<String> = match &cmd {
         Some(c) => vec!["/bin/sh".into(), "-c".into(), c.clone()],
         None => {

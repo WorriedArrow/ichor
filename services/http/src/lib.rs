@@ -204,6 +204,16 @@ impl ResponseParser {
         }
     }
 
+    /// How many bytes more the response may take in memory than it does:
+    /// what is left of a body of known size, or as much again as came of
+    /// another (which moves as it grows).
+    pub fn wants(&self) -> usize {
+        match &self.head {
+            Some((_, _, Body::Length(n))) => n.saturating_sub(self.buf.len()),
+            _ => 2 * (self.buf.len() + self.body.len()),
+        }
+    }
+
     /// Takes more bytes; a whole response once it has one.
     pub fn feed(&mut self, data: &[u8]) -> Result<Option<Response>, Error> {
         self.buf.extend_from_slice(data);
@@ -252,6 +262,15 @@ impl ResponseParser {
                 return Err(Error::TooLarge);
             }
             self.buf.drain(..end + 4);
+            // A body of known size does not move while it comes.
+            if let Body::Length(n) = body
+                && n > self.buf.len()
+            {
+                let more = n - self.buf.len();
+                self.buf
+                    .try_reserve_exact(more)
+                    .map_err(|_| Error::TooLarge)?;
+            }
             self.head = Some((status, headers, body));
         }
         self.take_body()

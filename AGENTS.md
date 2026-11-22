@@ -86,28 +86,25 @@ boot [done: VERW, IBPB, and page-table isolation (ADR-0004's second
   gaps. Verification now builds paths with backtracking and enforces name
   constraints, leaf serverAuth EKU and not-a-CA, DNS SAN syntax, serial
   and RSA key rules (98.4% accept / 99.4% refuse agreement).
-- M7 io_uring, first step: `kernel/uring` (host-tested) has the ABI, this
-  kernel's ring layout (one mapping for both rings, fields grouped by
-  writer) and the ordering rules (`Order`: links, hard links, drains,
-  chains cut at each submission's end). `linuxabi/uring.rs`: setup,
-  `mmap` of the ring descriptor (`Mm::map_frames`: kernel pages shared
-  with the process, kept across fork), enter (with GETEVENTS waits on
-  armed objects, EXT_ARG timeouts, overflow kept per NODROP) and register
-  (probe, eventfd). SQEs run on the submitting thread through
-  `linuxabi::dispatch` (the synchronous syscalls' code); one on a pipe or
-  socket that is not ready is armed and completes during a later enter.
-  Ops: NOP, READ/WRITE(V) (positional on files), FSYNC, POLL_ADD/REMOVE,
-  SEND/RECV(MSG), ACCEPT, CONNECT, SHUTDOWN, CLOSE, OPENAT, STATX,
-  RENAMEAT/UNLINKAT/MKDIRAT, TIMEOUT/TIMEOUT_REMOVE, ASYNC_CANCEL.
-  `runtest::uring_program` checks it from ring 3 on every boot. The
-  ring's worker (`uring::worker`, a `LinuxProcess::helper` thread: shares
-  the process, blocks signals but SIGKILL, is not one of the group's
-  threads, ends when the ring closes or the process has no threads)
-  completes armed SQEs with nobody in `io_uring_enter`; armed SQEs are
-  claimed (`running`) so they run once. `runtest::uring_worker_program`
-  checks completion while blocked on a registered eventfd and on
-  `epoll_wait` of the ring fd. Not yet: registered files/buffers,
-  LINK_TIMEOUT, the EXT_ARG signal mask, liburing's tests.
+- M7 io_uring (ADR-0013 and its 2026-11-22 amendment): `kernel/uring`
+  (host-tested) has the ABI, this kernel's ring layout and the ordering
+  rules (`Order`: links, hard links, link timeouts, drains; what is
+  complete is forgotten at once). `linuxabi/uring.rs` is the ring,
+  `uring/ops.rs` what an SQE may say and does (the synchronous syscalls'
+  code, through `linuxabi::dispatch`), `uring/tables.rs` what is
+  registered (files with tags, buffers, provided-buffer groups, rings,
+  restrictions). An SQE is tried without blocking on the description it
+  named when it began, lent to the thread as descriptor `LENT`; what it
+  points to is read when it is submitted (`Kept`); one that cannot go on is
+  armed with its own registration on its object (`poll::Hub::watch`), and
+  tried again when that changes: by a thread in `io_uring_enter`, by any
+  thread of its process after a system call (`uring::task_work`), or by the
+  ring's worker for that process (`LinuxProcess::helper`). Claimed while
+  tried, so it runs once. DEFER_TASKRUN rings only run when asked
+  (`nudge` tells the program); SQPOLL rings always say NEED_WAKEUP.
+  `runtest::uring_program` and `uring_worker_program` check it on every
+  boot; `cargo xtask workloads uring` runs liburing 2.5's tests. Not yet:
+  personalities, URING_CMD, zero-copy sends, NO_MMAP, xattr operations.
 - M7 CPython (first suite): `cargo xtask workloads python` pulls
   `python:3.12-slim-bookworm` plus the 3.12.16 source tree's `Lib/test`
   as a pinned layer and runs `python -m test -j0` in a cell. Fixed on
@@ -119,10 +116,12 @@ boot [done: VERW, IBPB, and page-table isolation (ADR-0004's second
   get/setpriority, `memfd_create`, absolute `clock_nanosleep`, named
   pipes (`mknod`/`mknodat` S_IFIFO, blocking opens), robust futex lists;
   open TCP NAT mappings live five days (Linux's established timeout), not
-  ten minutes. Known gaps from its runs: `test_math` cosh is 8 ulps off
-  under TCG (check on KVM), rseq (ENOSYS, glibc falls
-  back). Latest recorded full run: 409 of 445 modules (91.9%),
-  before shared file mappings; floor 88.0% in `workloads.toml`.
+  ten minutes; futex deadlines of the wall clock (`FUTEX_CLOCK_REALTIME`
+  was taken as time since boot, so `sem_timedwait` never timed out).
+  Latest full run (2026-11-22): 454 of 457 modules (99.3%). The three:
+  no compiler in the image (`test_ctypes`), `dnotify` (`test_fcntl`), and
+  `multiprocessing_spawn.test_processes`, which takes 9 of its 10 minutes
+  under TCG and passes with a longer limit. rseq is ENOSYS.
 - M7 Go (second suite): `cargo xtask workloads go` runs `go test -short
   std` on the official `golang` image. Fixed on the way: `epoll_wait` held
   descriptors and a fixed interest list while asleep (an epoll instance is
@@ -143,8 +142,11 @@ boot [done: VERW, IBPB, and page-table isolation (ADR-0004's second
   `linuxabi/netlink.rs`); CPU-time and POSIX timers (`itimer.rs`); pidfds
   and `clone3`. Debian's perl checks most of it on every boot
   (`SIGNAL_SCRIPT`, `MOVE_SCRIPT`). Explore with
-  `--cmd "go version" --follow FILE` (append shell lines to FILE). Under
-  TCG only: `crypto/sha1` (QEMU reads 32 bytes for a 16-byte AVX2 operand).
+  `--cmd "go version" --follow FILE` (append shell lines to FILE; with
+  `--image REF --memory MiB` on a machine too small for the suite's own).
+  Latest full run (2026-11-22): 260 of 262 packages. The two: `crypto/sha1`
+  (under TCG: QEMU reads 32 bytes for a 16-byte AVX2 operand) and `syscall`
+  (ptrace).
 - M7 PostgreSQL (third suite): `cargo xtask workloads postgres` builds
   16.16 in `buildpack-deps` (the official image carries no `pg_regress`)
   and runs `make check`; first run 223 of 224 (the other was QEMU's FMA on
@@ -162,11 +164,38 @@ boot [done: VERW, IBPB, and page-table isolation (ADR-0004's second
   `/proc/<pid>/cmdline` read from the process's memory (titles written over
   argv), 2 MiB of arguments.
 - M7 Node.js (fourth suite): `cargo xtask workloads node` runs its
-  `test/parallel` and `test/sequential`; first run (2026-11-22, 130 min
-  under TCG) 4365 of 4400. Most of the 35 are fixed since, or were sources
-  the suite did not have; `cpu-prof-*worker*` livelock under TCG (V8
-  samples every 100 us). The `jvm` suite (jtreg, OpenJDK 21's tier 1) is
-  defined, not run yet.
+  `test/parallel` and `test/sequential`; 4398 of 4404 (2026-11-22, 98 min
+  under TCG). The six: four CPU-profiler tests (V8 samples every 100 us,
+  which TCG cannot keep up with), `net-boundsocket` (wants port 1 refused;
+  any user may bind any port in a cell, as in Docker), and `watch-mode`.
+- M7 JVM (fifth suite): `cargo xtask workloads jvm` (jtreg, OpenJDK 21's
+  tier 1). Not scored: under TCG about one JVM in twenty dies, since QEMU
+  fetches an instruction in pieces while the JVM patches it (an `hs_err`
+  whose fault address decodes from the old first bytes and the new last
+  ones; memory is right). Score it on KVM (`workloads.yml`). A sample of
+  other directories passed 247 of 274; of its failures, `ProcessHandle`,
+  `PortUnreachable` and four more pass since. Left to work on: multicast,
+  urgent data, extended attributes (`CheckPermissions`, `FileAttributes`),
+  `CopyProcFile`, `TracePinnedThreads`.
+  Leave NIO's large-file tests out of a 5 GiB cell.
+- M7 liburing (sixth suite): `cargo xtask workloads uring` builds
+  liburing 2.5 (of Linux 6.6's time) in `buildpack-deps` and runs its
+  tests one by one: 150 of 156 (2026-11-22; `timeout` is fixed since, the
+  other five want IPv6, `CAP_SYS_RESOURCE`, which containers lack,
+  `IP_RECVORIGDSTADDR`, URING_CMD on sockets, and Linux's own worker
+  threads). It found the `execve` race (`/proc/<pid>/cmdline` read
+  the old arguments' address in the new memory) and that a TCP socket whose
+  connect was refused could not connect again.
+- A pull that does not fit in memory fails, and the control plane lives
+  on: `rt::memory_available` (`MEM_AVAILABLE`) is asked before large work,
+  through `layer::Room` (`gunzip_within`, `add_tar_within`, `into_image`).
+  Asking matters because a native process's heap does not fail: touching a
+  page the cell cannot pay for ends the process. Converting takes the image
+  about twice; layers may have several gzip members. Images are never freed
+  (`IMAGE_CREATE` leaks them).
+- WHPX (Windows) does not work with QEMU 9.0: it has no x2APIC, which frame
+  requires (and it cannot run firmware from pflash; `-bios` with the two
+  images concatenated gets as far as that).
 - M7 storage (ADR-0006's 2026-11-21 amendment): a cell's root writes are
   frames charged to its account (`page.rs`: one charged-page type for
   process memory and file pages; `overlay::Pages` is where the overlay
@@ -203,6 +232,13 @@ boot [done: VERW, IBPB, and page-table isolation (ADR-0004's second
   boot that times out now appends every vCPU's registers, LAPIC and stack
   to its log (`qemu::vcpu_state`): read that first. Both CPUs at the idle
   `hlt` with no timer armed means a lost wake-up, not a lost interrupt.
+- Cells cannot reach what is the machine's alone: link-local addresses and
+  Azure's 168.63.129.16, where clouds answer whoever asks with the machine's
+  credentials (`net::switch::is_machines`: refused with a reset at the
+  uplink, DNS excepted).
+- NICs: `virtio-net`, and `intel-gbe` (82574L and the 82576/I350/I210
+  family; tested on QEMU's `e1000e` and `igb`: `RunConfig::nic`). The first
+  that comes up is the uplink (`nettest::find`).
 - The uplink is any `net::link::Link` (`kernel/net/src/link.rs`:
   `mac`/`transmit`/`receive`): NIC drivers implement it (virtio-net), and
   a software link such as a VPN can wrap one. New NIC drivers (ENA,
@@ -290,8 +326,8 @@ other and to the host through a published port. The design is ADR-0010:
 our own sans-I/O stack in `kernel/net` (host-tested), one stack per cell,
 an in-kernel cell switch with assigned addresses, anti-spoofing, rate
 limits, a cross-cell fast path, and NAT plus published ports at the
-uplink; virtio-net (polled). Open from it: IPv6, ICMP errors for UDP,
-`MSG_PEEK`, interrupt-driven virtio-net (milestone 8 with cloud NICs).
+uplink; virtio-net (polled). Open from it: IPv6, ICMP errors through the
+NAT, interrupt-driven virtio-net (milestone 8 with cloud NICs).
 
 - M5 so far: `kernel/net` (wire formats, an IPv4 interface with ARP, a
   TCP state machine tested over a lossy, reordering simulated link),
@@ -326,7 +362,8 @@ uplink; virtio-net (polled). Open from it: IPv6, ICMP errors for UDP,
   space, 256 KiB receive queue that drops when full, autobind on first
   send, connect/AF_UNSPEC, MSG_TRUNC, msg_name in sendmsg/recvmsg).
   Tested on loopback (Debian perl), across the switch between cells, and
-  through the uplink's NAT to a host UDP echo. No ICMP errors yet.
+  through the uplink's NAT to a host UDP echo. A closed port is
+  ECONNREFUSED to a connected socket, in its cell or another.
 - M5 `AF_UNIX` (`linuxabi/unix.rs`): stream, datagram and seqpacket
   sockets, `socketpair`, path names (a socket node in the cell's root,
   `overlay::Kind::Socket`, checked for write permission; open is ENXIO)
@@ -684,7 +721,8 @@ and the control plane resolves through the lease's DNS server unless
 `dns=` is given. The uplink renews the lease at half its time, and moves
 address if the server says so (published ports stay, connections are
 cut); unrenewed past its end, it keeps the address and asks on. Not yet:
-the clouds' metadata servers, AWS ENA and GCP gVNIC, Hyper-V VMBus for Azure, Secure Boot.
+AWS ENA and GCP gVNIC, Hyper-V VMBus for Azure, Secure Boot; nothing has
+run on a real cloud or a real machine.
 
 ## Commands
 
@@ -720,7 +758,7 @@ the accelerator).
 
 Plain `cargo build` / `cargo test` at the root only touch host crates
 (`default-members`). Crates that depend on frame (`ichor`, `ichor-frame`,
-`ichor-virtio-pci`, `ichor-virtio-blk`, `ichor-virtio-rng`, `ichor-virtio-net`, `ichor-nvme`) are kernel-only: xtask's `KERNEL_ONLY` list keeps them
+`ichor-virtio-pci`, `ichor-virtio-blk`, `ichor-virtio-rng`, `ichor-virtio-net`, `ichor-intel-gbe`, `ichor-nvme`) are kernel-only: xtask's `KERNEL_ONLY` list keeps them
 out of host clippy and tests and lints them for the UEFI target. The kernel and frame build for `x86_64-unknown-uefi`
 through xtask, into `target/kernel` so they never contend for cargo's build
 lock with the host build.
@@ -753,6 +791,8 @@ comment.
 | `control_exit` | with `control`: stop when the first API client hangs up, then shut down (tests) |
 | `control_exit_after=SECONDS` | with `control`: stop after that long once no client is connected (tests) |
 | `uplink_mtu=N` | the uplink network's MTU, over the DHCP lease's (default: the lease's, else 1500); every TCP SYN crossing the uplink is clamped to MTU - 40 |
+| `metadata=CLOUD` | ask the cloud (`gcp`, `aws`, `azure`, or `auto`: each in turn) for the machine's configuration: `control*` and `dns` options, the API's token and certificate (`cloud.rs`, `net::metadata`, `docs/cloud.md`) |
+| `metadata_addr=IP:PORT` | ask there instead of at 169.254.169.254:80 (tests) |
 | `dhcp_lease=SECONDS` | the longest the uplink's DHCP lease is taken to last (tests: renewed sooner) |
 | `dns=A.B.C.D` | the control plane's DNS resolver (default: the uplink's DHCP lease's first DNS server, else `10.0.2.3`, QEMU's) |
 
@@ -788,6 +828,7 @@ kernel/drivers/virtio-pci  modern virtio PCI transport shared by the virtio driv
 kernel/drivers/virtio-blk  safe virtio-blk driver over frame's IoMem/DMA
 kernel/drivers/virtio-rng  safe virtio-rng (entropy) driver
 kernel/drivers/virtio-net  safe virtio-net driver (polled, MAC feature only)
+kernel/drivers/intel-gbe   safe Intel gigabit Ethernet driver (polled, DMA-trusted)
 kernel/net       network protocols, sans-I/O: Ethernet, ARP, IPv4, ICMP, UDP, TCP (host-tested; ADR-0010)
 kernel/uring     io_uring's ABI, ring layout and submission ordering, sans-I/O (host-tested; ADR-0013)
 kernel/drivers/nvme        safe NVMe driver (polled, DMA-trusted)
@@ -864,6 +905,8 @@ reason. Known candidates: CET/IBT codegen and retpolines (side-channel ADR).
 
 - CI (GitHub Actions, `ubuntu-24.04`) installs `qemu-system-x86` and `ovmf`,
   enables `/dev/kvm`, and runs lint, test, and cargo-deny.
+  `.github/workflows/workloads.yml` runs the workload suites on KVM, weekly
+  and on demand, and fails below their floors.
 - On Windows, QEMU's own `share/edk2-x86_64-code.fd` + `edk2-i386-vars.fd`
   are found automatically. There is no KVM there, so runs use TCG: about 2 s
   per boot. WHPX is untested.

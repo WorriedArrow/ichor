@@ -98,24 +98,50 @@ fn extra_layer() -> Vec<u8> {
     ))
 }
 
+/// A layer of one file of a GiB of zeros, in a few MiB: more than the guest
+/// has memory for.
+fn huge_layer() -> Vec<u8> {
+    const PART: usize = 8 << 20;
+    const PARTS: usize = 128;
+    let mut h = xtask::deflate::tar("src/zeros", b"")[..512].to_vec();
+    h[124..136].copy_from_slice(format!("{:011o}\0", PART * PARTS).as_bytes());
+    h[148..156].fill(b' ');
+    let sum: u32 = h.iter().map(|&b| u32::from(b)).sum();
+    h[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+    // The members of a gzip stream are one stream.
+    let mut out = xtask::deflate::gzip(&h);
+    let part = xtask::deflate::gzip(&vec![0u8; PART]);
+    for _ in 0..PARTS {
+        out.extend_from_slice(&part);
+    }
+    out
+}
+
 fn sha256(b: &[u8]) -> String {
     format!("sha256:{}", xtask::sha256::hex(&xtask::sha256::digest(b)))
 }
 
 /// Serves `body` to every HTTP request on 127.0.0.1 (the guest's
 /// 10.0.2.2), by a redirect under `/moved/`, until the process ends;
-/// returns the port, and how often it was asked.
+/// returns the port, and how often it was asked. `/huge` is
+/// [`huge_layer`], and not counted.
 fn serve(body: Vec<u8>) -> (u16, Arc<AtomicU32>) {
+    let huge = huge_layer();
     let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = l.local_addr().unwrap().port();
     let asked = Arc::new(AtomicU32::new(0));
     let count = asked.clone();
     std::thread::spawn(move || {
         for mut s in l.incoming().flatten() {
-            count.fetch_add(1, Ordering::SeqCst);
             let mut req = [0u8; 4096];
             let _ = s.set_read_timeout(Some(Duration::from_secs(10)));
             let n = s.read(&mut req).unwrap_or(0);
+            let body = if req[..n].starts_with(b"GET /huge") {
+                &huge
+            } else {
+                count.fetch_add(1, Ordering::SeqCst);
+                &body
+            };
             // What was asked for is elsewhere, as release files often are.
             if req[..n].starts_with(b"GET /moved/") {
                 let _ = s.write_all(
@@ -128,7 +154,7 @@ fn serve(body: Vec<u8>) -> (u16, Arc<AtomicU32>) {
                 body.len()
             );
             let _ = s.write_all(head.as_bytes());
-            let _ = s.write_all(&body);
+            let _ = s.write_all(body);
         }
     });
     (port, asked)
@@ -221,6 +247,22 @@ fn session(port: u16, layer_port: u16) -> Result<(Ran, Ran), String> {
     }
     eprintln!("host: refused as it should be: {msg}");
 
+    // One that does not fit in memory fails the pull, and only that.
+    let req = control::PullImageRequest {
+        reference: IMAGE.into(),
+        layers: vec![control::LayerSource {
+            url: format!("http://10.0.2.2:{layer_port}/huge.tar.gz"),
+            digest: sha256(&huge_layer()),
+            from: "src/".into(),
+            to: "/opt/huge/".into(),
+        }],
+    };
+    let (_, code, msg) = s.call(control::PULL_IMAGE, &req.encode(), Duration::from_secs(600))?;
+    if code == 0 || !msg.contains("do not fit in memory") {
+        return Err(format!("a huge layer was not refused: ({code}) {msg}"));
+    }
+    eprintln!("host: too large, as it should be: {msg}");
+
     // Two layers from one archive: it is fetched once.
     let again = control::LayerSource {
         to: "/opt/again/".into(),
@@ -234,7 +276,8 @@ fn session(port: u16, layer_port: u16) -> Result<(Ran, Ran), String> {
             "sh",
             "-c",
             "cat /etc/alpine-release; echo \"$((6 * 7)) from $(uname -s)\"; ls /bin/busybox; cat /opt/extra/greeting; \
-             cat /opt/again/greeting; head -1 /etc/hosts; cat /etc/hostname; exit 3",
+             cat /opt/again/greeting; head -1 /etc/hosts; cat /etc/hostname /etc/resolv.conf; \
+             nslookup registry-1.docker.io >/dev/null 2>&1 && echo a name was found; exit 3",
         ],
     )?;
     lifecycle(&mut s, "2")?;
@@ -318,6 +361,81 @@ fn lifecycle(s: &mut Session, id: &str) -> Result<(), String> {
     }
     eprintln!("host: cell {id} destroyed");
     Ok(())
+}
+
+/// A machine with nothing on its boot volume but where to ask: its cloud's
+/// metadata service (played by the host, as AWS's) says that it serves the
+/// API, with which token and certificate.
+#[test]
+fn a_machine_is_configured_by_its_clouds_metadata_service() {
+    let host_port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let metadata = l.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let config = format!(
+            "# what this machine is for\ncontrol=50051 control_publish=50051\ncontrol_exit\n\
+             api-token = {API_TOKEN}\n{TEST_IDENTITY}\n"
+        );
+        for mut s in l.incoming().flatten() {
+            let _ = s.set_read_timeout(Some(Duration::from_secs(10)));
+            let mut req = Vec::new();
+            let mut buf = [0u8; 2048];
+            while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                match s.read(&mut buf) {
+                    Ok(n) if n > 0 => req.extend_from_slice(&buf[..n]),
+                    _ => break,
+                }
+            }
+            let req = String::from_utf8_lossy(&req).into_owned();
+            let (status, body) = if req.starts_with("PUT /latest/api/token ")
+                && req.contains("\r\nX-aws-ec2-metadata-token-ttl-seconds: ")
+            {
+                ("200 OK", "AQAEAFtoken==")
+            } else if req.starts_with("GET /latest/user-data ")
+                && req.contains("\r\nX-aws-ec2-metadata-token: AQAEAFtoken==\r\n")
+            {
+                ("200 OK", config.as_str())
+            } else {
+                ("404 Not Found", "")
+            };
+            let _ = write!(
+                s,
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    let client = std::thread::spawn(move || -> Result<(), String> {
+        let trust = test_trust();
+        let until = Instant::now() + Duration::from_secs(600);
+        let mut s = Session::connect(host_port, Some(API_TOKEN), Some(&trust), until)?;
+        let bad = control::PullImageRequest {
+            reference: "UPPER/case!".into(),
+            layers: vec![],
+        };
+        let (_, code, _) = s.call(control::PULL_IMAGE, &bad.encode(), Duration::from_secs(60))?;
+        if code != grpc::status::INVALID_ARGUMENT {
+            return Err(format!("a bad reference gave status {code}"));
+        }
+        Ok(())
+    });
+    let cmdline = format!("metadata=auto metadata_addr=10.0.2.2:{metadata}");
+    let out = ichor_tests::boot_with("control-metadata", &cmdline, 2, |c| {
+        c.net_user_opts = format!("hostfwd=tcp:127.0.0.1:{host_port}-:50051");
+        c.timeout = Some(Duration::from_secs(600));
+    });
+    out.assert_exit(Exit::Success);
+    out.assert_in_order(&[
+        "ichor: cloud: aws: options [control control_publish control_exit], an API token, an API certificate",
+        "API token from the cloud, API certificate from the cloud)",
+        "published on uplink port 50051)",
+        "ichor: control: exited with Some(0)",
+    ]);
+    client.join().unwrap().unwrap();
 }
 
 /// The API is local to the system cell unless it is configured to be
@@ -464,7 +582,8 @@ fn the_control_plane_pulls_and_runs_an_image_from_docker_hub() {
     assert_eq!(
         text,
         "3.20.3\n42 from Linux\n/bin/busybox\nhello from an extra layer\n\
-         hello from an extra layer\n127.0.0.1\tlocalhost\nichor\n"
+         hello from an extra layer\n127.0.0.1\tlocalhost\nichor\n\
+         nameserver 10.0.2.3\na name was found\n"
     );
     assert_eq!(exit, 3 << 8);
     // Once refused, once for both layers, each after a redirect.

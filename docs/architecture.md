@@ -23,11 +23,12 @@ From the bottom up:
   page tables, ring-3 entry and exit, tasks and context switching,
   interrupts, PCI MMIO and DMA buffers, TLB shootdown, and the
   side-channel mitigations (ADR-0004). It exposes an API that must be
-  sound for *any* safe caller. Its size is a tracked budget: about 5,800
-  lines and 250 unsafe sites today, counted by `cargo xtask frame-audit`
+  sound for *any* safe caller. Its size is a tracked budget: about 6,250
+  lines and 260 unsafe sites today, counted by `cargo xtask frame-audit`
   and enforced by lint.
 - **Drivers** (`kernel/drivers/*`) are safe Rust over frame's `IoMem`,
-  `DmaBuf` and `VirtQueue`: virtio-blk, NVMe, virtio-net, virtio-rng.
+  `DmaBuf` and `VirtQueue`: virtio-blk, virtio-scsi, NVMe, virtio-net,
+  virtio-rng.
 - **Kernel services** (`kernel/ichor` plus pure-logic crates) are safe
   Rust with `#![forbid(unsafe_code)]`. Anything that does not touch
   hardware lives in its own host-testable crate (`cap`, `cell`, `sched`,
@@ -124,7 +125,9 @@ deliberately rigid in the trusted core.
   frame are written against frame's API, not against x86.
 
 **Not built yet, and where it would go:** Kubernetes CRI (milestone 9)
-would be another native service, or the control API extended. Writable
-shared file mappings need the overlay to keep file pages as frames.
-Per-process CPU scheduling weights (nice, affinity) need the scheduler
-policy to take them.
+would be another native service, or the control API extended. IPv6 would be
+a second address family in `kernel/net` and the cell switch. `ptrace`
+needs the stop machinery that job control already has, with a tracer to
+report to. Per-process CPU scheduling weights (nice, affinity) need the
+scheduler policy to take them. Some kernel memory a cell causes to be used
+(page tables, region maps, socket state) is not charged to it yet.

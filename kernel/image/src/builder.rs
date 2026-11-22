@@ -59,6 +59,25 @@ impl Builder {
         Self::default()
     }
 
+    /// With room for `data` bytes of chunks.
+    pub fn with_capacity(data: usize) -> Self {
+        Builder {
+            data: Vec::with_capacity(data),
+            ..Self::default()
+        }
+    }
+
+    /// How long the image is now, at most.
+    pub fn finished_len(&self) -> usize {
+        HEADER_LEN
+            + self.strings.len()
+            + self.nodes.len() * NODE_LEN
+            + self.dirents.len() * 8
+            + self.chunk_table.len() * CHUNK_LEN
+            + 2 * CHUNK_SIZE as usize
+            + self.data.len()
+    }
+
     fn string(&mut self, s: &str) -> (u64, u64) {
         // The table follows the header, so where a string lands in the
         // image is known here: not across a segment boundary.

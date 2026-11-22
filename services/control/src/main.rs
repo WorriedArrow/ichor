@@ -843,7 +843,7 @@ impl Control {
                 continue;
             }
             {
-                let Some(pulled) = p.pulled.take() else {
+                let Some(mut pulled) = p.pulled.take() else {
                     return Err("no image".into());
                 };
                 let extras: Vec<oci::Extra<'_>> = p
@@ -858,7 +858,7 @@ impl Control {
                     .collect();
                 {
                     let (conn, stream, started) = (p.conn, p.stream, p.started);
-                    let img = oci::convert_with(&pulled, &extras)
+                    let img = oci::convert_with(&mut pulled, &extras, &rt::memory_available)
                         .map_err(|e| format!("converting: {e:?}"))?;
                     drop(extras);
                     let id = image::Image::mount(&img)

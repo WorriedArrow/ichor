@@ -103,6 +103,8 @@ const VKILL: usize = 3;
 const VEOF: usize = 4;
 const VTIME: usize = 5;
 const VMIN: usize = 6;
+const VSTART: usize = 8;
+const VSTOP: usize = 9;
 const VSUSP: usize = 10;
 const VEOL: usize = 11;
 const VWERASE: usize = 14;
@@ -187,6 +189,8 @@ struct State {
     session: Option<(u64, u64)>,
     /// The foreground process group.
     fg: u64,
+    /// Output is suspended (`tcflow`).
+    stopped: bool,
 }
 
 impl State {
@@ -523,6 +527,7 @@ pub(crate) fn open_master(p: &mut LinuxProcess, ino: Ino, nonblock: bool) -> Res
             locked: true,
             session: None,
             fg: 0,
+            stopped: false,
         }),
         queue: WaitQueue::new(),
         changes: AtomicU64::new(0),
@@ -756,7 +761,7 @@ impl Object for End {
             }
             // Room for every byte even if each becomes "\r\n".
             let room = OUTPUT_MAX.saturating_sub(s.output.len()) / 2;
-            if room > 0 {
+            if room > 0 && !s.stopped {
                 let n = room.min(data.len());
                 for &c in &data[..n] {
                     s.emit(c);
@@ -794,7 +799,7 @@ impl Object for End {
             }
             if !s.master {
                 r |= POLLIN | POLLHUP;
-            } else if s.output.len() < OUTPUT_MAX {
+            } else if s.output.len() < OUTPUT_MAX && !s.stopped {
                 r |= POLLOUT;
             }
             r
@@ -840,6 +845,7 @@ pub(crate) fn ioctl(p: &mut LinuxProcess, end: &End, request: u64, arg: u64) -> 
     const TCSETSW: u64 = 0x5403;
     const TCSETSF: u64 = 0x5404;
     const TCSBRK: u64 = 0x5409;
+    const TCXONC: u64 = 0x540A;
     const TCFLSH: u64 = 0x540B;
     const TIOCSCTTY: u64 = 0x540E;
     const TIOCGPGRP: u64 = 0x540F;
@@ -897,6 +903,23 @@ pub(crate) fn ioctl(p: &mut LinuxProcess, end: &End, request: u64, arg: u64) -> 
         // Output reaches the master as it is written: a drain or a break
         // has nothing to wait for.
         TCSBRK | TCSBRKP => Ok(0),
+        // `tcflow`: suspends and resumes the slave's output, or asks whoever
+        // types (the master's reader) to stop and go on.
+        TCXONC => {
+            {
+                let mut s = pty.state.lock();
+                let cc = s.termios.cc;
+                match arg {
+                    0 => s.stopped = true,
+                    1 => s.stopped = false,
+                    2 => s.push_out(cc[VSTOP]),
+                    3 => s.push_out(cc[VSTART]),
+                    _ => return Err(EINVAL),
+                }
+            }
+            pty.changed();
+            Ok(0)
+        }
         TCFLSH => {
             let (input, output) = match arg {
                 0 => (true, false),

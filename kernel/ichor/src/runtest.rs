@@ -323,18 +323,19 @@ fn uring_program() -> Vec<u8> {
                ud: u64| {
         let w0 = u64::from(op) | (u64::from(flags) << 8) | (u64::from(fd as u32) << 32);
         let words = [w0, off, 0, u64::from(len), ud, 0, 0, 0];
+        let at = slot % 8;
         for (k, w) in words.iter().enumerate() {
             a.mov_imm(Reg::Rax, *w);
-            a.store(Reg::R13, slot * 64 + 8 * k as i32, Reg::Rax);
+            a.store(Reg::R13, at * 64 + 8 * k as i32, Reg::Rax);
         }
         if let Some((base, disp)) = addr {
             a.mov(Reg::Rax, base);
             a.add_imm(Reg::Rax, disp);
-            a.store(Reg::R13, slot * 64 + 16, Reg::Rax);
+            a.store(Reg::R13, at * 64 + 16, Reg::Rax);
         }
         // The SQ array names the slot, then the tail moves past it.
-        a.mov_imm(Reg::Rax, slot as u64);
-        a.store32(Reg::R12, l.sq.array as i32 + 4 * slot, Reg::Rax);
+        a.mov_imm(Reg::Rax, at as u64);
+        a.store32(Reg::R12, l.sq.array as i32 + 4 * at, Reg::Rax);
         a.mov_imm(Reg::Rax, slot as u64 + 1);
         a.store32(Reg::R12, l.sq.tail as i32, Reg::Rax);
     };
@@ -500,7 +501,75 @@ fn uring_program() -> Vec<u8> {
     enter(&mut a, 1, 1, u64::from(abi::ENTER_GETEVENTS));
     expect(&mut a, 13, 1);
     cqe(&mut a, 13, 5, 6, -22);
-    // 14: the probe: last op MKDIRAT (37), 38 ops listed.
+    set_cq_head(&mut a, 6);
+    // 15: a READ of the empty pipe that a LINK_TIMEOUT ends.
+    a.mov_data(Reg::Rbx, ms20);
+    sqe(
+        &mut a,
+        6,
+        abi::OP_READ,
+        abi::SQE_IO_LINK,
+        3,
+        0,
+        Some((Reg::Rbp, 600)),
+        1,
+        7,
+    );
+    sqe(
+        &mut a,
+        7,
+        abi::OP_LINK_TIMEOUT,
+        0,
+        -1,
+        0,
+        Some((Reg::Rbx, 0)),
+        1,
+        8,
+    );
+    enter(&mut a, 2, 2, u64::from(abi::ENTER_GETEVENTS));
+    expect(&mut a, 15, 2);
+    cqe(&mut a, 16, 6, 8, -62);
+    cqe(&mut a, 17, 7, 7, -125);
+    set_cq_head(&mut a, 8);
+    // 18: the pipe's write end as registered file 0, `text` as registered
+    // buffer 0: a WRITE_FIXED of it there, linked to a READ. A WRITE_FIXED
+    // of more than the buffer is -EFAULT.
+    let register = |a: &mut Asm, op: u32, n: u64| {
+        a.mov_imm(Reg::Rdi, 5);
+        a.mov_imm(Reg::Rsi, u64::from(op));
+        a.mov(Reg::Rdx, Reg::Rbp);
+        a.add_imm(Reg::Rdx, 640);
+        a.mov_imm(Reg::R10, n);
+        a.sys(sys::IO_URING_REGISTER);
+    };
+    a.mov_imm(Reg::Rax, 4);
+    a.store(Reg::Rbp, 640, Reg::Rax);
+    register(&mut a, abi::REGISTER_FILES, 1);
+    expect(&mut a, 18, 0);
+    a.mov_data(Reg::Rbx, text);
+    a.store(Reg::Rbp, 640, Reg::Rbx);
+    a.mov_imm(Reg::Rax, 6);
+    a.store(Reg::Rbp, 648, Reg::Rax);
+    register(&mut a, abi::REGISTER_BUFFERS, 1);
+    expect(&mut a, 19, 0);
+    a.mov_imm(Reg::Rax, 0);
+    a.store(Reg::Rbp, 512, Reg::Rax);
+    let fixed = abi::SQE_FIXED_FILE | abi::SQE_IO_LINK;
+    let write = abi::OP_WRITE_FIXED;
+    sqe(&mut a, 8, write, fixed, 0, 0, Some((Reg::Rbx, 0)), 6, 9);
+    let into = Some((Reg::Rbp, 512));
+    sqe(&mut a, 9, abi::OP_READ, 0, 3, 0, into, 6, 10);
+    enter(&mut a, 2, 2, u64::from(abi::ENTER_GETEVENTS));
+    expect(&mut a, 20, 2);
+    cqe(&mut a, 20, 8, 9, 6);
+    cqe(&mut a, 21, 9, 10, 6);
+    a.load(Reg::Rax, Reg::Rbp, 512);
+    expect(&mut a, 22, u64::from_le_bytes(*b"uring!\0\0"));
+    let fixed = abi::SQE_FIXED_FILE;
+    sqe(&mut a, 10, write, fixed, 0, 0, Some((Reg::Rbx, 0)), 7, 11);
+    enter(&mut a, 1, 1, 0);
+    cqe(&mut a, 23, 10, 11, -14);
+    // 14: the probe: last op SOCKET (45), 46 ops listed.
     a.mov_imm(Reg::Rdi, 5);
     a.mov_imm(Reg::Rsi, u64::from(abi::REGISTER_PROBE));
     a.mov(Reg::Rdx, Reg::Rbp);
@@ -509,7 +578,7 @@ fn uring_program() -> Vec<u8> {
     a.sys(sys::IO_URING_REGISTER);
     expect(&mut a, 14, 0);
     a.load(Reg::Rax, Reg::Rbp, 1024);
-    expect(&mut a, 14, 37 | (38 << 8));
+    expect(&mut a, 14, 45 | (46 << 8));
     a.mov_imm(Reg::R15, 0);
     a.bind(bad);
     a.mov(Reg::Rdi, Reg::R15);
@@ -3696,7 +3765,7 @@ pub(crate) fn run() {
         fail("uringtest");
     }
     println!(
-        "ichor: linux: io_uring: linked write and read, armed read woken by a child, timeout, probe ok ({syscalls} syscalls)"
+        "ichor: linux: io_uring: linked write and read, armed read woken by a child, timeouts, registered file and buffer, probe ok ({syscalls} syscalls)"
     );
 
     let (status, syscalls) = run_linux(

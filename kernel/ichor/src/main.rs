@@ -16,6 +16,7 @@ mod blktest;
 mod busytest;
 mod cellaccess;
 mod celltest;
+mod cloud;
 mod control;
 mod copytest;
 mod cred;
@@ -98,6 +99,9 @@ fn kmain(info: BootInfo) -> ! {
     }
     if let Some(secs) = cmdline.get("dhcp_lease").and_then(|v| v.parse().ok()) {
         nettest::set_lease_cap(secs);
+    }
+    if let Some(which) = cmdline.get("metadata") {
+        cloud::set(which, cmdline.get("metadata_addr"));
     }
 
     let image = info.kernel_image();
@@ -215,8 +219,24 @@ fn kmain(info: BootInfo) -> ! {
     // local to the system cell unless `control_listen`/`control_publish`
     // say otherwise; `control_exit` and `control_exit_after` end it (and
     // the machine with it), for tests.
-    if let Some(options) = control::options(&cmdline) {
-        let code = control::run(info.roots(), info.api_token(), info.api_tls(), &options);
+    // A cloud's configuration may say so too, but the boot volume's word
+    // goes first (later options count).
+    let from_cloud = cloud::config().unwrap_or_default();
+    let merged = alloc::format!("{} {}", from_cloud.options, info.cmdline());
+    if let Some(options) = control::options(&cmdline::Cmdline::new(&merged)) {
+        let pick = |volume: &'static [u8], cloud: &str| {
+            if volume.is_empty() {
+                (cloud::keep(cloud), "the cloud")
+            } else {
+                (volume, "the boot volume")
+            }
+        };
+        let code = control::run(
+            info.roots(),
+            pick(info.api_token(), &from_cloud.api_token),
+            pick(info.api_tls(), &from_cloud.api_tls),
+            &options,
+        );
         println!("ichor: control: exited with {code:?}");
         if code != Some(0) {
             shutdown(ExitStatus::Failure);

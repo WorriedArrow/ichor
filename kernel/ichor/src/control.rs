@@ -5,10 +5,19 @@
 
 use cap::{Cap, Rights};
 use frame::println;
+use frame::sync::SpinLock;
 
 use crate::kcell::{Object, System, rights};
 
 static CONTROL: &[u8] = include_bytes!(concat!(env!("ICHOR_SERVICES_DIR"), "/ichor-control"));
+
+/// The control plane's DNS resolver, which its cells use too.
+static RESOLVER: SpinLock<Option<alloc::string::String>> = SpinLock::new(None);
+
+/// The resolver for a cell's `/etc/resolv.conf`.
+pub(crate) fn resolver() -> Option<alloc::string::String> {
+    RESOLVER.lock().clone()
+}
 
 /// The service's options from the kernel command line: `control=PORT`
 /// (required), `control_listen=ADDR`, `control_publish=PORT`, `dns=ADDR`
@@ -36,6 +45,7 @@ pub(crate) fn options(c: &cmdline::Cmdline<'_>) -> Option<alloc::vec::Vec<alloc:
         },
     };
     o.push(format!("dns={dns}"));
+    *RESOLVER.lock() = Some(dns);
     if c.flag("control_plaintext") {
         o.push("plaintext".into());
     }
@@ -52,10 +62,11 @@ pub(crate) fn options(c: &cmdline::Cmdline<'_>) -> Option<alloc::vec::Vec<alloc:
 /// exit code (`None`: it could not start or was killed).
 pub(crate) fn run(
     roots: &'static [u8],
-    token: &'static [u8],
-    tls: &'static [u8],
+    (token, token_from): (&'static [u8], &str),
+    (tls, tls_from): (&'static [u8], &str),
     options: &[alloc::string::String],
 ) -> Option<u64> {
+    use alloc::format;
     // Most of memory: the control plane holds pulled layers and images,
     // and the cells it makes are carved from its account.
     let pages = frame::mm::stats().free_pages as u64 * 3 / 4;
@@ -76,20 +87,20 @@ pub(crate) fn run(
         roots.len() / 1024,
         pages / 256,
         if token.is_empty() {
-            "no API token"
+            "no API token".into()
         } else {
-            "API token from the boot volume"
+            format!("API token from {token_from}")
         },
         if tls.is_empty() {
-            "no API certificate"
+            "no API certificate".into()
         } else {
-            "API certificate from the boot volume"
+            format!("API certificate from {tls_from}")
         }
     );
     let hex = |h: cap::Handle| alloc::format!("{:x}", h.raw());
     let (me_s, switch_s, roots_s) = (hex(me), hex(switch), hex(roots_blob));
     // The API's token and TLS identity, if the boot volume has them
-    // (`\ichor\apitoken`, `\ichor\apitls.pem`).
+    // (`\ichor\apitoken`, `\ichor\apitls.pem`) or the cloud does.
     let mut secrets = alloc::vec::Vec::new();
     for (name, bytes) in [("token-blob", token), ("tls-blob", tls)] {
         if !bytes.is_empty() {

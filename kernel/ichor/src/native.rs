@@ -243,6 +243,10 @@ pub(crate) fn call(cell: &Arc<Cell>, mm: &mut Mm, nr: u64, a: [u64; 6]) -> Resul
                 .map_err(|_| Error::NoMemory)
         }
         sys::MEM_UNMAP => mm.munmap(a[0], a[1]).map_err(|_| Error::Invalid),
+        sys::MEM_AVAILABLE => {
+            let free = frame::mm::stats().free_pages as u64;
+            Ok(cell.account().available().min(free) * PAGE_SIZE)
+        }
         sys::OBJECT_WAIT => object_wait(cell, mm, a[0], a[1], a[2]),
         sys::TCP_CONNECT => {
             let s = sock::tcp_connect(cell, addr(a[0], a[1])?).map_err(errno)?;
@@ -533,9 +537,15 @@ fn write_etc(vfs: &crate::vfs::Vfs, name: &str, data: &[u8]) {
     else {
         return;
     };
-    let ino = match fs.lookup(etc, name) {
-        Ok(ino) => fs.truncate(ino, 0).map(|()| ino),
-        Err(_) => fs.create(etc, name, 0o644),
+    let there = fs.lookup(etc, name).ok();
+    let ino = match there {
+        // Not where a link points (an image's resolv.conf may be one, into
+        // a service that does not run here).
+        Some(ino) if fs.stat(ino).is_ok_and(|s| s.kind == Kind::Symlink) => fs
+            .unlink(etc, name)
+            .and_then(|()| fs.create(etc, name, 0o644)),
+        Some(ino) => fs.truncate(ino, 0).map(|()| ino),
+        None => fs.create(etc, name, 0o644),
     };
     if let Ok(ino) = ino {
         let _ = fs.write(ino, 0, data);
@@ -563,7 +573,8 @@ fn cell_create(cell: &Cell, parent: u64, image: u64, pages: u64) -> Result<u64, 
         println!("ichor: native: cell {} has no switch address", new.id());
     }
     // What a container runtime writes into every container (images do not
-    // carry them): `localhost` and the cell's own name resolve.
+    // carry them): `localhost` and the cell's own name resolve, and others
+    // are asked for where the control plane asks.
     let mut hosts = alloc::string::String::from("127.0.0.1\tlocalhost\n");
     if let Some(ip) = addr {
         let o = ip.octets();
@@ -571,6 +582,10 @@ fn cell_create(cell: &Cell, parent: u64, image: u64, pages: u64) -> Result<u64, 
     }
     write_etc(&vfs, "hosts", hosts.as_bytes());
     write_etc(&vfs, "hostname", alloc::format!("{HOSTNAME}\n").as_bytes());
+    if let Some(dns) = crate::control::resolver() {
+        let conf = alloc::format!("nameserver {dns}\n");
+        write_etc(&vfs, "resolv.conf", conf.as_bytes());
+    }
     install(
         cell,
         Object::Container(Arc::new(Container { cell: new, vfs })),

@@ -84,7 +84,7 @@ fn m1_boots_on_four_cpus() {
         "ichor: linux: mknod FIFO: ENXIO without a reader, EOF after the writer, blocking opens meet",
         "ichor: linux: close_range, fadvise64, get/setpriority, memfd_create, absolute clock_nanosleep, non-UTF-8 names ok",
         "ichor: linux: poll timeout and wakeup, epoll, eventfd ok",
-        "ichor: linux: io_uring: linked write and read, armed read woken by a child, timeout, probe ok",
+        "ichor: linux: io_uring: linked write and read, armed read woken by a child, timeouts, registered file and buffer, probe ok",
         "ichor: linux: io_uring: armed reads completed with nobody in io_uring_enter (registered eventfd, epoll on the ring)",
         "ichor: linux: fcntl record locks: conflict, F_GETLK, F_SETLKW wakeup ok",
         "ichor: linux: SCM_RIGHTS passed a descriptor over AF_UNIX, seqpacket kept boundaries, SO_PEERCRED named us",
@@ -234,7 +234,7 @@ fn m1_boots_on_one_cpu() {
         "ichor: linux: mknod FIFO: ENXIO without a reader, EOF after the writer, blocking opens meet",
         "ichor: linux: close_range, fadvise64, get/setpriority, memfd_create, absolute clock_nanosleep, non-UTF-8 names ok",
         "ichor: linux: poll timeout and wakeup, epoll, eventfd ok",
-        "ichor: linux: io_uring: linked write and read, armed read woken by a child, timeout, probe ok",
+        "ichor: linux: io_uring: linked write and read, armed read woken by a child, timeouts, registered file and buffer, probe ok",
         "ichor: linux: io_uring: armed reads completed with nobody in io_uring_enter (registered eventfd, epoll on the ring)",
         "ichor: linux: fcntl record locks: conflict, F_GETLK, F_SETLKW wakeup ok",
         "ichor: linux: SCM_RIGHTS passed a descriptor over AF_UNIX, seqpacket kept boundaries, SO_PEERCRED named us",
@@ -372,7 +372,7 @@ fn m2_scheduler_on_eight_cpus() {
         "ichor: linux: mknod FIFO: ENXIO without a reader, EOF after the writer, blocking opens meet",
         "ichor: linux: close_range, fadvise64, get/setpriority, memfd_create, absolute clock_nanosleep, non-UTF-8 names ok",
         "ichor: linux: poll timeout and wakeup, epoll, eventfd ok",
-        "ichor: linux: io_uring: linked write and read, armed read woken by a child, timeout, probe ok",
+        "ichor: linux: io_uring: linked write and read, armed read woken by a child, timeouts, registered file and buffer, probe ok",
         "ichor: linux: io_uring: armed reads completed with nobody in io_uring_enter (registered eventfd, epoll on the ring)",
         "ichor: linux: fcntl record locks: conflict, F_GETLK, F_SETLKW wakeup ok",
         "ichor: linux: SCM_RIGHTS passed a descriptor over AF_UNIX, seqpacket kept boundaries, SO_PEERCRED named us",
@@ -592,6 +592,23 @@ fn cloud_disk_boots_without_legacy_timers_on_two_sockets() {
 /// closes.
 #[test]
 fn tcp_through_virtio_net_to_a_host_echo_server() {
+    echo_through("net-echo", "virtio-net-pci,disable-legacy=on", "virtio-net");
+}
+
+/// The same through the Intel network devices of bare-metal servers.
+#[test]
+fn tcp_through_an_intel_82574_to_a_host_echo_server() {
+    echo_through("net-echo-e1000e", "e1000e", "e1000e");
+}
+
+#[test]
+fn tcp_through_an_intel_82576_to_a_host_echo_server() {
+    echo_through("net-echo-igb", "igb", "igb");
+}
+
+/// Boots with the network device `nic`, which the kernel's driver calls
+/// `name`.
+fn echo_through(run: &str, nic: &str, name: &str) {
     use std::io::{Read, Write};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -637,14 +654,16 @@ fn tcp_through_virtio_net_to_a_host_echo_server() {
             }
         }
     });
-    let out = boot("net-echo", &format!("net_echo_port={port}"), 2);
+    let out = ichor_tests::boot_with(run, &format!("net_echo_port={port}"), 2, |c| {
+        c.nic = nic.into();
+    });
     out.assert_exit(Exit::Success);
     out.assert_in_order(&[
-        "ichor: net: virtio-net ",
+        &format!("ichor: net: {name} "),
         "ichor: net: DHCP lease 10.0.2.15/24 via 10.0.2.2 from 10.0.2.2, DNS 10.0.2.3",
         "ichor: net: gateway 10.0.2.2 is at ",
         "ichor: net: tcp echo of 256 KiB through slirp ok",
-        "ichor: net: uplink 10.0.2.15 on virtio-net is the cell switch's",
+        &format!("ichor: net: uplink 10.0.2.15 on {name} is the cell switch's"),
         "through the switch; loopback is per cell",
         &format!("debian: nat: a cell echoed 256 KiB with 10.0.2.2:{port} through the uplink"),
         "debian: nat: a datagram went through the uplink and came back",

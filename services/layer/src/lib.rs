@@ -14,8 +14,31 @@ extern crate alloc;
 pub mod inflate;
 mod tar;
 
-pub use inflate::{crc32, gunzip, gunzip_all};
+pub use inflate::{crc32, gunzip, gunzip_all, gunzip_within};
 pub use tar::Tree;
+
+/// How much memory there is for a layer's work, in bytes, at each moment.
+/// A compressed layer may unpack to any size; what does not fit is an
+/// error before it is made.
+pub type Room<'a> = &'a dyn Fn() -> usize;
+
+/// As much as there is (for input of known size).
+pub const ANY: Room<'static> = &|| usize::MAX;
+
+/// Left for everything else that is allocated meanwhile.
+const SPARE: usize = 24 << 20;
+
+/// An error unless `bytes` fit in `room`.
+pub(crate) fn fits(bytes: usize, room: Room<'_>) -> Result<()> {
+    if room() >= bytes.saturating_add(SPARE) {
+        Ok(())
+    } else {
+        Err(Error(alloc::format!(
+            "{} MiB more do not fit in memory",
+            bytes.div_ceil(1 << 20)
+        )))
+    }
+}
 
 /// What was wrong with a layer.
 #[derive(Clone, Debug, PartialEq, Eq)]

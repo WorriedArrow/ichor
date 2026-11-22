@@ -1,5 +1,5 @@
-//! Milestone 5, first network test: the virtio-net driver and the
-//! `kernel/net` stack against a real peer, QEMU's user-mode network
+//! Milestone 5, first network test: a network driver (virtio-net, Intel
+//! gigabit Ethernet) and the `kernel/net` stack against a real peer, QEMU's user-mode network
 //! (slirp: gateway 10.0.2.2, this host 10.0.2.15, which its DHCP server
 //! hands out; the same code configures the uplink on a cloud VPC).
 //!
@@ -10,12 +10,14 @@
 //! harness's echo server on the host's loopback, sends [`ECHO_BYTES`]
 //! bytes, checks every byte comes back, and closes.
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
 use core::time::Duration;
 
 use frame::println;
 use net::iface::Interface;
+use net::link::Link;
 use net::tcp::{Segment, State, Tcp};
 use net::wire::{self, Echo};
 use net::{Ipv4Addr, Mac};
@@ -71,7 +73,7 @@ fn now() -> Duration {
 
 /// Moves frames between the device and the interface; returns the IP
 /// packets the interface hands up.
-fn pump(dev: &mut virtio_net::VirtioNet, ifc: &mut Interface) -> Vec<net::iface::Packet> {
+pub(crate) fn pump(dev: &mut dyn Link, ifc: &mut Interface) -> Vec<net::iface::Packet> {
     ifc.poll(now());
     while let Some(f) = ifc.transmit() {
         dev.transmit(&f);
@@ -88,24 +90,58 @@ fn pump(dev: &mut virtio_net::VirtioNet, ifc: &mut Interface) -> Vec<net::iface:
     up
 }
 
+/// The first network device there is a driver for; what does not come up is
+/// passed over.
+fn find() -> Option<Box<dyn Link>> {
+    for dev in virtio_net::probe_all() {
+        match dev {
+            Ok(d) => return Some(Box::new(d)),
+            Err(e) => println!("ichor: net: virtio-net init failed: {e:?}"),
+        }
+    }
+    // A cable in one port of several is as good as any.
+    let mut first = None;
+    for dev in intel_gbe::probe_all() {
+        match dev {
+            Ok(d) if d.link_up() => return Some(Box::new(d)),
+            Ok(d) => {
+                first.get_or_insert(d);
+            }
+            Err(e) => println!("ichor: net: Intel Ethernet init failed: {e:?}"),
+        }
+    }
+    let d = first?;
+    // It takes a while to agree with the other end.
+    let deadline = now() + Duration::from_secs(10);
+    while !d.link_up() && now() < deadline {
+        frame::task::yield_now();
+    }
+    if !d.link_up() {
+        println!("ichor: net: {} has no link yet", d.name());
+    }
+    Some(Box::new(d))
+}
+
 pub(crate) fn run() {
-    let Some(dev) = virtio_net::probe_all().into_iter().next() else {
-        println!("ichor: net: no virtio-net device");
+    let Some(mut dev) = find() else {
+        println!("ichor: net: no network device");
         return;
     };
-    let mut dev = dev.unwrap_or_else(|e| {
-        println!("ichor: net: virtio-net init failed: {e:?}");
-        fail("virtio-net init")
-    });
     let m = dev.mac();
     println!(
-        "ichor: net: virtio-net {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-        m[0], m[1], m[2], m[3], m[4], m[5]
+        "ichor: net: {} {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        dev.name(),
+        m[0],
+        m[1],
+        m[2],
+        m[3],
+        m[4],
+        m[5]
     );
     // The address from the network's DHCP server (a cloud VPC's, QEMU's),
     // else QEMU's user-network defaults.
     let mut client = None;
-    let (addr, prefix, router, mtu) = match dhcp(&mut dev, Mac(m)) {
+    let (addr, prefix, router, mtu) = match dhcp(&mut *dev, Mac(m)) {
         Some((c, l)) => {
             client = Some(c);
             let dns: Vec<_> = l.dns.iter().map(|d| alloc::format!("{d}")).collect();
@@ -147,7 +183,7 @@ pub(crate) fn run() {
     let deadline = now() + Duration::from_secs(2);
     let mut pinged = false;
     while now() < deadline && !pinged {
-        for p in pump(&mut dev, &mut ifc) {
+        for p in pump(&mut *dev, &mut ifc) {
             pinged |= p.protocol == wire::PROTO_ICMP
                 && Echo::parse(&p.payload)
                     .is_some_and(|e| e.kind == wire::ICMP_ECHO_REPLY && e.ident == PING_IDENT);
@@ -177,10 +213,11 @@ pub(crate) fn run() {
 
     let port = echo_port();
     if port != 0 {
-        tcp_echo(&mut dev, &mut ifc, port);
+        tcp_echo(&mut *dev, &mut ifc, port);
     }
+    crate::cloud::run(&mut *dev, &mut ifc);
     // From here on the device is the cell switch's uplink.
-    let link: alloc::boxed::Box<dyn net::link::Link> = alloc::boxed::Box::new(dev);
+    let link = dev;
     let name = alloc::string::String::from(link.name());
     let mtu = match MTU.load(Ordering::Relaxed) {
         0 => mtu,
@@ -196,10 +233,7 @@ pub(crate) fn run() {
 /// Asks the network's DHCP server for an address: up to 8 s, which
 /// covers the DISCOVER and two retransmissions. The client goes on with
 /// the uplink, which renews the lease.
-fn dhcp(
-    dev: &mut virtio_net::VirtioNet,
-    mac: Mac,
-) -> Option<(net::dhcp::Client, net::dhcp::Lease)> {
+fn dhcp(dev: &mut dyn Link, mac: Mac) -> Option<(net::dhcp::Client, net::dhcp::Lease)> {
     let mut xid = [0u8; 4];
     crate::random::fill(&mut xid);
     let mut c = net::dhcp::Client::new(mac, u32::from_le_bytes(xid));
@@ -228,7 +262,7 @@ pub(crate) fn echo_port() -> u16 {
 }
 
 /// Sends `ECHO_BYTES` to the harness's echo server and checks they return.
-fn tcp_echo(dev: &mut virtio_net::VirtioNet, ifc: &mut Interface, port: u16) {
+fn tcp_echo(dev: &mut dyn Link, ifc: &mut Interface, port: u16) {
     let data: Vec<u8> = (0..ECHO_BYTES)
         .map(|i| (i as u8).wrapping_mul(13) ^ (i >> 10) as u8)
         .collect();

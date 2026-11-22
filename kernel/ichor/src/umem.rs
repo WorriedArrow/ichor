@@ -579,6 +579,13 @@ impl Mm {
         self.regions.find(addr).is_some()
     }
 
+    /// Whether a file's contents are mapped at `addr`, shared.
+    pub(crate) fn maps_file(&self, addr: u64) -> bool {
+        self.regions
+            .find(addr)
+            .is_some_and(|r| matches!(&r.backing, Backing::File(f) if f.shared))
+    }
+
     /// Handles a user page fault at `addr`. Returns false if the access is
     /// not allowed (the process should get `SIGSEGV`).
     pub(crate) fn fault(&mut self, addr: u64, write: bool, exec: bool) -> bool {
@@ -747,26 +754,9 @@ impl Mm {
 
     /// Maps kernel pages shared with the kernel (an io_uring ring): placed
     /// as `mmap(MAP_SHARED | MAP_ANONYMOUS)` with `map_flags`' placement
-    /// bits would place them, the pages being `frames` instead of fresh
-    /// ones. They stay shared across `fork`. Charged as one page each while
-    /// mapped.
-    pub(crate) fn map_frames(
-        &mut self,
-        addr: u64,
-        frames: &[UFrame],
-        prot: u64,
-        map_flags: u64,
-    ) -> Result<u64, i64> {
-        let account = self.account.clone();
-        let pages: Option<Vec<Page>> = frames
-            .iter()
-            .map(|f| charged(&account, f.clone()))
-            .collect();
-        self.map_pages(addr, &pages.ok_or(ENOMEM)?, prot, map_flags)
-    }
-
-    /// [`Self::map_frames`] with pages that are charged already.
-    fn map_pages(
+    /// bits would place them, the pages being these (charged already)
+    /// instead of fresh ones. They stay shared across `fork`.
+    pub(crate) fn map_pages(
         &mut self,
         addr: u64,
         pages: &[Page],

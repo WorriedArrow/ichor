@@ -150,3 +150,15 @@ add one write's or segment's worth before the cap takes effect.
   of its own until cloud networking (milestone 8) can give it one.
 - The polled driver costs latency against Linux's interrupt-driven one;
   the benchmarks will show it, and interrupts are owed.
+
+## Amendment (2026-11-22): the machine's own addresses
+
+Clouds answer whoever asks from a machine at 169.254.169.254 (Azure: also
+at 168.63.129.16), with that machine's credentials among it. Behind the
+NAT every cell asks from the machine, so by default any container could
+take its host's identity: Docker's default, and a well-known way out of a
+container. Here link-local addresses and Azure's are the machine's alone:
+the uplink refuses a cell's connection there (with a reset, so that
+programs which probe for a cloud go on at once) and drops its datagrams,
+except for DNS, which some clouds serve at the same address. A cell that
+is to have cloud credentials will be given its own.

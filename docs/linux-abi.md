@@ -52,7 +52,7 @@ stale. Do not edit by hand.
 | 39 | `getpid` | implemented |  |
 | 40 | `sendfile` | implemented |  |
 | 41 | `socket` | partial | AF_INET (TCP, UDP) and AF_UNIX (stream, dgram, seqpacket); AF_NETLINK (NETLINK_ROUTE reads); no AF_INET6 |
-| 42 | `connect` | partial | no ICMP errors, so a connected UDP socket never sees ECONNREFUSED |
+| 42 | `connect` | partial | a connected UDP socket sees no ICMP errors from beyond the uplink |
 | 43 | `accept` | implemented |  |
 | 44 | `sendto` | partial | no out-of-band data |
 | 45 | `recvfrom` | partial | no out-of-band data |
@@ -257,9 +257,9 @@ stale. Do not edit by hand.
 | 332 | `statx` | implemented |  |
 | 334 | `rseq` | partial | always ENOSYS (libcs go without) |
 | 424 | `pidfd_send_signal` | partial | no flags |
-| 425 | `io_uring_setup` | partial | no SQPOLL/IOPOLL rings |
-| 426 | `io_uring_enter` | partial | the EXT_ARG signal mask is not applied; the worker completes armed pipe and socket operations but CONNECT runs on the submitter (it may block it); a forked child's submissions run on the parent's worker |
-| 427 | `io_uring_register` | partial | probe and eventfd only (no registered files or buffers) |
+| 425 | `io_uring_setup` | partial | no IOPOLL, NO_MMAP or ATTACH_WQ; an SQPOLL ring's poller always sleeps (NEED_WAKEUP stays set) |
+| 426 | `io_uring_enter` | partial | no personalities, extended attributes, URING_CMD or zero-copy sends, no multishot RECVMSG; opening a FIFO blocks the submitter |
+| 427 | `io_uring_register` | partial | registered buffers are address ranges (unmapped ones fail), tags are told at once; no personalities or worker limits |
 | 434 | `pidfd_open` | partial | processes only (no PIDFD_THREAD) |
 | 435 | `clone3` | partial | as clone; no CLONE_CLEAR_SIGHAND, CLONE_INTO_CGROUP or set_tid |
 | 436 | `close_range` | partial | CLOSE_RANGE_UNSHARE is EINVAL |

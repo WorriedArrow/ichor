@@ -25,9 +25,11 @@
 //! up to [`UDP_BUFFER`] bytes and drops what does not fit, as a full Linux
 //! socket does.
 //!
-//! Partial (milestone 5 so far): no IPv6, no ICMP errors for UDP (a
-//! datagram to a closed port is dropped silently, never ECONNREFUSED);
-//! socket buffers are not yet charged to the cell's account.
+//! A datagram for a port nobody has is answered with ICMP, which a
+//! connected socket reports as ECONNREFUSED, within the cell and between
+//! cells.
+//!
+//! Partial: no IPv6; ICMP errors from beyond the uplink do not pass the NAT.
 
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -41,7 +43,9 @@ use frame::task::{TaskOptions, WaitQueue};
 use net::Ipv4Addr;
 use net::iface::Packet;
 use net::tcp::{self, Segment, State, Tcp};
-use net::wire::{PROTO_TCP, PROTO_UDP, Udp};
+use net::wire::{
+    PROTO_ICMP, PROTO_TCP, PROTO_UDP, UNREACHABLE_HOST, UNREACHABLE_PORT, Udp, Unreachable,
+};
 
 use crate::poll::Watchers;
 
@@ -53,6 +57,7 @@ pub(crate) const EISCONN: i64 = 106;
 pub(crate) const ENOTCONN: i64 = 107;
 pub(crate) const ETIMEDOUT: i64 = 110;
 pub(crate) const ECONNREFUSED: i64 = 111;
+const EHOSTUNREACH: i64 = 113;
 pub(crate) const EALREADY: i64 = 114;
 pub(crate) const EINPROGRESS: i64 = 115;
 pub(crate) const EINVAL: i64 = 22;
@@ -154,6 +159,8 @@ pub(crate) const UDP_MAX: usize = 65507;
 struct Sock {
     kind: Kind,
     local: Option<Addr>,
+    /// `connect` picked `local`: nobody bound it.
+    picked: bool,
     wait: Arc<Waiters>,
     reuse_addr: bool,
     reuse_port: bool,
@@ -558,7 +565,59 @@ impl Inner {
         match p.protocol {
             PROTO_TCP => self.input(p.src, p.dst, &p.payload),
             PROTO_UDP => self.input_udp(p.src, p.dst, &p.payload),
+            PROTO_ICMP => self.input_icmp(p),
             _ => {}
+        }
+    }
+
+    /// A datagram nobody took goes back to its sender as "port
+    /// unreachable" (never one sent to several hosts, or from no single
+    /// one).
+    fn unreachable(&mut self, src: Ipv4Addr, dst: Ipv4Addr, bytes: &[u8]) {
+        let single =
+            |ip: Ipv4Addr| !ip.is_unspecified() && !ip.is_broadcast() && !ip.is_multicast();
+        if let Some(head) = bytes.first_chunk::<8>()
+            && single(src)
+            && self.is_local(dst)
+        {
+            let u = Unreachable {
+                code: UNREACHABLE_PORT,
+                src,
+                dst,
+                protocol: PROTO_UDP,
+                head: *head,
+            };
+            self.route_proto(PROTO_ICMP, dst, src, u.emit());
+        }
+    }
+
+    /// What ICMP says of a datagram we sent: the error of the socket that
+    /// sent it, if it is connected to where that went.
+    fn input_icmp(&mut self, p: &Packet) {
+        let Some(u) = Unreachable::parse(&p.payload) else {
+            return;
+        };
+        let port = |at: usize| u16::from_be_bytes([u.head[at], u.head[at + 1]]);
+        let error = match u.code {
+            // Only the host itself knows its ports.
+            UNREACHABLE_PORT if p.src == u.dst => ECONNREFUSED,
+            UNREACHABLE_HOST => EHOSTUNREACH,
+            _ => return,
+        };
+        if u.protocol != PROTO_UDP || p.dst != u.src {
+            return;
+        }
+        for (&id, s) in &mut self.socks {
+            let ours = s
+                .local
+                .is_some_and(|(ip, n)| n == port(0) && (ip.is_unspecified() || ip == u.src));
+            if let Kind::Udp { peer, .. } = &s.kind
+                && ours
+                && *peer == Some((u.dst, port(2)))
+            {
+                s.error = Some(error);
+                self.touched.insert(id);
+            }
         }
     }
 
@@ -591,7 +650,7 @@ impl Inner {
             })
             .collect();
         let Some(id) = self.choose(&found, from) else {
-            return;
+            return self.unreachable(src, dst, bytes);
         };
         // A full queue, or a cell short of memory, drops the datagram.
         if let Some(s) = self.socks.get_mut(&id)
@@ -686,6 +745,7 @@ impl Inner {
                                 queued: false,
                             },
                             local: Some(local),
+                            picked: false,
                             wait: Arc::new(Waiters::default()),
                             reuse_addr: false,
                             reuse_port: false,
@@ -912,6 +972,7 @@ impl Stack {
                     Kind::Fresh
                 },
                 local: None,
+                picked: false,
                 wait: wait.clone(),
                 reuse_addr: false,
                 reuse_port: false,
@@ -1009,6 +1070,7 @@ impl Stack {
                 Kind::Conn { .. } => return Err(EISCONN),
                 Kind::Listening { .. } => return Err(EINVAL),
             };
+            let picked = i.sock(id)?.local.is_none();
             let local = i.source_for(id, remote.0)?;
             if udp {
                 let s = i.sock(id)?;
@@ -1021,6 +1083,7 @@ impl Stack {
             let tcp = Box::new(Tcp::connect(local, remote, random_iss(), now()));
             let s = i.sock(id)?;
             s.local = Some(local);
+            s.picked = picked;
             s.kind = Kind::Conn {
                 tcp,
                 parent: None,
@@ -1039,7 +1102,14 @@ impl Stack {
         match &s.kind {
             Kind::Conn { tcp, .. } => match tcp.state() {
                 State::SynSent | State::SynReceived => None,
-                State::Closed => Some(Err(s.error.take().unwrap_or(ECONNREFUSED))),
+                State::Closed => {
+                    // It may try again, from where it is bound (if it is).
+                    s.kind = Kind::Fresh;
+                    if s.picked {
+                        s.local = None;
+                    }
+                    Some(Err(s.error.take().unwrap_or(ECONNREFUSED)))
+                }
                 _ => Some(Ok(())),
             },
             _ => Some(Err(ENOTCONN)),

@@ -96,7 +96,8 @@ my $lo = inet_aton("127.0.0.1");
 my $c = tcp();
 connect($c, pack_sockaddr_in(1, $lo)) and fail("connect to a closed port worked");
 $!{ECONNREFUSED} or fail("closed port: $!");
-close $c;
+connect($c, pack_sockaddr_in(1, $lo)) and fail("connect to a closed port worked the second time");
+$!{ECONNREFUSED} or fail("closed port, again: $!");
 # A listener on an ephemeral port; a second bind to it is refused.
 my $l = tcp();
 setsockopt($l, SOL_SOCKET, SO_REUSEADDR, 1) or fail("SO_REUSEADDR: $!");
@@ -104,6 +105,10 @@ bind($l, pack_sockaddr_in(0, $lo)) or fail("bind: $!");
 listen($l, 16) or fail("listen: $!");
 my ($port) = unpack_sockaddr_in(getsockname($l));
 $port >= 32768 or fail("ephemeral port $port");
+# The socket that was refused may connect after all.
+connect($c, pack_sockaddr_in($port, $lo)) or fail("connect after a refusal: $!");
+accept(my $ca, $l) or fail("accept after a refusal: $!");
+close $ca; close $c;
 -S $l or fail("fstat: not a socket");
 readlink("/proc/self/fd/" . fileno($l)) =~ /^socket:\[\d+\]$/ or fail("/proc/self/fd link");
 unpack("i", getsockopt($l, SOL_SOCKET, SO_TYPE)) == SOCK_STREAM or fail("SO_TYPE");
@@ -206,6 +211,21 @@ listen($u4, 1) and fail("listen on udp worked");
 fcntl($u2, F_SETFL, O_NONBLOCK) or fail("F_SETFL: $!");
 defined(sysread($u2, $m, 100)) and fail("empty udp read returned");
 $!{EAGAIN} or fail("empty non-blocking udp read: $!");
+# A connected socket learns that nobody listens, once; another does not.
+my $gone = udp();
+bind($gone, pack_sockaddr_in(0, $lo)) or fail("udp bind: $!");
+my $dead = getsockname($gone);
+close $gone;
+my $u5 = udp();
+connect($u5, $dead) or fail("udp connect: $!");
+syswrite($u5, "anyone?") == 7 or fail("udp write to a closed port: $!");
+my $rin5 = ""; vec($rin5, fileno($u5), 1) = 1;
+select(my $rout5 = $rin5, undef, undef, 5) == 1 or fail("an error does not make a socket ready");
+defined(sysread($u5, $m, 100)) and fail("read from a closed port");
+$!{ECONNREFUSED} or fail("a closed udp port: $!");
+unpack("i", getsockopt($u5, SOL_SOCKET, SO_ERROR)) == 0 or fail("the error stayed");
+send($u3, "anyone?", 0, $dead) == 7 or fail("udp send to a closed port: $!");
+unpack("i", getsockopt($u3, SOL_SOCKET, SO_ERROR)) == 0 or fail("an unconnected socket got an error");
 print "debian: udp: datagrams keep boundaries and sources, truncate, connect filters, ports are per protocol\n";
 "#;
 
@@ -540,7 +560,40 @@ sysopen(my $both, "/tmp/both", O_RDWR) or fail("O_RDWR FIFO: $!");
 (fcntl($both, F_GETFL, 0) & 3) == O_RDWR or fail("F_GETFL of an O_RDWR FIFO");
 syswrite($both, "round") == 5 && sysread($both, $m, 10) == 5 && $m eq "round" or fail("through an O_RDWR FIFO: $!");
 sysopen(my $one, "/tmp/both", O_WRONLY | O_NONBLOCK) or fail("a writer beside it: $!");
+(stat $both)[0] == (stat "/tmp/both")[0] && (stat _)[1] == (stat $both)[1] or fail("an open FIFO is not the FIFO");
 close $both;
+# A descriptor that only names a file, a symlink itself included.
+unlink "/tmp/named"; symlink("both", "/tmp/named") or fail("symlink: $!");
+sysopen(my $named, "/tmp/named", 010000000 | 0400000) or fail("O_PATH of a symlink: $!");
+((stat $named)[2] & 0170000) == 0120000 or fail("O_PATH followed the symlink");
+defined(sysread($named, $m, 1)) and fail("read through O_PATH");
+$!{EBADF} or fail("read through O_PATH: $!");
+sysopen(my $null, "/dev/null", O_RDWR) or fail("/dev/null: $!");
+sysseek($null, 100, 0) or fail("seek in /dev/null: $!");
+open(my $perl, "<", "/usr/bin/perl") or fail("open: $!");
+my $before = pack("q", -1);
+syscall(40, $wf, fileno $perl, $before, 10) == -1 && $!{EINVAL} or fail("sendfile from before the start: $!");
+sysopen(my $pdir, "/proc/$$", O_RDONLY) or fail("/proc/<pid>: $!");
+syscall(424, fileno $pdir, 0, 0, 0) == 0 or fail("a signal by /proc/<pid>: $!");
+syscall(424, $wf, 0, 0, 0) == -1 && $!{EBADF} or fail("a signal by a pipe: $!");
+# A futex waits until a time of the wall clock, not for ever.
+for my $when (time + 1, time - 100) {
+    my ($word, $ts) = (pack("L", 5), pack("qq", $when, 0));
+    syscall(202, $word, 9 | 256, 5, $ts, 0, 0xffffffff) == -1 && $!{ETIMEDOUT} or fail("a wall-clock futex wait: $!");
+    time - $when < 30 or $when < time - 50 or fail("a wall-clock futex wait was late");
+}
+# A process's files in /proc are its user's; with the machine's boot time
+# they say when it began.
+my $kid = fork // fail("fork: $!");
+if ($kid == 0) { $) = "33 33"; $> = 33; sleep 60; exit 0 }
+for (1 .. 3000) { last if (stat "/proc/$kid")[4] == 33; select undef, undef, undef, 0.01 }
+(stat "/proc/$kid/status")[4] == 33 && (stat "/proc/$kid")[5] == 33 or fail("/proc/<pid> is not its user's");
+open(my $kst, "<", "/proc/$kid/stat") or fail("stat: $!");
+(stat $kst)[4] == 33 && (stat $kst)[1] == (stat "/proc/$kid/stat")[1] or fail("fstat in /proc");
+my $began = (split / /, (<$kst> =~ /.*\) (.*)/s)[0])[19] / 100;
+my ($btime) = `cat /proc/stat` =~ /^btime (\d+)$/m;
+abs($btime + $began - time) < 120 or fail("booted at $btime, began $began later");
+kill "KILL", $kid; waitpid($kid, 0);
 { local $SIG{PIPE} = "IGNORE"; defined(syswrite($one, "x")) and fail("a write with no reader left"); $!{EPIPE} or fail("no reader: $!") }
 # A title written over argv is what /proc shows; many arguments, long ones.
 $0 = "a title";
@@ -726,6 +779,14 @@ my $reply = "";
 while (1) { my $r = sysread($s, my $buf, 4096); defined $r or fail("read: $!"); last if !$r; $reply .= $buf }
 $reply eq "$me $n\n" or fail("reply [$reply]");
 print "debian: cells: $me sent 1 MiB to $server through the switch; loopback is per cell\n";
+# The other cell says so when nobody has a port there.
+socket(my $v, AF_INET, SOCK_DGRAM, 0) or fail("udp socket: $!");
+connect($v, pack_sockaddr_in($port + 1, inet_aton($server))) or fail("udp connect: $!");
+syswrite($v, "anyone?") == 7 or fail("udp write: $!");
+my $vin = ""; vec($vin, fileno($v), 1) = 1;
+select(my $vout = $vin, undef, undef, 30) == 1 or fail("no word of a closed port in the other cell");
+defined(sysread($v, my $nothing, 10)) and fail("read from a closed port in the other cell");
+$!{ECONNREFUSED} or fail("a closed port in the other cell: $!");
 socket(my $u, AF_INET, SOCK_DGRAM, 0) or fail("udp socket: $!");
 my $to = pack_sockaddr_in($port, inet_aton($server));
 send($u, "ping", 0, $to) == 4 or fail("udp send: $!");
@@ -742,6 +803,12 @@ print "debian: cells: a datagram crossed the switch and came back\n";
 const NAT_CLIENT: &str = r#"use strict; use warnings; use Socket;
 sub fail { print "debian: nat FAILED: @_\n"; exit 1 }
 my ($host, $port) = @ARGV;
+# What a cloud tells the machine is not for its cells.
+for my $addr ("169.254.169.254", "168.63.129.16") {
+    socket(my $md, AF_INET, SOCK_STREAM, 0) or fail("socket: $!");
+    connect($md, pack_sockaddr_in(80, inet_aton($addr))) and fail("connected to the machine's $addr");
+    $!{ECONNREFUSED} or fail("$addr: $!");
+}
 socket(my $s, AF_INET, SOCK_STREAM, 0) or fail("socket: $!");
 connect($s, pack_sockaddr_in($port, inet_aton($host))) or fail("connect: $!");
 my $n = 256 * 1024;

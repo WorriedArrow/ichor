@@ -13,7 +13,7 @@
 //! (an open count on an inode, a reader/writer count on a pipe), so a file
 //! survives `unlink` while open.
 
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 
 use frame::mm::VmSpace;
@@ -55,6 +55,8 @@ pub(crate) struct PipeEnd {
     pub(crate) read: bool,
     pub(crate) write: bool,
     pub(crate) nonblock: bool,
+    /// The FIFO it was opened through (counted as open).
+    pub(crate) fifo: Option<Ino>,
 }
 
 impl PipeEnd {
@@ -65,6 +67,7 @@ impl PipeEnd {
             read: !write,
             write,
             nonblock,
+            fifo: None,
         }
     }
 
@@ -81,6 +84,7 @@ impl PipeEnd {
             read,
             write,
             nonblock,
+            fifo: None,
         }
     }
 
@@ -174,7 +178,12 @@ impl Drop for Description {
                 crate::linuxabi::inotify::note_close(&self.vfs, of.ino, write);
                 self.vfs.lock().close(of.ino)
             }
-            Fd::Pipe(e) => e.close(),
+            Fd::Pipe(e) => {
+                e.close();
+                if let Some(ino) = e.fifo {
+                    self.vfs.lock().close(ino);
+                }
+            }
         }
     }
 }
@@ -231,6 +240,10 @@ pub(crate) struct Group {
     pub(crate) prctl: SpinLock<Prctl>,
     /// User CPU time of threads that have exited (`cpu_ns`).
     gone_cpu_ns: core::sync::atomic::AtomicU64,
+    /// The io_uring instances operations of it wait in, and whether one's
+    /// object has changed (looked at after each system call).
+    pub(crate) rings: SpinLock<Vec<Weak<crate::linuxabi::uring::Ring>>>,
+    pub(crate) ring_due: Arc<core::sync::atomic::AtomicBool>,
 }
 
 /// State `prctl` sets.
@@ -330,8 +343,8 @@ impl Group {
     /// in its memory now, as a program may write a title for itself there.
     /// A title that is longer (it took the last NUL) ends at the next.
     pub(crate) fn cmdline(&self) -> Vec<u8> {
-        let args = self.exe.lock().1;
         let mut mm = self.mm();
+        let args = self.exe.lock().1;
         let mut read = |from: u64, to: u64| {
             let mut b = alloc::vec![0u8; to.saturating_sub(from).min(CMDLINE_MAX) as usize];
             let n = mm.copy_from_user(from, &mut b);
@@ -366,6 +379,11 @@ impl Group {
 
     pub(crate) fn umask(&self) -> u32 {
         self.files.lock().umask
+    }
+
+    /// Its address space now.
+    pub(crate) fn space(&self) -> Arc<VmSpace> {
+        self.space.lock().clone()
     }
 
     /// The descriptor `fd`'s description, if open.
@@ -523,7 +541,20 @@ impl Group {
         if !last {
             return None;
         }
+        self.wake_rings();
         Some(self.exit.lock().unwrap_or(status))
+    }
+
+    /// Wakes the workers of the process's io_uring instances, to see that
+    /// it ends, or runs another program.
+    fn wake_rings(&self) {
+        let rings: Vec<_> = {
+            let rings = self.rings.lock();
+            rings.iter().filter_map(Weak::upgrade).collect()
+        };
+        for r in rings {
+            r.wake();
+        }
     }
 }
 
@@ -562,6 +593,8 @@ pub(crate) struct LinuxProcess {
     /// The deadline of a timed wait that a signal interrupted, for when the
     /// call is restarted (no handler ran): it waits on, not over.
     pub(crate) resume_until: Option<core::time::Duration>,
+    /// What the thread keeps for io_uring. Not inherited.
+    pub(crate) uring: crate::linuxabi::uring::Thread,
     /// The cell pays for its kernel stack.
     _stack: Reserved,
 }
@@ -616,6 +649,8 @@ impl LinuxProcess {
             creds: SpinLock::new(crate::cred::Creds::root()),
             prctl: SpinLock::new(Prctl::default()),
             gone_cpu_ns: core::sync::atomic::AtomicU64::new(0),
+            rings: SpinLock::new(Vec::new()),
+            ring_due: Default::default(),
         });
         entry.set_group(&group);
         Some(Self {
@@ -627,6 +662,7 @@ impl LinuxProcess {
             clear_tid: 0,
             robust_list: 0,
             resume_until: None,
+            uring: Default::default(),
             _stack: stack,
         })
     }
@@ -672,6 +708,8 @@ impl LinuxProcess {
             creds: SpinLock::new(self.group.creds()),
             prctl: SpinLock::new(self.group.prctl.lock().clone()),
             gone_cpu_ns: core::sync::atomic::AtomicU64::new(0),
+            rings: SpinLock::new(Vec::new()),
+            ring_due: Default::default(),
         });
         entry.set_group(&group);
         let c = group.creds();
@@ -685,6 +723,7 @@ impl LinuxProcess {
             clear_tid: 0,
             robust_list: 0,
             resume_until: None,
+            uring: Default::default(),
             _stack: stack,
         })
     }
@@ -720,6 +759,7 @@ impl LinuxProcess {
             clear_tid: 0,
             robust_list: 0,
             resume_until: None,
+            uring: Default::default(),
             _stack: stack,
         })
     }
@@ -752,6 +792,7 @@ impl LinuxProcess {
             clear_tid: 0,
             robust_list: 0,
             resume_until: None,
+            uring: Default::default(),
             _stack: stack,
         })
     }
@@ -767,24 +808,38 @@ impl LinuxProcess {
         self.group.mm.lock()
     }
 
-    /// Replaces the address space (`execve`), returning the old one.
-    pub(crate) fn replace_mm(&self, mm: Mm) -> Mm {
+    /// Replaces the address space (`execve`) by that of the program at
+    /// `path`, returning the old one.
+    pub(crate) fn replace_mm(&self, mm: Mm, path: &str, name: &str, args: Args) -> Mm {
         let mut cur = self.group.mm.lock();
+        // Together, so that nobody looks for one's arguments in the other.
+        self.group.set_exec(path, name, args);
         // Not the old space's last reference: the old `Mm` holds one.
         *self.group.space.lock() = mm.shared_space();
-        core::mem::replace(&mut *cur, mm)
+        let old = core::mem::replace(&mut *cur, mm);
+        drop(cur);
+        self.group.wake_rings();
+        old
     }
 
     /// Copies `data` to user memory at `va` with the permissions a user
     /// store has (faulting pages in, breaking copy-on-write). Returns how
     /// many bytes were copied.
     pub(crate) fn copy_to_user(&mut self, va: u64, data: &[u8]) -> usize {
+        if let Some(b) = self.uring.written(va, data.len()) {
+            b.copy_from_slice(data);
+            return data.len();
+        }
         self.copy_user(va, UserBuf::To(data))
     }
 
     /// Copies user memory at `va` into `out` with the permissions a user
     /// load has (faulting pages in). Returns how many bytes were copied.
     pub(crate) fn copy_from_user(&mut self, va: u64, out: &mut [u8]) -> usize {
+        if let Some(kept) = self.uring.kept(va, out.len()) {
+            out.copy_from_slice(kept);
+            return out.len();
+        }
         self.copy_user(va, UserBuf::From(out))
     }
 
@@ -830,12 +885,33 @@ impl LinuxProcess {
 
     /// The descriptor `fd`'s description, if open.
     pub(crate) fn desc(&self, fd: u64) -> Option<Arc<Description>> {
-        self.group.desc(fd)
+        match self.uring.lent(fd) {
+            Some(d) => Some(d.clone()),
+            None => self.group.desc(fd),
+        }
     }
 
-    /// A snapshot of what descriptor `fd` names, if open.
+    /// A snapshot of what descriptor `fd` names, if open. One lent to an
+    /// io_uring operation does not block.
     pub(crate) fn fd(&self, fd: u64) -> Option<Fd> {
-        self.group.fd(fd)
+        let Some(d) = self.uring.lent(fd) else {
+            return self.group.fd(fd);
+        };
+        let mut f = d.state().clone();
+        match &mut f {
+            Fd::Pipe(e) => e.nonblock = true,
+            Fd::Object(o) => o.nonblock = true,
+            Fd::Console | Fd::File(_) | Fd::Dev(_) => {}
+        }
+        Some(f)
+    }
+
+    /// Takes a descriptor out of the table, open as it is (an io_uring
+    /// direct descriptor).
+    pub(crate) fn take_desc(&mut self, fd: u64) -> Option<Arc<Description>> {
+        let mut files = self.group.files.lock();
+        let slot = files.fds.get_mut(usize::try_from(fd).ok()?)?.take()?;
+        Some(slot.desc)
     }
 
     /// Runs `f` on an open file's state (its offset, say), shared by every

@@ -42,9 +42,29 @@ fn read_off(p: &mut LinuxProcess, at: u64) -> Result<Option<u64>, i64> {
 /// Where in a file a splice is: at the caller's offset, or the
 /// description's.
 struct At {
-    /// The user's `loff_t *`, and its value.
+    /// The offset given, and the `loff_t *` it came from (0: none).
     given: Option<(u64, u64)>,
     fd: u64,
+}
+
+/// The offset a splice is given.
+#[derive(Clone, Copy)]
+pub(super) enum Off {
+    /// A `loff_t *` (null: the description's).
+    User(u64),
+    /// By value (io_uring; -1: the description's).
+    Value(u64),
+}
+
+impl Off {
+    fn read(self, p: &mut LinuxProcess) -> Result<Option<(u64, u64)>, i64> {
+        match self {
+            Off::User(at) => Ok(read_off(p, at)?.map(|v| (at, v))),
+            Off::Value(u64::MAX) => Ok(None),
+            Off::Value(v) if v > i64::MAX as u64 => Err(EINVAL),
+            Off::Value(v) => Ok(Some((0, v))),
+        }
+    }
 }
 
 impl At {
@@ -65,7 +85,7 @@ impl At {
     /// Writes the offset back to the user.
     fn store(&self, p: &mut LinuxProcess) -> Result<(), i64> {
         match self.given {
-            Some((at, v)) if p.copy_to_user(at, &v.to_le_bytes()) != 8 => Err(EFAULT),
+            Some((at, v)) if at != 0 && p.copy_to_user(at, &v.to_le_bytes()) != 8 => Err(EFAULT),
             _ => Ok(()),
         }
     }
@@ -92,15 +112,32 @@ fn put(p: &mut LinuxProcess, f: &Fd, at: &mut At, data: &[u8], nb: bool) -> Resu
 /// what one read of the other side gives. Bytes taken out of a pipe that
 /// the other side does not take go back.
 pub(super) fn splice(p: &mut LinuxProcess, a: &[u64; 6]) -> Result<u64, i64> {
-    let (fd_in, off_in, fd_out, off_out, len, flags) = (a[0], a[1], a[2], a[3], a[4], a[5]);
+    splice_at(
+        p,
+        (a[0], Off::User(a[1])),
+        (a[2], Off::User(a[3])),
+        a[4],
+        a[5],
+    )
+}
+
+pub(super) fn splice_at(
+    p: &mut LinuxProcess,
+    (fd_in, off_in): (u64, Off),
+    (fd_out, off_out): (u64, Off),
+    len: u64,
+    flags: u64,
+) -> Result<u64, i64> {
     let nb = flags & SPLICE_F_NONBLOCK != 0;
     if flags & !SPLICE_F_ALL != 0 {
         return Err(EINVAL);
     }
     let (src, dst) = (p.fd(fd_in).ok_or(EBADF)?, p.fd(fd_out).ok_or(EBADF)?);
-    for (f, off, write) in [(&src, off_in, false), (&dst, off_out, true)] {
+    let given_in = off_in.read(p)?;
+    let given_out = off_out.read(p)?;
+    for (f, off, write) in [(&src, given_in, false), (&dst, given_out, true)] {
         match f {
-            Fd::Pipe(_) if off != 0 => return Err(ESPIPE),
+            Fd::Pipe(_) if off.is_some() => return Err(ESPIPE),
             Fd::Pipe(e) if !(if write { e.write } else { e.read }) => return Err(EBADF),
             Fd::Pipe(_) => {}
             Fd::File(of) => {
@@ -112,17 +149,16 @@ pub(super) fn splice(p: &mut LinuxProcess, a: &[u64; 6]) -> Result<u64, i64> {
                     return Err(EINVAL);
                 }
             }
-            _ if off != 0 => return Err(ESPIPE),
+            _ if off.is_some() => return Err(ESPIPE),
             _ => {}
         }
     }
-    let given = |p: &mut LinuxProcess, at: u64| read_off(p, at).map(|v| v.map(|v| (at, v)));
     let mut at_in = At {
-        given: given(p, off_in)?,
+        given: given_in,
         fd: fd_in,
     };
     let mut at_out = At {
-        given: given(p, off_out)?,
+        given: given_out,
         fd: fd_out,
     };
     let len = usize::try_from(len).unwrap_or(usize::MAX);

@@ -118,7 +118,18 @@ pub(super) fn send_signal(
     if flags != 0 {
         return Err(EINVAL);
     }
-    let e = entry(p, fd)?;
+    // A `/proc/<pid>` directory will do.
+    let e = match p.fd(fd) {
+        Some(Fd::Object(o)) if o.obj.proc_dir().is_some() => {
+            let of = o.obj.proc_dir().and_then(|d| d.strip_prefix("/proc/"));
+            let pid = match of.ok_or(EBADF)? {
+                "self" => p.group.tgid,
+                n => n.parse().map_err(|_| EBADF)?,
+            };
+            proc::find(p.entry.cell, pid).ok_or(ESRCH)?
+        }
+        _ => entry(p, fd)?,
+    };
     if e.cell != p.entry.cell || proc::exit_status(&e).is_some() {
         return Err(ESRCH);
     }

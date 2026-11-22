@@ -18,8 +18,9 @@ Every line goes to the serial console, so read it there:
   (`GPT disk, Ichor root partition at sector ...`)
 - NVMe command timeouts or error statuses, if any (opcode, queue, status)
 
-The only network driver is virtio-net (milestone 5); cloud NICs (AWS ENA,
-GCP gVNIC) come with milestone 8. On most cloud instance types the VM
+The network drivers are virtio-net and Intel gigabit Ethernet (82574L, and
+the 82576/I350/I210 family, for bare metal); cloud NICs (AWS ENA, GCP
+gVNIC) come with milestone 8. On most cloud instance types the VM
 therefore cannot be reached over the network, only through its serial
 console.
 
@@ -56,6 +57,36 @@ Clients connect with gRPC over TLS 1.3 to the uplink's port 50051, trust
 `api-cert.pem`, expect the name `ichor.example`, and send `authorization:
 Bearer <token>` with every call. The key and the token are on the disk
 unencrypted: whoever can read the image has them.
+
+### Configuration from the cloud
+
+One image can serve many machines: with `metadata=gcp`, `aws`, `azure` or
+`auto` on its command line, the kernel asks the cloud's metadata service
+for the machine's configuration once, at boot, and puts no secret on the
+disk. The configuration is the instance attribute `ichor` on GCP, and the
+user data on AWS (IMDSv2) and Azure:
+
+```text
+# what this machine is for
+control=50051 control_publish=50051
+api-token = 6f1d...
+-----BEGIN CERTIFICATE-----
+...
+-----END CERTIFICATE-----
+-----BEGIN PRIVATE KEY-----
+...
+-----END PRIVATE KEY-----
+```
+
+`control*` and `dns` options, the token and the certificate are read; a
+script (`#!`) has none of them. What the boot volume says goes over it.
+Whoever may change a machine's metadata can so take its API; whoever may
+read it has its secrets. Cells cannot reach the service (ADR-0010's
+amendment).
+
+This is tested against the host playing AWS
+(`a_machine_is_configured_by_its_clouds_metadata_service`); GCP's and
+Azure's answers only in host tests, and none on a real cloud.
 
 ## AWS (Nitro instances: NVMe boot volume, COM1 serial console)
 
@@ -103,7 +134,6 @@ with no NVMe at all.
 ## Not supported yet
 
 - Azure (Hyper-V VMBus storage and network).
-- Cloud NICs other than virtio-net (AWS ENA, GCP gVNIC); the cloud's
-  metadata server (instance attributes, SSH keys, startup configuration).
+- Cloud NICs other than virtio-net (AWS ENA, GCP gVNIC).
 - Secure Boot: launch with it off (the default for custom AWS AMIs; on
   GCP, without Shielded VM Secure Boot).
