@@ -65,6 +65,9 @@ mod sys {
     pub(super) const CLOCK_GETTIME: u64 = 228;
     pub(super) const MKNOD: u64 = 133;
     pub(super) const SYMLINK: u64 = 88;
+    pub(super) const SENDFILE: u64 = 40;
+    pub(super) const FTRUNCATE: u64 = 77;
+    pub(super) const LSEEK: u64 = 8;
     pub(super) const CLOCK_GETRES: u64 = 229;
     pub(super) const FALLOCATE: u64 = 285;
     pub(super) const SYNC_FILE_RANGE: u64 = 277;
@@ -1409,6 +1412,77 @@ fn misc_program() -> Vec<u8> {
         a.sys(call);
         check(&mut a, n, want);
     }
+    a.mov_imm(Reg::Rdi, 0);
+    a.bind(bad);
+    a.sys(sys::EXIT_GROUP);
+    static_elf(&a.finish(BLOB_VADDR).unwrap_or_else(|| fail("assembler")))
+}
+
+/// sendfile reports what it wrote: from a 1 MiB file into a non-blocking
+/// AF_UNIX stream socket nobody reads, the first call sends part of the
+/// file (more than 0, less than all; never EAGAIN after progress) and
+/// leaves the file offset there; the next call, with no room, is EAGAIN.
+/// Exits 0, or the failed check.
+fn sendfile_program() -> Vec<u8> {
+    const SOCK_STREAM_NONBLOCK: u64 = 1 | 0o4000;
+    const LEN: u64 = 1 << 20;
+    let mut a = Asm::new();
+    let bad = a.label();
+    let path = a.data(b"/sendfile\0");
+    a.mov(Reg::Rbp, Reg::Rsp);
+    a.sub_imm(Reg::Rbp, 4096);
+    a.mov_imm(Reg::Rdi, 1); // AF_UNIX
+    a.mov_imm(Reg::Rsi, SOCK_STREAM_NONBLOCK);
+    a.mov_imm(Reg::Rdx, 0);
+    a.mov(Reg::R10, Reg::Rbp);
+    a.sys(sys::SOCKETPAIR);
+    a.mov_imm(Reg::Rdi, 1);
+    a.cmp_imm(Reg::Rax, 0);
+    a.jne(bad);
+    a.load32(Reg::R12, Reg::Rbp, 0); // the end to send on
+    a.mov_data(Reg::Rdi, path);
+    a.mov_imm(Reg::Rsi, 0o102); // O_RDWR | O_CREAT
+    a.mov_imm(Reg::Rdx, 0o644);
+    a.sys(sys::OPEN);
+    a.mov(Reg::R13, Reg::Rax);
+    a.mov(Reg::Rdi, Reg::R13);
+    a.mov_imm(Reg::Rsi, LEN);
+    a.sys(sys::FTRUNCATE);
+    a.mov_imm(Reg::Rdi, 2);
+    a.cmp_imm(Reg::Rax, 0);
+    a.jne(bad);
+    // sendfile(sock, file, NULL, LEN): 0 < n < LEN.
+    a.mov(Reg::Rdi, Reg::R12);
+    a.mov(Reg::Rsi, Reg::R13);
+    a.mov_imm(Reg::Rdx, 0);
+    a.mov_imm(Reg::R10, LEN);
+    a.sys(sys::SENDFILE);
+    a.mov(Reg::R14, Reg::Rax);
+    a.mov_imm(Reg::Rdi, 3);
+    a.cmp_imm(Reg::Rax, 0);
+    a.jbe(bad); // 0, or an error (as unsigned: huge, caught below)
+    a.mov_imm(Reg::Rcx, LEN);
+    a.mov_imm(Reg::Rdi, 4);
+    a.cmp(Reg::Rcx, Reg::Rax);
+    a.jbe(bad); // LEN <= n: all of it, or an error's huge unsigned value
+    // The file offset is where the sending stopped.
+    a.mov(Reg::Rdi, Reg::R13);
+    a.mov_imm(Reg::Rsi, 0);
+    a.mov_imm(Reg::Rdx, 1); // SEEK_CUR
+    a.sys(sys::LSEEK);
+    a.mov_imm(Reg::Rdi, 5);
+    a.cmp(Reg::Rax, Reg::R14);
+    a.jne(bad);
+    // Nothing more fits: EAGAIN.
+    a.mov(Reg::Rdi, Reg::R12);
+    a.mov(Reg::Rsi, Reg::R13);
+    a.mov_imm(Reg::Rdx, 0);
+    a.mov_imm(Reg::R10, LEN);
+    a.sys(sys::SENDFILE);
+    a.mov_imm(Reg::Rcx, (-11i64) as u64);
+    a.mov_imm(Reg::Rdi, 6);
+    a.cmp(Reg::Rax, Reg::Rcx);
+    a.jne(bad);
     a.mov_imm(Reg::Rdi, 0);
     a.bind(bad);
     a.sys(sys::EXIT_GROUP);
@@ -3176,6 +3250,15 @@ pub(crate) fn run() {
     }
     println!(
         "ichor: linux: a backward rep movsq resumed backward across 16 page faults; DF kept across a syscall"
+    );
+
+    let (status, _) = run_linux(new_process(), &sendfile_program(), None, &["sendfiletest"]);
+    if status != 0 {
+        println!("ichor: linux: sendfiletest failed check {status}");
+        fail("sendfile progress");
+    }
+    println!(
+        "ichor: linux: sendfile into a full non-blocking socket reports what it sent, then EAGAIN"
     );
 
     let (status, _) = run_linux(new_process(), &fork_charge_program(), None, &["forkcharge"]);

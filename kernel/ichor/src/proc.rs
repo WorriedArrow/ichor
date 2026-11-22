@@ -532,9 +532,16 @@ pub(crate) fn run(mut p: LinuxProcess, mut ctx: UserContext) -> (u32, u32) {
                     _ => signal::SIGSEGV,
                 };
                 if let Some(status) = signal::fault(&mut p, &mut ctx, sig, cr2) {
+                    // The cell's memory with it: a fault the kernel could
+                    // not serve is often a full account.
+                    let acct = p.cell.account();
                     println!(
-                        "ichor: linux: pid {} killed: exception {vector} at rip {:#x} (cr2 {cr2:#x})",
-                        p.entry.pid, ctx.rip
+                        "ichor: linux: pid {} killed: exception {vector} at rip {:#x} (cr2 {cr2:#x}); cell {} uses {} of {} pages",
+                        p.entry.pid,
+                        ctx.rip,
+                        p.cell.id(),
+                        acct.used(),
+                        acct.limit()
                     );
                     p.group.begin_exit(status, &p.entry);
                     break status;

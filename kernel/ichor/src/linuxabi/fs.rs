@@ -1270,27 +1270,37 @@ pub(super) fn sendfile(
     };
     let mut buf = alloc::vec![0u8; CHUNK];
     let mut done = 0usize;
+    // What counts is what was written, not what was read: a socket or a
+    // pipe may take part of a chunk, and an error after some progress
+    // (EAGAIN on a full non-blocking socket, a signal) returns the
+    // progress, as Linux does. Otherwise a non-blocking caller told EAGAIN
+    // sends again what already went out (asyncio did, without end).
     while done < count {
         let want = CHUNK.min(count - done);
-        let n = p.vfs.read(src.ino, offset, &mut buf[..want])?;
+        let n = match p.vfs.read(src.ino, offset, &mut buf[..want]) {
+            Ok(n) => n,
+            Err(e) if done == 0 => return Err(e),
+            Err(_) => break,
+        };
         if n == 0 {
             break;
         }
-        match p.fd(out_fd).ok_or(EBADF)? {
-            Fd::Console => console_bytes(&buf[..n]),
-            Fd::Dev(d) => {
-                d.write(n)?;
+        let wrote: Result<usize, i64> = match p.fd(out_fd).ok_or(EBADF)? {
+            Fd::Console => {
+                console_bytes(&buf[..n]);
+                Ok(n)
             }
+            Fd::Dev(d) => d.write(n).map(|_| n),
             Fd::Object(o) => {
                 let entry = p.entry.clone();
                 o.obj
-                    .write(&buf[..n], o.nonblock, &|| proc::interrupted(&entry))?;
+                    .write(&buf[..n], o.nonblock, &|| proc::interrupted(&entry))
             }
-            Fd::Pipe(e) if !e.write => return Err(EBADF),
+            Fd::Pipe(e) if !e.write => Err(EBADF),
             Fd::Pipe(e) => {
                 let entry = p.entry.clone();
                 e.pipe
-                    .write(&buf[..n], e.nonblock, &|| proc::interrupted(&entry))?;
+                    .write(&buf[..n], e.nonblock, &|| proc::interrupted(&entry))
             }
             Fd::File(o) => {
                 let at = if o.flags & O_APPEND != 0 {
@@ -1298,14 +1308,25 @@ pub(super) fn sendfile(
                 } else {
                     o.offset
                 };
-                p.fs().write(o.ino, at, &buf[..n])?;
-                p.with_file(out_fd, |of| {
-                    of.offset = at + n as u64;
-                });
+                let r = p.fs().write(o.ino, at, &buf[..n]);
+                if let Ok(m) = r {
+                    p.with_file(out_fd, |of| {
+                        of.offset = at + m as u64;
+                    });
+                }
+                r
             }
+        };
+        let m = match wrote {
+            Ok(m) => m,
+            Err(e) if done == 0 => return Err(e),
+            Err(_) => break,
+        };
+        offset += m as u64;
+        done += m;
+        if m < n {
+            break; // the rest did not fit: report what went
         }
-        offset += n as u64;
-        done += n;
     }
     if offp != 0 {
         if p.copy_to_user(offp, &offset.to_le_bytes()) != 8 {
