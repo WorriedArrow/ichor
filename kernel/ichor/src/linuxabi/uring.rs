@@ -396,7 +396,10 @@ impl Ring {
             return;
         }
         let me = self.me.clone();
-        if !crate::proc::start_helper(p.helper(), move |p| worker(&me, p)) {
+        let started = p
+            .helper()
+            .is_some_and(|h| crate::proc::start_helper(h, move |p| worker(&me, p)));
+        if !started {
             self.worker.store(false, Ordering::Release);
         }
     }

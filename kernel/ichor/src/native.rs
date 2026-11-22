@@ -625,7 +625,7 @@ fn spawn(c: &Container, spec: &[u8]) -> Result<Arc<Process>, Error> {
     let (argv, envp) = parse_spec(spec)?;
     let path = find(&c.vfs, &argv[0], &envp).ok_or(Error::NotFound)?;
     let mut p = LinuxProcess::new(c.cell.clone(), c.vfs.clone()).ok_or(Error::NoMemory)?;
-    let output = Pipe::new();
+    let output = Pipe::new(c.cell.account());
     p.close(1);
     p.close(2);
     let end = PipeEnd {

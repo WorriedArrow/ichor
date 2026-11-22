@@ -76,6 +76,12 @@ pub(crate) trait Object: Send + Sync + Debug {
         nonblock: bool,
         interrupted: &dyn Fn() -> bool,
     ) -> Result<usize, i64>;
+    /// `lseek`, for what has a position.
+    fn seek(&self, offset: i64, whence: u64) -> Result<u64, i64> {
+        const ESPIPE: i64 = 29;
+        let _ = (offset, whence);
+        Err(ESPIPE)
+    }
     /// Current readiness (`POLL*` bits).
     fn poll(&self) -> u16;
     /// A count of state changes, for edge-triggered epoll.

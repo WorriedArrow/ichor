@@ -78,9 +78,7 @@ impl Vfs {
             Some(_) => usize::MAX,
             None => UPPER_BYTES,
         };
-        let pages = RootPages {
-            account: account.clone(),
-        };
+        let pages = RootPages::new(account.clone());
         let mut fs = Overlay::with_pages(&image, src, pages, max)?;
         fs.set_clock(realtime);
         crate::dev::populate(&mut fs);
@@ -143,6 +141,17 @@ impl Vfs {
     /// out of sharing.
     pub(crate) fn private_ns(&self) -> Option<u64> {
         self.view?.private_ns()
+    }
+
+    /// Pages of its owner's this root holds: written files, inodes and
+    /// private cache pages. None, if no cell owns it.
+    pub(crate) fn charged(&self) -> u64 {
+        if self.account.is_none() {
+            return 0;
+        }
+        let fs = self.fs.lock();
+        let cached = self.private_ns().map_or(0, crate::pagecache::private_pages);
+        (fs.used_bytes() / 4096 + fs.kept_pages() + cached) as u64
     }
 
     /// The verified cache page holding page `index` of `ino`, if `ino` is

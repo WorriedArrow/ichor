@@ -191,7 +191,9 @@ struct State {
 
 impl State {
     fn queued(&self) -> usize {
-        self.lines.iter().map(Vec::len).sum::<usize>() + self.line.len() + self.raw.len()
+        // (A line may be empty: an end of file.)
+        let lines = self.lines.iter().map(|l| l.len().max(1));
+        lines.sum::<usize>() + self.line.len() + self.raw.len()
     }
 
     fn readable(&self) -> usize {

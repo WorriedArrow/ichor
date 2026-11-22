@@ -8,7 +8,7 @@ use alloc::vec::Vec;
 
 use super::{EBADF, EFAULT, EINVAL, EMFILE, console_bytes, console_write, le_u64};
 use crate::pipe::Pipe;
-use crate::process::{Fd, LinuxProcess, OpenFile, PipeEnd};
+use crate::process::{Fd, LinuxProcess, OpenFile, PipeEnd, RLIMIT_FSIZE};
 use crate::vfs::{self, Ino, Kind, Stat, errno::*};
 use crate::{proc, procfs, signal};
 
@@ -185,7 +185,7 @@ fn open_path(
                 return Err(EINVAL);
             }
             fs.permission(ino, overlay::MAY_WRITE | overlay::MAY_EXEC)?;
-            let ino = fs.create_unnamed(mode as u32 & !umask);
+            let ino = fs.create_unnamed(mode as u32 & !umask)?;
             drop(fs);
             let f = OpenFile {
                 ino,
@@ -313,7 +313,7 @@ fn open_fifo(p: &mut LinuxProcess, id: u64, flags: u64) -> Result<u64, i64> {
         _ => return Err(EINVAL),
     };
     let nonblock = flags & O_NONBLOCK != 0;
-    let pipe = crate::pipe::fifo(id);
+    let pipe = crate::pipe::fifo(id, p.cell.account());
     if write && nonblock && pipe.readers() == 0 {
         return Err(ENXIO);
     }
@@ -351,7 +351,7 @@ pub(super) fn memfd_create(p: &mut LinuxProcess, name: u64, flags: u64) -> Resul
     if user_path(p, name)?.len() > MFD_NAME_MAX {
         return Err(EINVAL);
     }
-    let ino = p.fs().create_unnamed(0o600);
+    let ino = p.fs().create_unnamed(0o600)?;
     let f = OpenFile {
         ino,
         offset: 0,
@@ -390,9 +390,10 @@ fn open_proc(
         }
         procfs::Node::Dir(_) if flags & O_ACCMODE != 0 => return Err(EISDIR),
         procfs::Node::Dir(e) => alloc::sync::Arc::new(procfs::ProcDir::new(path, e)),
-        procfs::Node::File(_) if flags & O_DIRECTORY != 0 => return Err(ENOTDIR),
-        procfs::Node::File(_) if flags & O_ACCMODE != 0 => return Err(EACCES),
+        _ if flags & O_DIRECTORY != 0 => return Err(ENOTDIR),
+        _ if flags & O_ACCMODE != 0 => return Err(EACCES),
         procfs::Node::File(d) => alloc::sync::Arc::new(procfs::ProcFile::new(d)),
+        procfs::Node::Maps(g) => alloc::sync::Arc::new(procfs::ProcFile::maps(g)),
     };
     p.install_flags(
         Fd::Object(crate::process::ObjectEnd {
@@ -470,10 +471,36 @@ fn stat_proc(p: &mut LinuxProcess, path: &str, follow: bool, hops: u32) -> Resul
             let ino = fs.resolve(cwd, &target, true)?;
             to_stat(&fs.stat(ino)?)
         }
-        procfs::Node::Link(t) => stat_bytes(0, S_IFLNK | 0o777, 1, t.len() as u64),
-        procfs::Node::Dir(_) => stat_bytes(0, S_IFDIR | 0o555, 2, 0),
-        procfs::Node::File(_) => stat_bytes(0, S_IFREG | 0o444, 1, 0),
+        procfs::Node::Link(t) => {
+            let len = t.len() as u64;
+            apart(DEV_PROC, path_ino(path), S_IFLNK | 0o777, 1, len)
+        }
+        procfs::Node::Dir(_) => apart(DEV_PROC, path_ino(path), S_IFDIR | 0o555, 2, 0),
+        procfs::Node::File(_) | procfs::Node::Maps(_) => {
+            apart(DEV_PROC, path_ino(path), S_IFREG | 0o444, 1, 0)
+        }
     })
+}
+
+/// `st_dev` of what is not the root's (1): programs tell files apart by
+/// device and inode together.
+const DEV_PROC: u64 = 2;
+const DEV_PIPE: u64 = 3;
+const DEV_SOCKET: u64 = 4;
+const DEV_ANON: u64 = 5;
+
+/// An inode number for a `/proc` path: the same each time (FNV-1a).
+fn path_ino(path: &str) -> u64 {
+    path.bytes().fold(0xcbf2_9ce4_8422_2325, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+    })
+}
+
+/// A `struct stat` of something on device `dev`.
+fn apart(dev: u64, ino: u64, mode: u32, nlink: u32, size: u64) -> [u8; 144] {
+    let mut st = stat_bytes(ino, mode, nlink, size);
+    st[0..8].copy_from_slice(&dev.to_le_bytes());
+    st
 }
 
 /// Reads from file `f` at `offset` into user memory; returns bytes read.
@@ -528,6 +555,20 @@ fn write_file(
         return Err(EBADF);
     }
     let append = f.flags & O_APPEND != 0;
+    let limit = p.group.limits()[RLIMIT_FSIZE].0;
+    let count = if limit == u64::MAX || count == 0 {
+        count
+    } else {
+        let at = if append {
+            p.vfs.lock().stat(f.ino)?.size
+        } else {
+            offset
+        };
+        if at >= limit {
+            return Err(too_large(p));
+        }
+        count.min(usize::try_from(limit - at).unwrap_or(usize::MAX))
+    };
     let step = if append && count <= APPEND_ATOMIC {
         count.max(1)
     } else {
@@ -563,6 +604,22 @@ fn write_file(
         }
     }
     Ok((done as u64, pos))
+}
+
+/// A file may not grow past `RLIMIT_FSIZE`: SIGXFSZ, and EFBIG if that is
+/// ignored or handled.
+fn too_large(p: &LinuxProcess) -> i64 {
+    const SIGXFSZ: u32 = 25;
+    proc::post(&p.entry, SIGXFSZ);
+    EFBIG
+}
+
+/// Whether the process may make a file `len` bytes long.
+fn check_length(p: &LinuxProcess, len: u64) -> Result<(), i64> {
+    if len > p.group.limits()[RLIMIT_FSIZE].0 {
+        return Err(too_large(p));
+    }
+    Ok(())
 }
 
 /// Reads up to `max` bytes (at most [`STREAM`]) from what is not a file:
@@ -882,8 +939,11 @@ pub(super) fn lseek(p: &mut LinuxProcess, fd: u64, offset: i64, whence: u64) -> 
     const SEEK_SET: u64 = 0;
     const SEEK_CUR: u64 = 1;
     const SEEK_END: u64 = 2;
-    // A closed descriptor is EBADF; an open one that is not a file is
+    // A closed descriptor is EBADF; an open one that has no position is
     // ESPIPE.
+    if let Some(Fd::Object(o)) = p.fd(fd) {
+        return o.obj.seek(offset, whence);
+    }
     let f = file(p, fd).map_err(|e| if e == EBADF { EBADF } else { ESPIPE })?;
     let base = match whence {
         SEEK_SET => 0i64,
@@ -900,14 +960,19 @@ pub(super) fn lseek(p: &mut LinuxProcess, fd: u64, offset: i64, whence: u64) -> 
 
 pub(super) fn ftruncate(p: &mut LinuxProcess, fd: u64, len: u64) -> Result<u64, i64> {
     let f = file(p, fd)?;
-    if f.flags & O_ACCMODE == 0 {
+    if f.flags & O_ACCMODE == 0 || (len as i64) < 0 {
         return Err(EINVAL);
     }
+    check_length(p, len)?;
     p.fs().truncate(f.ino, len)?;
     Ok(0)
 }
 
 pub(super) fn truncate(p: &mut LinuxProcess, addr: u64, len: u64) -> Result<u64, i64> {
+    if (len as i64) < 0 {
+        return Err(EINVAL);
+    }
+    check_length(p, len)?;
     let (start, path) = path_at(p, AT_FDCWD, addr)?;
     let mut fs = p.fs();
     let ino = fs.resolve(start, &path, true)?;
@@ -999,6 +1064,7 @@ pub(super) fn fallocate(
         return Err(EBADF);
     }
     let end = off.checked_add(len).ok_or(EFBIG)?;
+    check_length(p, end)?;
     match mode {
         0 => {
             let mut fs = p.fs();
@@ -1075,15 +1141,31 @@ pub(super) fn fstat(p: &mut LinuxProcess, fd: u64, addr: u64) -> Result<u64, i64
 }
 
 fn fstat_raw(p: &mut LinuxProcess, fd: u64) -> Result<[u8; 144], i64> {
-    Ok(match p.fd(fd).ok_or(EBADF)? {
+    let f = p.fd(fd).ok_or(EBADF)?;
+    Ok(match &f {
         Fd::Console => stat_bytes(0, S_IFCHR | 0o620, 1, 0),
-        Fd::Pipe(_) => stat_bytes(0, S_IFIFO | 0o600, 1, 0),
-        Fd::Object(o) => match o.obj.tty() {
-            // A terminal stats as the node it was opened through, which
-            // `ttyname` checks.
-            Some(t) => to_stat(&p.fs().stat(t.ino())?),
-            None => stat_bytes(0, o.obj.mode() | 0o600, 1, 0),
-        },
+        Fd::Pipe(e) => {
+            let ino = alloc::sync::Arc::as_ptr(&e.pipe) as u64;
+            apart(DEV_PIPE, ino, S_IFIFO | 0o600, 1, 0)
+        }
+        // A terminal stats as the node it was opened through, which
+        // `ttyname` checks.
+        Fd::Object(o) if let Some(t) = o.obj.tty() => to_stat(&p.fs().stat(t.ino())?),
+        Fd::Object(o) if let Some(d) = o.obj.proc_dir() => {
+            apart(DEV_PROC, path_ino(d), S_IFDIR | 0o555, 2, 0)
+        }
+        Fd::Object(o) => {
+            let ino = match (o.obj.socket(), o.obj.unix()) {
+                (Some(s), _) => s.inode(),
+                (_, Some(u)) => u.inode(),
+                _ => alloc::sync::Arc::as_ptr(&o.obj).cast::<u8>() as u64,
+            };
+            let (dev, perm) = match o.obj.mode() {
+                S_IFSOCK => (DEV_SOCKET, 0o777),
+                _ => (DEV_ANON, 0o600),
+            };
+            apart(dev, ino, o.obj.mode() | perm, 1, 0)
+        }
         Fd::Dev(d) => {
             let mut st = stat_bytes(0, S_IFCHR | 0o666, 1, 0);
             st[40..48].copy_from_slice(&u64::from(d.rdev()).to_le_bytes()); // st_rdev
@@ -1245,6 +1327,8 @@ pub(super) fn getdents64(
     const DT_LNK: u8 = 10;
     const DT_SOCK: u8 = 12;
     const HEADER: usize = 19; // d_ino, d_off, d_reclen, d_type
+    // What one call returns at most, whatever the buffer holds.
+    let count = count.min(256 << 10);
     if let Some(Fd::Object(o)) = p.fd(fd)
         && let Some((entries, pos)) = o.obj.dir()
     {
@@ -1274,55 +1358,54 @@ pub(super) fn getdents64(
         return Ok(out.len() as u64);
     }
     let f = file(p, fd).map_err(|_| ENOTDIR)?;
-    let (me, parent, entries) = {
-        let mut fs = p.fs();
-        if fs.stat(f.ino)?.kind != Kind::Directory {
-            return Err(ENOTDIR);
-        }
-        let parent = fs.lookup(f.ino, "..")?;
-        let mut list = Vec::new();
-        for (name, ino, kind) in fs.readdir(f.ino)? {
-            list.push((name, fs.stat(ino)?.ino, kind));
-        }
-        (fs.stat(f.ino)?.ino, fs.stat(parent)?.ino, list)
-    };
+    let mut fs = p.fs();
+    let me = fs.stat(f.ino)?;
+    if me.kind != Kind::Directory {
+        return Err(ENOTDIR);
+    }
+    let parent = fs.lookup(f.ino, "..")?;
+    let parent = fs.stat(parent)?.ino;
     let mut out: Vec<u8> = Vec::new();
+    // Offsets: 0 is `.`, 1 is `..`, and 2 + a place in the listing (0 being
+    // its start) what comes after that place.
     let mut index = f.offset;
-    loop {
-        let entry = match index {
-            0 => Some((me, DT_DIR, ".")),
-            1 => Some((parent, DT_DIR, "..")),
-            i => entries.get((i - 2) as usize).map(|(n, ino, k)| {
-                let t = match k {
-                    Kind::Directory => DT_DIR,
-                    Kind::File => DT_REG,
-                    Kind::Symlink => DT_LNK,
-                    Kind::CharDevice => DT_CHR,
-                    Kind::Socket => DT_SOCK,
-                    Kind::Fifo => DT_FIFO,
-                };
-                (*ino, t, n.as_str())
-            }),
-        };
-        let Some((ino, dtype, name)) = entry else {
-            break;
+    let mut full = false;
+    let mut add = |next: u64, name: &str, ino: u64, kind: Kind| {
+        let dtype = match kind {
+            Kind::Directory => DT_DIR,
+            Kind::File => DT_REG,
+            Kind::Symlink => DT_LNK,
+            Kind::CharDevice => DT_CHR,
+            Kind::Socket => DT_SOCK,
+            Kind::Fifo => DT_FIFO,
         };
         let name = overlay::name::decode(name);
         let reclen = (HEADER + name.len() + 1).next_multiple_of(8);
         if out.len() + reclen > count {
-            if out.is_empty() {
-                return Err(EINVAL);
-            }
-            break;
+            full = true;
+            return false;
         }
         let start = out.len();
         out.extend_from_slice(&ino.to_le_bytes());
-        out.extend_from_slice(&(index + 1).to_le_bytes()); // d_off
+        out.extend_from_slice(&next.to_le_bytes()); // d_off
         out.extend_from_slice(&(reclen as u16).to_le_bytes());
         out.push(dtype);
         out.extend_from_slice(&name);
         out.resize(start + reclen, 0);
-        index += 1;
+        index = next;
+        true
+    };
+    if (f.offset > 0 || add(1, ".", me.ino, Kind::Directory))
+        && (f.offset > 1 || add(2, "..", parent, Kind::Directory))
+    {
+        let after = f.offset.saturating_sub(2);
+        fs.list(f.ino, after, |place, name, ino, kind| {
+            add(place + 2, name, ino, kind)
+        })?;
+    }
+    drop(fs);
+    if out.is_empty() && full {
+        return Err(EINVAL);
     }
     if p.copy_to_user(buf, &out) != out.len() {
         return Err(EFAULT);
@@ -1342,6 +1425,29 @@ pub(super) fn mkdir(p: &mut LinuxProcess, dirfd: i64, addr: u64, mode: u64) -> R
     Ok(0)
 }
 
+/// Checks a path's trailing slash, which only a directory has: what `name`
+/// is in `dir` (itself, if a symlink) has to be one.
+fn check_slash(fs: &mut vfs::Tree, path: &str, dir: Ino, name: &str) -> Result<(), i64> {
+    if !path.ends_with('/') {
+        return Ok(());
+    }
+    let ino = fs.lookup(dir, name)?;
+    match fs.stat(ino)?.kind {
+        Kind::Directory => Ok(()),
+        _ => Err(ENOTDIR),
+    }
+}
+
+/// The directory and name a new non-directory goes to: no trailing slash.
+fn new_name(fs: &mut vfs::Tree, start: Ino, path: &str) -> Result<(Ino, String), i64> {
+    let (dir, name) = fs.resolve_parent(start, path)?;
+    if path.ends_with('/') {
+        let there = fs.lookup(dir, &name).is_ok();
+        return Err(if there { EEXIST } else { ENOENT });
+    }
+    Ok((dir, name))
+}
+
 /// `mknod`/`mknodat`: FIFOs, regular files and socket nodes. Device nodes
 /// need CAP_MKNOD, which is outside the cell bounding set: EPERM, as for an
 /// unprivileged Linux process (a cell's devices are its `/dev`).
@@ -1358,7 +1464,7 @@ pub(super) fn mknod(
     let (start, path) = path_at(p, dirfd, addr)?;
     let perm = mode & 0o7777 & !p.umask();
     let mut fs = p.fs();
-    let (dir, name) = fs.resolve_parent(start, &path)?;
+    let (dir, name) = new_name(&mut fs, start, &path)?;
     match mode & S_IFMT {
         0 | S_IFREG => fs.create(dir, &name, perm)?,
         S_IFIFO => fs.mkfifo(dir, &name, perm)?,
@@ -1376,6 +1482,7 @@ pub(super) fn unlink(p: &mut LinuxProcess, dirfd: i64, addr: u64, flags: u64) ->
     let (start, path) = path_at(p, dirfd, addr)?;
     let mut fs = p.fs();
     let (dir, name) = fs.resolve_parent(start, &path)?;
+    check_slash(&mut fs, &path, dir, &name)?;
     if flags & AT_REMOVEDIR != 0 {
         fs.rmdir(dir, &name)?;
     } else {
@@ -1401,6 +1508,13 @@ pub(super) fn rename(
     let mut fs = p.fs();
     let (odir, oname) = fs.resolve_parent(ostart, &opath)?;
     let (ndir, nname) = fs.resolve_parent(nstart, &npath)?;
+    check_slash(&mut fs, &opath, odir, &oname)?;
+    if npath.ends_with('/') {
+        let old = fs.lookup(odir, &oname)?;
+        if fs.stat(old)?.kind != Kind::Directory {
+            return Err(ENOTDIR);
+        }
+    }
     if flags & RENAME_NOREPLACE != 0 && fs.lookup(ndir, &nname).is_ok() {
         return Err(EEXIST);
     }
@@ -1417,7 +1531,7 @@ pub(super) fn symlink(
     let target = user_path(p, target)?;
     let (start, path) = path_at(p, dirfd, addr)?;
     let mut fs = p.fs();
-    let (dir, name) = fs.resolve_parent(start, &path)?;
+    let (dir, name) = new_name(&mut fs, start, &path)?;
     fs.symlink(dir, &name, &target)?;
     Ok(0)
 }
@@ -1446,7 +1560,7 @@ pub(super) fn link(
     let ino = inode_at(p, odirfd, oaddr, (flags & AT_EMPTY_PATH) | follow)?;
     let (start, path) = path_at(p, ndirfd, naddr)?;
     let mut fs = p.fs();
-    let (dir, name) = fs.resolve_parent(start, &path)?;
+    let (dir, name) = new_name(&mut fs, start, &path)?;
     fs.link(ino, dir, &name)?;
     Ok(0)
 }
@@ -1507,7 +1621,13 @@ pub(super) fn fchmodat2(
 }
 
 pub(super) fn fchmod(p: &mut LinuxProcess, fd: u64, mode: u64) -> Result<u64, i64> {
-    let f = file(p, fd)?;
+    let f = match p.fd(fd).ok_or(EBADF)? {
+        Fd::File(f) => f,
+        // An inode nobody else opens by its mode (a bound socket's name is
+        // another one): nothing keeps it.
+        Fd::Pipe(_) | Fd::Object(_) => return Ok(0),
+        Fd::Console | Fd::Dev(_) => return Err(EPERM),
+    };
     p.fs().chmod(f.ino, mode as u32)?;
     Ok(0)
 }
@@ -1643,7 +1763,7 @@ pub(super) fn pipe2(p: &mut LinuxProcess, fds: u64, flags: u64) -> Result<u64, i
     if flags & !(O_NONBLOCK | O_CLOEXEC) != 0 {
         return Err(EINVAL);
     }
-    let pipe = Pipe::new();
+    let pipe = Pipe::new(p.cell.account());
     let nonblock = flags & O_NONBLOCK != 0;
     let end = |write| {
         Fd::Pipe(PipeEnd {

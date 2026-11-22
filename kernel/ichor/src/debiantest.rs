@@ -452,6 +452,24 @@ sysread($s, $m, 10) == 4 or fail("read: $!");
 setsockopt($c, SOL_SOCKET, SO_LINGER, pack("ii", 1, 0)) or fail("SO_LINGER: $!");
 close $c;
 !defined(sysread($s, $m, 1)) && $!{ECONNRESET} or fail("no reset from a close without lingering");
+# Two listeners share a port, and its connections; a third may not.
+my (@shared, @counts, @clients);
+for my $n (0, 1) {
+    socket($shared[$n], AF_INET, SOCK_STREAM, 0) or fail("socket: $!");
+    setsockopt($shared[$n], SOL_SOCKET, 15, 1) or fail("SO_REUSEPORT: $!");
+    bind($shared[$n], pack_sockaddr_in(4712, inet_aton("127.0.0.1"))) or fail("shared bind: $!");
+    listen($shared[$n], 64) or fail("shared listen: $!");
+    fcntl($shared[$n], F_SETFL, O_NONBLOCK);
+}
+socket(my $alone, AF_INET, SOCK_STREAM, 0) or fail("socket: $!");
+bind($alone, pack_sockaddr_in(4712, inet_aton("127.0.0.1"))) and fail("bound a port others share");
+for (1 .. 32) {
+    socket(my $cc, AF_INET, SOCK_STREAM, 0) or fail("socket: $!");
+    connect($cc, pack_sockaddr_in(4712, inet_aton("127.0.0.1"))) or fail("connect: $!");
+    push @clients, $cc;
+}
+for my $n (0, 1) { while (accept(my $ac, $shared[$n])) { $counts[$n]++ } }
+($counts[0] // 0) > 0 && ($counts[1] // 0) > 0 && $counts[0] + $counts[1] == 32 or fail("a shared port gave " . join(",", map { $_ // 0 } @counts));
 # What the cell's interfaces are.
 socket(my $n, 16, 3, 0) or fail("netlink: $!");
 send($n, pack("L S S L L C x3", 20, 22, 0x301, 1, 0, 0), 0) == 20 or fail("netlink send: $!");

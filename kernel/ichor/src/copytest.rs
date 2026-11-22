@@ -191,7 +191,7 @@ fn mm_unlocked(p: LinuxProcess) {
         .unwrap_or_else(|_| fail("usercopy: mmap"));
     p.mm().populate(va, LEN, true);
     let step = Arc::new((AtomicU32::new(0), WaitQueue::new()));
-    let mut copier = p.helper();
+    let mut copier = p.helper().unwrap_or_else(|| fail("usercopy: helper"));
     let shared = step.clone();
     let mm = p.mm();
     let spawned = TaskOptions::new(move || {

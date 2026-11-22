@@ -20,6 +20,7 @@ use frame::mm::VmSpace;
 use frame::sync::{Mutex, MutexGuard, SpinLock};
 
 use crate::kcell::Cell;
+use crate::page::Reserved;
 use crate::pipe::Pipe;
 use crate::proc::{self, ProcEntry};
 use crate::signal::{Actions, Signals};
@@ -245,13 +246,14 @@ impl Vfork {
 
 /// `RLIM_INFINITY`.
 pub(crate) const RLIM_INFINITY: u64 = u64::MAX;
+pub(crate) const RLIMIT_FSIZE: usize = 1;
 pub(crate) const RLIMIT_STACK: usize = 3;
 pub(crate) const RLIMIT_NOFILE: usize = 7;
 /// Number of Linux resource limits.
 pub(crate) const RLIM_NLIMITS: usize = 16;
 
-/// A process's resource limits. `NOFILE` and `STACK` are enforced; the
-/// others are stored and reported (nothing yet consumes them).
+/// A process's resource limits. `NOFILE`, `STACK` and `FSIZE` (but in
+/// `splice` and `copy_file_range`) are enforced; the others are stored and reported (nothing yet consumes them).
 pub(crate) type Limits = [(u64, u64); RLIM_NLIMITS];
 
 fn default_limits() -> Limits {
@@ -391,11 +393,16 @@ impl Group {
 
     /// Tells every thread but `me` to end.
     pub(crate) fn end_others(&self, me: &ProcEntry) {
-        for t in self.threads() {
-            if t.pid != me.pid {
-                proc::end_thread(&t);
-            }
-        }
+        let others = {
+            let threads = self.threads.lock();
+            let mut others = threads.clone();
+            others.retain(|t| t.pid != me.pid);
+            // Under the lock: a thread one of them is making (it takes the
+            // lock to add it) is marked here, or inherits the mark.
+            others.iter().for_each(|t| proc::end_thread(t));
+            others
+        };
+        others.iter().for_each(|t| proc::wake(t));
     }
 
     /// `execve` by thread `me`: the others end, and it is the process's
@@ -420,8 +427,12 @@ impl Group {
         Some(entry)
     }
 
-    /// Removes `me` from the live threads; returns the group's wait status
-    /// if it was the last (its exit status, or `status`, the last thread's).
+    /// Takes a thread that was made but never ran out of the live threads.
+    pub(crate) fn never_ran(&self, tid: u64) {
+        self.threads.lock().retain(|e| e.pid != tid);
+        self.gone.wake_all();
+    }
+
     /// The process's user CPU time: its live threads' and those gone.
     pub(crate) fn cpu_ns(&self) -> u64 {
         use core::sync::atomic::Ordering::Relaxed;
@@ -434,6 +445,8 @@ impl Group {
         live + self.gone_cpu_ns.load(Relaxed)
     }
 
+    /// Removes `me` from the live threads; returns the group's wait status
+    /// if it was the last (its exit status, or `status`, the last thread's).
     pub(crate) fn thread_exited(&self, me: &ProcEntry, status: u32) -> Option<u32> {
         let mut t = self.threads.lock();
         self.gone_cpu_ns.fetch_add(
@@ -486,6 +499,20 @@ pub(crate) struct LinuxProcess {
     /// The deadline of a timed wait that a signal interrupted, for when the
     /// call is restarted (no handler ran): it waits on, not over.
     pub(crate) resume_until: Option<core::time::Duration>,
+    /// The cell pays for its kernel stack.
+    _stack: Reserved,
+}
+
+/// Pages a thread's kernel stack takes, and those that its entry in the
+/// process table (with what hangs off it) is counted as. A cell that forks
+/// without end runs out of its own memory, not the machine's.
+const STACK_PAGES: u64 = 16;
+const ENTRY_PAGES: u64 = 1;
+
+/// What a new thread costs its cell; `None` if that cannot pay.
+fn thread_cost(cell: &Cell) -> Option<(Reserved, Reserved)> {
+    let stack = Reserved::new(cell.account(), STACK_PAGES)?;
+    Some((stack, Reserved::new(cell.account(), ENTRY_PAGES)?))
 }
 
 impl LinuxProcess {
@@ -493,9 +520,10 @@ impl LinuxProcess {
     /// `/` as its working directory, and the console on fds 0–2. `None` if
     /// memory runs out.
     pub(crate) fn new(cell: Arc<Cell>, vfs: Arc<Vfs>) -> Option<Self> {
+        let (stack, kept) = thread_cost(&cell)?;
         let mm = Mm::new(cell.account())?;
         let _ = vfs.lock().open(ROOT);
-        let entry = proc::register(cell.id(), 0, None, None, None);
+        let entry = proc::register(cell.id(), 0, None, None, None, kept);
         let group = Arc::new(Group {
             tgid: entry.pid,
             leader: entry.clone(),
@@ -536,6 +564,7 @@ impl LinuxProcess {
             clear_tid: 0,
             robust_list: 0,
             resume_until: None,
+            _stack: stack,
         })
     }
 
@@ -544,6 +573,7 @@ impl LinuxProcess {
     /// directory, umask and signal state, in a new group whose parent is
     /// this process. Only the calling thread is copied.
     pub(crate) fn fork(&mut self) -> Option<Self> {
+        let (stack, kept) = thread_cost(&self.cell)?;
         let mm = self.mm().fork()?;
         let (fds, cwd, umask) = {
             let f = self.group.files.lock();
@@ -559,6 +589,7 @@ impl LinuxProcess {
             None,
             Some(self.group.leader.group()),
             None,
+            kept,
         );
         let group = Arc::new(Group {
             tgid: entry.pid,
@@ -591,23 +622,33 @@ impl LinuxProcess {
             clear_tid: 0,
             robust_list: 0,
             resume_until: None,
+            _stack: stack,
         })
     }
 
     /// A new thread in this process (`clone` with `CLONE_VM |
     /// CLONE_THREAD`): shares everything but its tid and signal mask.
-    pub(crate) fn new_thread(&self) -> Self {
+    /// `None` if the cell cannot pay for it.
+    pub(crate) fn new_thread(&self) -> Option<Self> {
+        let (stack, kept) = thread_cost(&self.cell)?;
         let entry = proc::register(
             self.cell.id(),
             self.entry.ppid(),
             Some(self.group.tgid),
             None,
             Some(self.entry.shared.clone()),
+            kept,
         );
-        self.group.threads.lock().push(entry.clone());
+        {
+            let mut threads = self.group.threads.lock();
+            if proc::ending(&self.entry) {
+                proc::end_thread(&entry);
+            }
+            threads.push(entry.clone());
+        }
         let mut sig = self.sig.clone();
         sig.clear_alt_stack();
-        Self {
+        Some(Self {
             entry,
             group: self.group.clone(),
             cell: self.cell.clone(),
@@ -616,7 +657,8 @@ impl LinuxProcess {
             clear_tid: 0,
             robust_list: 0,
             resume_until: None,
-        }
+            _stack: stack,
+        })
     }
 
     /// A kernel helper thread of this process (an io_uring worker): it
@@ -624,19 +666,21 @@ impl LinuxProcess {
     /// thread id, blocks every signal SIGKILL and SIGSTOP aside, and is not
     /// one of the group's threads, so it neither keeps the process alive
     /// nor is waited for by `exit_group` or `execve`. Start it with
-    /// [`crate::proc::start_helper`].
-    pub(crate) fn helper(&self) -> Self {
+    /// [`crate::proc::start_helper`]. `None` if the cell cannot pay for it.
+    pub(crate) fn helper(&self) -> Option<Self> {
+        let (stack, kept) = thread_cost(&self.cell)?;
         let entry = proc::register(
             self.cell.id(),
             self.entry.ppid(),
             Some(self.group.tgid),
             None,
             None,
+            kept,
         );
         let mut sig = Signals::new();
         sig.mask = !(crate::signal::bit(crate::signal::SIGKILL) | crate::signal::bit(19));
         proc::set_masks(&entry, sig.mask, 0);
-        Self {
+        Some(Self {
             entry,
             group: self.group.clone(),
             cell: self.cell.clone(),
@@ -645,7 +689,8 @@ impl LinuxProcess {
             clear_tid: 0,
             robust_list: 0,
             resume_until: None,
-        }
+            _stack: stack,
+        })
     }
 
     /// The process's address space (locked).

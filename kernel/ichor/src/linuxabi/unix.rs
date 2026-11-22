@@ -91,6 +91,8 @@ const MSG_CMSG_CLOEXEC: u64 = 0x4000_0000;
 
 /// Bytes a socket's receive queue holds (stream bytes, or datagrams).
 const BUFFER: usize = 256 * 1024;
+/// And messages (or writes to a stream), however small.
+const MESSAGES: usize = 4096;
 /// Most descriptors one `SCM_RIGHTS` message carries (Linux's limit).
 const SCM_MAX_FD: usize = 253;
 /// `sizeof(sun_path)`.
@@ -474,6 +476,9 @@ impl Endpoint {
         if ps.closed || ps.shut_rd {
             return Some(Err(EPIPE));
         }
+        if ps.rx.len() >= MESSAGES {
+            return None;
+        }
         let room = BUFFER.saturating_sub(ps.rx_bytes);
         let n = match self.ty {
             Type::Stream => {
@@ -531,7 +536,7 @@ impl Endpoint {
         {
             return Some(Err(EPERM));
         }
-        if ts.rx_bytes + data.len() > BUFFER && ts.rx_bytes > 0 {
+        if ts.rx.len() >= MESSAGES || (ts.rx_bytes + data.len() > BUFFER && ts.rx_bytes > 0) {
             return None;
         }
         let after = ts.rx_bytes + data.len();
@@ -770,7 +775,7 @@ impl Object for UnixSocket {
         match peer.as_ref().map(Weak::upgrade) {
             Some(Some(pe)) => {
                 let ps = pe.state.lock();
-                if !ps.closed && ps.rx_bytes < BUFFER {
+                if !ps.closed && ps.rx_bytes < BUFFER && ps.rx.len() < MESSAGES {
                     r |= POLLOUT;
                 }
             }

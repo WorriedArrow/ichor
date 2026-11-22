@@ -12,12 +12,15 @@ use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 
+use cell::Account;
 use frame::sync::SpinLock;
 use frame::task::WaitQueue;
 
-const EAGAIN: i64 = 11;
-const EPIPE: i64 = 32;
 use crate::signal::ERESTARTSYS;
+
+const EAGAIN: i64 = 11;
+const ENOMEM: i64 = 12;
+const EPIPE: i64 = 32;
 
 /// Bytes a pipe buffers (Linux's default).
 const CAPACITY: usize = 64 * 1024;
@@ -35,6 +38,34 @@ struct State {
     writer_opens: u64,
     /// Bytes the pipe holds (`F_SETPIPE_SZ`; CAPACITY to start).
     capacity: usize,
+    /// The cell that made the pipe, and the pages of buffer it pays for.
+    account: Arc<Account>,
+    kept: u64,
+}
+
+impl State {
+    /// Makes room for `more` bytes, at the cell's cost; false if it cannot
+    /// pay.
+    fn grow(&mut self, more: usize) -> bool {
+        let need = self.buf.len() + more;
+        if need <= self.buf.capacity() {
+            return true;
+        }
+        let pages = need.div_ceil(PIPE_BUF).next_power_of_two();
+        let extra = (pages as u64).saturating_sub(self.kept);
+        if self.account.charge(extra).is_err() {
+            return false;
+        }
+        self.kept += extra;
+        self.buf.reserve_exact(pages * PIPE_BUF - self.buf.len());
+        true
+    }
+}
+
+impl Drop for State {
+    fn drop(&mut self) {
+        self.account.release(self.kept);
+    }
 }
 
 /// A pipe.
@@ -52,18 +83,19 @@ pub(crate) struct Pipe {
 }
 
 impl Pipe {
-    /// A new pipe with one reader and one writer reference.
-    pub(crate) fn new() -> Arc<Pipe> {
-        Self::with_ends(1)
+    /// A new pipe with one reader and one writer reference, its buffer
+    /// charged to `account`.
+    pub(crate) fn new(account: &Arc<Account>) -> Arc<Pipe> {
+        Self::with_ends(1, account)
     }
 
     /// A named pipe's pipe: no ends until the FIFO is opened
     /// ([`Pipe::add_end`]).
-    pub(crate) fn new_fifo() -> Arc<Pipe> {
-        Self::with_ends(0)
+    fn new_fifo(account: &Arc<Account>) -> Arc<Pipe> {
+        Self::with_ends(0, account)
     }
 
-    fn with_ends(n: u32) -> Arc<Pipe> {
+    fn with_ends(n: u32, account: &Arc<Account>) -> Arc<Pipe> {
         Arc::new(Pipe {
             state: SpinLock::new(State {
                 buf: VecDeque::new(),
@@ -72,6 +104,8 @@ impl Pipe {
                 reader_opens: u64::from(n),
                 writer_opens: u64::from(n),
                 capacity: CAPACITY,
+                account: account.clone(),
+                kept: 0,
             }),
             readable: WaitQueue::new(),
             writable: WaitQueue::new(),
@@ -363,6 +397,9 @@ impl Pipe {
                 let room = s.capacity.saturating_sub(s.buf.len());
                 if room >= need {
                     let n = room.min(rest.len());
+                    if !s.grow(n) {
+                        return Some(Err(ENOMEM));
+                    }
                     s.buf.extend(&rest[..n]);
                     Some(Ok(n))
                 } else if nonblock {
@@ -393,8 +430,9 @@ static FIFOS: SpinLock<BTreeMap<u64, Weak<Pipe>>> = SpinLock::new(BTreeMap::new(
 /// A blocking FIFO open whose peer opens and closes again before the wait
 /// begins returns at once (it used to wait forever).
 pub(crate) fn fifo_selftest() {
+    let account = Account::root(1);
     for write in [false, true] {
-        let p = Pipe::new_fifo();
+        let p = Pipe::new_fifo(&account);
         let opens = p.add_end(write);
         p.add_end(!write);
         p.drop_end(!write);
@@ -403,22 +441,38 @@ pub(crate) fn fifo_selftest() {
             crate::runtest::fail("pipe: a FIFO open missed a peer that came and went");
         }
         // With no peer at all it does wait.
-        let lone = Pipe::new_fifo();
+        let lone = Pipe::new_fifo(&account);
         let opens = lone.add_end(write);
         if lone.wait_peer(write, opens, &|| true) != Err(ERESTARTSYS) {
             crate::runtest::fail("pipe: a FIFO open did not wait for its peer");
         }
     }
+    // What a pipe holds is the cell's memory, until the pipe is gone.
+    let p = Pipe::new(&account);
+    let page = [7u8; PIPE_BUF];
+    if p.write(&page, true, &|| true) != Ok(PIPE_BUF)
+        || account.used() != 1
+        || p.write(&page, true, &|| true) != Err(ENOMEM)
+        || p.take(PIPE_BUF, true, &|| true) != Ok(page.to_vec())
+        || p.write(&page, true, &|| true) != Ok(PIPE_BUF)
+    {
+        crate::runtest::fail("pipe: the buffer's charge");
+    }
+    drop(p);
+    if account.used() != 0 {
+        crate::runtest::fail("pipe: a pipe that is gone is still charged");
+    }
 }
 
-/// The pipe behind FIFO `id`, made on its first open.
-pub(crate) fn fifo(id: u64) -> Arc<Pipe> {
+/// The pipe behind FIFO `id`, made on its first open (by a process of the
+/// cell `account` is of).
+pub(crate) fn fifo(id: u64, account: &Arc<Account>) -> Arc<Pipe> {
     let mut m = FIFOS.lock();
     if let Some(p) = m.get(&id).and_then(Weak::upgrade) {
         return p;
     }
     m.retain(|_, w| w.strong_count() > 0);
-    let p = Pipe::new_fifo();
+    let p = Pipe::new_fifo(account);
     m.insert(id, Arc::downgrade(&p));
     p
 }

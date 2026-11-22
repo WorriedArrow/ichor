@@ -301,7 +301,7 @@ pub(crate) fn load<S: AsRef<[u8]>>(
         }
     }
 
-    if !mm.reserve(STACK_TOP - stack_size, STACK_TOP, Prot::RW) {
+    if !mm.reserve_stack(STACK_TOP - stack_size, STACK_TOP) {
         return Err(LoadError::Map);
     }
     let stack_pointer = build_stack(mm, &aux, argv, envp, stack_size)?;

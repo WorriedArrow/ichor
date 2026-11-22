@@ -18,6 +18,7 @@ use frame::task::{Task, TaskOptions, WaitQueue};
 use frame::user::{UserContext, UserEvent, UserMode};
 
 use crate::linuxabi::{self, Outcome};
+use crate::page::Reserved;
 use crate::process::{Group, LinuxProcess};
 use crate::sched::SchedInfo;
 use crate::signal::{self, Info};
@@ -221,6 +222,8 @@ pub(crate) struct ProcEntry {
     /// CPU time this thread has spent in user code, in nanoseconds (the
     /// time inside `UserMode::execute`; kernel time is not counted yet).
     pub(crate) cpu_ns: AtomicU64,
+    /// What the entry costs the cell, until it is reaped.
+    _kept: Reserved,
 }
 
 impl ProcEntry {
@@ -437,13 +440,14 @@ static NEXT_PID: AtomicU64 = AtomicU64::new(1);
 /// the table, as a new process (`tgid` `None`) or a thread of process
 /// `tgid`, which shares the process's signals if it is given them (a kernel
 /// helper is not). A new process starts in `group` = (pgid, sid), or in a
-/// group and session of its own.
+/// group and session of its own. `kept` is what the entry costs the cell.
 pub(crate) fn register(
     cell: u64,
     ppid: u64,
     tgid: Option<u64>,
     group: Option<(u64, u64)>,
     shared: Option<Arc<Shared>>,
+    kept: Reserved,
 ) -> Arc<ProcEntry> {
     let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
     let (pgid, sid) = group.unwrap_or((pid, pid));
@@ -469,6 +473,7 @@ pub(crate) fn register(
         signals: WaitQueue::new(),
         process: SpinLock::new(Weak::new()),
         cpu_ns: AtomicU64::new(0),
+        _kept: kept,
     });
     TABLE.lock().insert(pid, e.clone());
     e
@@ -509,11 +514,11 @@ pub(crate) fn ending(e: &ProcEntry) -> bool {
     e.ending.load(Ordering::SeqCst)
 }
 
-/// Tells thread `e` to end, without ending its process: the process is
-/// exiting already, or another of its threads is in `execve`.
+/// Marks thread `e` as to end, without ending its process: the process is
+/// exiting already, or another of its threads is in `execve`. Wake it
+/// ([`wake`]) unless it is the caller's.
 pub(crate) fn end_thread(e: &ProcEntry) {
     e.ending.store(true, Ordering::SeqCst);
-    wake(e);
 }
 
 /// Whether `e` must stop what it is doing and end.
@@ -1229,6 +1234,7 @@ pub(crate) fn start_helper(
 /// out of the table.
 pub(crate) fn discard(p: LinuxProcess) {
     let pid = p.entry.pid;
+    p.group.never_ran(pid);
     drop(p);
     forget(pid);
 }
@@ -1242,7 +1248,7 @@ pub(crate) fn forget(pid: u64) {
 /// Spawns the task that runs a forked child.
 pub(crate) fn start(child: LinuxProcess, ctx: UserContext) -> Result<u64, i64> {
     let pid = child.entry.pid;
-    let entry = child.entry.clone();
+    let group = Arc::downgrade(&child.group);
     let sched = SchedInfo::of_cell(child.cell.id());
     let task = TaskOptions::new(move || {
         run(child, ctx);
@@ -1252,7 +1258,10 @@ pub(crate) fn start(child: LinuxProcess, ctx: UserContext) -> Result<u64, i64> {
     if task.is_none() {
         // The closure (and with it the child) was dropped unrun; nobody
         // learned its pid, so it leaves the table at once.
-        TABLE.lock().remove(&entry.pid);
+        forget(pid);
+        if let Some(g) = group.upgrade() {
+            g.never_ran(pid);
+        }
         return Err(EAGAIN);
     }
     Ok(pid)

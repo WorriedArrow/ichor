@@ -154,6 +154,22 @@ not write it; merge its branch when it lands.
   (`umem::fault_shared`, `runtest::shared_file_program`,
   `blktest::root_charges`), and images with megabytes of metadata mount
   (format v4: 64 KiB segments, `Image::mount_segments`).
+- M7 what a cell takes of the kernel (2026-11-22; Go's runtime tests split
+  a mapping into 40,000 pieces and the kernel panicked on one 4.5 MiB list
+  of them): no list a program can lengthen is one allocation without a
+  bound (an allocation over 4 MiB, or one that fails, is a kernel panic:
+  bound it, page it, or keep it in a tree), and what is held for long is
+  charged to the cell. Mappings: one `vma::RegionMap` with each region's
+  backing (alike neighbors joined), at most 65,530 (`max_map_count`);
+  `/proc/<pid>/maps` is written as it is read. Charged: upper inodes,
+  names and long symlinks (`overlay::Pages::keep`, 8 a page), a thread's
+  kernel stack and table entry (`page::Reserved`: 17 pages; EAGAIN), pipe
+  buffers (ENOMEM). Bounded: 524,288 inodes a root, 16,384 locks a file,
+  4,096 queued datagrams or `AF_UNIX` messages a socket. Directories are
+  listed by an entry's place (`Overlay::list`), not its index, so removing
+  while reading skips nothing. Not charged yet: page tables, region maps,
+  epoll interest, open file descriptions, sockets' own state, futex and
+  timer entries; kernel stacks are pooled, never freed.
 - Boot hangs under the full gate's load (2026-11-21), found by booting 30
   VMs at a time until one stuck (1 in 60) and by reading. Fixed: a
   blocking FIFO open missed a peer that opened, wrote and closed between

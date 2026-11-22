@@ -49,7 +49,21 @@ pub(crate) fn charged(account: &Arc<Account>, frame: UFrame) -> Option<Page> {
 /// (a root without one is bounded by its byte budget alone).
 #[derive(Debug)]
 pub(crate) struct RootPages {
-    pub(crate) account: Option<Arc<Account>>,
+    account: Option<Arc<Account>>,
+    /// Charged for the root's inodes and names.
+    kept: usize,
+}
+
+impl RootPages {
+    pub(crate) fn new(account: Option<Arc<Account>>) -> RootPages {
+        RootPages { account, kept: 0 }
+    }
+}
+
+impl Drop for RootPages {
+    fn drop(&mut self) {
+        overlay::Pages::keep(self, 0);
+    }
 }
 
 /// A page of a written file.
@@ -69,6 +83,42 @@ impl overlay::Pages for RootPages {
             }),
         };
         Some(FilePage(page))
+    }
+
+    fn keep(&mut self, pages: usize) -> bool {
+        if let Some(a) = &self.account {
+            if pages > self.kept && a.charge((pages - self.kept) as u64).is_err() {
+                return false;
+            }
+            a.release(self.kept.saturating_sub(pages) as u64);
+        }
+        self.kept = pages;
+        true
+    }
+}
+
+/// Pages of kernel memory charged to an account for as long as this lives
+/// (a thread's stack and bookkeeping).
+#[derive(Debug)]
+pub(crate) struct Reserved {
+    account: Arc<Account>,
+    pages: u64,
+}
+
+impl Reserved {
+    /// Charges `pages`, or `None` if the account is full.
+    pub(crate) fn new(account: &Arc<Account>, pages: u64) -> Option<Reserved> {
+        account.charge(pages).ok()?;
+        Some(Reserved {
+            account: account.clone(),
+            pages,
+        })
+    }
+}
+
+impl Drop for Reserved {
+    fn drop(&mut self) {
+        self.account.release(self.pages);
     }
 }
 

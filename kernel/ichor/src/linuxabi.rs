@@ -84,7 +84,7 @@ mod nr {
     pub(super) const GETSOCKNAME: u64 = 51;
     pub(super) const GETPEERNAME: u64 = 52;
     pub(super) const SOCKETPAIR: u64 = 53;
-    pub(super) const SETSOCKOPT: u64 = 54; // partial: SO_REUSEADDR, SO_PASSCRED, SO_RCVTIMEO, SO_SNDTIMEO and SO_LINGER with no time act; other known options are recorded only
+    pub(super) const SETSOCKOPT: u64 = 54; // partial: SO_REUSEADDR, SO_REUSEPORT, SO_PASSCRED, SO_RCVTIMEO, SO_SNDTIMEO and SO_LINGER with no time act; other known options are recorded only
     pub(super) const GETSOCKOPT: u64 = 55; // partial: SO_ERROR, SO_TYPE, SO_ACCEPTCONN, SO_REUSEADDR, SO_PEERCRED, SO_PASSCRED; others echo what was set
     pub(super) const CLONE: u64 = 56; // partial: fork, vfork-style and thread clones
     pub(super) const FORK: u64 = 57;
@@ -231,7 +231,7 @@ mod nr {
     pub(super) const MEMBARRIER: u64 = 324; // partial: CMD_QUERY reports no commands
     pub(super) const MEMFD_CREATE: u64 = 319; // partial: no sealing (F_ADD_SEALS); /proc/self/fd shows anon_inode:[file], not /memfd:NAME
     pub(super) const STATX: u64 = 332;
-    pub(super) const PRLIMIT64: u64 = 302; // partial: own process only; NOFILE and STACK enforced, others stored
+    pub(super) const PRLIMIT64: u64 = 302; // partial: NOFILE, STACK and FSIZE enforced, others stored
     pub(super) const GETRANDOM: u64 = 318; // ChaCha20 seeded from RDSEED/RDRAND and virtio-rng
     pub(super) const RENAMEAT2: u64 = 316; // partial: RENAME_NOREPLACE only
     pub(super) const MINCORE: u64 = 27;
@@ -1178,7 +1178,7 @@ fn clone(
         let mut c = ctx.clone();
         c.set_return(0);
         c.rsp = stack;
-        (p.new_thread(), c)
+        (p.new_thread().ok_or(EAGAIN)?, c)
     } else {
         proc::fork(p, ctx, stack)?
     };
@@ -1186,11 +1186,12 @@ fn clone(
         cctx.fs_base = tls;
     }
     let tid = (child.entry.pid as u32).to_le_bytes();
-    if flags & CLONE_PARENT_SETTID != 0 && p.copy_to_user(parent_tid, &tid) != tid.len() {
-        return Err(EFAULT);
+    // An address that cannot be written is passed over, as on Linux.
+    if flags & CLONE_PARENT_SETTID != 0 {
+        let _ = p.copy_to_user(parent_tid, &tid);
     }
-    if flags & CLONE_CHILD_SETTID != 0 && child.copy_to_user(child_tid, &tid) != tid.len() {
-        return Err(EFAULT);
+    if flags & CLONE_CHILD_SETTID != 0 {
+        let _ = child.copy_to_user(child_tid, &tid);
     }
     if flags & CLONE_CHILD_CLEARTID != 0 {
         child.clear_tid = child_tid;
@@ -1751,14 +1752,19 @@ fn setgroups(p: &mut LinuxProcess, size: u64, list: u64) -> Result<u64, i64> {
 fn prlimit(p: &mut LinuxProcess, pid: u64, resource: u64, new: u64, old: u64) -> Result<u64, i64> {
     use crate::process::{MAX_FDS, RLIM_NLIMITS, RLIMIT_NOFILE};
     const ESRCH: i64 = 3;
-    if pid != 0 && pid != p.group.tgid {
-        return Err(ESRCH);
-    }
+    let group = if pid == 0 || pid == p.group.tgid {
+        p.group.clone()
+    } else {
+        let e = proc::find(p.entry.cell, pid).ok_or(ESRCH)?;
+        signal::may_signal(p, pid, 0)?; // the same rights as to signal it
+        let leader = proc::find(p.entry.cell, e.tgid).ok_or(ESRCH)?;
+        leader.process().ok_or(ESRCH)?
+    };
     let r = usize::try_from(resource)
         .ok()
         .filter(|&r| r < RLIM_NLIMITS)
         .ok_or(EINVAL)?;
-    let (cur, max) = p.group.limits()[r];
+    let (cur, max) = group.limits()[r];
     if new != 0 {
         let mut b = [0u8; 16];
         if p.copy_from_user(new, &mut b) != 16 {
@@ -1775,7 +1781,7 @@ fn prlimit(p: &mut LinuxProcess, pid: u64, resource: u64, new: u64, old: u64) ->
         if hard > max || (r == RLIMIT_NOFILE && hard > MAX_FDS as u64) {
             return Err(EPERM);
         }
-        p.group.set_limit(r, soft, hard);
+        group.set_limit(r, soft, hard);
     }
     if old != 0 {
         put_pair(p, old, cur, max)?;

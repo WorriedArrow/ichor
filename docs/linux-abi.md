@@ -64,7 +64,7 @@ stale. Do not edit by hand.
 | 51 | `getsockname` | implemented |  |
 | 52 | `getpeername` | implemented |  |
 | 53 | `socketpair` | implemented |  |
-| 54 | `setsockopt` | partial | SO_REUSEADDR, SO_PASSCRED, SO_RCVTIMEO, SO_SNDTIMEO and SO_LINGER with no time act; other known options are recorded only |
+| 54 | `setsockopt` | partial | SO_REUSEADDR, SO_REUSEPORT, SO_PASSCRED, SO_RCVTIMEO, SO_SNDTIMEO and SO_LINGER with no time act; other known options are recorded only |
 | 55 | `getsockopt` | partial | SO_ERROR, SO_TYPE, SO_ACCEPTCONN, SO_REUSEADDR, SO_PEERCRED, SO_PASSCRED; others echo what was set |
 | 56 | `clone` | partial | fork, vfork-style and thread clones |
 | 57 | `fork` | implemented |  |
@@ -240,7 +240,7 @@ stale. Do not edit by hand.
 | 296 | `pwritev` | implemented |  |
 | 297 | `rt_tgsigqueueinfo` | implemented |  |
 | 299 | `recvmmsg` | partial | as recvmsg |
-| 302 | `prlimit64` | partial | own process only; NOFILE and STACK enforced, others stored |
+| 302 | `prlimit64` | partial | NOFILE, STACK and FSIZE enforced, others stored |
 | 306 | `syncfs` | partial | the upper layer is memory |
 | 307 | `sendmmsg` | partial | as sendmsg |
 | 308 | `setns` | partial | always EPERM (no CAP_SYS_ADMIN in cells) |

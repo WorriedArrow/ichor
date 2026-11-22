@@ -4,18 +4,18 @@
 //! that lead there (`Overlay::set_elsewhere`), by a symbolic link, a working
 //! directory or otherwise. Opening a file snapshots its contents into a
 //! descriptor (like Linux's `seq_file`, reads continue through the
-//! snapshot); directories list their entries through `getdents64`; links
+//! snapshot; `maps` is written as it is read); directories list their entries through `getdents64`; links
 //! answer `readlink` and are followed like symlinks, but for descriptors',
 //! which are opened anew (`fs::reopen`).
 //!
-//! Partial: threads have no `task` directories, and a zombie only `stat`
-//! and `status`.
+//! Partial: a zombie has only `stat` and `status`.
 
 use alloc::format;
 use alloc::string::{String, ToString};
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 
-use frame::sync::SpinLock;
+use frame::sync::{Mutex, SpinLock};
 
 use crate::poll::Object;
 use crate::proc::{self, ProcEntry};
@@ -34,6 +34,8 @@ const DT_LNK: u8 = 10;
 pub(crate) enum Node {
     Dir(Vec<(String, u8)>),
     File(Vec<u8>),
+    /// A process's `maps`, written as it is read: it may be long.
+    Maps(Weak<Group>),
     Link(String),
 }
 
@@ -211,6 +213,7 @@ fn process(p: &LinuxProcess, pid: u64, rest: &[&str]) -> Result<Node, i64> {
             ("stat", DT_REG),
             ("statm", DT_REG),
             ("status", DT_REG),
+            ("task", DT_DIR),
         ])),
         // A cell sees itself as the root of a cgroup (v2) namespace; there
         // is no cgroup file system to look further in.
@@ -236,14 +239,14 @@ fn process(p: &LinuxProcess, pid: u64, rest: &[&str]) -> Result<Node, i64> {
             let f = g.fd(n).ok_or(ENOENT)?;
             Ok(Node::Link(describe(&g, &f)))
         }
-        ["maps"] => Ok(Node::File(g.mm().maps().into_bytes())),
+        ["maps"] => Ok(Node::Maps(Arc::downgrade(&g))),
         ["mountinfo"] => Ok(Node::File(
             b"1 0 0:1 / / rw - ichor rootfs rw\n2 1 0:2 / /proc rw - proc proc rw\n\
               3 1 0:3 / /dev rw - devtmpfs devtmpfs rw\n"
                 .to_vec(),
         )),
         ["mounts"] => Ok(Node::File(mounts())),
-        ["stat"] => Ok(Node::File(stat_process(&g))),
+        ["stat"] => Ok(Node::File(stat_process(&g, &g.leader))),
         ["statm"] => {
             let (size, rss) = {
                 let mm = g.mm();
@@ -253,7 +256,30 @@ fn process(p: &LinuxProcess, pid: u64, rest: &[&str]) -> Result<Node, i64> {
                 format!("{size} {rss} 0 0 0 {rss} 0\n").into_bytes(),
             ))
         }
-        ["status"] => Ok(Node::File(status(&g))),
+        ["status"] => Ok(Node::File(status(&g, &g.leader))),
+        ["task"] => {
+            let t = g.threads();
+            let names = t.iter().map(|t| (t.pid.to_string(), DT_DIR));
+            Ok(Node::Dir(names.collect()))
+        }
+        ["task", tid, rest @ ..] => {
+            let tid: u64 = tid.parse().map_err(|_| ENOENT)?;
+            let threads = g.threads();
+            let t = threads.iter().find(|t| t.pid == tid).ok_or(ENOENT)?;
+            match rest {
+                [] => Ok(dir(&[
+                    ("comm", DT_REG),
+                    ("stat", DT_REG),
+                    ("status", DT_REG),
+                ])),
+                ["comm"] => Ok(Node::File(format!("{}\n", comm(&g)).into_bytes())),
+                ["stat"] => Ok(Node::File(stat_process(&g, t))),
+                ["status"] => Ok(Node::File(status(&g, t))),
+                // Shared by the process's threads.
+                ["cmdline" | "cwd" | "exe" | "fd" | "maps" | "mounts", ..] => process(p, pid, rest),
+                _ => Err(ENOENT),
+            }
+        }
         _ => Err(ENOENT),
     }
 }
@@ -389,7 +415,8 @@ fn stat_global(p: &LinuxProcess) -> Vec<u8> {
     s.into_bytes()
 }
 
-fn status(g: &Group) -> Vec<u8> {
+/// `status` of thread `t` of a process.
+fn status(g: &Group, t: &ProcEntry) -> Vec<u8> {
     let (size, rss) = {
         let mm = g.mm();
         (mm.virtual_size() / 1024, mm.resident_pages() as u64 * 4)
@@ -402,8 +429,8 @@ fn status(g: &Group) -> Vec<u8> {
     }
     let acts = g.actions.lock().clone();
     format!(
-        "Name:\t{}\nUmask:\t{:04o}\nState:\t{letter} ({word})\nTgid:\t{pid}\nNgid:\t0\n\
-         Pid:\t{pid}\nPPid:\t{}\nTracerPid:\t0\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\n\
+        "Name:\t{}\nUmask:\t{:04o}\nState:\t{letter} ({word})\nTgid:\t{}\nNgid:\t0\n\
+         Pid:\t{}\nPPid:\t{}\nTracerPid:\t0\nUid:\t{}\t{}\t{}\t{}\nGid:\t{}\t{}\t{}\t{}\n\
          FDSize:\t{}\nGroups:\t{groups}\nVmPeak:\t{size} kB\nVmSize:\t{size} kB\n\
          VmHWM:\t{rss} kB\nVmRSS:\t{rss} kB\nThreads:\t{}\nSigQ:\t0/4096\n\
          SigPnd:\t0000000000000000\nShdPnd:\t{:016x}\nSigBlk:\t{:016x}\nSigIgn:\t{:016x}\n\
@@ -412,6 +439,8 @@ fn status(g: &Group) -> Vec<u8> {
          Cpus_allowed_list:\t{}\n",
         comm(g),
         g.umask(),
+        g.tgid,
+        t.pid,
         g.leader.ppid(),
         c.ruid,
         c.euid,
@@ -423,8 +452,8 @@ fn status(g: &Group) -> Vec<u8> {
         c.fsgid,
         g.open_fds().len().next_power_of_two().max(64),
         g.threads().len(),
-        proc::pending(&g.leader),
-        proc::blocked(&g.leader),
+        proc::pending(t),
+        proc::blocked(t),
         acts.set_ignored(),
         acts.caught(),
         c.permitted,
@@ -432,7 +461,6 @@ fn status(g: &Group) -> Vec<u8> {
         crate::cred::BOUNDING,
         u8::from(g.prctl.lock().no_new_privs),
         cpu_list(),
-        pid = g.tgid,
     )
     .into_bytes()
 }
@@ -447,7 +475,7 @@ fn cpu_list() -> String {
 
 /// `/proc/<pid>/stat`. User CPU time, start time, size and resident pages
 /// are real; what is not counted is zero.
-fn stat_process(g: &Group) -> Vec<u8> {
+fn stat_process(g: &Group, t: &ProcEntry) -> Vec<u8> {
     let (pgid, sid) = g.leader.group();
     let (vsize, rss) = {
         let mm = g.mm();
@@ -459,7 +487,7 @@ fn stat_process(g: &Group) -> Vec<u8> {
     format!(
         "{} ({}) {letter} {} {pgid} {sid} 0 -1 0 0 0 0 0 {ticks} 0 0 0 {} {nice} {} 0 {} {vsize} \
          {rss} {}{}\n",
-        g.tgid,
+        t.pid,
         comm(g),
         g.leader.ppid(),
         20 + nice,
@@ -475,11 +503,20 @@ fn stat_process(g: &Group) -> Vec<u8> {
 // Descriptors for opened /proc nodes.
 // ---------------------------------------------------------------------------
 
-/// An opened `/proc` file: a snapshot read sequentially.
+/// An opened `/proc` file: a snapshot read sequentially, or (`maps`) text
+/// made a piece at a time.
 #[derive(Debug)]
 pub(crate) struct ProcFile {
+    state: Mutex<Text>,
+    maps: Option<Weak<Group>>,
+}
+
+#[derive(Debug, Default)]
+struct Text {
     data: Vec<u8>,
-    pos: SpinLock<usize>,
+    pos: usize,
+    /// Where the next piece of `maps` starts.
+    next: Option<u64>,
 }
 
 /// An opened `/proc` directory.
@@ -493,8 +530,21 @@ pub(crate) struct ProcDir {
 impl ProcFile {
     pub(crate) fn new(data: Vec<u8>) -> ProcFile {
         ProcFile {
-            data,
-            pos: SpinLock::new(0),
+            state: Mutex::new(Text {
+                data,
+                ..Text::default()
+            }),
+            maps: None,
+        }
+    }
+
+    pub(crate) fn maps(of: Weak<Group>) -> ProcFile {
+        ProcFile {
+            state: Mutex::new(Text {
+                next: Some(0),
+                ..Text::default()
+            }),
+            maps: Some(of),
         }
     }
 }
@@ -511,14 +561,47 @@ impl ProcDir {
 
 impl Object for ProcFile {
     fn read(&self, max: usize, _: bool, _: &dyn Fn() -> bool) -> Result<Vec<u8>, i64> {
-        let mut pos = self.pos.lock();
-        let start = (*pos).min(self.data.len());
-        let end = start.saturating_add(max).min(self.data.len());
-        *pos = end;
-        Ok(self.data[start..end].to_vec())
+        let mut t = self.state.lock();
+        if t.pos >= t.data.len()
+            && let Some(from) = t.next
+        {
+            // A process that has exited maps nothing.
+            let group = self.maps.as_ref().and_then(Weak::upgrade);
+            let (text, next) = group.map_or_else(Default::default, |g| g.mm().maps(from));
+            *t = Text {
+                data: text.into_bytes(),
+                pos: 0,
+                next,
+            };
+        }
+        let start = t.pos.min(t.data.len());
+        let end = start.saturating_add(max).min(t.data.len());
+        t.pos = end;
+        Ok(t.data[start..end].to_vec())
     }
     fn write(&self, _: &[u8], _: bool, _: &dyn Fn() -> bool) -> Result<usize, i64> {
         Err(EINVAL)
+    }
+    fn seek(&self, offset: i64, whence: u64) -> Result<u64, i64> {
+        let mut t = self.state.lock();
+        let base = match whence {
+            0 => 0,
+            1 => t.pos as i64,
+            _ => return Err(EINVAL),
+        };
+        let to = base.checked_add(offset).and_then(|n| u64::try_from(n).ok());
+        let to = to.ok_or(EINVAL)?;
+        if self.maps.is_none() {
+            t.pos = usize::try_from(to).map_err(|_| EINVAL)?;
+        } else if to == 0 && whence == 0 {
+            *t = Text {
+                next: Some(0),
+                ..Text::default()
+            };
+        } else if whence == 0 || offset != 0 {
+            return Err(EINVAL);
+        }
+        Ok(to)
     }
     fn poll(&self) -> u16 {
         crate::poll::POLLIN | crate::poll::POLLOUT
@@ -540,6 +623,14 @@ impl Object for ProcDir {
     }
     fn mode(&self) -> u32 {
         0o040_000 // S_IFDIR
+    }
+    fn seek(&self, offset: i64, whence: u64) -> Result<u64, i64> {
+        let to = u64::try_from(offset).map_err(|_| EINVAL)?;
+        if whence != 0 {
+            return Err(EINVAL);
+        }
+        *self.pos.lock() = to;
+        Ok(to)
     }
     fn dir(&self) -> Option<(&[crate::poll::DirEntry], &SpinLock<u64>)> {
         Some((&self.entries, &self.pos))

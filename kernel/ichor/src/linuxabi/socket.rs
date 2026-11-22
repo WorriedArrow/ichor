@@ -71,6 +71,7 @@ const IP_TTL: u64 = 2;
 const IP_MTU_DISCOVER: u64 = 10;
 const IP_FREEBIND: u64 = 15;
 const IP_BIND_ADDRESS_NO_PORT: u64 = 24;
+const IP_MULTICAST_IF: u64 = 32;
 const IP_MULTICAST_TTL: u64 = 33;
 const IP_MULTICAST_LOOP: u64 = 34;
 const TCP_NODELAY: u64 = 1;
@@ -632,6 +633,7 @@ fn known_option(s: &Socket, level: u64, name: u64) -> bool {
                 | IP_MTU_DISCOVER
                 | IP_FREEBIND
                 | IP_BIND_ADDRESS_NO_PORT
+                | IP_MULTICAST_IF
                 | IP_MULTICAST_TTL
                 | IP_MULTICAST_LOOP
         ),
@@ -718,6 +720,10 @@ pub(super) fn setsockopt(
             return Ok(0);
         }
         (SOL_SOCKET, SO_REUSEADDR) => s.stack.set_reuse_addr(s.id(), int(0)? != 0)?,
+        (SOL_SOCKET, SO_REUSEPORT) => {
+            s.stack.set_reuse_port(s.id(), int(0)? != 0)?;
+            v = int(0)?.to_le_bytes().to_vec();
+        }
         // struct linger { int l_onoff, l_linger; }: no time means reset.
         (SOL_SOCKET, SO_LINGER) => {
             let reset = int(0)? != 0 && int(4)? == 0;
@@ -729,6 +735,20 @@ pub(super) fn setsockopt(
             const MAX: i32 = 212_992;
             let twice = int(0)?.clamp(1152, MAX) * 2;
             v = twice.to_le_bytes().to_vec();
+        }
+        // An address to send multicast from: an `in_addr`, or an `ip_mreq`
+        // or `ip_mreqn`, which have it second.
+        (IPPROTO_IP, IP_MULTICAST_IF) => {
+            let at = if v.len() >= 8 { 4 } else { 0 };
+            let b: [u8; 4] = v
+                .get(at..at + 4)
+                .and_then(|b| b.try_into().ok())
+                .ok_or(EINVAL)?;
+            let ip = net::Ipv4Addr::from(b);
+            if !ip.is_unspecified() && !ip.is_loopback() && s.stack.addr() != Some(ip) {
+                return Err(netstack::EADDRNOTAVAIL);
+            }
+            v = b.to_vec();
         }
         // IP options may be a byte; everything here else is an int.
         (IPPROTO_IP, _) if v.len() == 1 => v = i32::from(v[0]).to_le_bytes().to_vec(),

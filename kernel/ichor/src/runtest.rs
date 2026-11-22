@@ -556,9 +556,8 @@ pub(crate) fn run_linux(
     let name = path.rsplit('/').next().unwrap_or("");
     p.group.set_exec(path, name, argv);
     let cell = p.cell.clone();
-    // A root that opted out of page sharing charges its private cache pages
-    // to the cell too; those are the root's, not the process's.
-    let cache_ns = p.vfs.private_ns();
+    // What the root holds is not the process's to give back.
+    let vfs = p.vfs.clone();
     let leader = p.group.leader.clone();
     let ctx = UserContext::new(loaded.entry, loaded.stack_pointer);
     let (_, syscalls) = proc::run(p, ctx);
@@ -570,21 +569,19 @@ pub(crate) fn run_linux(
         }
         frame::task::yield_now();
     };
+    drop(leader);
     // Orphans the program left (killed, or exiting on their own) may still
     // be on their way out: give the cell's other processes time to go.
     let deadline = frame::time::now() + core::time::Duration::from_secs(30);
-    let cached = loop {
-        let cached = cache_ns.map_or(0, |ns| crate::pagecache::private_pages(ns) as u64);
-        if cell.account().used() == cached || frame::time::now() > deadline {
-            break cached;
-        }
+    while cell.account().used() != vfs.charged() && frame::time::now() <= deadline {
         frame::task::yield_now();
-    };
-    if cell.account().used() != cached {
+    }
+    let root = vfs.charged();
+    if cell.account().used() != root {
         let (threads, procs, _) = proc::census(cell.id());
         println!("ichor: runtest: {procs} processes ({threads} threads) still live in the cell");
         println!(
-            "ichor: runtest: {} pages still charged ({cached} private cache pages)",
+            "ichor: runtest: {} pages still charged ({root} of them the root's)",
             cell.account().used()
         );
         fail("process memory was not returned");
@@ -3453,13 +3450,93 @@ pub(crate) fn root_image() -> &'static [u8] {
     b.finish(root).leak()
 }
 
+/// What a process may ask for without end is bounded, or its cell's to pay
+/// for: a program in a cell must not be able to use up the kernel's memory.
+fn limits_selftest(system: &System, vfs: &Arc<Vfs>) {
+    use crate::umem::flags::{MAP_ANONYMOUS, MAP_PRIVATE};
+    const PAGE: u64 = 4096;
+    const ENOMEM: i64 = 12;
+    let cell = Cell::new(&system.root_account, 128).unwrap_or_else(|| fail("no process cell"));
+    let account = cell.account().clone();
+    let mut p = LinuxProcess::new(cell, vfs.clone()).unwrap_or_else(|| fail("limits: no process"));
+
+    // A mapping split at every other page: refused at Linux's limit, with
+    // what is there intact.
+    {
+        let mut mm = p.mm();
+        let n = vma::MAX_REGIONS as u64 + 64;
+        let anonymous = MAP_PRIVATE | MAP_ANONYMOUS;
+        let at = mm
+            .mmap(0, n * PAGE, 0, anonymous, None)
+            .unwrap_or_else(|_| fail("limits: mmap"));
+        let mut i = 1;
+        while i < n && mm.mprotect(at + i * PAGE, PAGE, 1).is_ok() {
+            i += 2;
+        }
+        let (mut lines, mut from) = (0, Some(0));
+        while let Some(at) = from {
+            let (text, next) = mm.maps(at);
+            lines += text.lines().count();
+            from = next;
+        }
+        if i >= n || lines != mm.mappings() || lines > vma::MAX_REGIONS {
+            fail("limits: a process has more than 65530 mappings");
+        }
+        let mut extra = Vec::new();
+        while mm.mappings() < vma::MAX_REGIONS {
+            match mm.mmap(0, PAGE, 1 + 2 * (extra.len() as u64 & 1), anonymous, None) {
+                Ok(va) => extra.push(va),
+                Err(_) => fail("limits: room for a mapping"),
+            }
+        }
+        let inside = at + (n - 2) * PAGE;
+        let one_too_many = [
+            mm.mprotect(inside, PAGE, 1),
+            mm.munmap(inside, PAGE),
+            mm.mmap(inside, PAGE, 3, anonymous | 0x10, None),
+        ];
+        if one_too_many.iter().any(|r| *r != Err(ENOMEM)) || !mm.all_mapped(at, at + n * PAGE) {
+            fail("limits: splitting a mapping at the limit");
+        }
+        if mm.munmap(at, n * PAGE).is_err() || mm.mappings() != extra.len() {
+            fail("limits: unmapping them");
+        }
+    }
+
+    // Threads, and processes that come and go: their cell pays.
+    let before = account.used();
+    let mut threads = Vec::new();
+    while let Some(t) = p.new_thread() {
+        threads.push(t);
+    }
+    let n = threads.len();
+    for t in threads {
+        proc::discard(t);
+    }
+    if !(1..8).contains(&n) || account.used() != before {
+        fail("limits: threads are not charged to their cell");
+    }
+    match p.fork() {
+        Some(child) if account.used() > before => proc::discard(child),
+        _ => fail("limits: a process is not charged to its cell"),
+    }
+    if account.used() != before {
+        fail("limits: a process that is gone is still charged");
+    }
+    proc::discard(p);
+    if account.used() != 0 {
+        fail("limits: a cell with nothing in it is charged");
+    }
+    println!("ichor: linux: mappings are limited to 65530, and threads charged to their cell");
+}
+
 pub(crate) fn run() {
     let system = System::new(4096).unwrap_or_else(|| fail("no system cell"));
     let vfs = Arc::new(
         Vfs::mount_slice(root_image()).unwrap_or_else(|_| fail("could not mount the root image")),
     );
     let new_process = || {
-        let cell = Cell::new(&system.root_account, 128).unwrap_or_else(|| fail("no process cell"));
+        let cell = Cell::new(&system.root_account, 512).unwrap_or_else(|| fail("no process cell"));
         LinuxProcess::new(cell, vfs.clone()).unwrap_or_else(|| fail("no process"))
     };
 
@@ -3538,12 +3615,17 @@ pub(crate) fn run() {
         "ichor: linux: sendfile into a full non-blocking socket reports what it sent, then EAGAIN"
     );
 
-    let (status, _) = run_linux(new_process(), &fork_charge_program(), None, &["forkcharge"]);
+    // 128 pages, and two threads.
+    let cell =
+        Cell::new(&system.root_account, 128 + 2 * 17).unwrap_or_else(|| fail("no process cell"));
+    let p = LinuxProcess::new(cell, vfs.clone()).unwrap_or_else(|| fail("no process"));
+    let (status, _) = run_linux(p, &fork_charge_program(), None, &["forkcharge"]);
     if status != 0 {
         println!("ichor: linux: forkcharge failed check {status}");
         fail("fork accounting");
     }
-    println!("ichor: linux: fork charges only what is copied (80 shared pages in a 128-page cell)");
+    println!("ichor: linux: fork charges only what is copied (80 shared pages in a 162-page cell)");
+    limits_selftest(&system, &vfs);
 
     // Its own system and cell: the test needs more than one batch of
     // pages (4200 pages, 16 MiB), more than the usual test cells hold.
