@@ -10,18 +10,17 @@ suite's own unit), passed / run. Floors are in `workloads.toml`.
 - Image: `docker.io/library/python@sha256:935c3c5b12357a7e10caa9c1e6ca5692344d97cf229832ef584be2cec9fc03df`
 - Layer: `https://www.python.org/ftp/python/3.12.16/Python-3.12.16.tgz` (sha256:710c3e75dac8b2f258d9cd0f76e5c4c2e9175fac9e249c98901552f7cf33b7dd), `Python-3.12.16/Lib/test/` at `/usr/local/lib/python3.12/test/`
 - Command: `python3 -m test -j0 --timeout 600`
-- Result: 403 of 445 modules passed (90.5%), 47 skipped; floor 88.0%
-- Run time: 28 min (TCG, 4 vCPUs, the cell given 3 GiB)
-- Known causes among the failures: worker processes killed when the
-  cell's memory account filled (test_colorsys, test_codecs, test_compile
-  and test_compiler_assemble died of SIGSEGV within seconds of each
-  other, under investigation); writable shared file mappings (test_mmap);
-  `cosh` 8 ulps off under TCG (test_math, to check on KVM).
+- Result: 409 of 445 modules passed (91.9%), 47 skipped; floor 88.0%
+- Run time: 24 min (TCG, 4 vCPUs, the cell given 3 GiB)
+- Known causes among the failures: writable shared file mappings
+  (test_mmap; the overlay's upper pages are heap buffers, not frames);
+  `cosh` 8 ulps off under TCG (test_math, to check on KVM). Fixed since
+  the previous run: sendfile resending what it had sent, which filled the
+  cell's memory and killed other modules' workers.
 
 Failed:
 
 - `test.test_asyncio.test_base_events`
-- `test.test_asyncio.test_sendfile`
 - `test.test_asyncio.test_ssl`
 - `test.test_asyncio.test_subprocess`
 - `test.test_concurrent_futures.test_as_completed`
@@ -31,12 +30,7 @@ Failed:
 - `test.test_concurrent_futures.test_shutdown`
 - `test.test_concurrent_futures.test_wait`
 - `test_cmd_line`
-- `test_cmd_line_script`
-- `test_codecs`
-- `test_colorsys`
-- `test_compile`
 - `test_compileall`
-- `test_compiler_assemble`
 - `test_ctypes`
 - `test_dbm`
 - `test_dbm_gnu`
