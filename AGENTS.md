@@ -106,10 +106,12 @@ not write it; merge its branch when it lands.
   get/setpriority, `memfd_create`, absolute `clock_nanosleep`, named
   pipes (`mknod`/`mknodat` S_IFIFO, blocking opens), robust futex lists;
   open TCP NAT mappings live five days (Linux's established timeout), not
-  ten minutes. Known gaps from its runs: `test_math` cosh is 8 ulps off
-  under TCG (check on KVM), rseq (ENOSYS, glibc falls
-  back). Latest recorded full run: 409 of 445 modules (91.9%),
-  before shared file mappings; floor 88.0% in `workloads.toml`.
+  ten minutes; futex deadlines of the wall clock (`FUTEX_CLOCK_REALTIME`
+  was taken as time since boot, so `sem_timedwait` never timed out).
+  Latest full run (2026-11-22): 454 of 457 modules (99.3%). The three:
+  no compiler in the image (`test_ctypes`), `dnotify` (`test_fcntl`), and
+  `multiprocessing_spawn.test_processes`, which takes 9 of its 10 minutes
+  under TCG and passes with a longer limit. rseq is ENOSYS.
 - M7 Go (second suite): `cargo xtask workloads go` runs `go test -short
   std` on the official `golang` image. Fixed on the way: `epoll_wait` held
   descriptors and a fixed interest list while asleep (an epoll instance is

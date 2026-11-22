@@ -10,52 +10,14 @@ suite's own unit), passed / run. Floors are in `workloads.toml`.
 - Image: `docker.io/library/python@sha256:935c3c5b12357a7e10caa9c1e6ca5692344d97cf229832ef584be2cec9fc03df`
 - Layer: `https://www.python.org/ftp/python/3.12.16/Python-3.12.16.tgz` (sha256:710c3e75dac8b2f258d9cd0f76e5c4c2e9175fac9e249c98901552f7cf33b7dd), `Python-3.12.16/Lib/test/` at `/usr/local/lib/python3.12/test/`
 - Command: `python3 -m test -j0 --timeout 600`
-- Result: 409 of 445 modules passed (91.9%), 47 skipped; floor 88.0%
-- Run time: 24 min (TCG, 4 vCPUs, the cell given 3 GiB)
-- Known causes among the failures: writable shared file mappings
-  (test_mmap; the overlay's upper pages are heap buffers, not frames);
-  `cosh` 8 ulps off under TCG (test_math, to check on KVM). Fixed since
-  the previous run: sendfile resending what it had sent, which filled the
-  cell's memory and killed other modules' workers.
+- Result: 454 of 457 modules passed (99.3%), 35 skipped; floor 88.0%
+- Run time: 31 min (tcg, 4 vCPUs, the cell given 3 GiB)
 
 Failed:
 
-- `test.test_asyncio.test_base_events`
-- `test.test_asyncio.test_ssl`
-- `test.test_asyncio.test_subprocess`
-- `test.test_concurrent_futures.test_as_completed`
-- `test.test_concurrent_futures.test_deadlock`
-- `test.test_concurrent_futures.test_init`
-- `test.test_concurrent_futures.test_process_pool`
-- `test.test_concurrent_futures.test_shutdown`
-- `test.test_concurrent_futures.test_wait`
-- `test_cmd_line`
-- `test_compileall`
+- `test.test_multiprocessing_spawn.test_processes`
 - `test_ctypes`
-- `test_dbm`
-- `test_dbm_gnu`
 - `test_fcntl`
-- `test_fileio`
-- `test_ftplib`
-- `test_httplib`
-- `test_importlib`
-- `test_ioctl`
-- `test_logging`
-- `test_math`
-- `test_mmap`
-- `test_os`
-- `test_posix`
-- `test_shelve`
-- `test_shutil`
-- `test_signal`
-- `test_socket`
-- `test_ssl`
-- `test_subprocess`
-- `test_tarfile`
-- `test_tempfile`
-- `test_termios`
-- `test_venv`
-- `test_zipfile`
 
 ## go
 

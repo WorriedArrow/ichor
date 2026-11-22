@@ -3,8 +3,8 @@
 # run. A full run below its floor fails. Raise a floor in the change that
 # earns it; leave a little room under the last result for flaky tests.
 
-# 2026-11-21: 403 of 445 modules (90.5%) under TCG on 4 vCPUs.
-python = 880
+# 2026-11-22: 454 of 457 modules (99.3%) under TCG on 4 vCPUs.
+python = 970
 
 # 2026-11-21: 254 of 262 packages (96.9%) under TCG on 4 vCPUs.
 go = 940
