@@ -45,6 +45,16 @@ pub(crate) fn set_mtu(mtu: u16) {
     MTU.store(u32::from(mtu), Ordering::Relaxed);
 }
 
+/// The longest the uplink's lease is taken to last, in seconds (0: as long
+/// as the server says).
+static LEASE_CAP: AtomicU32 = AtomicU32::new(0);
+
+/// Caps the uplink's lease (`dhcp_lease=SECONDS`), so it is renewed within
+/// a test.
+pub(crate) fn set_lease_cap(secs: u32) {
+    LEASE_CAP.store(secs, Ordering::Relaxed);
+}
+
 /// Sets the published-port test's uplink port (`net_publish=N`).
 pub(crate) fn set_publish_port(port: u16) {
     PUBLISH_PORT.store(u32::from(port), Ordering::Relaxed);
@@ -94,8 +104,10 @@ pub(crate) fn run() {
     );
     // The address from the network's DHCP server (a cloud VPC's, QEMU's),
     // else QEMU's user-network defaults.
+    let mut client = None;
     let (addr, prefix, router, mtu) = match dhcp(&mut dev, Mac(m)) {
-        Some(l) => {
+        Some((c, l)) => {
+            client = Some(c);
             let dns: Vec<_> = l.dns.iter().map(|d| alloc::format!("{d}")).collect();
             println!(
                 "ichor: net: DHCP lease {}/{} via {} from {}, DNS {}, for {}",
@@ -174,7 +186,7 @@ pub(crate) fn run() {
         0 => mtu,
         forced => forced as u16,
     };
-    crate::switch::set_uplink(link, ifc, mtu);
+    crate::switch::set_uplink(link, ifc, mtu, client);
     crate::netstack::start();
     println!(
         "ichor: net: uplink {addr} on {name} is the cell switch's (NAT for 10.88.0.0/16, MTU {mtu})"
@@ -182,13 +194,19 @@ pub(crate) fn run() {
 }
 
 /// Asks the network's DHCP server for an address: up to 8 s, which
-/// covers the DISCOVER and two retransmissions. The lease is not renewed
-/// once the device is the uplink (partial: clouds' leases run for hours,
-/// and a cloud keeps a VM's address for its life).
-fn dhcp(dev: &mut virtio_net::VirtioNet, mac: Mac) -> Option<net::dhcp::Lease> {
+/// covers the DISCOVER and two retransmissions. The client goes on with
+/// the uplink, which renews the lease.
+fn dhcp(
+    dev: &mut virtio_net::VirtioNet,
+    mac: Mac,
+) -> Option<(net::dhcp::Client, net::dhcp::Lease)> {
     let mut xid = [0u8; 4];
     crate::random::fill(&mut xid);
     let mut c = net::dhcp::Client::new(mac, u32::from_le_bytes(xid));
+    match LEASE_CAP.load(Ordering::Relaxed) {
+        0 => {}
+        s => c.cap_lease(Duration::from_secs(u64::from(s))),
+    }
     let deadline = now() + Duration::from_secs(8);
     while now() < deadline {
         if let Some(f) = c.poll(now()) {
@@ -196,7 +214,7 @@ fn dhcp(dev: &mut virtio_net::VirtioNet, mac: Mac) -> Option<net::dhcp::Lease> {
         }
         while let Some(f) = dev.receive() {
             if let Some(lease) = c.receive(now(), &f) {
-                return Some(lease);
+                return Some((c, lease));
             }
         }
         frame::task::yield_now();

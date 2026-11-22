@@ -601,8 +601,10 @@ with their virtio-net NIC those can network: the uplink takes its
 address, router and DNS server from DHCP (`net::dhcp`, host-tested;
 QEMU's slirp hands out 10.0.2.15, so the tests see the same address),
 and the control plane resolves through the lease's DNS server unless
-`dns=` is given. Not yet: renewing the lease, the clouds' metadata
-servers, AWS ENA and GCP gVNIC, Hyper-V VMBus for Azure, Secure Boot.
+`dns=` is given. The uplink renews the lease at half its time, and moves
+address if the server says so (published ports stay, connections are
+cut); unrenewed past its end, it keeps the address and asks on. Not yet:
+the clouds' metadata servers, AWS ENA and GCP gVNIC, Hyper-V VMBus for Azure, Secure Boot.
 
 ## Commands
 
@@ -668,6 +670,7 @@ comment.
 | `control_exit` | with `control`: stop when the first API client hangs up, then shut down (tests) |
 | `control_exit_after=SECONDS` | with `control`: stop after that long once no client is connected (tests) |
 | `uplink_mtu=N` | the uplink network's MTU, over the DHCP lease's (default: the lease's, else 1500); every TCP SYN crossing the uplink is clamped to MTU - 40 |
+| `dhcp_lease=SECONDS` | the longest the uplink's DHCP lease is taken to last (tests: renewed sooner) |
 | `dns=A.B.C.D` | the control plane's DNS resolver (default: the uplink's DHCP lease's first DNS server, else `10.0.2.3`, QEMU's) |
 
 ## Layout

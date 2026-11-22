@@ -21,8 +21,10 @@ use alloc::sync::Weak;
 use alloc::vec::Vec;
 use core::time::Duration;
 
+use frame::println;
 use frame::sync::SpinLock;
 use net::Ipv4Addr;
+use net::dhcp::{Client, Lease};
 use net::iface::{Interface, Packet};
 use net::link::Link;
 use net::nat::{self, Nat};
@@ -51,6 +53,78 @@ struct Uplink {
     /// The largest TCP segment the uplink's network carries: its MTU
     /// less 40 (every SYN crossing the uplink is clamped to it).
     mss: u16,
+    /// The client whose lease the address is, if it came from DHCP.
+    dhcp: Option<Client>,
+    renewed: bool,
+    /// The lease ran out unrenewed (the address is kept: see
+    /// [`Uplink::lease_news`]).
+    expired: bool,
+}
+
+/// What became of the uplink's lease, to log outside the lock.
+enum LeaseNews {
+    /// The first renewal (later ones that change nothing are quiet).
+    Renewed(Lease),
+    /// A renewal that moved the uplink, from this address.
+    Moved(Ipv4Addr, Lease),
+    /// Nobody renewed it in time.
+    Expired,
+}
+
+impl Uplink {
+    /// Sends what the DHCP client has to say; tells when the lease has run
+    /// out. The address is then kept, and servers asked until one answers:
+    /// giving it up (RFC 2131 §4.4.5) would cut off every cell because a
+    /// DHCP server was away, and clouds keep a VM's address for its life.
+    fn poll_dhcp(&mut self, t: Duration) -> Option<LeaseNews> {
+        let c = self.dhcp.as_mut()?;
+        if let Some(f) = c.poll(t) {
+            self.dev.transmit(&f);
+        }
+        let out = c.lease().is_none();
+        (out && !core::mem::replace(&mut self.expired, out)).then_some(LeaseNews::Expired)
+    }
+
+    /// Takes a frame the DHCP client may be waiting for; applies the lease
+    /// if it was the answer.
+    fn dhcp_frame(&mut self, t: Duration, frame: &[u8]) -> Option<LeaseNews> {
+        let c = self.dhcp.as_mut().filter(|c| c.exchanging())?;
+        let lease = c.receive(t, frame)?;
+        self.expired = false;
+        let was = self.ifc.addr;
+        if (lease.addr, lease.prefix, lease.router) == (was, self.ifc.prefix, self.ifc.gateway) {
+            let first = !core::mem::replace(&mut self.renewed, true);
+            return first.then_some(LeaseNews::Renewed(lease));
+        }
+        self.ifc.readdress(lease.addr, lease.prefix, lease.router);
+        if lease.addr != was {
+            self.nat.set_outside(lease.addr);
+        }
+        Some(LeaseNews::Moved(was, lease))
+    }
+}
+
+/// Logs what became of the uplink's lease, and takes its DNS servers.
+fn lease_news(news: LeaseNews) {
+    match news {
+        LeaseNews::Renewed(l) => {
+            println!(
+                "ichor: net: DHCP lease renewed ({}/{} from {})",
+                l.addr, l.prefix, l.server
+            );
+            set_uplink_dns(l.dns);
+        }
+        LeaseNews::Moved(was, l) => {
+            println!(
+                "ichor: net: DHCP moved the uplink from {was} to {}/{} (from {}); connections through it are cut",
+                l.addr, l.prefix, l.server
+            );
+            set_uplink_dns(l.dns);
+        }
+        LeaseNews::Expired => println!(
+            "ichor: net: the DHCP lease ran out and no server renewed it; keeping the address and asking on"
+        ),
+    }
 }
 
 static TABLE: SpinLock<Option<Table>> = SpinLock::new(None);
@@ -144,8 +218,9 @@ pub(crate) fn stats(cell: u64) -> Option<(u64, u64, u64)> {
 }
 
 /// Makes `dev`/`ifc` the uplink, on a network whose MTU is `mtu` (GCP's
-/// VPCs: 1460; most others 1500).
-pub(crate) fn set_uplink(dev: Box<dyn Link>, ifc: Interface, mtu: u16) {
+/// VPCs: 1460; most others 1500). `dhcp` is the client whose lease `ifc`
+/// has, renewed from here on.
+pub(crate) fn set_uplink(dev: Box<dyn Link>, ifc: Interface, mtu: u16, dhcp: Option<Client>) {
     let nat = Nat::new(ifc.addr);
     *UPLINK.lock() = Some(Uplink {
         dev,
@@ -153,6 +228,9 @@ pub(crate) fn set_uplink(dev: Box<dyn Link>, ifc: Interface, mtu: u16) {
         nat,
         last_expire: now(),
         mss: mtu.clamp(576, 1500) - 40,
+        dhcp,
+        renewed: false,
+        expired: false,
     });
 }
 
@@ -266,6 +344,7 @@ pub(crate) fn poll_uplink() -> bool {
     let mut inbound: Vec<(PortId, Packet)> = Vec::new();
     let mut any = false;
     let mut st = UplinkStats::default();
+    let mut news = None;
     {
         let mut u = UPLINK.lock();
         let Some(u) = u.as_mut() else {
@@ -273,6 +352,7 @@ pub(crate) fn poll_uplink() -> bool {
         };
         let t = now();
         u.ifc.poll(t);
+        news = u.poll_dhcp(t).or(news);
         if t.saturating_sub(u.last_expire) > Duration::from_secs(10) {
             u.nat.expire(t);
             u.last_expire = t;
@@ -283,6 +363,10 @@ pub(crate) fn poll_uplink() -> bool {
             };
             any = true;
             st.frames += 1;
+            if let Some(n) = u.dhcp_frame(t, &frame) {
+                news = Some(n);
+                continue;
+            }
             let Some(mut p) = u.ifc.receive(t, &frame) else {
                 continue;
             };
@@ -336,6 +420,9 @@ pub(crate) fn poll_uplink() -> bool {
         while let Some(frame) = u.ifc.transmit() {
             u.dev.transmit(&frame);
         }
+    }
+    if let Some(n) = news {
+        lease_news(n);
     }
     if any {
         st.delivered = inbound.len() as u64;

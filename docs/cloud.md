@@ -65,8 +65,8 @@ unless gVNIC is asked for, give the VM a virtio-net NIC: both have Ichor
 drivers, so these are the ones that can network. The uplink takes its
 address, router and DNS server from the VPC's DHCP server (the boot log
 shows `ichor: net: DHCP lease ...`), and the control plane resolves
-through that DNS server unless `dns=` says otherwise. The lease is not
-renewed yet; GCP keeps a VM's internal address for its life. GCP's VPC
+through that DNS server unless `dns=` says otherwise. The uplink renews
+the lease at half its time. GCP's VPC
 MTU is 1460 by default: the lease says so, and the uplink clamps every
 TCP SYN crossing it to an MSS of 1420 (`uplink_mtu=N` overrides).
 The newer ones (C3, C4, ...) boot from NVMe and require gVNIC, which
@@ -88,8 +88,7 @@ with no NVMe at all.
 ## Not supported yet
 
 - Azure (Hyper-V VMBus storage and network).
-- Cloud NICs other than virtio-net (AWS ENA, GCP gVNIC); renewing the
-  uplink's DHCP lease; the cloud's metadata server (instance attributes,
-  SSH keys, startup configuration).
+- Cloud NICs other than virtio-net (AWS ENA, GCP gVNIC); the cloud's
+  metadata server (instance attributes, SSH keys, startup configuration).
 - Secure Boot: launch with it off (the default for custom AWS AMIs; on
   GCP, without Shielded VM Secure Boot).

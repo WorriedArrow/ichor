@@ -66,6 +66,17 @@ impl Interface {
         }
     }
 
+    /// Moves to another address and network, forgetting the old one's
+    /// neighbors and what waited for them.
+    pub fn readdress(&mut self, addr: Ipv4Addr, prefix: u8, gateway: Option<Ipv4Addr>) {
+        self.addr = addr;
+        self.prefix = prefix.min(32);
+        self.gateway = gateway;
+        self.arp.clear();
+        self.asked.clear();
+        self.waiting.clear();
+    }
+
     fn mask(&self) -> u32 {
         if self.prefix == 0 {
             0

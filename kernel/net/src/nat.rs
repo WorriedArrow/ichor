@@ -105,6 +105,14 @@ impl Nat {
         self.outside
     }
 
+    /// Moves the uplink to another address: published ports stay, and every
+    /// mapping goes (its remote only knows the old address).
+    pub fn set_outside(&mut self, outside: Ipv4Addr) {
+        self.outside = outside;
+        self.by_inside.clear();
+        self.by_outside.clear();
+    }
+
     /// Publishes `port` on the uplink to `inside`. Fails if the port is
     /// already published.
     pub fn publish(&mut self, proto: u8, port: u16, inside: Endpoint) -> bool {
@@ -476,6 +484,25 @@ mod tests {
             n.inbound(PROTO_TCP, (FAR, 5555), 8080, ACK, t(1)),
             Some((CELL, 80))
         );
+    }
+
+    #[test]
+    fn a_new_outside_address_keeps_published_ports_only() {
+        const NEW: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 77);
+        let mut n = Nat::new(UP);
+        assert!(n.publish(PROTO_TCP, 8080, (CELL, 80)));
+        let old = n.outbound(PROTO_TCP, (CELL, 40000), (FAR, 443), SYN, t(0));
+        assert_eq!(old.map(|e| e.0), Some(UP));
+        n.set_outside(NEW);
+        assert!(n.is_empty());
+        let p = old.unwrap().1;
+        assert_eq!(n.inbound(PROTO_TCP, (FAR, 443), p, ACK, t(1)), None);
+        assert_eq!(
+            n.inbound(PROTO_TCP, (FAR, 5000), 8080, SYN, t(1)),
+            Some((CELL, 80))
+        );
+        let new = n.outbound(PROTO_TCP, (CELL, 40001), (FAR, 443), SYN, t(1));
+        assert_eq!(new.map(|e| e.0), Some(NEW));
     }
 
     #[test]

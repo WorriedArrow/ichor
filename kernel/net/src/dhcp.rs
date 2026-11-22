@@ -9,8 +9,9 @@
 //! gives the frame to send now, if any (DISCOVER, REQUEST, and their
 //! retransmissions with exponential backoff, RFC 2131 §4.1);
 //! [`Client::receive`] takes any frame and returns the lease once an ACK
-//! binds it. A bound client asks again (broadcast, `ciaddr` set) at half
-//! the lease time, and a NAK starts over.
+//! binds it. A bound client asks again at half the lease time (from its
+//! address, broadcast as a rebinding client does, so any of the network's
+//! servers may answer); a NAK, or the lease running out, starts over.
 //!
 //! Every parser treats its input as hostile: a bad frame or message is
 //! ignored, never a panic.
@@ -84,6 +85,8 @@ pub struct Client {
     state: State,
     /// When the last message went out, and the wait before the next.
     sent: Option<(Duration, Duration)>,
+    /// The longest a lease is taken to last ([`Client::cap_lease`]).
+    cap: Option<Duration>,
 }
 
 impl Client {
@@ -95,7 +98,20 @@ impl Client {
             xid,
             state: State::Selecting,
             sent: None,
+            cap: None,
         }
+    }
+
+    /// Takes leases to last at most `t`, whatever the server says (so it
+    /// is renewed sooner; tests).
+    pub fn cap_lease(&mut self, t: Duration) {
+        self.cap = Some(t);
+    }
+
+    /// Whether an exchange with a server is under way (a reply would mean
+    /// something): always, but for a bound client not yet due to renew.
+    pub fn exchanging(&self) -> bool {
+        !matches!(self.state, State::Bound { .. })
     }
 
     /// The current lease, if bound.
@@ -133,6 +149,7 @@ impl Client {
             Some(_) => return None,
         };
         self.sent = Some((now, wait));
+        let from = self.lease().map_or(Ipv4Addr::UNSPECIFIED, |l| l.addr);
         let msg = match &self.state {
             State::Selecting => self.message(DISCOVER, None, None, None),
             State::Requesting { addr, server } => {
@@ -141,7 +158,7 @@ impl Client {
             State::Renewing { lease, .. } => self.message(REQUEST, None, None, Some(lease.addr)),
             State::Bound { .. } => return None,
         };
-        Some(frame(self.mac, &msg))
+        Some(frame(self.mac, from, &msg))
     }
 
     /// Takes a received frame; returns the lease when an ACK binds (or
@@ -158,7 +175,10 @@ impl Client {
                 None
             }
             (State::Requesting { .. } | State::Renewing { .. }, ACK) => {
-                let lease = reply.lease()?;
+                let mut lease = reply.lease()?;
+                if let Some(cap) = self.cap {
+                    lease.time = Some(lease.time.map_or(cap, |t| t.min(cap)));
+                }
                 self.state = State::Bound {
                     lease: lease.clone(),
                     at: now,
@@ -214,10 +234,10 @@ impl Client {
     }
 }
 
-/// A client message in a broadcast frame: from `mac` and 0.0.0.0:68 to
-/// everyone's port 67.
-fn frame(mac: Mac, msg: &[u8]) -> Vec<u8> {
-    let (from, to) = (Ipv4Addr::UNSPECIFIED, Ipv4Addr::BROADCAST);
+/// A client message in a broadcast frame: from `mac` and `from`:68 (no
+/// address until bound) to everyone's port 67.
+fn frame(mac: Mac, from: Ipv4Addr, msg: &[u8]) -> Vec<u8> {
+    let to = Ipv4Addr::BROADCAST;
     let udp = wire::udp(from, CLIENT_PORT, to, SERVER_PORT, msg);
     let ip = wire::ipv4(from, to, PROTO_UDP, 0, &udp);
     wire::ethernet(Mac::BROADCAST, mac, ETHERTYPE_IPV4, &ip)
@@ -352,15 +372,17 @@ mod tests {
         Duration::from_secs(s)
     }
 
-    /// The DHCP message in a client frame.
+    /// The DHCP message in a frame from a client with no address.
     fn sent(frame: &[u8]) -> (u8, u32, Vec<u8>) {
+        sent_from(frame, Ipv4Addr::UNSPECIFIED)
+    }
+
+    /// The DHCP message in a client frame from `from`.
+    fn sent_from(frame: &[u8], from: Ipv4Addr) -> (u8, u32, Vec<u8>) {
         let eth = wire::Ethernet::parse(frame).unwrap();
         assert_eq!(eth.dst, Mac::BROADCAST);
         let ip = wire::Ipv4::parse(eth.payload).unwrap();
-        assert_eq!(
-            (ip.src, ip.dst),
-            (Ipv4Addr::UNSPECIFIED, Ipv4Addr::BROADCAST)
-        );
+        assert_eq!((ip.src, ip.dst), (from, Ipv4Addr::BROADCAST));
         let udp = wire::Udp::parse(ip.payload, ip.src, ip.dst).unwrap();
         assert_eq!((udp.src_port, udp.dst_port), (68, 67));
         let m = udp.payload.to_vec();
@@ -465,18 +487,36 @@ mod tests {
         c.receive(t(1), &reply(OFFER, 9, &[]));
         c.poll(t(1)).unwrap();
         c.receive(t(2), &reply(ACK, 9, &[])).unwrap();
-        // At half the 3600 s lease: a broadcast REQUEST with ciaddr set.
+        // At half the 3600 s lease: a broadcast REQUEST from our address,
+        // with ciaddr set.
         assert!(c.poll(t(1000)).is_none());
-        let (kind, _, m) = sent(&c.poll(t(1802)).unwrap());
+        assert!(!c.exchanging());
+        let (kind, _, m) = sent_from(&c.poll(t(1802)).unwrap(), OFFERED);
         assert_eq!(kind, REQUEST);
         assert_eq!(&m[12..16], &OFFERED.octets());
+        assert!(c.exchanging());
         assert!(c.lease().is_some(), "still bound while renewing");
         let renewed = c.receive(t(1803), &reply(ACK, 9, &[])).unwrap();
         assert_eq!(renewed.addr, OFFERED);
+        assert!(!c.exchanging());
         // Unrenewed past the lease: back to discovering.
         c.poll(t(1803 + 1800)).unwrap();
         let f = c.poll(t(1803 + 3600 + 1)).unwrap();
         assert_eq!(sent(&f).0, DISCOVER);
         assert!(c.lease().is_none());
+        assert!(c.exchanging());
+    }
+
+    #[test]
+    fn a_capped_lease_is_renewed_sooner() {
+        let mut c = Client::new(MAC, 11);
+        c.cap_lease(t(4));
+        c.poll(t(0)).unwrap();
+        c.receive(t(0), &reply(OFFER, 11, &[]));
+        c.poll(t(0)).unwrap();
+        let lease = c.receive(t(0), &reply(ACK, 11, &[])).unwrap();
+        assert_eq!(lease.time, Some(t(4)), "not the server's hour");
+        assert!(c.poll(t(1)).is_none());
+        assert_eq!(sent_from(&c.poll(t(2)).unwrap(), OFFERED).0, REQUEST);
     }
 }

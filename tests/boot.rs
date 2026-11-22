@@ -728,7 +728,9 @@ fn a_published_port_serves_the_host_from_a_cell() {
     });
     // A 1400-byte uplink MTU: the host's SYNs (MSS 1460) are clamped to
     // 1360 on the way in, and the cells' replies must still arrive whole.
-    let out = ichor_tests::boot_with("net-publish", "net_publish=8080 uplink_mtu=1400", 2, |c| {
+    // A 6 s DHCP lease: the uplink renews it every 3 s meanwhile.
+    let cmdline = "net_publish=8080 uplink_mtu=1400 dhcp_lease=6";
+    let out = ichor_tests::boot_with("net-publish", cmdline, 2, |c| {
         c.net_user_opts = format!("hostfwd=tcp:127.0.0.1:{host_port}-:8080");
         c.timeout = Some(Duration::from_secs(420)); // two servers wait for the host
     });
@@ -742,6 +744,8 @@ fn a_published_port_serves_the_host_from_a_cell() {
         "debian: published: served a request from 10.0.2.2",
     ]);
     out.assert_in_order(&["alpine: nginx served the host through the published port"]);
+    out.assert_in_order(&["ichor: net: DHCP lease renewed (10.0.2.15/24 from 10.0.2.2)"]);
+    assert!(!out.serial.contains("DHCP moved the uplink"));
     for (resp, body) in got.iter().zip(BODIES) {
         let resp = resp
             .as_deref()

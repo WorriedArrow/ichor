@@ -88,6 +88,9 @@ fn kmain(info: BootInfo) -> ! {
     if let Some(mtu) = cmdline.get("uplink_mtu").and_then(|v| v.parse().ok()) {
         nettest::set_mtu(mtu);
     }
+    if let Some(secs) = cmdline.get("dhcp_lease").and_then(|v| v.parse().ok()) {
+        nettest::set_lease_cap(secs);
+    }
 
     let image = info.kernel_image();
     println!("ichor: image at {} ({} KiB)", image.base, image.len / 1024);
