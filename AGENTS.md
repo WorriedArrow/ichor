@@ -35,8 +35,8 @@ fails if frame or rt relaxes an unsafe-code lint]; (3) the control-plane
 listener local unless configured, with a test [done:
 `the_control_api_is_local_unless_configured`], then API authentication and
 Signal/Inspect/Destroy before any cloud boot [done: bearer token from
-`\ichor\apitoken`, ADR-0012 amendment; TLS for the API still owed before
-anything internet-reachable]; (4) io_uring completions
+`\ichor\apitoken`, ADR-0012 amendment; then TLS 1.3 from
+`\ichor\apitls.pem`, its 2026-11-21 amendment]; (4) io_uring completions
 without an enter (epoll on the ring fd, registered eventfd), with a test,
 before the Node.js suite [done]; (5) extra layers in PullImage, each pinned and
 verified by digest, with a refusal test [done: `LayerSource` (url, sha256
@@ -574,7 +574,7 @@ RSB filling, masked indices, AMD's measures. Boot logs which apply.
 Frame budget: ADR-0005 sets the milestone 3 ceiling at 8,500 lines / 380
 sites; ADR-0007 raises it to 9,500 / 420 for milestone 4 (TLB shootdown,
 atomic user ops for futexes, PCID). `audit.toml` is at step 7 (6,250 / 265,
-ADR-0004's isolation amendment); frame is at 6,209 / 261 (A5 added
+ADR-0004's isolation amendment); frame is at 6,213 / 261 (A5 added
 RDSEED/RDRAND and UEFI GetTime; B added XSAVE; C the frames tree and
 request tracking; M6 reading `\ichor\roots.pem`; ADR-0011 the checked user
 copy; ADR-0004 VERW/IBPB, page-table isolation and eIBRS). `services/rt` has
@@ -664,9 +664,10 @@ comment.
 | `bench` | run the Phase E benchmarks (`bench.rs`) after the root disk's self-tests and print them |
 | `net_echo_port=N` | the kernel's TCP, then a Debian cell through NAT, echo 256 KiB with the host's echo server at 10.0.2.2:N |
 | `net_publish=N` | publish uplink port N to a Debian cell's port 80 and serve one HTTP request from the host (QEMU forwards a host port to N) |
-| `control=PORT` | after the self-tests, run the control plane serving gRPC on PORT, on the system cell's loopback only (the API has no authentication yet) |
-| `control_listen=ADDR` | the address the API listens on (`0.0.0.0`: all of the system cell's, reachable from other cells) |
-| `control_publish=PORT` | publish the API on uplink port PORT (without `control_listen`, listens on all addresses); needs an API token in `\ichor\apitoken` (`RunConfig::api_token`, `disk-image --api-token-file`), else the API stays on loopback |
+| `control=PORT` | after the self-tests, run the control plane serving gRPC on PORT, on the system cell's loopback only, over TLS if there is `\ichor\apitls.pem` |
+| `control_listen=ADDR` | the address the API listens on (`0.0.0.0`: all of the system cell's, reachable from other cells); needs what `control_publish` needs |
+| `control_publish=PORT` | publish the API on uplink port PORT (without `control_listen`, listens on all addresses); needs an API token in `\ichor\apitoken` (`RunConfig::api_token`, `disk-image --api-token-file`) and a certificate and Ed25519 key in `\ichor\apitls.pem` (`RunConfig::api_tls`, `disk-image --api-tls-file`), else the API stays on loopback |
+| `control_plaintext` | let `control_listen`/`control_publish` do without a certificate (a network you trust) |
 | `control_exit` | with `control`: stop when the first API client hangs up, then shut down (tests) |
 | `control_exit_after=SECONDS` | with `control`: stop after that long once no client is connected (tests) |
 | `uplink_mtu=N` | the uplink network's MTU, over the DHCP lease's (default: the lease's, else 1500); every TCP SYN crossing the uplink is clamped to MTU - 40 |
@@ -714,9 +715,9 @@ xtask/src/inflate.rs       gzip/DEFLATE decoder; rootfs.rs: tar -> Ichor image
 xtask/src/disk.rs, fat.rs  bootable GPT disk image (FAT32 ESP + Ichor root partition)
 xtask/src/linuxref.rs      Linux reference boot for `cargo xtask bench` (Alpine linux-virt + initramfs)
 kernel/ichor     the kernel binary; frame::main!(kmain); kcell/nativeabi tie it together
-services/crypto  SHA-2, HMAC/HKDF, ChaCha20-Poly1305, X25519, RSA/ECDSA verify (host-tested; ADR-0012)
+services/crypto  SHA-2, HMAC/HKDF, ChaCha20-Poly1305, X25519, Ed25519, RSA/ECDSA verify (host-tested; ADR-0012)
 services/x509    DER, X.509, PEM root stores, chain verification (host-tested)
-services/tls     sans-I/O TLS 1.3 + 1.2 client (host-tested, recorded sessions)
+services/tls     sans-I/O TLS 1.3 + 1.2 client, TLS 1.3 server (host-tested, recorded sessions; `testdata/api.pem` is a public test key)
 services/http    sans-I/O HTTP/1.1 client messages (host-tested)
 services/layer   gzip/DEFLATE + tar layers (OCI whiteouts) into images; xtask uses it (host-tested)
 services/oci     image references, the registry pull protocol, conversion, image config (host-tested)

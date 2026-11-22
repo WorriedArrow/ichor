@@ -3,9 +3,11 @@
 //! for the acceptance tests and `cargo xtask workloads`.
 
 use std::collections::HashMap;
+use std::hash::{BuildHasher, RandomState};
 use std::io::{ErrorKind, Read, Write};
 use std::net::TcpStream;
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime};
 
 use grpc::control::{self, RunEvent};
 use grpc::{Client, Response};
@@ -15,11 +17,45 @@ use crate::Result;
 /// A call's messages so far, and its status once it ended.
 type Messages = (Vec<Vec<u8>>, Option<(u32, String)>);
 
-/// One API session: the socket and the gRPC client over it. Several calls
-/// can be in flight ([`Session::start`], [`Session::wait`]).
+/// The throwaway identity (certificate and key) test boots serve their API
+/// with; [`test_trust`] trusts it. Public, so good for nothing else.
+pub const TEST_IDENTITY: &str = include_str!("../../services/tls/testdata/api.pem");
+const TEST_CA: &str = include_str!("../../services/tls/testdata/api-ca.pem");
+
+/// Whom a session trusts to be the API: a certificate for `host` issued
+/// under `roots`.
+#[derive(Clone, Debug)]
+pub struct Trust {
+    pub roots: Arc<x509::RootStore>,
+    pub host: String,
+}
+
+/// Trust in [`TEST_IDENTITY`].
+pub fn test_trust() -> Trust {
+    Trust {
+        roots: Arc::new(x509::RootStore::from_pem(TEST_CA)),
+        host: "ichor-api.test".into(),
+    }
+}
+
+/// Random bytes from the operating system, by way of the standard
+/// library's hash keys (seeded from it).
+fn random<const N: usize>() -> [u8; N] {
+    let mut out = [0u8; N];
+    for (i, chunk) in out.chunks_mut(8).enumerate() {
+        let h = RandomState::new().hash_one((i, SystemTime::now()));
+        chunk.copy_from_slice(&h.to_le_bytes()[..chunk.len()]);
+    }
+    out
+}
+
+/// One API session: the socket and the gRPC client over it (through TLS,
+/// if the session has someone to trust). Several calls can be in flight
+/// ([`Session::start`], [`Session::wait`]).
 #[derive(Debug)]
 pub struct Session {
     sock: TcpStream,
+    tls: Option<Box<tls::Client>>,
     client: Client,
     pending: HashMap<u32, Messages>,
 }
@@ -27,32 +63,91 @@ pub struct Session {
 impl Session {
     /// Connects once the guest serves: QEMU accepts forwarded connections
     /// at once and drops them until the guest listens, so a session counts
-    /// only once the server's HTTP/2 SETTINGS arrive.
-    pub fn connect(port: u16, token: Option<&str>, deadline: Instant) -> Result<Session> {
+    /// only once the server's HTTP/2 SETTINGS arrive. A server that is not
+    /// the one trusted is an error at once.
+    pub fn connect(
+        port: u16,
+        token: Option<&str>,
+        trust: Option<&Trust>,
+        deadline: Instant,
+    ) -> Result<Session> {
         while Instant::now() < deadline {
-            if let Ok(mut sock) = TcpStream::connect(("127.0.0.1", port)) {
-                let mut client = match token {
+            if let Ok(sock) = TcpStream::connect(("127.0.0.1", port)) {
+                let client = match token {
                     Some(t) => Client::with_token("ichor", t),
                     None => Client::new("ichor"),
                 };
+                let tls = trust.map(|t| {
+                    let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH);
+                    Box::new(tls::Client::new(tls::Config {
+                        host: t.host.clone(),
+                        roots: t.roots.clone(),
+                        now: now.map_or(0, |d| d.as_secs()),
+                        random: random(),
+                        ed25519: true,
+                        alpn: Some(b"h2"),
+                    }))
+                });
                 let _ = sock.set_read_timeout(Some(Duration::from_secs(10)));
-                if sock.write_all(&client.conn.take_output()).is_ok() {
-                    let mut buf = [0u8; 4096];
-                    if let Ok(n) = sock.read(&mut buf)
-                        && n > 0
-                        && client.receive(&buf[..n]).is_ok()
-                    {
-                        return Ok(Session {
-                            sock,
-                            client,
-                            pending: HashMap::new(),
-                        });
-                    }
+                let mut s = Session {
+                    sock,
+                    tls,
+                    client,
+                    pending: HashMap::new(),
+                };
+                match s.greet() {
+                    Ok(true) => return Ok(s),
+                    Ok(false) => {}
+                    Err(e) => return Err(e),
                 }
             }
             std::thread::sleep(Duration::from_millis(500));
         }
         Err("the control plane never answered".into())
+    }
+
+    /// Exchanges the first bytes; whether the server's HTTP/2 arrived (a
+    /// whole frame header of it: a TLS alert is shorter).
+    fn greet(&mut self) -> Result<bool> {
+        let mut buf = [0u8; 4096];
+        let mut got = 0;
+        loop {
+            if self.flush().is_err() {
+                return Ok(false);
+            }
+            let n = match self.sock.read(&mut buf) {
+                Ok(n) if n > 0 => n,
+                _ => return Ok(false), // not up yet, or not this protocol
+            };
+            let plain = match self.tls.as_mut() {
+                Some(t) => {
+                    t.feed(&buf[..n]).map_err(|e| format!("TLS: {e:?}"))?;
+                    t.read()
+                }
+                None => buf[..n].to_vec(),
+            };
+            got += plain.len();
+            if self.client.receive(&plain).is_err() {
+                return Ok(false);
+            }
+            if got >= 9 {
+                return Ok(true);
+            }
+        }
+    }
+
+    /// Sends what the client has queued.
+    fn flush(&mut self) -> Result<()> {
+        let mut out = self.client.conn.take_output();
+        if let Some(t) = self.tls.as_mut() {
+            if !out.is_empty() {
+                t.write(&out);
+            }
+            out = t.take_output();
+        }
+        self.sock
+            .write_all(&out)
+            .map_err(|e| format!("sending to the control plane: {e}"))
     }
 
     /// Makes a call; returns its messages and final status.
@@ -101,19 +196,13 @@ impl Session {
                 && let Some((_, Some((code, message)))) = self.pending.remove(&id)
             {
                 // Flush acknowledgements before the next call.
-                let out = self.client.conn.take_output();
-                let _ = self.sock.write_all(&out);
+                let _ = self.flush();
                 return Ok((code, message));
             }
             if Instant::now() >= deadline {
                 return Err(format!("call {id} timed out"));
             }
-            let out = self.client.conn.take_output();
-            if !out.is_empty() {
-                self.sock
-                    .write_all(&out)
-                    .map_err(|e| format!("send: {e}"))?;
-            }
+            self.flush()?;
             let n = match self.sock.read(&mut buf) {
                 Ok(0) => return Err("the server closed the connection".into()),
                 Ok(n) => n,
@@ -122,9 +211,16 @@ impl Session {
                 }
                 Err(e) => return Err(format!("receive: {e}")),
             };
+            let plain = match self.tls.as_mut() {
+                Some(t) => {
+                    t.feed(&buf[..n]).map_err(|e| format!("TLS: {e:?}"))?;
+                    t.read()
+                }
+                None => buf[..n].to_vec(),
+            };
             for r in self
                 .client
-                .receive(&buf[..n])
+                .receive(&plain)
                 .map_err(|e| format!("HTTP/2: {e:?}"))?
             {
                 match r {

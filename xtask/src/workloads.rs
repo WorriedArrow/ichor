@@ -237,6 +237,7 @@ pub fn run(
     cfg.cmdline = "qemu_debug_exit control=50051 control_publish=50051 control_exit".into();
     cfg.net_user_opts = format!("hostfwd=tcp:127.0.0.1:{port}-:50051");
     cfg.api_token = Some(token.clone());
+    cfg.api_tls = Some(crate::api::TEST_IDENTITY.into());
     cfg.capture = true;
     cfg.memory_mib = 6144;
     cfg.smp = 4;
@@ -247,6 +248,7 @@ pub fn run(
         let mut s = Session::connect(
             port,
             Some(&token),
+            Some(&crate::api::test_trust()),
             Instant::now() + Duration::from_secs(900),
         )?;
         eprintln!("workloads: pulling {}", suite.image);

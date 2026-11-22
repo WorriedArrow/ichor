@@ -20,6 +20,8 @@ const ECDSA_SHA384: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x03];
 const ECDSA_SHA512: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x04];
 const PRIME256V1: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07];
 const SECP384R1: &[u8] = &[0x2b, 0x81, 0x04, 0x00, 0x22];
+/// Both the key type and the signature algorithm (RFC 8410).
+const ED25519: &[u8] = &[0x2b, 0x65, 0x70];
 const BASIC_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x13];
 const KEY_USAGE: &[u8] = &[0x55, 0x1d, 0x0f];
 const SUBJECT_ALT_NAME: &[u8] = &[0x55, 0x1d, 0x11];
@@ -75,6 +77,7 @@ pub const KEY_CERT_SIGN: u16 = 1 << 5;
 pub enum SigAlg {
     RsaPkcs1(HashAlg),
     Ecdsa(HashAlg),
+    Ed25519,
 }
 
 /// A subject public key.
@@ -82,6 +85,7 @@ pub enum SigAlg {
 pub enum PublicKey<'a> {
     Rsa { n: &'a [u8], e: &'a [u8] },
     Ec { curve: Curve, point: &'a [u8] },
+    Ed25519(&'a [u8; 32]),
 }
 
 impl PublicKey<'_> {
@@ -93,6 +97,7 @@ impl PublicKey<'_> {
             (PublicKey::Ec { curve, point }, SigAlg::Ecdsa(h)) => {
                 crypto::ecdsa::verify_der(curve, point, &h.digest(msg), sig)
             }
+            (PublicKey::Ed25519(k), SigAlg::Ed25519) => crypto::ed25519::verify(k, msg, sig),
             _ => false,
         }
     }
@@ -144,6 +149,8 @@ fn sig_alg(body: &[u8]) -> Result<SigAlg, Error> {
         ECDSA_SHA256 => SigAlg::Ecdsa(HashAlg::Sha256),
         ECDSA_SHA384 => SigAlg::Ecdsa(HashAlg::Sha384),
         ECDSA_SHA512 => SigAlg::Ecdsa(HashAlg::Sha512),
+        // No parameters, not even NULL (RFC 8410 §3).
+        ED25519 if r.is_empty() => SigAlg::Ed25519,
         _ => return Err(Error::Unsupported),
     })
 }
@@ -218,8 +225,30 @@ fn public_key(spki: &[u8]) -> Result<PublicKey<'_>, Error> {
             };
             Ok(PublicKey::Ec { curve, point: key })
         }
+        ED25519 if a.is_empty() => Ok(PublicKey::Ed25519(
+            key.try_into().map_err(|_| Error::Malformed)?,
+        )),
         _ => Err(Error::Unsupported),
     }
+}
+
+/// The seed in a PKCS #8 Ed25519 private key (RFC 8410 §7).
+pub fn ed25519_seed(pkcs8: &[u8]) -> Option<[u8; 32]> {
+    let mut outer = Reader::new(pkcs8);
+    let mut k = Reader::new(outer.expect(der::SEQUENCE)?);
+    // Version 0 (v1), or 1 with the public key after the private one.
+    let version = k.expect(der::INTEGER)?;
+    if !outer.is_empty() || !matches!(version, [0] | [1]) {
+        return None;
+    }
+    let mut alg = Reader::new(k.expect(der::SEQUENCE)?);
+    if alg.expect(der::OID)? != ED25519 || !alg.is_empty() {
+        return None;
+    }
+    // An OCTET STRING in the OCTET STRING.
+    let mut inner = Reader::new(k.expect(der::OCTET_STRING)?);
+    let seed = inner.expect(der::OCTET_STRING)?.try_into().ok()?;
+    inner.is_empty().then_some(seed)
 }
 
 /// Parses one DER certificate.

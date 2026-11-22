@@ -36,6 +36,8 @@ fn config(host: &str, seed: &str) -> Config {
         roots: Arc::new(x509::RootStore::from_pem(ROOTS)),
         now: NOW,
         random,
+        ed25519: false,
+        alpn: None,
     }
 }
 

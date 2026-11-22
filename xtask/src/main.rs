@@ -31,7 +31,8 @@ Commands:
                ichor.efi, Ichor root partition), for cloud import or bare metal;
                the kernel command line is --cmdline (default: empty);
                --size-gib N pads it; --gcp also writes target/ichor-gcp.tar.gz;
-               --api-token-file F puts the control plane's API token on it
+               --api-token-file F puts the control plane's API token on it,
+               --api-tls-file F its TLS certificate and Ed25519 key (PEM)
   help         Show this message
 
 Options:
@@ -72,6 +73,8 @@ struct Opts {
     gcp: bool,
     /// `disk-image`: the control plane's API token, from this file.
     api_token_file: Option<std::path::PathBuf>,
+    /// `disk-image`: the API's TLS certificates and key, from this file.
+    api_tls_file: Option<std::path::PathBuf>,
     /// `run`: boot this whole-disk image from NVMe instead.
     disk: Option<std::path::PathBuf>,
     extra: Vec<String>,
@@ -91,6 +94,7 @@ fn parse(args: &[String]) -> Result<Opts> {
         size_gib: None,
         gcp: false,
         api_token_file: None,
+        api_tls_file: None,
         disk: None,
         extra: Vec::new(),
     };
@@ -129,6 +133,7 @@ fn parse(args: &[String]) -> Result<Opts> {
             }
             "--gcp" => o.gcp = true,
             "--api-token-file" => o.api_token_file = Some(value("--api-token-file")?.into()),
+            "--api-tls-file" => o.api_tls_file = Some(value("--api-tls-file")?.into()),
             "--disk" => o.disk = Some(value("--disk")?.into()),
             "--" => {
                 o.extra.extend(it.by_ref().cloned());
@@ -251,11 +256,26 @@ fn cmd_disk_image(o: &Opts, args: &[String]) -> Result<()> {
     let kernel = build::kernel(o.profile)?;
     // GCP requires a whole number of GiB; cloud volumes are sized in GiB.
     let gib = o.size_gib.unwrap_or(if o.gcp { 1 } else { 0 });
-    let token = match &o.api_token_file {
-        Some(p) => Some(std::fs::read(p).map_err(|e| format!("reading {}: {e}", p.display()))?),
-        None => None,
+    let read = |p: &Option<std::path::PathBuf>| match p {
+        Some(p) => std::fs::read(p)
+            .map(Some)
+            .map_err(|e| format!("reading {}: {e}", p.display())),
+        None => Ok(None),
     };
-    let img = xtask::disk::image_sized(&kernel, &cmdline, gib << 30, token.as_deref())?;
+    let token = read(&o.api_token_file)?;
+    let tls = read(&o.api_tls_file)?;
+    // What the service would refuse at boot, said now.
+    if let Some(pem) = &tls {
+        tls::server::Identity::from_pem(&String::from_utf8_lossy(pem))
+            .map_err(|e| format!("--api-tls-file: {e:?}"))?;
+    }
+    let img = xtask::disk::image_sized(
+        &kernel,
+        &cmdline,
+        gib << 30,
+        token.as_deref(),
+        tls.as_deref(),
+    )?;
     if o.gcp && !img.len().is_multiple_of(1 << 30) {
         return Err(format!(
             "the disk is {} MiB, more than --size-gib {gib}; give a larger size",

@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use grpc::Client;
 use grpc::control::{self, RunEvent};
 use ichor_tests::Exit;
-use xtask::api::Session;
+use xtask::api::{Session, TEST_IDENTITY, Trust, test_trust};
 
 /// Docker's `hello-world`, pinned by its index digest (the image the OCI
 /// crate's recorded pull is of).
@@ -124,12 +124,19 @@ fn serve(body: Vec<u8>) -> u16 {
 /// The whole flow, from the host: hello-world, then Alpine with an extra
 /// layer (and, first, the same layer with a wrong digest, refused).
 fn session(port: u16, layer_port: u16) -> Result<(Ran, Ran), String> {
+    let trust = test_trust();
+    let trust = Some(&trust);
     // Without the token, or with a wrong one, every call is refused. (The
     // sessions stay open until the real one is: `control_exit` ends the
     // service when no client is left.)
     let mut refused = Vec::new();
     for token in [None, Some("not-the-token")] {
-        let mut s = Session::connect(port, token, Instant::now() + Duration::from_secs(600))?;
+        let mut s = Session::connect(
+            port,
+            token,
+            trust,
+            Instant::now() + Duration::from_secs(600),
+        )?;
         let req = control::PullImageRequest {
             reference: IMAGE.into(),
             layers: vec![],
@@ -141,9 +148,24 @@ fn session(port: u16, layer_port: u16) -> Result<(Ran, Ran), String> {
         refused.push(s);
     }
     eprintln!("host: unauthenticated calls refused");
+    // In the clear, the API says nothing to anyone, token or not.
+    let soon = || Instant::now() + Duration::from_secs(5);
+    if Session::connect(port, Some(API_TOKEN), None, soon()).is_ok() {
+        return Err("the API answered in the clear".into());
+    }
+    // And a client that trusts someone else does not get as far as talking.
+    let stranger = Trust {
+        roots: Default::default(),
+        ..test_trust()
+    };
+    match Session::connect(port, Some(API_TOKEN), Some(&stranger), soon()) {
+        Err(e) if e.contains("UnknownIssuer") => {}
+        other => return Err(format!("an untrusted API: {other:?}")),
+    }
     let mut s = Session::connect(
         port,
         Some(API_TOKEN),
+        trust,
         Instant::now() + Duration::from_secs(60),
     )?;
     drop(refused);
@@ -278,12 +300,29 @@ fn lifecycle(s: &mut Session, id: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// The API has no authentication yet, so by default it is local to the
-/// system cell: with only `control=PORT`, the port QEMU forwards from the
-/// host never answers HTTP/2, and the system cell's own switch address
-/// (where other cells could reach it) refuses connections.
+/// The API is local to the system cell unless it is configured to be
+/// reachable: asked to publish without an API token, it stays there.
 #[test]
 fn the_control_api_is_local_unless_configured() {
+    stays_local("control-local", None, "no API token (\\ichor\\apitoken)");
+}
+
+/// Nor is a token enough: without a certificate it would travel in the
+/// clear.
+#[test]
+fn the_control_api_is_local_without_a_certificate() {
+    stays_local(
+        "control-no-cert",
+        Some(API_TOKEN),
+        "no API certificate (\\ichor\\apitls.pem)",
+    );
+}
+
+/// Boots with the API asked to publish and checks that it does not, for
+/// want of `missing`: the port QEMU forwards from the host never answers,
+/// and the system cell's own switch address (where other cells could reach
+/// it) refuses connections.
+fn stays_local(name: &str, token: Option<&str>, missing: &str) {
     let host_port = std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
@@ -310,15 +349,14 @@ fn the_control_api_is_local_unless_configured() {
         }
         (tries, answers)
     });
-    // Publishing is asked for, but there is no API token on the boot volume:
-    // the API stays on loopback.
     let out = ichor_tests::boot_with(
-        "control-local",
+        name,
         "control=50051 control_publish=50051 control_exit_after=30",
         2,
         |c| {
             c.net_user_opts = format!("hostfwd=tcp:127.0.0.1:{host_port}-:50051");
             c.timeout = Some(Duration::from_secs(600));
+            c.api_token = token.map(String::from);
         },
     );
     stop.store(true, std::sync::atomic::Ordering::Release);
@@ -326,8 +364,8 @@ fn the_control_api_is_local_unless_configured() {
     out.assert_exit(Exit::Success);
     out.assert_in_order(&[
         "ichor: control: starting (",
-        "no API token)",
-        "control: no API token (\\ichor\\apitoken): serving on loopback only, not published",
+        "no API certificate)",
+        &format!("control: {missing}: serving on loopback only, not published"),
         "control: serving ichor.v1.Control on 127.0.0.1:50051 (",
         "not published)",
         "control: not reachable at 10.88.",
@@ -360,13 +398,15 @@ fn the_control_plane_pulls_and_runs_an_image_from_docker_hub() {
         c.net_user_opts = format!("hostfwd=tcp:127.0.0.1:{host_port}-:50051");
         c.timeout = Some(Duration::from_secs(900));
         c.api_token = Some(API_TOKEN.into());
+        c.api_tls = Some(TEST_IDENTITY.into());
     });
     let result = client.join().unwrap();
     out.assert_exit(Exit::Success);
     out.assert_in_order(&[
         "ichor: control: starting (",
         "control: serving ichor.v1.Control on 0.0.0.0:50051 (",
-        "published on uplink port 50051)",
+        "TLS 1.3, published on uplink port 50051)",
+        "control: an API client broke the protocol: TLS: Unexpected(80)", // in the clear
         "control: pulling docker.io/library/hello-world@sha256:cf1b20a0",
         "control: pulled sha256:",
         "control: cell 1 at 10.88.",

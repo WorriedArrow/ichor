@@ -35,12 +35,27 @@ kernel command line is empty unless `--cmdline` is given; useful options:
 `trace_errors` (log failing syscalls), `control=50051` (run the control
 plane; its gRPC API stays local to the system cell unless
 `control_publish=PORT` publishes it on the uplink, which also needs a
-token: `--api-token-file F` puts one on the disk, and clients send
-`authorization: Bearer <token>`; the API is not yet TLS, so publish it
-only on a private network or through an SSH tunnel) and
-`dns=A.B.C.D` (its resolver; the cloud's, e.g. `169.254.169.253` on
-AWS). The disk's ESP carries the pinned CA bundle as
-`\ichor\roots.pem`.
+token and a certificate, below) and `dns=A.B.C.D` (its resolver; the
+cloud's, e.g. `169.254.169.253` on AWS). The disk's ESP carries the
+pinned CA bundle as `\ichor\roots.pem`.
+
+To publish the API, make a token and an Ed25519 certificate (here
+self-signed; name it what clients will check) and put both on the disk:
+
+```bash
+openssl rand -hex 32 > api-token
+openssl req -x509 -newkey ed25519 -nodes -days 365 -subj /CN=ichor \
+  -addext subjectAltName=DNS:ichor.example -addext extendedKeyUsage=serverAuth \
+  -keyout api-key.pem -out api-cert.pem
+cat api-cert.pem api-key.pem > api-tls.pem
+cargo xtask disk-image --release --cmdline "control=50051 control_publish=50051" \
+  --api-token-file api-token --api-tls-file api-tls.pem
+```
+
+Clients connect with gRPC over TLS 1.3 to the uplink's port 50051, trust
+`api-cert.pem`, expect the name `ichor.example`, and send `authorization:
+Bearer <token>` with every call. The key and the token are on the disk
+unencrypted: whoever can read the image has them.
 
 ## AWS (Nitro instances: NVMe boot volume, COM1 serial console)
 

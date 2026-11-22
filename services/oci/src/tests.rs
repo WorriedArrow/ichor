@@ -169,6 +169,8 @@ fn record_live() {
             roots: roots.clone(),
             now,
             random,
+            ed25519: false,
+            alpn: None,
         });
         c.write(&req.encode());
         let mut s = std::net::TcpStream::connect((req.url.host.as_str(), 443)).unwrap();

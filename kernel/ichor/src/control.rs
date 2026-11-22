@@ -13,8 +13,9 @@ static CONTROL: &[u8] = include_bytes!(concat!(env!("ICHOR_SERVICES_DIR"), "/ich
 /// The service's options from the kernel command line: `control=PORT`
 /// (required), `control_listen=ADDR`, `control_publish=PORT`, `dns=ADDR`
 /// (default: the uplink's DHCP-given DNS server, else QEMU's 10.0.2.3),
-/// `control_exit`, `control_exit_after=SECONDS`. Without `control_listen`
-/// or `control_publish` the API is local to the system cell.
+/// `control_plaintext`, `control_exit`, `control_exit_after=SECONDS`.
+/// Without `control_listen` or `control_publish` the API is local to the
+/// system cell.
 pub(crate) fn options(c: &cmdline::Cmdline<'_>) -> Option<alloc::vec::Vec<alloc::string::String>> {
     use alloc::format;
     let port: u16 = c.get("control")?.parse().ok()?;
@@ -35,6 +36,9 @@ pub(crate) fn options(c: &cmdline::Cmdline<'_>) -> Option<alloc::vec::Vec<alloc:
         },
     };
     o.push(format!("dns={dns}"));
+    if c.flag("control_plaintext") {
+        o.push("plaintext".into());
+    }
     if c.flag("control_exit") {
         o.push("exit-on-close".into());
     }
@@ -49,6 +53,7 @@ pub(crate) fn options(c: &cmdline::Cmdline<'_>) -> Option<alloc::vec::Vec<alloc:
 pub(crate) fn run(
     roots: &'static [u8],
     token: &'static [u8],
+    tls: &'static [u8],
     options: &[alloc::string::String],
 ) -> Option<u64> {
     // Most of memory: the control plane holds pulled layers and images,
@@ -58,21 +63,15 @@ pub(crate) fn run(
     let cell = system.cell.clone();
     let me = cell.install(Cap::mint(Object::Cell(cell.clone()), Rights::ALL))?;
     let switch = cell.install(Cap::mint(Object::Switch, Rights::ALL))?;
-    let blob = cell.install(Cap::mint(
-        Object::Blob(roots),
-        Rights::DUPLICATE | Rights::INSPECT | rights::READ,
-    ))?;
-    // The API token, if the boot volume has one (`\ichor\apitoken`).
-    let token_blob = if token.is_empty() {
-        None
-    } else {
-        Some(cell.install(Cap::mint(
-            Object::Blob(token),
+    let blob = |bytes: &'static [u8]| {
+        cell.install(Cap::mint(
+            Object::Blob(bytes),
             Rights::DUPLICATE | Rights::INSPECT | rights::READ,
-        ))?)
+        ))
     };
+    let roots_blob = blob(roots)?;
     println!(
-        "ichor: control: starting ({} KiB service, {} KiB CA bundle, {} MiB, {})",
+        "ichor: control: starting ({} KiB service, {} KiB CA bundle, {} MiB, {}, {})",
         CONTROL.len() / 1024,
         roots.len() / 1024,
         pages / 256,
@@ -80,14 +79,26 @@ pub(crate) fn run(
             "no API token"
         } else {
             "API token from the boot volume"
+        },
+        if tls.is_empty() {
+            "no API certificate"
+        } else {
+            "API certificate from the boot volume"
         }
     );
     let hex = |h: cap::Handle| alloc::format!("{:x}", h.raw());
-    let (me_s, switch_s, blob_s) = (hex(me), hex(switch), hex(blob));
-    let token_opt = token_blob.map(|h| alloc::format!("token-blob={:x}", h.raw()));
-    let mut argv = alloc::vec!["control", me_s.as_str(), &switch_s, &blob_s];
+    let (me_s, switch_s, roots_s) = (hex(me), hex(switch), hex(roots_blob));
+    // The API's token and TLS identity, if the boot volume has them
+    // (`\ichor\apitoken`, `\ichor\apitls.pem`).
+    let mut secrets = alloc::vec::Vec::new();
+    for (name, bytes) in [("token-blob", token), ("tls-blob", tls)] {
+        if !bytes.is_empty() {
+            secrets.push(alloc::format!("{name}={}", hex(blob(bytes)?)));
+        }
+    }
+    let mut argv = alloc::vec!["control", me_s.as_str(), &switch_s, &roots_s];
     argv.extend(options.iter().map(alloc::string::String::as_str));
-    argv.extend(token_opt.as_deref());
+    argv.extend(secrets.iter().map(alloc::string::String::as_str));
     let code = crate::native::run(&cell, CONTROL, &argv);
     // The cell's handle to itself would keep it alive forever.
     let _ = cell.close(me);

@@ -256,6 +256,8 @@ fn tls_config(name: &str, host: &str) -> tls::Config {
         roots,
         now: NOW,
         random,
+        ed25519: false,
+        alpn: None,
     }
 }
 
@@ -329,6 +331,62 @@ fn tls_run(input: &[u8]) {
     }
 }
 
+/// The control API's identity, and what its clients send: this crate's
+/// client with the matching randomness, so the mutations land in a session
+/// whose Finished is right.
+fn api_identity() -> Arc<tls::server::Identity> {
+    static ID: std::sync::OnceLock<Arc<tls::server::Identity>> = std::sync::OnceLock::new();
+    ID.get_or_init(|| {
+        let pem = String::from_utf8(read("services/tls/testdata/api.pem")).unwrap();
+        Arc::new(tls::server::Identity::from_pem(&pem).unwrap())
+    })
+    .clone()
+}
+
+fn api_server() -> tls::server::Server {
+    tls::server::Server::new(tls::server::ServerConfig {
+        identity: api_identity(),
+        alpn: b"h2",
+        random: [0x42; 64],
+    })
+}
+
+fn tls_server_seeds() -> Vec<Vec<u8>> {
+    let ca = String::from_utf8(read("services/tls/testdata/api-ca.pem")).unwrap();
+    let mut c = tls::Client::new(tls::Config {
+        host: "ichor-api.test".into(),
+        roots: Arc::new(x509::RootStore::from_pem(&ca)),
+        now: 1_795_400_000,
+        random: [0x17; 96],
+        ed25519: true,
+        alpn: Some(b"h2"),
+    });
+    let mut s = api_server();
+    let hello = c.take_output();
+    s.feed(&hello).unwrap();
+    c.feed(&s.take_output()).unwrap();
+    c.write(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+    c.close();
+    let mut all = hello.clone();
+    all.extend(c.take_output());
+    s.feed(&all[hello.len()..]).unwrap();
+    assert!(s.is_closed() && !s.read().is_empty());
+    vec![hello, all]
+}
+
+/// What an API client may send before and after the handshake.
+fn tls_server_run(input: &[u8]) {
+    let mut s = api_server();
+    s.write(b"pending");
+    let cut = input.len() / 3;
+    if s.feed(&input[..cut]).is_ok() {
+        let _ = s.feed(&input[cut..]);
+    }
+    let _ = s.read();
+    s.close();
+    let _ = s.take_output();
+}
+
 fn x509_run(input: &[u8]) {
     if let Ok(cert) = x509::parse(input) {
         let _ = format!("{cert:?}");
@@ -351,10 +409,15 @@ fn pem_run(input: &[u8]) {
     let s = String::from_utf8_lossy(input);
     let _ = x509::RootStore::from_pem(&s);
     let _ = x509::base64(&s);
+    let _ = x509::ed25519_seed(input);
+    let _ = tls::server::Identity::from_pem(&s);
 }
 
 fn pem_seeds() -> Vec<Vec<u8>> {
-    PEMS.iter().map(|p| read(p)).collect()
+    PEMS.iter()
+        .chain(&["services/tls/testdata/api.pem"])
+        .map(|p| read(p))
+        .collect()
 }
 
 fn hpack_seeds() -> Vec<Vec<u8>> {
@@ -663,6 +726,11 @@ pub const TARGETS: &[Target] = &[
         name: "tls",
         seeds: tls_seeds,
         run: tls_run,
+    },
+    Target {
+        name: "tls-server",
+        seeds: tls_server_seeds,
+        run: tls_server_run,
     },
     Target {
         name: "x509",

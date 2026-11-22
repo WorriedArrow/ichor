@@ -8,6 +8,7 @@
 //! esp/ichor/cmdline          the kernel command line
 //! esp/ichor/roots.pem        the control plane's CA bundle (Mozilla's, pinned)
 //! esp/ichor/apitoken         the control plane's API token (when configured)
+//! esp/ichor/apitls.pem       its TLS certificates and key (when configured)
 //! root.img                   the root image, attached as virtio-blk and NVMe disks
 //! ```
 //!
@@ -236,6 +237,9 @@ pub struct RunConfig {
     pub net_user_opts: String,
     /// The control plane's API token, written to `\ichor\apitoken`.
     pub api_token: Option<String>,
+    /// The API's TLS certificates and key (PEM), written to
+    /// `\ichor\apitls.pem`.
+    pub api_tls: Option<String>,
 }
 
 impl RunConfig {
@@ -295,6 +299,7 @@ impl RunConfig {
             smp_topology: String::new(),
             net_user_opts: String::new(),
             api_token: None,
+            api_tls: None,
         }
     }
 }
@@ -376,6 +381,9 @@ fn prepare_run_dir(cfg: &RunConfig, fw: &Firmware) -> Result<PathBuf> {
     .map_err(|e| format!("writing roots.pem: {e}"))?;
     if let Some(t) = &cfg.api_token {
         fs::write(cfg_dir.join("apitoken"), t).map_err(|e| format!("writing apitoken: {e}"))?;
+    }
+    if let Some(t) = &cfg.api_tls {
+        fs::write(cfg_dir.join("apitls.pem"), t).map_err(|e| format!("writing apitls.pem: {e}"))?;
     }
     fs::write(dir.join("root.img"), root_image()?)
         .map_err(|e| format!("writing root image: {e}"))?;

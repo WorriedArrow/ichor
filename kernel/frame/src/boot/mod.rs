@@ -38,6 +38,8 @@ pub(crate) const CMDLINE_MAX: usize = 4096;
 pub(crate) const ROOTS_MAX: usize = 512 * 1024;
 /// Room for `\ichor\apitoken` (the control plane's API credential).
 pub(crate) const TOKEN_MAX: usize = 256;
+/// Room for `\ichor\apitls.pem` (the API's TLS certificates and key).
+pub(crate) const TLS_MAX: usize = 16 * 1024;
 pub(crate) const VENDOR_MAX: usize = 64;
 
 /// What boot learns from firmware, kept in `.bss` and handed from the
@@ -54,6 +56,9 @@ pub(crate) struct BootState {
     /// `\ichor\apitoken`, the control plane's API credential.
     pub(crate) token: [u8; TOKEN_MAX],
     pub(crate) token_len: usize,
+    /// `\ichor\apitls.pem`, the API's TLS certificates and key.
+    pub(crate) tls: [u8; TLS_MAX],
+    pub(crate) tls_len: usize,
     pub(crate) vendor: [u8; VENDOR_MAX],
     pub(crate) vendor_len: usize,
     pub(crate) acpi_rsdp: Option<PhysAddr>,
@@ -94,6 +99,8 @@ static BOOT_STATE: BootStateCell = BootStateCell(UnsafeCell::new(BootState {
     roots_len: 0,
     token: [0; TOKEN_MAX],
     token_len: 0,
+    tls: [0; TLS_MAX],
+    tls_len: 0,
     vendor: [0; VENDOR_MAX],
     vendor_len: 0,
     acpi_rsdp: None,
@@ -278,6 +285,7 @@ pub(crate) extern "sysv64" fn kernel_space_entry() -> ! {
         cmdline: state.cmdline(),
         roots: &state.roots[..state.roots_len],
         api_token: Secret(&state.token[..state.token_len]),
+        api_tls: Secret(&state.tls[..state.tls_len]),
         memory_map: state.regions(),
         acpi_rsdp: state.acpi_rsdp,
         firmware_vendor: core::str::from_utf8(&state.vendor[..state.vendor_len]).unwrap_or(""),
@@ -336,6 +344,7 @@ pub struct BootInfo {
     cmdline: &'static str,
     roots: &'static [u8],
     api_token: Secret,
+    api_tls: Secret,
     memory_map: &'static [MemoryRegion],
     acpi_rsdp: Option<PhysAddr>,
     firmware_vendor: &'static str,
@@ -360,6 +369,12 @@ impl BootInfo {
     /// there is none): the control plane's API credential.
     pub fn api_token(&self) -> &'static [u8] {
         self.api_token.0
+    }
+
+    /// The contents of `\ichor\apitls.pem` on the boot volume (empty if
+    /// there is none): the control plane's TLS certificates and key.
+    pub fn api_tls(&self) -> &'static [u8] {
+        self.api_tls.0
     }
 }
 

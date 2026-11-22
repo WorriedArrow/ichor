@@ -199,6 +199,8 @@ impl Fetch {
                                 roots: net.roots.clone(),
                                 now: rt::realtime() / 1_000_000_000,
                                 random,
+                                ed25519: false,
+                                alpn: None,
                             }));
                             tls.write(&request);
                             self.out.extend(tls.take_output());

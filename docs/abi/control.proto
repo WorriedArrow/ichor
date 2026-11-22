@@ -1,7 +1,7 @@
 // The control plane's API (ADR-0012 §5), served by services/control as
-// gRPC over h2c on a published port. services/grpc implements these
-// messages by hand (no code generation); this file is the reference for
-// other clients.
+// gRPC over TLS 1.3 (ALPN h2) when the boot volume has a certificate, in
+// the clear (h2c) otherwise. services/grpc implements these messages by
+// hand (no code generation); this file is the reference for other clients.
 
 syntax = "proto3";
 
@@ -25,8 +25,9 @@ service Control {
 }
 
 // Every call needs `authorization: Bearer <token>` when the boot volume
-// has an API token (\ichor\apitoken); otherwise the API is on the
-// system cell's loopback only.
+// has an API token (\ichor\apitoken). Without one, or without a
+// certificate (\ichor\apitls.pem), the API is on the system cell's
+// loopback only.
 
 message Empty {}
 

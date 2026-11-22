@@ -298,5 +298,6 @@ dependencies = [
  "ichor-layer",
  "ichor-oci",
  "ichor-testprog",
+ "ichor-tls",
  "ichor-x509",
 ]

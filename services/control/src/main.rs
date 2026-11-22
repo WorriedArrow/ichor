@@ -1,6 +1,6 @@
 //! The control plane (ADR-0012): a native service in the system cell that
-//! serves `ichor.v1.Control` (`docs/abi/control.proto`) as gRPC over h2c
-//! on a published port. `PullImage` pulls from a registry over HTTPS,
+//! serves `ichor.v1.Control` (`docs/abi/control.proto`) as gRPC, over TLS
+//! when it has a certificate. `PullImage` pulls from a registry over HTTPS,
 //! verifies every blob against its digest, converts the layers into an
 //! Ichor image and hands it to the kernel; `CreateCell` makes a cell from
 //! one; `Run` starts a process there and streams its output.
@@ -10,16 +10,21 @@
 //!
 //! Arguments (from the kernel): the system cell's handle, the switch's and
 //! the CA bundle's (hex), then options: `port=N` (default 50051),
-//! `listen=A.B.C.D`, `publish=N`, `dns=A.B.C.D`, `exit-on-close` (tests:
+//! `listen=A.B.C.D`, `publish=N`, `dns=A.B.C.D`, `plaintext`,
+//! `token-blob=HANDLE` and `tls-blob=HANDLE` (the boot volume's
+//! `\ichor\apitoken` and `\ichor\apitls.pem`), `exit-on-close` (tests:
 //! stop when the first API client hangs up) and `exit-after=SECONDS`.
 //!
-//! The API has no authentication yet, so it is local by default: it
-//! listens on the system cell's loopback only, reachable neither from other
-//! cells (through the switch) nor from the uplink. `listen=` binds another
-//! address (`0.0.0.0`: all of the cell's), and `publish=N` publishes it on
-//! uplink port N (and, without `listen=`, listens on all addresses). At
-//! start the service checks that its switch address refuses connections
-//! when it is not meant to listen there.
+//! The API is local by default: it listens on the system cell's loopback
+//! only, reachable neither from other cells (through the switch) nor from
+//! the uplink. `listen=` binds another address (`0.0.0.0`: all of the
+//! cell's), and `publish=N` publishes it on uplink port N (and, without
+//! `listen=`, listens on all addresses). Either needs an API token, which
+//! every call must then carry, and a certificate, so the token does not
+//! travel in the clear (`plaintext` waives the certificate, on a network
+//! that is trusted); without them the API stays on loopback. At start the
+//! service checks that its switch address refuses connections when it is
+//! not meant to listen there.
 
 #![no_std]
 #![no_main]
@@ -29,6 +34,7 @@ extern crate alloc;
 
 mod fetch;
 
+use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -38,6 +44,7 @@ use alloc::vec::Vec;
 use grpc::control::{self, RunEvent};
 use grpc::{Call, status};
 use rt::{Error, Handle, WaitItem};
+use tls::server::{Identity, Server as TlsServer, ServerConfig};
 
 use fetch::{Fetch, Net};
 
@@ -45,11 +52,62 @@ rt::main!(main);
 
 /// The default cell memory: 256 MiB.
 const DEFAULT_CELL_BYTES: u64 = 256 << 20;
+/// Most API connections at once (more are closed as they come).
+const MAX_CONNS: usize = 64;
+/// How long a client may take over the TLS handshake.
+const HANDSHAKE_NS: u64 = 15_000_000_000;
 
+/// An API connection.
 struct Api {
     sock: Handle,
+    /// The connection's TLS, when the service has a certificate.
+    tls: Option<Box<TlsServer>>,
+    /// When it was accepted.
+    since: u64,
     server: grpc::Server,
     out: Vec<u8>,
+}
+
+impl Api {
+    /// Takes bytes from the socket: decrypted, if this is TLS.
+    fn receive(&mut self, data: &[u8]) -> Result<Vec<Call>, String> {
+        let plain;
+        let data = match self.tls.as_mut() {
+            Some(t) => {
+                t.feed(data).map_err(|e| format!("TLS: {e:?}"))?;
+                plain = t.read();
+                &plain
+            }
+            None => data,
+        };
+        if data.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.server
+            .receive(data)
+            .map_err(|e| format!("HTTP/2: {e:?}"))
+    }
+
+    /// Moves what the gRPC server has to say into `out`, encrypted if this
+    /// is TLS.
+    fn fill(&mut self) {
+        let plain = self.server.conn.take_output();
+        match self.tls.as_mut() {
+            Some(t) => {
+                if !plain.is_empty() {
+                    t.write(&plain);
+                }
+                self.out.extend(t.take_output());
+            }
+            None => self.out.extend(plain),
+        }
+    }
+
+    /// Whether the client has taken too long over the handshake.
+    fn stalled(&self) -> bool {
+        self.tls.as_ref().is_some_and(|t| !t.is_connected())
+            && rt::monotonic() - self.since > HANDSHAKE_NS
+    }
 }
 
 struct Pull {
@@ -105,6 +163,8 @@ struct Control {
     /// The API token every call must carry (empty: none configured, and
     /// the API is then on loopback only).
     token: Vec<u8>,
+    /// What the API's TLS proves itself with (`None`: in the clear).
+    identity: Option<Arc<Identity>>,
 }
 
 fn handle(arg: Option<&&str>) -> Option<Handle> {
@@ -159,13 +219,31 @@ fn main(args: &[&str]) -> i32 {
     };
     let port: u16 = opt("port").and_then(|p| p.parse().ok()).unwrap_or(50051);
     let resolver = opt("dns").and_then(parse_ip).unwrap_or([10, 0, 2, 3]);
+    let blob = |key: &str| -> Vec<u8> {
+        opt(key)
+            .and_then(|h| u64::from_str_radix(h, 16).ok())
+            .map(Handle::from_raw)
+            .and_then(|b| rt::blob_read(&b).ok())
+            .unwrap_or_default()
+    };
     // The API token (`\ichor\apitoken`; surrounding whitespace ignored).
-    let token: Vec<u8> = opt("token-blob")
-        .and_then(|h| u64::from_str_radix(h, 16).ok())
-        .map(Handle::from_raw)
-        .and_then(|b| rt::blob_read(&b).ok())
-        .map(|t| t.trim_ascii().to_vec())
-        .unwrap_or_default();
+    let token: Vec<u8> = blob("token-blob").trim_ascii().to_vec();
+    // The API's certificate and key (`\ichor\apitls.pem`). A bad one is
+    // not the same as none: serving in the clear instead would surprise.
+    let pem = blob("tls-blob");
+    let identity = match core::str::from_utf8(&pem).map(Identity::from_pem) {
+        _ if pem.is_empty() => None,
+        Ok(Ok(id)) => Some(Arc::new(id)),
+        Ok(Err(e)) => {
+            rt::log!("control: \\ichor\\apitls.pem: {e:?}");
+            return 2;
+        }
+        Err(_) => {
+            rt::log("control: \\ichor\\apitls.pem is not text");
+            return 2;
+        }
+    };
+    drop(pem);
     let mut publish: Option<u16> = opt("publish").and_then(|p| p.parse().ok());
     let mut listen = match opt("listen") {
         Some(a) => match parse_ip(a) {
@@ -179,11 +257,19 @@ fn main(args: &[&str]) -> i32 {
         None if publish.is_some() => [0, 0, 0, 0],
         None => [127, 0, 0, 1],
     };
-    // Reachable beyond this cell only with authentication.
-    if token.is_empty() && (publish.is_some() || listen[0] != 127) {
-        rt::log(
-            "control: no API token (\\ichor\\apitoken): serving on loopback only, not published",
-        );
+    // Reachable beyond this cell only with authentication, and encrypted
+    // unless the operator says the network is trusted.
+    let missing = if token.is_empty() {
+        Some("no API token (\\ichor\\apitoken)")
+    } else if identity.is_none() && !args.contains(&"plaintext") {
+        Some("no API certificate (\\ichor\\apitls.pem)")
+    } else {
+        None
+    };
+    if let Some(what) = missing
+        && (publish.is_some() || listen[0] != 127)
+    {
+        rt::log!("control: {what}: serving on loopback only, not published");
         listen = [127, 0, 0, 1];
         publish = None;
     }
@@ -218,9 +304,14 @@ fn main(args: &[&str]) -> i32 {
     };
     drop(switch);
     rt::log!(
-        "control: serving ichor.v1.Control on {}:{port} ({} roots, {})",
+        "control: serving ichor.v1.Control on {}:{port} ({} roots, {}, {})",
         ip_text(listen),
         store.len(),
+        if identity.is_some() {
+            "TLS 1.3"
+        } else {
+            "in the clear"
+        },
         match (published, publish) {
             (true, Some(p)) => format!("published on uplink port {p}"),
             _ => "not published".into(),
@@ -253,6 +344,7 @@ fn main(args: &[&str]) -> i32 {
         next_cell: 1,
         served: false,
         token,
+        identity,
     };
     loop {
         c.wait();
@@ -308,9 +400,25 @@ impl Control {
 
     fn accept(&mut self) {
         while let Ok(sock) = rt::tcp_accept(&self.listener) {
-            self.served = true;
+            if self.conns.iter().flatten().count() >= MAX_CONNS {
+                rt::log("control: too many API connections; refused one");
+                continue; // dropped: closed
+            }
+            let tls = self.identity.clone().map(|identity| {
+                let mut random = [0u8; 64];
+                rt::random(&mut random);
+                Box::new(TlsServer::new(ServerConfig {
+                    identity,
+                    alpn: b"h2",
+                    random,
+                }))
+            });
+            // Over TLS a client counts once its handshake is done.
+            self.served |= tls.is_none();
             let api = Api {
                 sock,
+                tls,
+                since: rt::monotonic(),
                 server: grpc::Server::new(),
                 out: Vec::new(),
             };
@@ -319,6 +427,15 @@ impl Control {
                 None => self.conns.push(Some(api)),
             }
         }
+    }
+
+    /// Forgets connection `i`: nobody is left to answer, and the slot may
+    /// be another client's next, which must not get this one's answers.
+    /// Processes it started keep running.
+    fn drop_conn(&mut self, i: usize) {
+        self.conns[i] = None;
+        self.pulls.retain(|p| p.conn != i);
+        self.runs.retain(|r| r.conn != i);
     }
 
     /// Reads what an API connection sent and starts its calls.
@@ -336,10 +453,10 @@ impl Control {
                         gone = true;
                         break;
                     }
-                    Ok(n) => match a.server.receive(&buf[..n]) {
+                    Ok(n) => match a.receive(&buf[..n]) {
                         Ok(c) => calls.extend(c),
                         Err(e) => {
-                            rt::log!("control: an API client broke the protocol: {e:?}");
+                            rt::log!("control: an API client broke the protocol: {e}");
                             gone = true;
                             break;
                         }
@@ -352,15 +469,24 @@ impl Control {
                     }
                 }
             }
+            if let Some(t) = &a.tls {
+                self.served |= t.is_connected();
+                if t.is_closed() && !gone {
+                    rt::log("control: an API client closed its TLS session");
+                    gone = true;
+                }
+            }
+            if a.stalled() {
+                rt::log("control: an API client never finished its TLS handshake");
+                gone = true;
+            }
         }
         for call in calls {
             self.dispatch(i, call);
         }
         if gone {
             self.flush(i);
-            self.conns[i] = None;
-            // Nobody is left to answer (and the slot may be reused).
-            self.pulls.retain(|p| p.conn != i);
+            self.drop_conn(i);
         }
     }
 
@@ -759,7 +885,7 @@ impl Control {
         let Some(a) = self.conns.get_mut(i).and_then(Option::as_mut) else {
             return;
         };
-        a.out.extend(a.server.conn.take_output());
+        a.fill();
         while !a.out.is_empty() {
             match rt::send(&a.sock, &a.out) {
                 Ok(n) => {
@@ -768,7 +894,7 @@ impl Control {
                 Err(Error::WouldBlock) => break,
                 Err(e) => {
                     rt::log!("control: sending to an API client failed: {e:?}");
-                    self.conns[i] = None;
+                    self.drop_conn(i);
                     return;
                 }
             }

@@ -5,7 +5,9 @@
 //! - [`hmac`]: HMAC (RFC 2104), HKDF (RFC 5869) and the TLS 1.2 PRF
 //!   (RFC 5246 §5);
 //! - [`aead`]: ChaCha20-Poly1305 (RFC 8439);
-//! - [`x25519`]: X25519 key agreement (RFC 7748).
+//! - [`x25519`]: X25519 key agreement (RFC 7748);
+//! - [`ed25519`]: Ed25519 signatures (RFC 8032);
+//! - [`ecdsa`], [`rsa`]: verification only (public values).
 //!
 //! Secrets (keys, the X25519 scalar) only flow through code whose timing
 //! does not depend on them: no secret-indexed tables, no secret branches.
@@ -19,6 +21,8 @@ extern crate alloc;
 pub mod aead;
 pub mod bignum;
 pub mod ecdsa;
+pub mod ed25519;
+mod field;
 pub mod hmac;
 pub mod rsa;
 pub mod sha2;

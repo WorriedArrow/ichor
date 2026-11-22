@@ -34,6 +34,7 @@ oci.workspace = true
 civil.workspace = true
 # The control plane's API, from the host (tests, `cargo xtask workloads`).
 grpc.workspace = true
+tls.workspace = true
 
 [lints]
 workspace = true

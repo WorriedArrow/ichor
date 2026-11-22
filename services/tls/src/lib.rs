@@ -16,6 +16,8 @@
 //!
 //! Not supported: session resumption and 0-RTT, HelloRetryRequest,
 //! renegotiation, client certificates, AES-GCM suites.
+//!
+//! [`server`] is the other end, for the control API.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -32,6 +34,8 @@ use crypto::ecdsa::{self, Curve};
 use crypto::hmac::{Hmac, hkdf_expand, hkdf_extract, tls12_prf};
 use crypto::sha2::Sha256;
 use crypto::x25519;
+
+pub mod server;
 
 /// Why a connection failed.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -85,6 +89,9 @@ const SIG_SCHEMES: [u16; 8] = [
     0x0601, // rsa_pkcs1_sha512
 ];
 
+/// The ed25519 signature scheme.
+const ED25519: u16 = 0x0807;
+
 /// The ServerHello random of a HelloRetryRequest (RFC 8446 §4.1.3).
 const HRR_RANDOM: [u8; 32] = [
     0xcf, 0x21, 0xad, 0x74, 0xe5, 0x9a, 0x61, 0x11, 0xbe, 0x1d, 0x8c, 0x02, 0x1e, 0x65, 0xb8, 0x91,
@@ -104,6 +111,11 @@ pub struct Config {
     /// 96 random bytes: the client random, the X25519 secret and the
     /// legacy session id.
     pub random: [u8; 96],
+    /// Offer Ed25519 signatures too (the control API's server makes them;
+    /// public CAs do not issue such certificates).
+    pub ed25519: bool,
+    /// The application protocol to offer, if any.
+    pub alpn: Option<&'static [u8]>,
 }
 
 /// One direction's record protection.
@@ -315,6 +327,9 @@ fn verify_sig(leaf: &[u8], scheme: u16, msg: &[u8], sig: &[u8], tls13: bool) -> 
     let Ok(cert) = x509::parse(leaf) else {
         return false;
     };
+    if let (ED25519, x509::PublicKey::Ed25519(k)) = (scheme, cert.key) {
+        return crypto::ed25519::verify(k, msg, sig);
+    }
     let hash = match scheme {
         0x0403 | 0x0804 | 0x0401 => HashAlg::Sha256,
         0x0503 | 0x0805 | 0x0501 => HashAlg::Sha384,
@@ -406,6 +421,9 @@ impl Client {
         for s in SIG_SCHEMES {
             algs.extend_from_slice(&s.to_be_bytes());
         }
+        if self.cfg.ed25519 {
+            algs.extend_from_slice(&ED25519.to_be_bytes());
+        }
         let mut sa = Vec::new();
         put_vec(&mut sa, 2, &algs);
         ext(&mut exts, 13, &sa);
@@ -417,6 +435,13 @@ impl Client {
         ext(&mut exts, 11, &[1, 0]);
         ext(&mut exts, 23, &[]);
         ext(&mut exts, 0xff01, &[0]);
+        if let Some(p) = self.cfg.alpn {
+            let mut name = Vec::new();
+            put_vec(&mut name, 1, p);
+            let mut list = Vec::new();
+            put_vec(&mut list, 2, &name);
+            ext(&mut exts, 16, &list);
+        }
         put_vec(&mut b, 2, &exts);
         b
     }
@@ -843,5 +868,7 @@ impl Client {
     }
 }
 
+#[cfg(test)]
+mod server_tests;
 #[cfg(test)]
 mod tests;

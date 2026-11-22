@@ -40,16 +40,18 @@ const ROOT_GUID: gpt::Guid = gpt::guid(
 /// The disk image: `kernel` (`ichor.efi`) booted with `cmdline`, and the
 /// test root image (busybox, motd, the pattern file) as its root.
 pub fn image(kernel: &Path, cmdline: &str) -> Result<Vec<u8>> {
-    image_sized(kernel, cmdline, 0, None)
+    image_sized(kernel, cmdline, 0, None, None)
 }
 
 /// [`image`], at least `min_bytes` long (clouds want whole GiB), with the
-/// control plane's API token (`\ichor\apitoken`) if one is given.
+/// control plane's API token (`\ichor\apitoken`) and its TLS certificates
+/// and key (`\ichor\apitls.pem`) if they are given.
 pub fn image_sized(
     kernel: &Path,
     cmdline: &str,
     min_bytes: u64,
     api_token: Option<&[u8]>,
+    api_tls: Option<&[u8]>,
 ) -> Result<Vec<u8>> {
     let efi = fs::read(kernel).map_err(|e| format!("reading {}: {e}", kernel.display()))?;
     let mut esp = Volume::default();
@@ -58,6 +60,9 @@ pub fn image_sized(
     esp.add("ICHOR/ROOTS.PEM", &crate::artifact::MOZILLA_ROOTS.bytes()?)?;
     if let Some(t) = api_token {
         esp.add("ICHOR/APITOKEN", t)?;
+    }
+    if let Some(t) = api_tls {
+        esp.add("ICHOR/APITLS.PEM", t)?;
     }
     let esp = esp.image(ESP_SECTORS, ESP_START)?;
     let root = qemu::root_image()?;

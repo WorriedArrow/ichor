@@ -195,4 +195,44 @@ boot:
   TLS for the API. The token travels in the clear over h2c, so today it
   protects only on a network the operator controls (a private subnet or
   an SSH tunnel). TLS needs a server side in `services/tls` and signing
-  in `services/crypto`.
+  in `services/crypto`. (Built since: the next amendment.)
+
+## Amendment (2026-11-21): TLS for the API
+
+- **The server.** `services/tls::server`: TLS 1.3 only, with one suite
+  (ChaCha20-Poly1305), X25519, ALPN `h2` and an **Ed25519** certificate.
+  Current gRPC clients' TLS stacks offer all of these; OpenSSL's client
+  completes a verified handshake with it (a test, run by hand). It refuses
+  everything else with the matching alert. It does not do
+  HelloRetryRequest, session tickets, 0-RTT, client certificates or a
+  choice of certificate by SNI. `fuzz/` has a target for it.
+- **Why Ed25519.** Signing is new to `services/crypto`, and it handles a
+  long-lived secret next to hostile cells, so it must not leak through
+  timing. Ed25519 has a complete addition formula over the field X25519
+  already uses, so constant-time code is short and needs no per-signature
+  randomness; ECDSA P-256 would need constant-time scalar and field
+  arithmetic the verifier does not have. The cost is that public CAs do
+  not issue Ed25519 certificates: the operator runs their own CA (or
+  self-signs) and gives its certificate to the clients, as cluster APIs
+  usually do. P-256 signing can be added later without changing the API.
+- **Verification.** `services/x509` now accepts Ed25519 keys and
+  signatures, so our own client can verify the API's certificate. The
+  registry client does not offer Ed25519 in its handshake, and its
+  ClientHello is unchanged.
+- **The identity** is `\ichor\apitls.pem` on the boot volume: the
+  certificate chain and a PKCS #8 key (`cargo xtask disk-image
+  --api-tls-file F` checks it and puts it there). Frame reads it with the
+  token, never logs it, and the kernel hands it to the service as a
+  read-only Blob. One that does not parse, or whose key is not the
+  certificate's, stops the service: falling back to cleartext would be a
+  surprise. The boot volume holds the key unencrypted, as it holds the
+  token; disk encryption is the cloud's for now.
+- **The rule.** Listening beyond loopback, or publishing, needs a token
+  and a certificate. `control_plaintext` waives the certificate, for a
+  network the operator trusts.
+- **Limits.** At most 64 connections, and 15 s for a handshake. A
+  connection that ends takes its calls with it: a slot reused by the next
+  client can no longer receive the last one's output (it could before,
+  for a `Run` whose caller had left).
+- **Not done:** rotating the certificate without a reboot, client
+  certificates, rate limiting of failed tokens.

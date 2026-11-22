@@ -12,7 +12,7 @@ use core::ffi::c_void;
 use core::ptr;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use super::{MemoryKind, MemoryRegion, Phase, ROOTS_MAX, TOKEN_MAX, take_boot_state};
+use super::{MemoryKind, MemoryRegion, Phase, take_boot_state};
 use crate::mm::{PAGE_SIZE, PhysAddr};
 use crate::power::{self, ExitStatus};
 use crate::{arch, println};
@@ -279,6 +279,8 @@ const CMDLINE_PATH: [u16; 15] = ucs2("\\ichor\\cmdline");
 const ROOTS_PATH: [u16; 17] = ucs2("\\ichor\\roots.pem");
 /// Where the control plane's API token lives.
 const TOKEN_PATH: [u16; 16] = ucs2("\\ichor\\apitoken");
+/// Where the control plane's TLS certificates and key live.
+const TLS_PATH: [u16; 18] = ucs2("\\ichor\\apitls.pem");
 
 // ---------------------------------------------------------------------------
 // Firmware: boot services as a typestate. Holding a `Firmware` means boot
@@ -648,24 +650,18 @@ extern "efiapi" fn efi_main(image: Handle, system_table: *const SystemTable) -> 
             e.valid_up_to()
         }
     };
-    state.roots_len = match fw.read_boot_file(&ROOTS_PATH, &mut state.roots) {
-        Ok(n) if n == ROOTS_MAX => {
-            println!(r"ichor: frame: warning: \ichor\roots.pem is larger than {ROOTS_MAX} bytes");
+    // Files a boot volume may do without: 0 bytes if absent or too large.
+    let optional = |path: &[u16], name, buf: &mut [u8]| match fw.read_boot_file(path, buf) {
+        Ok(n) if n == buf.len() => {
+            println!("ichor: frame: warning: {name} is {n} bytes or more; ignored");
             0
         }
         Ok(n) => n,
         Err(_) => 0,
     };
-    state.token_len = match fw.read_boot_file(&TOKEN_PATH, &mut state.token) {
-        Ok(n) if n == TOKEN_MAX => {
-            println!(
-                r"ichor: frame: warning: \ichor\apitoken is larger than {TOKEN_MAX} bytes; ignored"
-            );
-            0
-        }
-        Ok(n) => n,
-        Err(_) => 0,
-    };
+    state.roots_len = optional(&ROOTS_PATH, r"\ichor\roots.pem", &mut state.roots);
+    state.token_len = optional(&TOKEN_PATH, r"\ichor\apitoken", &mut state.token);
+    state.tls_len = optional(&TLS_PATH, r"\ichor\apitls.pem", &mut state.tls);
     if cmdline::Cmdline::new(state.cmdline()).flag("qemu_debug_exit") {
         power::enable_qemu_debug_exit();
     }
