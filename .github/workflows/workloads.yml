@@ -1,0 +1,67 @@
+name: workloads
+
+# The runtimes' own test suites, in cells, through the control plane
+# (ADR-0013): on demand and once a week, not on every push (they take hours).
+# A suite below its floor in workloads.toml fails. The result is the job
+# summary; the suite's whole output and the guest's log are kept.
+
+on:
+  workflow_dispatch:
+    inputs:
+      suites:
+        description: Suites to run (a JSON list)
+        default: '["python", "go", "postgres", "node", "jvm"]'
+  schedule:
+    - cron: "17 3 * * 0"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: workloads-${{ github.ref }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  suite:
+    name: ${{ matrix.suite }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: ${{ fromJSON(inputs.suites || '["python", "go", "postgres", "node", "jvm"]') }}
+    env:
+      # (Never pasted into a command: it may come from the dispatch form.)
+      SUITE: ${{ matrix.suite }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install QEMU and OVMF
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-system-x86 ovmf
+      - name: Enable KVM for the runner user
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+      - name: Install pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo xtask workloads "$SUITE" --accel kvm
+      - name: Summarize
+        if: always()
+        run: |
+          awk -v s="## $SUITE" '/^## /{on=($0==s)} on' docs/workloads.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: workloads-${{ matrix.suite }}
+          path: |
+            target/workloads-${{ matrix.suite }}.out
+            target/workloads-${{ matrix.suite }}.serial.log
+            docs/workloads.md
+          if-no-files-found: ignore

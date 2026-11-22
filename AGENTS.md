@@ -849,6 +849,8 @@ reason. Known candidates: CET/IBT codegen and retpolines (side-channel ADR).
 
 - CI (GitHub Actions, `ubuntu-24.04`) installs `qemu-system-x86` and `ovmf`,
   enables `/dev/kvm`, and runs lint, test, and cargo-deny.
+  `.github/workflows/workloads.yml` runs the workload suites on KVM, weekly
+  and on demand, and fails below their floors.
 - On Windows, QEMU's own `share/edk2-x86_64-code.fd` + `edk2-i386-vars.fd`
   are found automatically. There is no KVM there, so runs use TCG: about 2 s
   per boot. WHPX is untested.
