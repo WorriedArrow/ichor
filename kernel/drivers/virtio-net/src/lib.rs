@@ -162,3 +162,18 @@ impl VirtioNet {
         true
     }
 }
+
+impl net::link::Link for VirtioNet {
+    fn mac(&self) -> [u8; 6] {
+        VirtioNet::mac(self)
+    }
+    fn transmit(&mut self, frame: &[u8]) -> bool {
+        VirtioNet::transmit(self, frame)
+    }
+    fn receive(&mut self) -> Option<Vec<u8>> {
+        VirtioNet::receive(self)
+    }
+    fn name(&self) -> &str {
+        "virtio-net"
+    }
+}

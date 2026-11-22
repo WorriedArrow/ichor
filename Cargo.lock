@@ -245,6 +245,7 @@ name = "ichor-virtio-net"
 version = "0.0.0"
 dependencies = [
  "ichor-frame",
+ "ichor-net",
  "ichor-virtio-pci",
 ]
 

@@ -95,7 +95,19 @@ not write it; merge its branch when it lands.
   open TCP NAT mappings live five days (Linux's established timeout), not
   ten minutes. Known gaps from its runs: `test_math` cosh is 8 ulps off
   under TCG (check on KVM), O_RDWR FIFOs, rseq/clone3 (ENOSYS, glibc
-  falls back).
+  falls back), writable shared file mappings (`test_mmap`; the overlay's
+  upper pages are heap buffers, not frames), and worker processes killed
+  about six minutes in when the cell's 3 GiB account filled (under
+  investigation). First recorded full run: 403 of 445 modules (90.5%),
+  floor 88.0% in `workloads.toml`.
+- Open: one intermittent boot hang (2026-11-21) right after
+  `proc: native process ran`, i.e. in `copytest::frame_race`, in
+  `cloud_disk_boots_from_gpt_on_nvme` (2 vCPUs) under the full gate's
+  load; it passed on three reruns alone and the gate's rerun.
+- The uplink is any `net::link::Link` (`kernel/net/src/link.rs`:
+  `mac`/`transmit`/`receive`): NIC drivers implement it (virtio-net), and
+  a software link such as a VPN can wrap one. New NIC drivers (ENA,
+  gVNIC, VMBus) implement it too.
 
 **Milestone 6 is done** (2026-11-15): the control plane pulls a real OCI
 image from a registry, verifies it, converts it, and runs it through the

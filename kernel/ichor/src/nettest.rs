@@ -130,9 +130,11 @@ pub(crate) fn run() {
         tcp_echo(&mut dev, &mut ifc, port);
     }
     // From here on the device is the cell switch's uplink.
-    crate::switch::set_uplink(dev, ifc);
+    let link: alloc::boxed::Box<dyn net::link::Link> = alloc::boxed::Box::new(dev);
+    let name = alloc::string::String::from(link.name());
+    crate::switch::set_uplink(link, ifc);
     crate::netstack::start();
-    println!("ichor: net: uplink {GUEST} is the cell switch's (NAT for 10.88.0.0/16)");
+    println!("ichor: net: uplink {GUEST} on {name} is the cell switch's (NAT for 10.88.0.0/16)");
 }
 
 /// The harness's TCP echo port (0: none).

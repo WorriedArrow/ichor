@@ -10,7 +10,7 @@ flowchart LR
   end
   sw["Cell switch<br/>assigned addresses, anti-spoofing,<br/>rate limits, cross-cell fast path"]
   up["Uplink<br/>source NAT, published ports"]
-  nic["virtio-net<br/>(ENA, gVNIC, VMBus next)"]
+  nic["a Link: virtio-net today<br/>(ENA, gVNIC, VMBus next;<br/>or a VPN around a NIC)"]
   world["outside"]
   sa <--> sw
   sb <--> sw

@@ -95,6 +95,13 @@ deliberately rigid in the trusted core.
 - **Drivers.** A driver is a safe crate over frame's PCI, MMIO and DMA
   types, with no new `unsafe`. Cloud NICs (ENA, gVNIC) and Hyper-V VMBus
   are the next ones.
+- **Network links.** The cell switch's uplink is any `net::link::Link`
+  (`mac`, `transmit`, `receive`): a NIC driver implements it, and so can a
+  software link wrapped around one. A VPN in the kernel, say, is a crate
+  with its protocol (sans-I/O, host-tested like `kernel/net`) and a `Link`
+  that encrypts what it transmits and decrypts what it receives, handed
+  to the switch in place of the NIC. A fork that adds one changes no
+  upstream file but the line that picks the uplink.
 - **The control API.** It is protobuf over gRPC, so new calls are new
   messages and a new handler in the control plane.
 - **Policy.** The scheduler's policy is a host-tested crate injected into

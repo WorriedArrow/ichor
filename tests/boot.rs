@@ -586,7 +586,7 @@ fn tcp_through_virtio_net_to_a_host_echo_server() {
         "ichor: net: virtio-net ",
         "ichor: net: gateway 10.0.2.2 is at ",
         "ichor: net: tcp echo of 256 KiB through slirp ok",
-        "ichor: net: uplink 10.0.2.15 is the cell switch's",
+        "ichor: net: uplink 10.0.2.15 on virtio-net is the cell switch's",
         "through the switch; loopback is per cell",
         &format!("debian: nat: a cell echoed 256 KiB with 10.0.2.2:{port} through the uplink"),
         "debian: nat: a datagram went through the uplink and came back",
@@ -686,7 +686,7 @@ fn a_published_port_serves_the_host_from_a_cell() {
     eprintln!("host client: {log}");
     out.assert_exit(Exit::Success);
     out.assert_in_order(&[
-        "ichor: net: uplink 10.0.2.15 is the cell switch's",
+        "ichor: net: uplink 10.0.2.15 on virtio-net is the cell switch's",
         "debian: published: listening on port 80",
         "debian: published: served a request from 10.0.2.2",
     ]);

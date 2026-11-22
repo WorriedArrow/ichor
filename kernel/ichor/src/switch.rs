@@ -1,8 +1,9 @@
 //! The cell switch (ADR-0010 §3): every cell's stack is a port with an
 //! address the switch assigns in 10.88.0.0/16; the switch forwards IP
 //! packets between ports by that assignment (anti-spoofing and rate limits
-//! in `net::switch`), and anything bound outside goes to the uplink, a
-//! virtio-net interface, through source NAT and published ports
+//! in `net::switch`), and anything bound outside goes to the uplink, any
+//! `net::link::Link` (a NIC driver, or a software link such as a VPN
+//! wrapped around one), through source NAT and published ports
 //! (`net::nat`).
 //!
 //! Between two cells a packet is handed from one stack to the other as an
@@ -14,6 +15,7 @@
 //! Lock order: the uplink's lock may be held while taking the table's,
 //! never the reverse; stack locks are never held while taking either.
 
+use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Weak;
 use alloc::vec::Vec;
@@ -22,6 +24,7 @@ use core::time::Duration;
 use frame::sync::SpinLock;
 use net::Ipv4Addr;
 use net::iface::{Interface, Packet};
+use net::link::Link;
 use net::nat::{self, Nat};
 use net::switch::{PortId, Switch, Verdict};
 use net::tcp;
@@ -41,7 +44,7 @@ struct Table {
 }
 
 struct Uplink {
-    dev: virtio_net::VirtioNet,
+    dev: Box<dyn Link>,
     ifc: Interface,
     nat: Nat,
     last_expire: Duration,
@@ -125,7 +128,7 @@ pub(crate) fn stats(cell: u64) -> Option<(u64, u64, u64)> {
 }
 
 /// Makes `dev`/`ifc` the uplink.
-pub(crate) fn set_uplink(dev: virtio_net::VirtioNet, ifc: Interface) {
+pub(crate) fn set_uplink(dev: Box<dyn Link>, ifc: Interface) {
     let nat = Nat::new(ifc.addr);
     *UPLINK.lock() = Some(Uplink {
         dev,
