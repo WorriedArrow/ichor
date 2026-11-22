@@ -396,7 +396,10 @@ fn cmd_workloads(args: &[String]) -> Result<()> {
             other => return Err(format!("workloads: unknown option {other:?}")),
         }
     }
-    let suite = suite.ok_or("which suite? (python, go)")?;
+    let suite = suite.ok_or_else(|| {
+        let names: Vec<&str> = workloads::SUITES.iter().map(|s| s.name).collect();
+        format!("which suite? ({})", names.join(", "))
+    })?;
     let argv: Vec<String> = match &cmd {
         Some(c) => vec!["/bin/sh".into(), "-c".into(), c.clone()],
         None => {
@@ -455,7 +458,9 @@ fn cmd_workloads(args: &[String]) -> Result<()> {
         .map_or(0, |(_, f)| f);
     let doc_path = root.join("docs").join("workloads.md");
     let old = std::fs::read_to_string(&doc_path).unwrap_or_default();
-    let section = workloads::section(suite, &s, started.elapsed().as_secs(), floor);
+    let machine = format!("{:?}", accel.resolve()).to_lowercase();
+    let secs = started.elapsed().as_secs();
+    let section = workloads::section(suite, &s, secs, &machine, floor);
     std::fs::write(&doc_path, workloads::merge_doc(&old, suite.name, &section))
         .map_err(|e| format!("{}: {e}", doc_path.display()))?;
     println!("workloads: wrote {}", doc_path.display());

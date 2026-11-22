@@ -388,7 +388,8 @@ pub fn floors(text: &str) -> Vec<(String, u32)> {
 }
 
 /// One suite's section of `docs/workloads.md`.
-pub fn section(suite: &Suite, s: &Score, secs: u64, floor: u32) -> String {
+/// `machine` is what it ran on ("kvm").
+pub fn section(suite: &Suite, s: &Score, secs: u64, machine: &str, floor: u32) -> String {
     let mut out = format!("## {}\n\n", suite.name);
     out += &format!("- Image: `{}`\n", suite.image);
     for l in suite.layers {
@@ -412,7 +413,11 @@ pub fn section(suite: &Suite, s: &Score, secs: u64, floor: u32) -> String {
         floor / 10,
         floor % 10
     );
-    out += &format!("- Run time: {} min\n\n", secs.div_ceil(60));
+    out += &format!(
+        "- Run time: {} min ({machine}, 4 vCPUs, the cell given {} GiB)\n\n",
+        secs.div_ceil(60),
+        suite.cell_bytes >> 30
+    );
     if !s.failed.is_empty() {
         out += "Failed:\n\n";
         for f in &s.failed {
