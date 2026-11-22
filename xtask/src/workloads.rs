@@ -148,6 +148,7 @@ pub const NODE: Suite = Suite {
         node_source("node-v24.22.3/test/", "/usr/src/node/test/"),
         node_source("node-v24.22.3/tools/", "/usr/src/node/tools/"),
         // What some tests compare the program with, or run.
+        node_source("node-v24.22.3/CHANGELOG.md", "/usr/src/node/CHANGELOG.md"),
         node_source("node-v24.22.3/benchmark/", "/usr/src/node/benchmark/"),
         node_source("node-v24.22.3/doc/", "/usr/src/node/doc/"),
         node_source("node-v24.22.3/lib/", "/usr/src/node/lib/"),

@@ -617,10 +617,22 @@ impl Tcp {
             self.arm_retransmit(now);
         }
         if !sent_any && self.ack_now {
-            let seg = self.segment(self.snd_nxt, ACK, &[], false);
+            let seg = self.segment(self.ack_seq(), ACK, &[], false);
             self.out.push_back(seg);
         }
         self.ack_now = false;
+    }
+
+    /// The sequence number of a bare ACK: past everything sent (not where a
+    /// retransmission has gone back to), but within the peer's window, so
+    /// that the peer takes it.
+    fn ack_seq(&self) -> u32 {
+        let end = self.snd_una.wrapping_add(self.snd_wnd);
+        if lt(end, self.snd_max) {
+            end
+        } else {
+            self.snd_max
+        }
     }
 
     fn enter_fin_sent(&mut self) {
@@ -689,7 +701,17 @@ impl Tcp {
         let start = seg.seq;
         let end = seg.seq.wrapping_add(len.max(1)).wrapping_sub(1);
         let in_window = |s: u32| le(self.rcv_nxt, s) && lt(s, self.rcv_nxt.wrapping_add(wnd));
+        // What carries nothing may also be at the window's edge, as a peer
+        // that has filled the window sends it, or (for a peer that counts
+        // its zero-window probe) one past a closed one. Else the ACKs of a
+        // peer we have stopped reading from would be lost, and what we send
+        // it with them.
+        let told = self.told_edge;
+        let edge = seq_max(self.rcv_nxt.wrapping_add(wnd), told);
+        let edge = if wnd == 0 { edge.wrapping_add(1) } else { edge };
+        let at_edge = le(self.rcv_nxt, start) && le(start, edge);
         let acceptable = match (len, wnd) {
+            (0, _) if seg.flags & RST == 0 => at_edge,
             (0, 0) => seg.seq == self.rcv_nxt,
             // A bare FIN at rcv_nxt needs no window (Linux takes it too),
             // so a reader with a full buffer still learns of the end.
@@ -698,11 +720,20 @@ impl Tcp {
             (_, 0) => false,
             _ => in_window(start) || in_window(end),
         };
+        // Data with no window for it: the ACK it carries counts all the
+        // same (RFC 9293 asks for that), and it is answered with one.
+        let only_ack = !acceptable
+            && wnd == 0
+            && at_edge
+            && !seg.payload.is_empty()
+            && seg.flags & (SYN | RST) == 0;
         if !acceptable {
             if seg.flags & RST == 0 {
                 self.ack_now = true;
             }
-            return;
+            if !only_ack {
+                return;
+            }
         }
         // 2. RST: exact match resets, otherwise a challenge ACK (RFC 5961).
         if seg.flags & RST != 0 {
@@ -750,7 +781,7 @@ impl Tcp {
             return;
         }
         self.on_ack(seg, now);
-        if self.state == State::Closed {
+        if self.state == State::Closed || only_ack {
             return;
         }
         // 5. Data and FIN. New data for an application that has gone away
@@ -1014,13 +1045,12 @@ impl Tcp {
             {
                 // Zero-window probe: the byte at snd_una, past the closed
                 // window. A peer whose window has opened takes and
-                // acknowledges it.
+                // acknowledges it; until then it has not been sent.
                 let off = self.snd_una.wrapping_sub(self.buf_seq) as usize;
                 if let Some(&b) = self.send_buf.get(off) {
                     let seg = self.segment(self.snd_una, ACK, &[b], false);
                     self.out.push_back(seg);
-                    self.snd_nxt = seq_max(self.snd_nxt, self.snd_una.wrapping_add(1));
-                    self.snd_max = seq_max(self.snd_max, self.snd_nxt);
+                    self.snd_max = seq_max(self.snd_max, self.snd_una.wrapping_add(1));
                 }
                 self.retransmit_at = Some(now + self.rto);
                 return;
@@ -1323,6 +1353,61 @@ mod tests {
             }
         }
         assert_eq!(got, data);
+    }
+
+    /// One direction's window is closed and probed (B does not read) while
+    /// the other carries data: A's ACKs count all the same, and what B
+    /// sends flows at its usual pace.
+    #[test]
+    fn a_closed_window_does_not_stop_the_other_direction() {
+        for loss in [0, 20] {
+            let mut sim = Sim::new(loss, 0, 23, 9);
+            for _ in 0..10 {
+                sim.step();
+            }
+            let up = pattern(2 * BUFFER, 7);
+            let mut sent_up = 0;
+            // B's buffer fills (the last bytes, less than the scaled window
+            // tells of, by A's probes) and A probes it, for a while.
+            let until = sim.now + Duration::from_secs(8000);
+            while sim.now < until {
+                let now = sim.now;
+                sent_up += sim.a.send(&up[sent_up..], now);
+                if !sim.step() {
+                    break;
+                }
+            }
+            assert_eq!(sim.b.as_ref().unwrap().readable(), BUFFER);
+            assert_eq!(sim.a.state(), State::Established);
+            let down = pattern(2 << 20, 8);
+            let (mut sent, mut got) = (0, Vec::new());
+            let mut buf = vec![0u8; 65536];
+            let start = sim.now;
+            while got.len() < down.len() {
+                let now = sim.now;
+                sent += sim.b.as_mut().unwrap().send(&down[sent..], now);
+                let n = sim.a.recv(&mut buf, now);
+                got.extend_from_slice(&buf[..n]);
+                let more = sim.step();
+                assert!(
+                    more && sim.now < start + Duration::from_secs(60),
+                    "loss {loss}: {} of {} bytes",
+                    got.len(),
+                    down.len()
+                );
+            }
+            assert_eq!(got, down);
+            // And once B reads, what waited arrives.
+            let mut got = Vec::new();
+            while got.len() < up.len() {
+                let now = sim.now;
+                sent_up += sim.a.send(&up[sent_up..], now);
+                let n = sim.b.as_mut().unwrap().recv(&mut buf, now);
+                got.extend_from_slice(&buf[..n]);
+                assert!(sim.step() || got.len() == up.len());
+            }
+            assert_eq!(got, up);
+        }
     }
 
     /// A slow reader whose buffer is full still takes the peer's FIN, and
