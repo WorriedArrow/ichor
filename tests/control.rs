@@ -9,6 +9,8 @@
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use grpc::Client;
@@ -101,12 +103,16 @@ fn sha256(b: &[u8]) -> String {
 }
 
 /// Serves `body` to every HTTP request on 127.0.0.1 (the guest's
-/// 10.0.2.2) until the process ends; returns the port.
-fn serve(body: Vec<u8>) -> u16 {
+/// 10.0.2.2) until the process ends; returns the port, and how often it
+/// was asked.
+fn serve(body: Vec<u8>) -> (u16, Arc<AtomicU32>) {
     let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = l.local_addr().unwrap().port();
+    let asked = Arc::new(AtomicU32::new(0));
+    let count = asked.clone();
     std::thread::spawn(move || {
         for mut s in l.incoming().flatten() {
+            count.fetch_add(1, Ordering::SeqCst);
             let mut req = [0u8; 4096];
             let _ = s.set_read_timeout(Some(Duration::from_secs(10)));
             let _ = s.read(&mut req);
@@ -118,7 +124,7 @@ fn serve(body: Vec<u8>) -> u16 {
             let _ = s.write_all(&body);
         }
     });
-    port
+    (port, asked)
 }
 
 /// The whole flow, from the host: hello-world, then Alpine with an extra
@@ -208,15 +214,20 @@ fn session(port: u16, layer_port: u16) -> Result<(Ran, Ran), String> {
     }
     eprintln!("host: refused as it should be: {msg}");
 
+    // Two layers from one archive: it is fetched once.
+    let again = control::LayerSource {
+        to: "/opt/again/".into(),
+        ..layer(sha256(&body))
+    };
     let alpine = pull_and_run(
         &mut s,
         ALPINE,
-        vec![layer(sha256(&body))],
+        vec![layer(sha256(&body)), again],
         &[
             "sh",
             "-c",
             "cat /etc/alpine-release; echo \"$((6 * 7)) from $(uname -s)\"; ls /bin/busybox; cat /opt/extra/greeting; \
-             head -1 /etc/hosts; cat /etc/hostname; exit 3",
+             cat /opt/again/greeting; head -1 /etc/hosts; cat /etc/hostname; exit 3",
         ],
     )?;
     lifecycle(&mut s, "2")?;
@@ -245,8 +256,10 @@ fn lifecycle(s: &mut Session, id: &str) -> Result<(), String> {
         }
         let info = control::InspectResponse::decode(m.first().ok_or("no Inspect reply")?)
             .map_err(|_| "bad InspectResponse")?;
-        // Counted once registered, charged once its program is loaded.
-        if (info.processes >= 1 && info.memory_used_bytes > 0) || Instant::now() > deadline {
+        // Counted once registered; the cell is charged more than its root
+        // and the process's kernel stack once the program is loaded.
+        let loaded = info.processes >= 1 && info.memory_used_bytes > 100 << 10;
+        if loaded || Instant::now() > deadline {
             break info;
         }
         std::thread::sleep(Duration::from_millis(200));
@@ -384,7 +397,7 @@ fn the_control_plane_pulls_and_runs_an_image_from_docker_hub() {
         .local_addr()
         .unwrap()
         .port();
-    let layer_port = serve(extra_layer());
+    let (layer_port, asked) = serve(extra_layer());
     let client = std::thread::spawn(move || {
         let r = session(host_port, layer_port);
         if let Err(e) = &r {
@@ -444,7 +457,9 @@ fn the_control_plane_pulls_and_runs_an_image_from_docker_hub() {
     assert_eq!(
         text,
         "3.20.3\n42 from Linux\n/bin/busybox\nhello from an extra layer\n\
-         127.0.0.1\tlocalhost\nichor\n"
+         hello from an extra layer\n127.0.0.1\tlocalhost\nichor\n"
     );
     assert_eq!(exit, 3 << 8);
+    // Once refused, once for both layers.
+    assert_eq!(asked.load(Ordering::SeqCst), 2);
 }

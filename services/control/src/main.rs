@@ -37,6 +37,7 @@ mod fetch;
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::format;
+use alloc::rc::Rc;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -121,7 +122,7 @@ struct Pull {
     pulled: Option<oci::Pulled>,
     /// Layers to add, and those fetched and verified so far.
     layers: Vec<control::LayerSource>,
-    extras: Vec<Vec<u8>>,
+    extras: Vec<Rc<Vec<u8>>>,
 }
 
 /// Whether `d` is a digest we can check (`sha256:` and 64 hex digits).
@@ -773,7 +774,7 @@ impl Control {
                                 ));
                             }
                             rt::log!("control: layer {} verified ({len} bytes)", l.url);
-                            p.extras.push(resp.body);
+                            p.extras.push(Rc::new(resp.body));
                         }
                     }
                 }
@@ -788,6 +789,15 @@ impl Control {
                 }
             }
             if let Some(l) = p.layers.get(p.extras.len()) {
+                // Several layers may come from one archive: what hashes to
+                // this digest is here already.
+                let same = |have: &&control::LayerSource| have.digest == l.digest;
+                let have = p.layers.iter().zip(&p.extras);
+                if let Some((_, data)) = have.into_iter().find(|(have, _)| same(have)) {
+                    let data = data.clone();
+                    p.extras.push(data);
+                    continue;
+                }
                 let url = http::Url::parse(&l.url).ok_or("a layer URL does not parse")?;
                 p.fetch = Some(Fetch::start(http::Request::get(url), &mut self.net)?);
                 continue;

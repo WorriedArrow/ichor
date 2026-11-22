@@ -56,3 +56,34 @@ Failed:
 - `test_termios`
 - `test_venv`
 - `test_zipfile`
+
+## go
+
+- Image: `docker.io/library/golang@sha256:4fa7c968ba93f1635670522dbb01a2c78150443e1385746924566079f36570ea`
+- Command: `go test -short -vet=off -timeout 30m std`
+- Result: 254 of 262 packages passed (96.9%), 121 skipped; floor 94.0%
+- Run time: 78 min (tcg, 4 vCPUs, the cell given 6 GiB)
+- Known causes among the failures: `crypto/sha1` is QEMU's (TCG reads 32
+  bytes for VINSERTI128's 16-byte operand), as `math` was (its FMA, which
+  the emulated CPU no longer has); `syscall` wants ptrace; `time` ran out of
+  its minute under TCG. Fixed since the run: what `net`, `os` and
+  `path/filepath` failed on.
+
+Failed:
+
+- `crypto/sha1`
+- `math`
+- `net`
+- `os`
+- `path/filepath`
+- `runtime`
+- `syscall`
+- `time`
+
+## postgres
+
+- Image: `docker.io/library/buildpack-deps@sha256:f53cd4c58cdb96a467b98696cd510a949ef4ccd7d23e07b75107de754773007a`
+- Layer: `https://ftp.postgresql.org/pub/source/v16.16/postgresql-16.16.tar.gz` (sha256:3e930f3366f675ab26e873d16201201f8e9b6d9bc13686e4465380271145ea2d), `postgresql-16.16/` at `/usr/src/postgresql/`
+- Command: `sh -c set -e; useradd -m pg; cp -r /usr/src/postgresql /home/pg/src; chown -R pg /home/pg/src; exec su pg -c 'set -e; cd ~/src; ./configure --prefix=/home/pg/inst --without-icu --without-readline --without-zlib CFLAGS=-O1 >../configure.log 2>&1 || { tail ../configure.log; exit 1; }; make -s -j4 >../make.log 2>&1 || { tail ../make.log; exit 1; }; echo built; cd src/test/regress; if [ $# -gt 0 ]; then make -s check-tests TESTS="test_setup $*"; else make -s check; fi; s=$?; cat regression.diffs 2>/dev/null | head -c 2000000; exit $s' -- "$0" "$@" postgres`
+- Result: 224 of 224 tests passed (100.0%), 0 skipped; floor 98.0%
+- Run time: 39 min

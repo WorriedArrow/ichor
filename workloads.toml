@@ -5,3 +5,9 @@
 
 # 2026-11-21: 403 of 445 modules (90.5%) under TCG on 4 vCPUs.
 python = 880
+
+# 2026-11-21: 254 of 262 packages (96.9%) under TCG on 4 vCPUs.
+go = 940
+
+# 2026-11-21: 224 of 224 tests under TCG on 4 vCPUs.
+postgres = 980

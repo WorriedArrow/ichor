@@ -128,6 +128,16 @@ pub const POSTGRES: Suite = Suite {
     parse: parse_tap,
 };
 
+/// A part of Node.js 24's source release.
+const fn node_source(from: &'static str, to: &'static str) -> LayerPin {
+    LayerPin {
+        url: "https://nodejs.org/dist/v24.22.3/node-v24.22.3.tar.gz",
+        sha256: "sha256:4690edccae352134bbe31d844b37898f2a28b2c3d67901d0112fb6c4996d556a",
+        from,
+        to,
+    }
+}
+
 /// Node.js 24's `test/parallel` and `test/sequential`, from the release the
 /// image holds, run by its own `tools/test.py` (the full image, not the slim
 /// one, has the Python that needs).
@@ -135,24 +145,34 @@ pub const NODE: Suite = Suite {
     name: "node",
     image: "docker.io/library/node@sha256:9d266751ca3d7fdbe651c878ffd5ad0a42fed49a18c283509267c97f025b7496",
     layers: &[
-        LayerPin {
-            url: "https://nodejs.org/dist/v24.22.3/node-v24.22.3.tar.gz",
-            sha256: "sha256:4690edccae352134bbe31d844b37898f2a28b2c3d67901d0112fb6c4996d556a",
-            from: "node-v24.22.3/test/",
-            to: "/usr/src/node/test/",
-        },
-        LayerPin {
-            url: "https://nodejs.org/dist/v24.22.3/node-v24.22.3.tar.gz",
-            sha256: "sha256:4690edccae352134bbe31d844b37898f2a28b2c3d67901d0112fb6c4996d556a",
-            from: "node-v24.22.3/tools/",
-            to: "/usr/src/node/tools/",
-        },
+        node_source("node-v24.22.3/test/", "/usr/src/node/test/"),
+        node_source("node-v24.22.3/tools/", "/usr/src/node/tools/"),
+        // What some tests compare the program with, or run.
+        node_source("node-v24.22.3/benchmark/", "/usr/src/node/benchmark/"),
+        node_source("node-v24.22.3/doc/", "/usr/src/node/doc/"),
+        node_source("node-v24.22.3/lib/", "/usr/src/node/lib/"),
+        node_source("node-v24.22.3/src/", "/usr/src/node/src/"),
+        node_source("node-v24.22.3/deps/acorn/", "/usr/src/node/deps/acorn/"),
+        node_source(
+            "node-v24.22.3/deps/corepack/",
+            "/usr/src/node/deps/corepack/",
+        ),
+        node_source("node-v24.22.3/deps/npm/", "/usr/src/node/deps/npm/"),
+        node_source("node-v24.22.3/deps/undici/", "/usr/src/node/deps/undici/"),
+        node_source(
+            "node-v24.22.3/deps/v8/src/objects/",
+            "/usr/src/node/deps/v8/src/objects/",
+        ),
     ],
     argv: &[
         "sh",
         "-c",
-        "cd /usr/src/node && [ $# -gt 0 ] || set -- parallel sequential; \
-         exec python3 tools/test.py -J --shell=/usr/local/bin/node -p tap --timeout 600 \"$@\"",
+        // As the image's `node` user, as upstream's CI does: some tests are
+        // refused things that root is not.
+        "chown -R node /usr/src/node && cd /usr/src/node && \
+         { [ $# -gt 0 ] || set -- parallel sequential; } && \
+         exec su node -c 'exec python3 tools/test.py -J --shell=/usr/local/bin/node -p tap \
+         --timeout 600 \"$@\"' -- \"$0\" \"$@\"",
         "node",
     ],
     all: &[],
