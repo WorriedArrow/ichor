@@ -5,26 +5,29 @@
 //! datagram socket every read takes one datagram (the rest of a longer one
 //! is discarded, `MSG_TRUNC` in `recvmsg`) and every write sends one.
 //!
-//! Partial: no `AF_INET6` or `AF_UNIX` yet (EAFNOSUPPORT); `MSG_PEEK`
-//! and out-of-band data are unsupported; socket options are recorded and
-//! reported back, and only `SO_ERROR`, `SO_TYPE` and `SO_REUSEADDR` change
-//! behavior.
+//! Partial: no `AF_INET6` (EAFNOSUPPORT); out-of-band data is unsupported;
+//! socket options are recorded and reported back, and only `SO_REUSEADDR`,
+//! `SO_RCVTIMEO`, `SO_SNDTIMEO` and `SO_LINGER` without a time (close
+//! resets) change behavior.
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::time::Duration;
 
 use frame::sync::SpinLock;
 
-use super::{EFAULT, unix};
+use super::{EFAULT, fs, netlink, unix};
 use crate::netstack::{self, Addr, Stack, Waiters};
 use crate::poll::{Object, Watchers};
 use crate::proc;
 use crate::process::{Fd, LinuxProcess, ObjectEnd};
 use crate::signal;
 
+const EINTR: i64 = 4;
 const EAGAIN: i64 = 11;
 const EBADF: i64 = 9;
+const EDOM: i64 = 33;
 const EINVAL: i64 = 22;
 const EMFILE: i64 = 24;
 const ENOTSOCK: i64 = 88;
@@ -37,6 +40,7 @@ const AF_UNSPEC: u16 = 0;
 const AF_INET: u16 = 2;
 const SOCK_STREAM: u64 = 1;
 const SOCK_DGRAM: u64 = 2;
+const SOCK_RAW: u64 = 3;
 const SOCK_NONBLOCK: u64 = 0o4000;
 const SOCK_CLOEXEC: u64 = 0o2_000_000;
 const IPPROTO_TCP: u64 = 6;
@@ -47,15 +51,34 @@ const SOL_SOCKET: u64 = 1;
 const SO_REUSEADDR: u64 = 2;
 const SO_TYPE: u64 = 3;
 const SO_ERROR: u64 = 4;
+const SO_DONTROUTE: u64 = 5;
+const SO_BROADCAST: u64 = 6;
 const SO_SNDBUF: u64 = 7;
 const SO_RCVBUF: u64 = 8;
 const SO_KEEPALIVE: u64 = 9;
+const SO_OOBINLINE: u64 = 10;
+const SO_PRIORITY: u64 = 12;
 const SO_LINGER: u64 = 13;
 const SO_REUSEPORT: u64 = 15;
-const SO_RCVTIMEO: u64 = 20;
-const SO_SNDTIMEO: u64 = 21;
+pub(super) const SO_RCVTIMEO: u64 = 20;
+pub(super) const SO_SNDTIMEO: u64 = 21;
 const SO_ACCEPTCONN: u64 = 30;
+const SO_PROTOCOL: u64 = 38;
+const SO_DOMAIN: u64 = 39;
+const IPPROTO_IP: u64 = 0;
+const IP_TOS: u64 = 1;
+const IP_TTL: u64 = 2;
+const IP_MTU_DISCOVER: u64 = 10;
+const IP_FREEBIND: u64 = 15;
+const IP_BIND_ADDRESS_NO_PORT: u64 = 24;
+const IP_MULTICAST_TTL: u64 = 33;
+const IP_MULTICAST_LOOP: u64 = 34;
 const TCP_NODELAY: u64 = 1;
+const TCP_MAXSEG: u64 = 2;
+const TCP_SYNCNT: u64 = 7;
+const TCP_LINGER2: u64 = 8;
+const TCP_WINDOW_CLAMP: u64 = 10;
+const TCP_NOTSENT_LOWAT: u64 = 25;
 /// nginx corks around `sendfile` (`TCP_NOPUSH`); our TCP sends what it
 /// has at once, so corking is recorded and changes nothing.
 const TCP_CORK: u64 = 3;
@@ -69,7 +92,10 @@ const TCP_FASTOPEN: u64 = 23;
 
 const MSG_PEEK: u64 = 0x2;
 const MSG_DONTWAIT: u64 = 0x40;
+const MSG_WAITALL: u64 = 0x100;
 const MSG_NOSIGNAL: u64 = 0x4000;
+const MSG_WAITFORONE: u64 = 0x10000;
+const MSG_CMSG_CLOEXEC: u64 = 0x4000_0000;
 
 /// Largest single read or write moved through the kernel at once.
 const CHUNK: usize = 64 * 1024;
@@ -83,6 +109,11 @@ pub(crate) struct Socket {
     /// UDP (`SOCK_DGRAM`).
     dgram: bool,
     listening: AtomicBool,
+    /// A `connect` started and has not reported its outcome yet.
+    connecting: AtomicBool,
+    /// `SO_LINGER` with no time: closing resets the connection.
+    reset_on_close: AtomicBool,
+    timeouts: Timeouts,
     opts: SpinLock<Vec<SockOpt>>,
 }
 
@@ -97,6 +128,9 @@ impl Socket {
             wait,
             dgram,
             listening: AtomicBool::new(false),
+            connecting: AtomicBool::new(false),
+            reset_on_close: AtomicBool::new(false),
+            timeouts: Timeouts::default(),
             opts: SpinLock::new(Vec::new()),
         }
     }
@@ -105,11 +139,29 @@ impl Socket {
     fn recv_datagram(
         &self,
         nonblock: bool,
+        peek: bool,
         interrupted: &dyn Fn() -> bool,
     ) -> Result<(Addr, Vec<u8>), i64> {
-        block(self, nonblock, interrupted, || {
-            self.stack.recv_from(self.id).transpose()
+        block_recv(self, nonblock, interrupted, || {
+            self.stack.recv_from(self.id, peek).transpose()
         })
+    }
+
+    /// Receives some of a stream (blocking as asked): up to `max` bytes,
+    /// left in place if `peek`.
+    fn recv_stream(
+        &self,
+        max: usize,
+        nonblock: bool,
+        peek: bool,
+        interrupted: &dyn Fn() -> bool,
+    ) -> Result<Vec<u8>, i64> {
+        let mut buf = alloc::vec![0u8; max.min(CHUNK)];
+        let n = block_recv(self, nonblock, interrupted, || {
+            self.stack.recv(self.id, &mut buf, peek).transpose()
+        })?;
+        buf.truncate(n);
+        Ok(buf)
     }
 
     fn id(&self) -> u64 {
@@ -124,24 +176,100 @@ impl Socket {
 
 impl Drop for Socket {
     fn drop(&mut self) {
-        self.stack.release(self.id);
+        self.stack
+            .release(self.id, self.reset_on_close.load(Ordering::Relaxed));
     }
 }
 
-/// Blocks on `s` until `attempt` yields, honoring non-blocking mode and
-/// signals.
-fn block<T>(
-    s: &Socket,
+/// `SO_RCVTIMEO` and `SO_SNDTIMEO`, in nanoseconds (0: wait forever).
+#[derive(Debug, Default)]
+pub(super) struct Timeouts {
+    pub(super) recv: AtomicU64,
+    pub(super) send: AtomicU64,
+}
+
+impl Timeouts {
+    fn of(&self, name: u64) -> &AtomicU64 {
+        if name == SO_RCVTIMEO {
+            &self.recv
+        } else {
+            &self.send
+        }
+    }
+
+    /// Sets one from a `struct timeval`.
+    pub(super) fn set(&self, name: u64, v: &[u8]) -> Result<(), i64> {
+        let word = |at: usize| v.get(at..at + 8).map(super::le_u64).ok_or(EINVAL);
+        let (sec, usec) = (word(0)? as i64, word(8)? as i64);
+        if !(0..1_000_000).contains(&usec) {
+            return Err(EDOM);
+        }
+        let ns = u64::try_from(sec)
+            .unwrap_or(0)
+            .saturating_mul(1_000_000_000)
+            .saturating_add(usec as u64 * 1000);
+        self.of(name).store(ns, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// One as a `struct timeval`.
+    pub(super) fn get(&self, name: u64) -> Vec<u8> {
+        let ns = self.of(name).load(Ordering::Relaxed);
+        let mut v = (ns / 1_000_000_000).to_le_bytes().to_vec();
+        v.extend_from_slice(&(ns % 1_000_000_000 / 1000).to_le_bytes());
+        v
+    }
+}
+
+/// Blocks on `w` until `attempt` yields, honoring non-blocking mode,
+/// `timeout` (nanoseconds, 0 for none; EAGAIN when it passes) and signals
+/// (which a call with a timeout does not restart after, as on Linux).
+pub(super) fn block_on<T>(
+    w: &Waiters,
     nonblock: bool,
+    timeout: u64,
     interrupted: &dyn Fn() -> bool,
     mut attempt: impl FnMut() -> Option<Result<T, i64>>,
 ) -> Result<T, i64> {
-    s.wait.queue.wait_until(|| match attempt() {
+    let cond = || match attempt() {
         Some(r) => Some(r),
         None if nonblock => Some(Err(EAGAIN)),
-        None if interrupted() => Some(Err(signal::ERESTARTSYS)),
+        None if interrupted() => Some(Err(if timeout == 0 {
+            signal::ERESTARTSYS
+        } else {
+            EINTR
+        })),
         None => None,
-    })
+    };
+    if timeout == 0 {
+        return w.queue.wait_until(cond);
+    }
+    let deadline = frame::time::now().saturating_add(Duration::from_nanos(timeout));
+    w.queue
+        .wait_until_deadline(deadline, cond)
+        .unwrap_or(Err(EAGAIN))
+}
+
+/// [`block_on`] a socket to receive (or accept).
+fn block_recv<T>(
+    s: &Socket,
+    nonblock: bool,
+    interrupted: &dyn Fn() -> bool,
+    attempt: impl FnMut() -> Option<Result<T, i64>>,
+) -> Result<T, i64> {
+    let t = s.timeouts.recv.load(Ordering::Relaxed);
+    block_on(&s.wait, nonblock, t, interrupted, attempt)
+}
+
+/// [`block_on`] a socket to send (or connect).
+fn block_send<T>(
+    s: &Socket,
+    nonblock: bool,
+    interrupted: &dyn Fn() -> bool,
+    attempt: impl FnMut() -> Option<Result<T, i64>>,
+) -> Result<T, i64> {
+    let t = s.timeouts.send.load(Ordering::Relaxed);
+    block_on(&s.wait, nonblock, t, interrupted, attempt)
 }
 
 impl Object for Socket {
@@ -152,17 +280,11 @@ impl Object for Socket {
         interrupted: &dyn Fn() -> bool,
     ) -> Result<Vec<u8>, i64> {
         if self.dgram {
-            let (_, mut d) = self.recv_datagram(nonblock, interrupted)?;
+            let (_, mut d) = self.recv_datagram(nonblock, false, interrupted)?;
             d.truncate(max);
             return Ok(d);
         }
-        let mut buf = alloc::vec![0u8; max.min(CHUNK)];
-        let id = self.id();
-        let n = block(self, nonblock, interrupted, || {
-            self.stack.recv(id, &mut buf, false).transpose()
-        })?;
-        buf.truncate(n);
-        Ok(buf)
+        self.recv_stream(max, nonblock, false, interrupted)
     }
 
     fn write(
@@ -175,16 +297,24 @@ impl Object for Socket {
             // A datagram is sent whole or not at all; nothing blocks.
             return self.stack.send_to(self.id, None, data);
         }
-        if data.is_empty() {
-            return Ok(0);
-        }
+        // Everything, however long that takes (what fits, if it may not
+        // wait); an error after some went reports what went.
         let id = self.id();
-        block(self, nonblock, interrupted, || {
-            match self.stack.send(id, &data[..data.len().min(CHUNK)]) {
-                Ok(0) => None,
-                r => Some(r),
+        let mut done = 0;
+        while done < data.len() {
+            let next = &data[done..data.len().min(done + CHUNK)];
+            match block_send(self, nonblock, interrupted, || {
+                match self.stack.send(id, next) {
+                    Ok(0) => None,
+                    r => Some(r),
+                }
+            }) {
+                Ok(n) => done += n,
+                Err(e) if done == 0 => return Err(e),
+                Err(_) => break,
             }
-        })
+        }
+        Ok(done)
     }
 
     fn poll(&self) -> u16 {
@@ -206,6 +336,10 @@ impl Object for Socket {
     fn socket(&self) -> Option<&Socket> {
         Some(self)
     }
+
+    fn readable(&self) -> Option<usize> {
+        Some(self.stack.readable(self.id))
+    }
 }
 
 fn read_addr(p: &mut LinuxProcess, addr: u64, len: u64) -> Result<Addr, i64> {
@@ -224,8 +358,23 @@ fn read_addr(p: &mut LinuxProcess, addr: u64, len: u64) -> Result<Addr, i64> {
     Ok((ip, port))
 }
 
-/// Writes `a` to a user `sockaddr` whose buffer length is at `lenp`.
-fn write_addr(p: &mut LinuxProcess, addr: u64, lenp: u64, a: Addr) -> Result<(), i64> {
+/// `a` as a `struct sockaddr_in`.
+pub(super) fn sockaddr(a: Addr) -> [u8; 16] {
+    let mut b = [0u8; 16];
+    b[..2].copy_from_slice(&AF_INET.to_le_bytes());
+    b[2..4].copy_from_slice(&a.1.to_be_bytes());
+    b[4..8].copy_from_slice(&a.0.octets());
+    b
+}
+
+/// Writes the `sockaddr` `b` to user memory at `addr`, whose buffer length
+/// is at `lenp` (in: the room; out: the address's length).
+pub(super) fn write_sockaddr(
+    p: &mut LinuxProcess,
+    addr: u64,
+    lenp: u64,
+    b: &[u8],
+) -> Result<(), i64> {
     if addr == 0 || lenp == 0 {
         return Ok(());
     }
@@ -233,16 +382,18 @@ fn write_addr(p: &mut LinuxProcess, addr: u64, lenp: u64, a: Addr) -> Result<(),
     if p.copy_from_user(lenp, &mut lb) != 4 {
         return Err(EFAULT);
     }
-    let room = u32::from_le_bytes(lb) as usize;
-    let mut b = [0u8; 16];
-    b[..2].copy_from_slice(&AF_INET.to_le_bytes());
-    b[2..4].copy_from_slice(&a.1.to_be_bytes());
-    b[4..8].copy_from_slice(&a.0.octets());
-    let n = room.min(16);
-    if p.copy_to_user(addr, &b[..n]) != n || p.copy_to_user(lenp, &16u32.to_le_bytes()) != 4 {
+    let n = (u32::from_le_bytes(lb) as usize).min(b.len());
+    if p.copy_to_user(addr, &b[..n]) != n
+        || p.copy_to_user(lenp, &(b.len() as u32).to_le_bytes()) != 4
+    {
         return Err(EFAULT);
     }
     Ok(())
+}
+
+/// Writes `a` to a user `sockaddr` whose buffer length is at `lenp`.
+fn write_addr(p: &mut LinuxProcess, addr: u64, lenp: u64, a: Addr) -> Result<(), i64> {
+    write_sockaddr(p, addr, lenp, &sockaddr(a))
 }
 
 /// The socket behind `fd` and whether it is non-blocking.
@@ -269,12 +420,17 @@ pub(super) fn socket(p: &mut LinuxProcess, domain: u64, ty: u64, proto: u64) -> 
     if domain == unix::AF_UNIX {
         return unix::socket(p, ty, proto);
     }
+    if domain == netlink::AF_NETLINK {
+        return netlink::socket(p, ty, proto);
+    }
     if domain != u64::from(AF_INET) {
         return Err(EAFNOSUPPORT);
     }
     let dgram = match ty & 0xf {
         SOCK_STREAM => false,
         SOCK_DGRAM => true,
+        // CAP_NET_RAW is outside the cell bounding set (ADR-0009 §3).
+        SOCK_RAW => return Err(super::EPERM),
         _ => return Err(ESOCKTNOSUPPORT),
     };
     let want = if dgram { IPPROTO_UDP } else { IPPROTO_TCP };
@@ -305,6 +461,9 @@ pub(super) fn socketpair(
 pub(super) fn bind(p: &mut LinuxProcess, fd: u64, addr: u64, len: u64) -> Result<u64, i64> {
     if let Some((o, _)) = unix::of(p, fd) {
         return unix::bind(p, unix::sock(&o)?, addr, len);
+    }
+    if let Some((o, _)) = netlink::of(p, fd) {
+        return netlink::bind(p, netlink::sock(&o)?, addr, len);
     }
     let (o, _) = sock_of(p, fd)?;
     let a = read_addr(p, addr, len)?;
@@ -342,7 +501,7 @@ pub(super) fn accept4(
     let s = o.socket().ok_or(ENOTSOCK)?;
     let entry = p.entry.clone();
     let id = s.id();
-    let (cid, wait, peer) = block(s, nonblock, &|| proc::interrupted(&entry), || {
+    let (cid, wait, peer) = block_recv(s, nonblock, &|| proc::interrupted(&entry), || {
         s.stack.accept(id).transpose()
     })?;
     let new = Socket::new(s.stack.clone(), cid, wait, false);
@@ -359,6 +518,9 @@ pub(super) fn connect(p: &mut LinuxProcess, fd: u64, addr: u64, len: u64) -> Res
     if let Some((o, nonblock)) = unix::of(p, fd) {
         return unix::connect(p, unix::sock(&o)?, nonblock, addr, len);
     }
+    if let Some((o, _)) = netlink::of(p, fd) {
+        return netlink::connect(p, netlink::sock(&o)?, addr, len);
+    }
     let (o, nonblock) = sock_of(p, fd)?;
     let s = o.socket().ok_or(ENOTSOCK)?;
     let id = s.id();
@@ -374,14 +536,15 @@ pub(super) fn connect(p: &mut LinuxProcess, fd: u64, addr: u64, len: u64) -> Res
     }
     let a = read_addr(p, addr, len)?;
     match s.stack.connect(id, a) {
-        Ok(()) => {}
-        // A second connect on a socket already connecting or connected.
-        Err(netstack::EISCONN) => {
-            return match s.stack.connect_result(id) {
-                None => Err(netstack::EALREADY),
-                Some(Ok(())) => Err(netstack::EISCONN),
-                Some(Err(e)) => Err(e),
-            };
+        Ok(()) => s.connecting.store(true, Ordering::Relaxed),
+        // Connecting already: a non-blocking caller learns the outcome once
+        // it is known, a blocking one (restarted after a signal) waits on.
+        Err(netstack::EISCONN) if s.connecting.load(Ordering::Relaxed) => {
+            if nonblock {
+                let r = s.stack.connect_result(id).ok_or(netstack::EALREADY)?;
+                s.connecting.store(false, Ordering::Relaxed);
+                return r.map(|()| 0);
+            }
         }
         Err(e) => return Err(e),
     }
@@ -391,20 +554,33 @@ pub(super) fn connect(p: &mut LinuxProcess, fd: u64, addr: u64, len: u64) -> Res
         // answers so, and callers wait for writability, then read
         // SO_ERROR (0 here). An immediate failure is reported as it is.
         return match s.stack.connect_result(id) {
-            Some(Err(e)) => Err(e),
+            Some(Err(e)) => {
+                s.connecting.store(false, Ordering::Relaxed);
+                Err(e)
+            }
             Some(Ok(())) | None => Err(netstack::EINPROGRESS),
         };
     }
     let entry = p.entry.clone();
-    block(s, false, &|| proc::interrupted(&entry), || {
+    let r = block_send(s, false, &|| proc::interrupted(&entry), || {
         s.stack.connect_result(id)
-    })
-    .map(|()| 0)
+    });
+    match r {
+        // SO_SNDTIMEO passed, or a signal came: the connection goes on.
+        Err(EAGAIN) => return Err(netstack::EINPROGRESS),
+        Err(EINTR | signal::ERESTARTSYS) => {}
+        _ => s.connecting.store(false, Ordering::Relaxed),
+    }
+    r.map(|()| 0)
 }
 
 pub(super) fn getsockname(p: &mut LinuxProcess, fd: u64, addr: u64, lenp: u64) -> Result<u64, i64> {
     if let Some((o, _)) = unix::of(p, fd) {
         return unix::getsockname(p, unix::sock(&o)?, addr, lenp);
+    }
+    if let Some((o, _)) = netlink::of(p, fd) {
+        let me = netlink::sock(&o)?.port();
+        return write_sockaddr(p, addr, lenp, &netlink::sockaddr(me)).map(|()| 0);
     }
     let (o, _) = sock_of(p, fd)?;
     let s = o.socket().ok_or(ENOTSOCK)?;
@@ -416,41 +592,85 @@ pub(super) fn getpeername(p: &mut LinuxProcess, fd: u64, addr: u64, lenp: u64) -
     if let Some((o, _)) = unix::of(p, fd) {
         return unix::getpeername(p, unix::sock(&o)?, addr, lenp);
     }
+    if netlink::of(p, fd).is_some() {
+        return write_sockaddr(p, addr, lenp, &netlink::sockaddr(0)).map(|()| 0);
+    }
     let (o, _) = sock_of(p, fd)?;
     let s = o.socket().ok_or(ENOTSOCK)?;
     let a = s.stack.peer_addr(s.id())?;
     write_addr(p, addr, lenp, a).map(|()| 0)
 }
 
-fn known_option(level: u64, name: u64) -> bool {
+/// Options of a kind this socket has: those that act (see [`setsockopt`]
+/// and [`getsockopt`]), and those that are recorded only.
+fn known_option(s: &Socket, level: u64, name: u64) -> bool {
     match level {
         SOL_SOCKET => matches!(
             name,
             SO_REUSEADDR
                 | SO_TYPE
                 | SO_ERROR
+                | SO_DONTROUTE
+                | SO_BROADCAST
                 | SO_SNDBUF
                 | SO_RCVBUF
                 | SO_KEEPALIVE
+                | SO_OOBINLINE
+                | SO_PRIORITY
                 | SO_LINGER
                 | SO_REUSEPORT
                 | SO_RCVTIMEO
                 | SO_SNDTIMEO
                 | SO_ACCEPTCONN
+                | SO_PROTOCOL
+                | SO_DOMAIN
         ),
-        IPPROTO_TCP => matches!(
+        IPPROTO_IP => matches!(
+            name,
+            IP_TOS
+                | IP_TTL
+                | IP_MTU_DISCOVER
+                | IP_FREEBIND
+                | IP_BIND_ADDRESS_NO_PORT
+                | IP_MULTICAST_TTL
+                | IP_MULTICAST_LOOP
+        ),
+        IPPROTO_TCP if !s.dgram => matches!(
             name,
             TCP_NODELAY
+                | TCP_MAXSEG
                 | TCP_CORK
                 | TCP_KEEPIDLE
                 | TCP_KEEPINTVL
                 | TCP_KEEPCNT
+                | TCP_SYNCNT
+                | TCP_LINGER2
                 | TCP_DEFER_ACCEPT
+                | TCP_WINDOW_CLAMP
                 | TCP_QUICKACK
                 | TCP_USER_TIMEOUT
                 | TCP_FASTOPEN
+                | TCP_NOTSENT_LOWAT
         ),
         _ => false,
+    }
+}
+
+/// What an option that was never set reads as (Linux's defaults).
+fn option_default(s: &Socket, level: u64, name: u64) -> i32 {
+    match (level, name) {
+        (SOL_SOCKET, SO_SNDBUF | SO_RCVBUF) if s.dgram => netstack::UDP_BUFFER as i32,
+        (SOL_SOCKET, SO_SNDBUF | SO_RCVBUF) => net::tcp::BUFFER as i32,
+        (IPPROTO_IP, IP_TTL) => 64,
+        (IPPROTO_IP, IP_MULTICAST_TTL | IP_MULTICAST_LOOP | IP_MTU_DISCOVER) => 1,
+        (IPPROTO_TCP, TCP_MAXSEG) => 536,
+        (IPPROTO_TCP, TCP_KEEPIDLE) => 7200,
+        (IPPROTO_TCP, TCP_KEEPINTVL) => 75,
+        (IPPROTO_TCP, TCP_KEEPCNT) => 9,
+        (IPPROTO_TCP, TCP_SYNCNT) => 6,
+        (IPPROTO_TCP, TCP_LINGER2) => 60,
+        (IPPROTO_TCP, TCP_QUICKACK) => 1,
+        _ => 0,
     }
 }
 
@@ -465,12 +685,18 @@ pub(super) fn setsockopt(
     if let Some((o, _)) = unix::of(p, fd) {
         return unix::setsockopt(p, unix::sock(&o)?, level, name, val, len);
     }
+    if netlink::of(p, fd).is_some() {
+        return netlink::setsockopt(level, name);
+    }
     let (o, _) = sock_of(p, fd)?;
     let s = o.socket().ok_or(ENOTSOCK)?;
-    if !known_option(level, name)
+    if !known_option(s, level, name)
         || matches!(
             (level, name),
-            (SOL_SOCKET, SO_TYPE | SO_ERROR | SO_ACCEPTCONN)
+            (
+                SOL_SOCKET,
+                SO_TYPE | SO_ERROR | SO_ACCEPTCONN | SO_PROTOCOL | SO_DOMAIN
+            )
         )
     {
         return Err(ENOPROTOOPT);
@@ -480,9 +706,33 @@ pub(super) fn setsockopt(
     if p.copy_from_user(val, &mut v) != len {
         return Err(EFAULT);
     }
-    if (level, name) == (SOL_SOCKET, SO_REUSEADDR) {
-        let on = v.iter().any(|&b| b != 0);
-        s.stack.set_reuse_addr(s.id(), on)?;
+    let int = |at: usize| {
+        v.get(at..at + 4)
+            .and_then(|b| b.try_into().ok())
+            .map(i32::from_le_bytes)
+            .ok_or(EINVAL)
+    };
+    match (level, name) {
+        (SOL_SOCKET, SO_RCVTIMEO | SO_SNDTIMEO) => {
+            s.timeouts.set(name, &v)?;
+            return Ok(0);
+        }
+        (SOL_SOCKET, SO_REUSEADDR) => s.stack.set_reuse_addr(s.id(), int(0)? != 0)?,
+        // struct linger { int l_onoff, l_linger; }: no time means reset.
+        (SOL_SOCKET, SO_LINGER) => {
+            let reset = int(0)? != 0 && int(4)? == 0;
+            s.reset_on_close.store(reset, Ordering::Relaxed);
+        }
+        // Linux doubles what is asked, for its own overhead, and reports
+        // that. (Buffers here grow with use; this does not size them.)
+        (SOL_SOCKET, SO_SNDBUF | SO_RCVBUF) => {
+            const MAX: i32 = 212_992;
+            let twice = int(0)?.clamp(1152, MAX) * 2;
+            v = twice.to_le_bytes().to_vec();
+        }
+        // IP options may be a byte; everything here else is an int.
+        (IPPROTO_IP, _) if v.len() == 1 => v = i32::from(v[0]).to_le_bytes().to_vec(),
+        _ => v = int(0)?.to_le_bytes().to_vec(),
     }
     let mut opts = s.opts.lock();
     opts.retain(|(k, _)| *k != (level, name));
@@ -501,38 +751,11 @@ pub(super) fn getsockopt(
     if let Some((o, _)) = unix::of(p, fd) {
         return unix::getsockopt(p, unix::sock(&o)?, level, name, val, lenp);
     }
-    let (o, _) = sock_of(p, fd)?;
-    let s = o.socket().ok_or(ENOTSOCK)?;
-    if !known_option(level, name) {
-        return Err(ENOPROTOOPT);
-    }
-    let int = |v: i32| v.to_le_bytes().to_vec();
-    let value = match (level, name) {
-        (SOL_SOCKET, SO_TYPE) => int(if s.dgram { SOCK_DGRAM } else { SOCK_STREAM } as i32),
-        (SOL_SOCKET, SO_ERROR) => int(s.stack.take_error(s.id()) as i32),
-        (SOL_SOCKET, SO_REUSEADDR) => int(i32::from(s.stack.reuse_addr(s.id()))),
-        (SOL_SOCKET, SO_ACCEPTCONN) => int(i32::from(s.listening.load(Ordering::Acquire))),
-        (SOL_SOCKET, SO_SNDBUF | SO_RCVBUF) => s
-            .opts
-            .lock()
-            .iter()
-            .find(|(k, _)| *k == (level, name))
-            .map_or_else(
-                || {
-                    int(if s.dgram {
-                        netstack::UDP_BUFFER
-                    } else {
-                        net::tcp::BUFFER
-                    } as i32)
-                },
-                |(_, v)| v.clone(),
-            ),
-        _ => s
-            .opts
-            .lock()
-            .iter()
-            .find(|(k, _)| *k == (level, name))
-            .map_or_else(|| int(0), |(_, v)| v.clone()),
+    let value = if let Some((o, _)) = netlink::of(p, fd) {
+        netlink::getsockopt(netlink::sock(&o)?, level, name)?
+    } else {
+        let (o, _) = sock_of(p, fd)?;
+        option_value(o.socket().ok_or(ENOTSOCK)?, level, name)?
     };
     let mut lb = [0u8; 4];
     if p.copy_from_user(lenp, &mut lb) != 4 {
@@ -546,61 +769,144 @@ pub(super) fn getsockopt(
     Ok(0)
 }
 
-/// Sends `data` on `fd` with `flags`, to `to` on a datagram socket (the
-/// address is ignored on a connected stream socket, as on Linux); EPIPE
-/// raises SIGPIPE unless `MSG_NOSIGNAL`.
-fn send_bytes(
+/// The value of an option of an inet socket.
+fn option_value(s: &Socket, level: u64, name: u64) -> Result<Vec<u8>, i64> {
+    if !known_option(s, level, name) {
+        return Err(ENOPROTOOPT);
+    }
+    let int = |v: i32| v.to_le_bytes().to_vec();
+    Ok(match (level, name) {
+        (SOL_SOCKET, SO_TYPE) => int(if s.dgram { SOCK_DGRAM } else { SOCK_STREAM } as i32),
+        (SOL_SOCKET, SO_ERROR) => int(s.stack.take_error(s.id()) as i32),
+        (SOL_SOCKET, SO_REUSEADDR) => int(i32::from(s.stack.reuse_addr(s.id()))),
+        (SOL_SOCKET, SO_ACCEPTCONN) => int(i32::from(s.listening.load(Ordering::Acquire))),
+        (SOL_SOCKET, SO_DOMAIN) => int(i32::from(AF_INET)),
+        (SOL_SOCKET, SO_PROTOCOL) => int(if s.dgram { IPPROTO_UDP } else { IPPROTO_TCP } as i32),
+        (SOL_SOCKET, SO_RCVTIMEO | SO_SNDTIMEO) => s.timeouts.get(name),
+        _ => {
+            let opts = s.opts.lock();
+            match opts.iter().find(|(k, _)| *k == (level, name)) {
+                Some((_, v)) => v.clone(),
+                None if (level, name) == (SOL_SOCKET, SO_LINGER) => alloc::vec![0u8; 8],
+                None => int(option_default(s, level, name)),
+            }
+        }
+    })
+}
+
+/// Copies `total` bytes of `iov` in from user memory.
+fn gather(p: &mut LinuxProcess, iov: &[(u64, usize)], total: usize) -> Result<Vec<u8>, i64> {
+    let mut data = alloc::vec![0u8; total];
+    let mut at = 0;
+    for &(base, len) in iov {
+        if p.copy_from_user(base, &mut data[at..at + len]) != len {
+            return Err(EFAULT);
+        }
+        at += len;
+    }
+    Ok(data)
+}
+
+/// Copies `data` out over `iov`.
+fn scatter(p: &mut LinuxProcess, iov: &[(u64, usize)], data: &[u8]) -> Result<(), i64> {
+    let mut at = 0;
+    for &(base, len) in iov {
+        let n = len.min(data.len() - at);
+        if p.copy_to_user(base, &data[at..at + n]) != n {
+            return Err(EFAULT);
+        }
+        at += n;
+    }
+    Ok(())
+}
+
+/// Sends user memory on `fd` with `flags`: on a datagram socket as one
+/// datagram, to the address `name` points at if given (a connected stream
+/// socket ignores it, as on Linux); on a stream, all of it (what fits,
+/// without blocking). EPIPE raises SIGPIPE unless `MSG_NOSIGNAL`.
+fn send_iov(
     p: &mut LinuxProcess,
     fd: u64,
-    data: &[u8],
+    iov: &[(u64, usize)],
     flags: u64,
-    to: Option<Addr>,
+    name: (u64, u64),
 ) -> Result<u64, i64> {
+    let total: usize = iov.iter().map(|&(_, n)| n).sum();
+    if let Some((o, _)) = netlink::of(p, fd) {
+        if total > CHUNK {
+            return Err(netstack::EMSGSIZE);
+        }
+        let data = gather(p, iov, total)?;
+        netlink::sock(&o)?.request(&data);
+        return Ok(total as u64);
+    }
     let (o, nonblock) = sock_of(p, fd)?;
     let s = o.socket().ok_or(ENOTSOCK)?;
-    if s.dgram {
-        return s.stack.send_to(s.id(), to, data).map(|n| n as u64);
+    if !s.dgram {
+        let nonblock = nonblock || flags & MSG_DONTWAIT != 0;
+        let f = Fd::Object(ObjectEnd {
+            obj: o.clone(),
+            nonblock,
+        });
+        let sigpipe = flags & MSG_NOSIGNAL == 0;
+        return fs::stream_gather(p, &f, iov, nonblock, sigpipe).map(|n| n as u64);
     }
-    let entry = p.entry.clone();
-    let r = o.write(data, nonblock || flags & MSG_DONTWAIT != 0, &|| {
-        proc::interrupted(&entry)
-    });
-    if r == Err(netstack::EPIPE) && flags & MSG_NOSIGNAL == 0 {
-        proc::post(&p.entry, signal::SIGPIPE);
+    if total > netstack::UDP_MAX {
+        return Err(netstack::EMSGSIZE);
     }
-    r.map(|n| n as u64)
+    let data = gather(p, iov, total)?;
+    let to = match name {
+        (0, _) => None,
+        (addr, len) => Some(read_addr(p, addr, len)?),
+    };
+    s.stack.send_to(s.id(), to, &data).map(|n| n as u64)
 }
 
 /// What one receive took.
 struct Received {
     data: Vec<u8>,
-    /// A datagram's source.
-    from: Option<Addr>,
+    /// A datagram's source, as a `sockaddr`.
+    from: Option<Vec<u8>>,
     /// A datagram's full length (more than `data` when truncated).
     full: usize,
 }
 
 fn recv_bytes(p: &mut LinuxProcess, fd: u64, max: usize, flags: u64) -> Result<Received, i64> {
-    if flags & MSG_PEEK != 0 {
-        return Err(netstack::EOPNOTSUPP);
-    }
-    let (o, nonblock) = sock_of(p, fd)?;
+    let peek = flags & MSG_PEEK != 0;
     let entry = p.entry.clone();
-    let nonblock = nonblock || flags & MSG_DONTWAIT != 0;
     let interrupted = || proc::interrupted(&entry);
-    if let Some(s) = o.socket()
-        && s.dgram
-    {
-        let (from, mut data) = s.recv_datagram(nonblock, &interrupted)?;
+    if let Some((o, nonblock)) = netlink::of(p, fd) {
+        let nonblock = nonblock || flags & MSG_DONTWAIT != 0;
+        let mut data = netlink::sock(&o)?.recv(nonblock, peek, &interrupted)?;
         let full = data.len();
         data.truncate(max);
         return Ok(Received {
             data,
-            from: Some(from),
+            from: Some(netlink::sockaddr(0).to_vec()),
             full,
         });
     }
-    let data = o.read(max, nonblock, &interrupted)?;
+    let (o, nonblock) = sock_of(p, fd)?;
+    let s = o.socket().ok_or(ENOTSOCK)?;
+    let nonblock = nonblock || flags & MSG_DONTWAIT != 0;
+    if s.dgram {
+        let (from, mut data) = s.recv_datagram(nonblock, peek, &interrupted)?;
+        let full = data.len();
+        data.truncate(max);
+        return Ok(Received {
+            data,
+            from: Some(sockaddr(from).to_vec()),
+            full,
+        });
+    }
+    let mut data = s.recv_stream(max, nonblock, peek, &interrupted)?;
+    // MSG_WAITALL: until that much came, or the stream ends.
+    while flags & MSG_WAITALL != 0 && !peek && !data.is_empty() && data.len() < max {
+        match s.recv_stream(max - data.len(), nonblock, false, &interrupted) {
+            Ok(more) if !more.is_empty() => data.extend_from_slice(&more),
+            _ => break,
+        }
+    }
     Ok(Received {
         full: data.len(),
         data,
@@ -608,33 +914,13 @@ fn recv_bytes(p: &mut LinuxProcess, fd: u64, max: usize, flags: u64) -> Result<R
     })
 }
 
-/// A datagram's payload from user memory: `len` bytes, EMSGSIZE past the
-/// largest UDP payload; a stream write takes up to [`CHUNK`] at a time.
-fn send_len(p: &LinuxProcess, fd: u64, len: usize) -> Result<usize, i64> {
-    let (o, _) = sock_of(p, fd)?;
-    match o.socket() {
-        Some(s) if s.dgram && len > netstack::UDP_MAX => Err(netstack::EMSGSIZE),
-        Some(s) if s.dgram => Ok(len),
-        _ => Ok(len.min(CHUNK)),
-    }
-}
-
 /// `sendto(fd, buf, len, flags, addr, addrlen)`.
 pub(super) fn sendto(p: &mut LinuxProcess, a: &[u64; 6]) -> Result<u64, i64> {
     if let Some((o, nonblock)) = unix::of(p, a[0]) {
         return unix::sendto(p, unix::sock(&o)?, nonblock, a);
     }
-    let len = send_len(p, a[0], usize::try_from(a[2]).map_err(|_| EINVAL)?)?;
-    let mut data = alloc::vec![0u8; len];
-    if p.copy_from_user(a[1], &mut data) != len {
-        return Err(EFAULT);
-    }
-    let to = if a[4] == 0 {
-        None
-    } else {
-        Some(read_addr(p, a[4], a[5])?)
-    };
-    send_bytes(p, a[0], &data, a[3], to)
+    let len = usize::try_from(a[2]).map_err(|_| EINVAL)?;
+    send_iov(p, a[0], &[(a[1], len)], a[3], (a[4], a[5]))
 }
 
 /// `recvfrom(fd, buf, len, flags, addr, addrlen)`. `MSG_TRUNC` returns a
@@ -653,11 +939,13 @@ pub(super) fn recvfrom(p: &mut LinuxProcess, a: &[u64; 6]) -> Result<u64, i64> {
             Some(f) => Some(f),
             None => {
                 let (o, _) = sock_of(p, a[0])?;
-                o.socket().and_then(|s| s.stack.peer_addr(s.id()).ok())
+                o.socket()
+                    .and_then(|s| s.stack.peer_addr(s.id()).ok())
+                    .map(|a| sockaddr(a).to_vec())
             }
         };
         if let Some(f) = from {
-            write_addr(p, a[4], a[5], f)?;
+            write_sockaddr(p, a[4], a[5], &f)?;
         }
     }
     let n = if a[3] & MSG_TRUNC != 0 {
@@ -683,25 +971,12 @@ pub(super) fn msg_hdr(p: &mut LinuxProcess, msg: u64) -> Result<MsgHdr, i64> {
     if p.copy_from_user(msg, &mut h) != 56 {
         return Err(EFAULT);
     }
-    let u = |at: usize| u64::from_le_bytes(h[at..at + 8].try_into().unwrap_or([0; 8]));
-    let (iov, n) = (u(16), u(24));
-    if n > 1024 {
-        return Err(EINVAL);
-    }
-    let mut v = Vec::new();
-    for i in 0..n {
-        let mut e = [0u8; 16];
-        if p.copy_from_user(iov + i * 16, &mut e) != 16 {
-            return Err(EFAULT);
-        }
-        let base = u64::from_le_bytes(e[..8].try_into().unwrap_or([0; 8]));
-        let len = u64::from_le_bytes(e[8..].try_into().unwrap_or([0; 8]));
-        v.push((base, usize::try_from(len).map_err(|_| EINVAL)?));
-    }
+    let u = |at: usize| super::le_u64(&h[at..at + 8]);
+    let n = usize::try_from(u(24)).map_err(|_| netstack::EMSGSIZE)?;
     Ok(MsgHdr {
         name: u(0),
         namelen: u(8) & 0xffff_ffff,
-        iov: v,
+        iov: fs::read_iov(p, u(16), n)?,
         control: u(32),
         controllen: u(40),
     })
@@ -712,26 +987,7 @@ pub(super) fn sendmsg(p: &mut LinuxProcess, fd: u64, msg: u64, flags: u64) -> Re
         return unix::sendmsg(p, unix::sock(&o)?, nonblock, msg, flags);
     }
     let h = msg_hdr(p, msg)?;
-    let total: usize = h.iov.iter().map(|&(_, l)| l).sum();
-    let want = send_len(p, fd, total)?;
-    let mut data = Vec::new();
-    for (base, len) in h.iov {
-        let take = len.min(want - data.len());
-        let at = data.len();
-        data.resize(at + take, 0);
-        if p.copy_from_user(base, &mut data[at..]) != take {
-            return Err(EFAULT);
-        }
-        if data.len() == want {
-            break;
-        }
-    }
-    let to = if h.name == 0 {
-        None
-    } else {
-        Some(read_addr(p, h.name, h.namelen)?)
-    };
-    send_bytes(p, fd, &data, flags, to)
+    send_iov(p, fd, &h.iov, flags, (h.name, h.namelen))
 }
 
 pub(super) fn recvmsg(p: &mut LinuxProcess, fd: u64, msg: u64, flags: u64) -> Result<u64, i64> {
@@ -741,34 +997,23 @@ pub(super) fn recvmsg(p: &mut LinuxProcess, fd: u64, msg: u64, flags: u64) -> Re
     let h = msg_hdr(p, msg)?;
     let total: usize = h.iov.iter().map(|&(_, l)| l).sum();
     let r = recv_bytes(p, fd, total, flags)?;
-    let mut at = 0;
-    for (base, len) in h.iov {
-        if at >= r.data.len() {
-            break;
-        }
-        let n = len.min(r.data.len() - at);
-        if p.copy_to_user(base, &r.data[at..at + n]) != n {
-            return Err(EFAULT);
-        }
-        at += n;
-    }
+    scatter(p, &h.iov, &r.data)?;
     // A datagram's source goes to msg_name (msg_namelen is in-out); no
     // control messages; MSG_TRUNC if the datagram was cut.
-    match r.from {
-        Some(f) if h.name != 0 => write_addr(p, h.name, msg + 8, f)?,
+    match &r.from {
+        Some(f) if h.name != 0 => write_sockaddr(p, h.name, msg + 8, f)?,
         _ => {
             if p.copy_to_user(msg + 8, &[0u8; 4]) != 4 {
                 return Err(EFAULT);
             }
         }
     }
-    let mflags = if r.full > r.data.len() {
-        MSG_TRUNC as u32
-    } else {
-        0
-    };
+    let mut mflags = flags & MSG_CMSG_CLOEXEC;
+    if r.full > r.data.len() {
+        mflags |= MSG_TRUNC;
+    }
     if p.copy_to_user(msg + 40, &[0u8; 8]) != 8
-        || p.copy_to_user(msg + 48, &mflags.to_le_bytes()) != 4
+        || p.copy_to_user(msg + 48, &(mflags as u32).to_le_bytes()) != 4
     {
         return Err(EFAULT);
     }
@@ -778,6 +1023,80 @@ pub(super) fn recvmsg(p: &mut LinuxProcess, fd: u64, msg: u64, flags: u64) -> Re
         r.data.len()
     };
     Ok(n as u64)
+}
+
+/// `struct mmsghdr`: a `msghdr`, then what its message moved.
+const MMSGHDR: u64 = 64;
+/// Most messages one `sendmmsg` or `recvmmsg` moves (Linux's `UIO_MAXIOV`).
+const MMSG_MAX: u64 = 1024;
+
+/// Runs `one` over `vlen` `mmsghdr`s at `vec`, storing each length; stops
+/// at the first error, which is reported only if nothing went before it.
+fn each_message(
+    p: &mut LinuxProcess,
+    vec: u64,
+    vlen: u64,
+    mut one: impl FnMut(&mut LinuxProcess, u64, u64) -> Option<Result<u64, i64>>,
+) -> Result<u64, i64> {
+    let mut done = 0;
+    while done < vlen.min(MMSG_MAX) {
+        let msg = vec + done * MMSGHDR;
+        match one(p, msg, done) {
+            None => break,
+            Some(Err(e)) if done == 0 => return Err(e),
+            Some(Err(_)) => break,
+            Some(Ok(n)) => {
+                if p.copy_to_user(msg + 56, &(n as u32).to_le_bytes()) != 4 {
+                    return Err(EFAULT);
+                }
+                done += 1;
+            }
+        }
+    }
+    Ok(done)
+}
+
+/// `sendmmsg(fd, vec, vlen, flags)`.
+pub(super) fn sendmmsg(
+    p: &mut LinuxProcess,
+    fd: u64,
+    vec: u64,
+    vlen: u64,
+    flags: u64,
+) -> Result<u64, i64> {
+    each_message(p, vec, vlen, |p, msg, _| Some(sendmsg(p, fd, msg, flags)))
+}
+
+/// `recvmmsg(fd, vec, vlen, flags, timeout)`. As on Linux, the timeout is
+/// looked at only after each message.
+pub(super) fn recvmmsg(p: &mut LinuxProcess, a: &[u64; 6]) -> Result<u64, i64> {
+    let (fd, flags) = (a[0], a[3] & 0xffff_ffff);
+    let until = if a[4] == 0 {
+        None
+    } else {
+        let mut b = [0u8; 16];
+        if p.copy_from_user(a[4], &mut b) != 16 {
+            return Err(EFAULT);
+        }
+        let (s, ns) = (super::le_u64(&b[..8]), super::le_u64(&b[8..]));
+        if ns >= 1_000_000_000 || s > i64::MAX as u64 {
+            return Err(EINVAL);
+        }
+        let t = Duration::from_secs(s).saturating_add(Duration::from_nanos(ns));
+        Some(frame::time::now().saturating_add(t))
+    };
+    each_message(p, a[1], a[2] & 0xffff_ffff, |p, msg, done| {
+        let mut f = flags & !MSG_WAITFORONE;
+        if done > 0 {
+            if until.is_some_and(|t| frame::time::now() >= t) {
+                return None;
+            }
+            if flags & MSG_WAITFORONE != 0 {
+                f |= MSG_DONTWAIT;
+            }
+        }
+        Some(recvmsg(p, fd, msg, f))
+    })
 }
 
 /// Sockets for the native personality (`native.rs`): the same objects on
@@ -836,7 +1155,7 @@ pub(crate) mod native {
 
     pub(crate) fn udp_recv(o: &Arc<dyn Object>) -> Result<Option<(Addr, Vec<u8>)>, i64> {
         let s = o.socket().ok_or(ENOTSOCK)?;
-        s.stack.recv_from(s.id())
+        s.stack.recv_from(s.id(), false)
     }
 
     /// A connecting socket's outcome, once known.

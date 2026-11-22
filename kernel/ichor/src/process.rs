@@ -164,6 +164,8 @@ pub(crate) struct Group {
     pub(crate) gone: Arc<frame::task::WaitQueue>,
     /// Set by `exit_group` or a fatal signal: the group's wait status.
     exit: SpinLock<Option<u32>>,
+    /// The thread ending the others for its `execve`.
+    execing: SpinLock<Option<u64>>,
     /// The program's path and argv (NUL-separated), for `/proc`.
     exe: SpinLock<(alloc::string::String, Vec<u8>)>,
     /// Resource limits (soft, hard), by `RLIMIT_*`.
@@ -333,11 +335,38 @@ impl Group {
                 *e = Some(status);
             }
         }
+        self.end_others(me);
+    }
+
+    /// Tells every thread but `me` to end.
+    pub(crate) fn end_others(&self, me: &ProcEntry) {
         for t in self.threads() {
             if t.pid != me.pid {
-                proc::post(&t, crate::signal::SIGKILL);
+                proc::end_thread(&t);
             }
         }
+    }
+
+    /// `execve` by thread `me`: the others end, and it is the process's
+    /// first thread from here on (its entry is returned). `None` if another
+    /// thread was first, or the process is exiting: `me` is to end too.
+    pub(crate) fn sole_thread(&self, me: &Arc<ProcEntry>) -> Option<Arc<ProcEntry>> {
+        {
+            let mut by = self.execing.lock();
+            if by.is_some() || proc::ending(me) {
+                return None;
+            }
+            *by = Some(me.pid);
+        }
+        self.end_others(me);
+        self.wait_threads(1);
+        if self.exit.lock().is_some() {
+            return None; // `exit_group` was called meanwhile
+        }
+        let entry = proc::take_over_leader(me, &self.leader);
+        *self.threads.lock() = alloc::vec![entry.clone()];
+        *self.execing.lock() = None;
+        Some(entry)
     }
 
     /// Removes `me` from the live threads; returns the group's wait status
@@ -403,6 +432,9 @@ pub(crate) struct LinuxProcess {
     /// `set_robust_list`: the head of the thread's robust futex list,
     /// walked when it exits (`futex::exit_robust_list`). Not inherited.
     pub(crate) robust_list: u64,
+    /// The deadline of a timed wait that a signal interrupted, for when the
+    /// call is restarted (no handler ran): it waits on, not over.
+    pub(crate) resume_until: Option<core::time::Duration>,
 }
 
 impl LinuxProcess {
@@ -412,7 +444,7 @@ impl LinuxProcess {
     pub(crate) fn new(cell: Arc<Cell>, vfs: Arc<Vfs>) -> Option<Self> {
         let mm = Mm::new(cell.account())?;
         let _ = vfs.lock().open(ROOT);
-        let entry = proc::register(cell.id(), 0, None, None);
+        let entry = proc::register(cell.id(), 0, None, None, None);
         let group = Arc::new(Group {
             tgid: entry.pid,
             leader: entry.clone(),
@@ -435,6 +467,7 @@ impl LinuxProcess {
             threads: SpinLock::new(alloc::vec![entry.clone()]),
             gone: Arc::new(frame::task::WaitQueue::new()),
             exit: SpinLock::new(None),
+            execing: SpinLock::new(None),
             exe: SpinLock::new(Default::default()),
             limits: SpinLock::new(default_limits()),
             vfork: SpinLock::new(None),
@@ -450,6 +483,7 @@ impl LinuxProcess {
             sig: Signals::new(),
             clear_tid: 0,
             robust_list: 0,
+            resume_until: None,
         })
     }
 
@@ -472,6 +506,7 @@ impl LinuxProcess {
             self.group.tgid,
             None,
             Some(self.group.leader.group()),
+            None,
         );
         let group = Arc::new(Group {
             tgid: entry.pid,
@@ -484,6 +519,7 @@ impl LinuxProcess {
             threads: SpinLock::new(alloc::vec![entry.clone()]),
             gone: Arc::new(frame::task::WaitQueue::new()),
             exit: SpinLock::new(None),
+            execing: SpinLock::new(None),
             exe: SpinLock::new(exe),
             limits: SpinLock::new(self.group.limits()),
             vfork: SpinLock::new(None),
@@ -501,6 +537,7 @@ impl LinuxProcess {
             sig: self.sig.clone(),
             clear_tid: 0,
             robust_list: 0,
+            resume_until: None,
         })
     }
 
@@ -512,6 +549,7 @@ impl LinuxProcess {
             self.entry.ppid(),
             Some(self.group.tgid),
             None,
+            Some(self.entry.shared.clone()),
         );
         self.group.threads.lock().push(entry.clone());
         let mut sig = self.sig.clone();
@@ -524,6 +562,7 @@ impl LinuxProcess {
             sig,
             clear_tid: 0,
             robust_list: 0,
+            resume_until: None,
         }
     }
 
@@ -539,6 +578,7 @@ impl LinuxProcess {
             self.entry.ppid(),
             Some(self.group.tgid),
             None,
+            None,
         );
         let mut sig = Signals::new();
         sig.mask = !(crate::signal::bit(crate::signal::SIGKILL) | crate::signal::bit(19));
@@ -551,6 +591,7 @@ impl LinuxProcess {
             sig,
             clear_tid: 0,
             robust_list: 0,
+            resume_until: None,
         }
     }
 

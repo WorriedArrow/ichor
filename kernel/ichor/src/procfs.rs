@@ -162,16 +162,21 @@ fn process(p: &LinuxProcess, rest: &[&str], follow_last: bool) -> Result<Node, i
     let _ = follow_last;
     match rest {
         [] => Ok(dir(&[
+            ("cgroup", DT_REG),
             ("cmdline", DT_REG),
             ("comm", DT_REG),
             ("cwd", DT_LNK),
             ("exe", DT_LNK),
             ("fd", DT_DIR),
             ("maps", DT_REG),
+            ("mountinfo", DT_REG),
             ("mounts", DT_REG),
             ("stat", DT_REG),
             ("status", DT_REG),
         ])),
+        // A cell sees itself as the root of a cgroup (v2) namespace; there
+        // is no cgroup file system to look further in.
+        ["cgroup"] => Ok(Node::File(b"0::/\n".to_vec())),
         ["cmdline"] => Ok(Node::File(p.group.cmdline())),
         ["comm"] => Ok(Node::File(format!("{}\n", comm(p)).into_bytes())),
         ["cwd"] => {
@@ -195,6 +200,11 @@ fn process(p: &LinuxProcess, rest: &[&str], follow_last: bool) -> Result<Node, i
             Ok(Node::Link(describe(p, &f)))
         }
         ["maps"] => Ok(Node::File(p.mm().maps().into_bytes())),
+        ["mountinfo"] => Ok(Node::File(
+            b"1 0 0:1 / / rw - ichor rootfs rw\n2 1 0:2 / /proc rw - proc proc rw\n\
+              3 1 0:3 / /dev rw - devtmpfs devtmpfs rw\n"
+                .to_vec(),
+        )),
         ["mounts"] => Ok(Node::File(mounts())),
         ["stat"] => Ok(Node::File(stat_process(p))),
         ["status"] => Ok(Node::File(status(p))),

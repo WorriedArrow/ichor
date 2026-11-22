@@ -10,6 +10,7 @@
 
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::{Arc, Weak};
+use alloc::vec::Vec;
 
 use frame::sync::SpinLock;
 use frame::task::WaitQueue;
@@ -227,27 +228,36 @@ impl Pipe {
         }
     }
 
-    /// Reads up to `out.len()` bytes, blocking until some data is available
-    /// or every writer is gone (then 0, end of file).
+    /// Reads up to `out.len()` bytes (see [`Pipe::take`]).
     pub(crate) fn read(
         &self,
         out: &mut [u8],
         nonblock: bool,
         interrupted: &dyn Fn() -> bool,
     ) -> Result<usize, i64> {
-        if out.is_empty() {
-            return Ok(0);
+        let got = self.take(out.len(), nonblock, interrupted)?;
+        out[..got.len()].copy_from_slice(&got);
+        Ok(got.len())
+    }
+
+    /// Takes up to `max` bytes out, blocking until some data is available
+    /// or every writer is gone (then nothing, end of file).
+    pub(crate) fn take(
+        &self,
+        max: usize,
+        nonblock: bool,
+        interrupted: &dyn Fn() -> bool,
+    ) -> Result<Vec<u8>, i64> {
+        if max == 0 {
+            return Ok(Vec::new());
         }
         let r = self.readable.wait_until(|| {
             let mut s = self.state.lock();
             if !s.buf.is_empty() {
-                let n = out.len().min(s.buf.len());
-                for (o, b) in out.iter_mut().zip(s.buf.drain(..n)) {
-                    *o = b;
-                }
-                Some(Ok(n))
+                let n = max.min(s.buf.len());
+                Some(Ok(s.buf.drain(..n).collect()))
             } else if s.writers == 0 {
-                Some(Ok(0))
+                Some(Ok(Vec::new()))
             } else if nonblock {
                 Some(Err(EAGAIN))
             } else if interrupted() {
@@ -259,6 +269,73 @@ impl Pipe {
         self.writable.wake_all();
         self.changed();
         r
+    }
+
+    /// Bytes waiting to be read.
+    pub(crate) fn buffered(&self) -> usize {
+        self.state.lock().buf.len()
+    }
+
+    /// Puts back, in front, bytes [`Pipe::take`] gave that could not be
+    /// passed on (`splice` to a socket that took only part). Another reader
+    /// may have come in between: it then read later bytes first.
+    pub(crate) fn give_back(&self, data: &[u8]) {
+        if data.is_empty() {
+            return;
+        }
+        {
+            let mut s = self.state.lock();
+            for &b in data.iter().rev() {
+                s.buf.push_front(b);
+            }
+        }
+        self.readable.wake_all();
+        self.changed();
+    }
+
+    /// A copy of up to `max` bytes, left where they are (`tee`): blocking
+    /// as [`Pipe::take`].
+    pub(crate) fn peek(
+        &self,
+        max: usize,
+        nonblock: bool,
+        interrupted: &dyn Fn() -> bool,
+    ) -> Result<Vec<u8>, i64> {
+        self.readable.wait_until(|| {
+            let s = self.state.lock();
+            if !s.buf.is_empty() {
+                Some(Ok(s.buf.iter().take(max).copied().collect()))
+            } else if s.writers == 0 {
+                Some(Ok(Vec::new()))
+            } else if nonblock {
+                Some(Err(EAGAIN))
+            } else if interrupted() {
+                Some(Err(ERESTARTSYS))
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Waits until the pipe has room, and says how much: EPIPE once no
+    /// reader is left.
+    pub(crate) fn room(
+        &self,
+        nonblock: bool,
+        interrupted: &dyn Fn() -> bool,
+    ) -> Result<usize, i64> {
+        self.writable.wait_until(|| {
+            let s = self.state.lock();
+            if s.readers == 0 {
+                return Some(Err(EPIPE));
+            }
+            match s.capacity.saturating_sub(s.buf.len()) {
+                0 if nonblock => Some(Err(EAGAIN)),
+                0 if interrupted() => Some(Err(ERESTARTSYS)),
+                0 => None,
+                n => Some(Ok(n)),
+            }
+        })
     }
 
     /// Writes all of `data` (blocking while the pipe is full), or fails

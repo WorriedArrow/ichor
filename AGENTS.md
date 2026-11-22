@@ -107,9 +107,30 @@ not write it; merge its branch when it lands.
   pipes (`mknod`/`mknodat` S_IFIFO, blocking opens), robust futex lists;
   open TCP NAT mappings live five days (Linux's established timeout), not
   ten minutes. Known gaps from its runs: `test_math` cosh is 8 ulps off
-  under TCG (check on KVM), O_RDWR FIFOs, rseq/clone3 (ENOSYS, glibc
-  falls back). Latest recorded full run: 409 of 445 modules (91.9%),
+  under TCG (check on KVM), O_RDWR FIFOs, rseq (ENOSYS, glibc falls
+  back). Latest recorded full run: 409 of 445 modules (91.9%),
   before shared file mappings; floor 88.0% in `workloads.toml`.
+- M7 Go (second suite): `cargo xtask workloads go` runs `go test -short
+  std` on the official `golang` image. Fixed on the way: `epoll_wait` held
+  descriptors and a fixed interest list while asleep (an epoll instance is
+  now an eventcount hub: `Poller`, `Watchers::notify`); TCP announces a
+  window that grew (pulls crawled at 0.8 MB/s); pulls time out on silence,
+  not on size; signals sent to a process go to a thread that does not block
+  them, `siginfo` says who sent one, real-time ones queue
+  (`proc::Shared`, `proc::Pending`), and one posted to a thread spinning in
+  ring 3 on an otherwise idle CPU takes it out (`Task::interrupt`,
+  `UserMode::execute_unless`; it used to wait for a trap); `execve` from a
+  process with threads killed the process; stop signals stop
+  (`proc::begin_stop`, parked in `signal::deliver`), `wait4`/`waitid`
+  report it, ptys send SIGTTIN/SIGTTOU; calls a signal interrupts without a
+  handler go on to their deadline (`ERESTARTNOHAND`, `resume_until`);
+  `splice` and friends (`linuxabi/splice.rs`), streams move more than 4 KiB
+  a call and gathered writes are one; `MSG_PEEK`, `SO_RCVTIMEO`,
+  `SO_LINGER` resets, `recvmmsg`; `NETLINK_ROUTE` reads (`net::rtnl`,
+  `linuxabi/netlink.rs`); CPU-time and POSIX timers (`itimer.rs`); pidfds
+  and `clone3`. Debian's perl checks most of it on every boot
+  (`SIGNAL_SCRIPT`, `MOVE_SCRIPT`). Explore with
+  `--cmd "go version" --follow FILE` (append shell lines to FILE).
 - M7 storage (ADR-0006's 2026-11-21 amendment): a cell's root writes are
   frames charged to its account (`page.rs`: one charged-page type for
   process memory and file pages; `overlay::Pages` is where the overlay
@@ -439,8 +460,9 @@ from a local mirror). Phase E (scalability) is done except the vDSO
   ISIG to the foreground group, MIN/TIME, ONLCR), termios/winsize/job
   control/ptmx ioctls, controlling terminals and `/dev/tty`, hangup on
   master close. Debian's perl drives a session through dash, `tty` and
-  `stty` on every boot. Partial: no SIGTTIN/SIGTTOU, flow control or
-  packet mode; the console is still not a tty.
+  `stty` on every boot. Partial: no flow control or packet mode; the
+  console is still not a tty, and `/dev/tty` without a controlling terminal
+  is ENXIO.
 - Page-sharing opt-out (ADR-0004 §4): `Vfs::mount_disk_private` gives a
   cell's root a private page-cache namespace (`pagecache::View`), charged
   to the cell's account, evicting only its own pages, freed with the root.
@@ -578,7 +600,7 @@ RSB filling, masked indices, AMD's measures. Boot logs which apply.
 Frame budget: ADR-0005 sets the milestone 3 ceiling at 8,500 lines / 380
 sites; ADR-0007 raises it to 9,500 / 420 for milestone 4 (TLB shootdown,
 atomic user ops for futexes, PCID). `audit.toml` is at step 7 (6,250 / 265,
-ADR-0004's isolation amendment); frame is at 6,213 / 261 (A5 added
+ADR-0004's isolation amendment); frame is at 6,236 / 261 (A5 added
 RDSEED/RDRAND and UEFI GetTime; B added XSAVE; C the frames tree and
 request tracking; M6 reading `\ichor\roots.pem`; ADR-0011 the checked user
 copy; ADR-0004 VERW/IBPB, page-table isolation and eIBRS). `services/rt` has

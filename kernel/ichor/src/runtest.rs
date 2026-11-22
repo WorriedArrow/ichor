@@ -2042,6 +2042,131 @@ fn poll_program() -> Vec<u8> {
     static_elf(&a.finish(BLOB_VADDR).unwrap_or_else(|| fail("assembler")))
 }
 
+/// A thread asleep in `epoll_wait` on an empty instance sees what another
+/// thread adds to it, and does not keep a pipe's write end open once it is
+/// closed: the read end (added edge-triggered) reports the hang-up, and
+/// reads end-of-file. Go's runtime parks a thread there all the time.
+/// Exits 0, or the failed check.
+fn epoll_threads_program() -> Vec<u8> {
+    const FLAGS: u64 = 0x35_0f00; // as `thread_program`
+    const FUTEX_WAIT_PRIVATE: u64 = 128;
+    const FUTEX_WAKE_PRIVATE: u64 = 129;
+    const IN_RDHUP_ET: u64 = 0x8000_2001;
+    let mut a = Asm::new();
+    let bad = a.label();
+    let main = a.label();
+    let wait = a.label();
+    let woken = a.label();
+    let ms50 = a.data(&[0, 0, 0, 0, 0, 0, 0, 0, 0x80, 0xf0, 0xfa, 0x02, 0, 0, 0, 0]);
+    let s5 = a.data(&[5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    let expect = |a: &mut Asm, n: u64, v: i32| {
+        a.mov_imm(Reg::R15, n);
+        a.cmp_imm(Reg::Rax, v);
+        a.jne(bad);
+    };
+    let nap = |a: &mut Asm| {
+        a.mov_data(Reg::Rdi, ms50);
+        a.mov_imm(Reg::Rsi, 0);
+        a.sys(sys::NANOSLEEP);
+    };
+    // [rbp] done, [rbp+8] epoll_wait's result, +16 the event added, +32 the
+    // pipe's ends, +48 the thread's tid, +64 the events reported.
+    a.mov(Reg::Rbp, Reg::Rsp);
+    a.sub_imm(Reg::Rbp, 4096);
+    a.mov_imm(Reg::Rax, 0);
+    a.store(Reg::Rbp, 0, Reg::Rax);
+    a.store(Reg::Rbp, 24, Reg::Rax);
+    a.mov_imm(Reg::Rax, IN_RDHUP_ET | (0x77 << 32));
+    a.store(Reg::Rbp, 16, Reg::Rax);
+    // 1: epoll -> 3, a pipe -> 4 and 5, a stack for the thread.
+    a.mov_imm(Reg::Rdi, 0);
+    a.sys(sys::EPOLL_CREATE1);
+    expect(&mut a, 1, 3);
+    a.mov(Reg::Rdi, Reg::Rbp);
+    a.add_imm(Reg::Rdi, 32);
+    a.mov_imm(Reg::Rsi, 0);
+    a.sys(sys::PIPE2);
+    expect(&mut a, 1, 0);
+    a.mov_imm(Reg::Rdi, 0);
+    a.mov_imm(Reg::Rsi, 0x1_0000);
+    a.mov_imm(Reg::Rdx, 3);
+    a.mov_imm(Reg::R10, 0x22);
+    a.mov_imm(Reg::R8, u64::MAX);
+    a.mov_imm(Reg::R9, 0);
+    a.sys(sys::MMAP);
+    a.mov(Reg::Rsi, Reg::Rax);
+    a.add_imm(Reg::Rsi, 0x1_0000);
+    a.mov_imm(Reg::Rdi, FLAGS);
+    a.mov(Reg::Rdx, Reg::Rbp);
+    a.add_imm(Reg::Rdx, 48);
+    a.mov(Reg::R10, Reg::Rdx);
+    a.mov_imm(Reg::R8, 0);
+    a.sys(sys::CLONE);
+    a.cmp_imm(Reg::Rax, 0);
+    a.jne(main);
+    // The thread: wait for whatever comes.
+    a.mov_imm(Reg::Rdi, 3);
+    a.mov(Reg::Rsi, Reg::Rbp);
+    a.add_imm(Reg::Rsi, 64);
+    a.mov_imm(Reg::Rdx, 4);
+    a.mov_imm(Reg::R10, u64::MAX); // -1: no timeout
+    a.sys(sys::EPOLL_WAIT);
+    a.store(Reg::Rbp, 8, Reg::Rax);
+    a.mov_imm(Reg::Rax, 1);
+    a.store(Reg::Rbp, 0, Reg::Rax);
+    a.mov(Reg::Rdi, Reg::Rbp);
+    a.mov_imm(Reg::Rsi, FUTEX_WAKE_PRIVATE);
+    a.mov_imm(Reg::Rdx, 1);
+    a.sys(sys::FUTEX);
+    a.mov_imm(Reg::Rdi, 0);
+    a.sys(sys::EXIT);
+    // Main: once it sleeps, add the read end; a while later close the
+    // write end.
+    a.bind(main);
+    nap(&mut a);
+    a.mov_imm(Reg::Rdi, 3);
+    a.mov_imm(Reg::Rsi, 1); // EPOLL_CTL_ADD
+    a.mov_imm(Reg::Rdx, 4);
+    a.mov(Reg::R10, Reg::Rbp);
+    a.add_imm(Reg::R10, 16);
+    a.sys(sys::EPOLL_CTL);
+    expect(&mut a, 2, 0);
+    nap(&mut a);
+    a.mov_imm(Reg::Rdi, 5);
+    a.sys(sys::CLOSE);
+    expect(&mut a, 2, 0);
+    // 3: the thread is woken (within 5 s).
+    a.bind(wait);
+    a.load(Reg::Rax, Reg::Rbp, 0);
+    a.cmp_imm(Reg::Rax, 0);
+    a.jne(woken);
+    a.mov(Reg::Rdi, Reg::Rbp);
+    a.mov_imm(Reg::Rsi, FUTEX_WAIT_PRIVATE);
+    a.mov_imm(Reg::Rdx, 0);
+    a.mov_data(Reg::R10, s5);
+    a.sys(sys::FUTEX);
+    a.mov_imm(Reg::R15, 3);
+    a.cmp_imm(Reg::Rax, -110); // ETIMEDOUT
+    a.je(bad);
+    a.jmp(wait);
+    // 4: with one event, the pipe's; 5: which reads end-of-file.
+    a.bind(woken);
+    a.load(Reg::Rax, Reg::Rbp, 8);
+    expect(&mut a, 4, 1);
+    a.load(Reg::Rax, Reg::Rbp, 68);
+    expect(&mut a, 4, 0x77);
+    a.mov_imm(Reg::Rdi, 4);
+    a.mov(Reg::Rsi, Reg::Rbp);
+    a.mov_imm(Reg::Rdx, 8);
+    a.sys(sys::READ);
+    expect(&mut a, 5, 0);
+    a.mov_imm(Reg::R15, 0);
+    a.bind(bad);
+    a.mov(Reg::Rdi, Reg::R15);
+    a.sys(sys::EXIT_GROUP);
+    static_elf(&a.finish(BLOB_VADDR).unwrap_or_else(|| fail("assembler")))
+}
+
 /// Close-on-exec: opens a file with and without `O_CLOEXEC` and a pipe with
 /// `O_CLOEXEC`, then execs `/bin/sh`, which checks through `/proc/self/fd`
 /// that only the plain descriptor survived. Needs a root with busybox.
@@ -3471,6 +3596,13 @@ pub(crate) fn run() {
         fail("polltest");
     }
     println!("ichor: linux: poll timeout and wakeup, epoll, eventfd ok ({syscalls} syscalls)");
+
+    let (status, _) = run_linux(new_process(), &epoll_threads_program(), None, &["epollthr"]);
+    if status != 0 {
+        println!("ichor: linux: epollthr failed check {status}");
+        fail("epoll across threads");
+    }
+    println!("ichor: linux: a sleeping epoll_wait sees what another thread adds and closes");
 
     let (status, syscalls) = run_linux(new_process(), &uring_program(), None, &["uringtest"]);
     if status != 0 {

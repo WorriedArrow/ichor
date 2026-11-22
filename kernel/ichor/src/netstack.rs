@@ -73,6 +73,15 @@ fn now() -> Duration {
     frame::time::now()
 }
 
+/// Sending to 0.0.0.0 means this host, as on Linux.
+fn to_this_host(a: Addr) -> Addr {
+    if a.0.is_unspecified() {
+        (Ipv4Addr::LOCALHOST, a.1)
+    } else {
+        a
+    }
+}
+
 /// What a socket's readers and pollers wait on.
 #[derive(Debug, Default)]
 pub(crate) struct Waiters {
@@ -281,7 +290,7 @@ pub(crate) fn accounting_selftest() {
         fail("net: accounting: the sender was not held to the cell's memory");
     }
     for id in [a, c, l] {
-        st.release(id);
+        st.release(id, false);
     }
     let deadline = now() + Duration::from_secs(30);
     while cell.account().used() != 0 {
@@ -439,7 +448,7 @@ impl Inner {
     /// its bound port or a new ephemeral one.
     fn source_for(&mut self, id: u64, dst: Ipv4Addr) -> Result<Addr, i64> {
         let loopback = dst.is_loopback();
-        if dst.is_unspecified() || dst.is_broadcast() || dst.is_multicast() {
+        if dst.is_broadcast() || dst.is_multicast() {
             return Err(ENETUNREACH);
         }
         let bound = self.sock(id)?.local;
@@ -895,6 +904,7 @@ impl Stack {
 
     /// Starts connecting to `remote` (for UDP: fixes the peer).
     pub(crate) fn connect(&self, id: u64, remote: Addr) -> Result<(), i64> {
+        let remote = to_this_host(remote);
         self.with(|i| {
             let udp = match i.sock(id)?.kind {
                 Kind::Fresh => false,
@@ -996,7 +1006,7 @@ impl Stack {
             };
             if tcp.readable() > 0 {
                 if peek {
-                    return Err(EOPNOTSUPP);
+                    return Ok(Some(tcp.peek(out)));
                 }
                 let n = tcp.recv(out, now());
                 i.touched.insert(id);
@@ -1038,8 +1048,9 @@ impl Stack {
     }
 
     /// The descriptor went away: close gracefully (a listener resets its
-    /// queued connections) and forget the socket once done.
-    pub(crate) fn release(&self, id: u64) {
+    /// queued connections; a connection resets if told to `reset`) and
+    /// forget the socket once done.
+    pub(crate) fn release(&self, id: u64, reset: bool) {
         self.with(|i| {
             let mut doomed = Vec::new();
             if let Some(s) = i.socks.get_mut(&id) {
@@ -1058,8 +1069,15 @@ impl Stack {
                     Kind::Conn { tcp, .. } => {
                         // What the application never read goes, and its
                         // memory with it.
+                        let unread = tcp.readable() > 0;
                         tcp.discard_received();
-                        tcp.close(now());
+                        // Closing on unread data resets too, as on Linux:
+                        // the peer learns that not all of it was read.
+                        if reset || unread {
+                            tcp.abort();
+                        } else {
+                            tcp.close(now());
+                        }
                         s.orphan = true;
                         i.touched.insert(id);
                     }
@@ -1119,6 +1137,15 @@ impl Stack {
         r
     }
 
+    /// Bytes the next read would give: a stream's, or one datagram's.
+    pub(crate) fn readable(&self, id: u64) -> usize {
+        match self.inner.lock().socks.get(&id).map(|s| &s.kind) {
+            Some(Kind::Conn { tcp, .. }) => tcp.readable(),
+            Some(Kind::Udp { rx, .. }) => rx.front().map_or(0, |(_, d)| d.len()),
+            _ => 0,
+        }
+    }
+
     /// `getsockname`.
     pub(crate) fn local_addr(&self, id: u64) -> Result<Addr, i64> {
         let i = self.inner.lock();
@@ -1163,7 +1190,7 @@ impl Stack {
                 return Err(EOPNOTSUPP);
             };
             let dst = match (to, *peer) {
-                (Some(t), _) => t,
+                (Some(t), _) => to_this_host(t),
                 (None, Some(p)) => p,
                 (None, None) => return Err(EDESTADDRREQ),
             };
@@ -1181,9 +1208,9 @@ impl Stack {
         })
     }
 
-    /// Takes the next received datagram and its source: `Ok(None)` when
-    /// none is queued.
-    pub(crate) fn recv_from(&self, id: u64) -> Result<Option<(Addr, Vec<u8>)>, i64> {
+    /// Takes the next received datagram and its source (a copy, if `peek`):
+    /// `Ok(None)` when none is queued.
+    pub(crate) fn recv_from(&self, id: u64, peek: bool) -> Result<Option<(Addr, Vec<u8>)>, i64> {
         let mut i = self.inner.lock();
         let s = i.sock(id)?;
         if let Some(e) = s.error.take() {
@@ -1193,6 +1220,9 @@ impl Stack {
         let Kind::Udp { rx, bytes, .. } = &mut s.kind else {
             return Err(EOPNOTSUPP);
         };
+        if peek && let Some(d) = rx.front() {
+            return Ok(Some(d.clone()));
+        }
         match rx.pop_front() {
             Some((from, d)) => {
                 *bytes -= d.len();

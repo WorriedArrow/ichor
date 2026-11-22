@@ -20,11 +20,12 @@
 //!
 //! Controlling terminals: a session leader without one that opens a slave
 //! (no `O_NOCTTY`) or calls `TIOCSCTTY` acquires it; `/dev/tty` opens the
-//! caller's controlling terminal (the console if it has none). Partial: no
-//! job-control checks on background reads/writes (SIGTTIN/SIGTTOU), no
-//! flow control (IXON, `TCXONC`), no packet mode; a master writing into a
-//! full input queue drops bytes instead of blocking; MIN/TIME's timer runs
-//! from the start of the read rather than between bytes.
+//! caller's controlling terminal (ENXIO if it has none). A background
+//! process group that reads it, changes it or (with TOSTOP) writes to it is
+//! sent SIGTTIN or SIGTTOU ([`foreground`]). Partial: no flow control
+//! (IXON, `TCXONC`), no packet mode; a master writing into a full input
+//! queue drops bytes instead of blocking; MIN/TIME's timer runs from the
+//! start of the read rather than between bytes.
 
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::String;
@@ -609,6 +610,48 @@ pub(crate) fn open_controlling(p: &mut LinuxProcess, nonblock: bool) -> Option<R
     Some(open_slave_end(p, pty, true, nonblock))
 }
 
+/// Job control, before process `p` touches slave `end` of its controlling
+/// terminal: from a background process group, `sig` (`SIGTTIN` to read,
+/// `SIGTTOU` to change or write to it) goes to the group and the call is
+/// restarted once it is in the foreground. If that would not stop it (it
+/// ignores or blocks the signal, or nobody could continue it), a read is
+/// EIO and the rest is allowed, but for an orphaned group's, which is EIO.
+pub(crate) fn foreground(p: &LinuxProcess, end: &End, sig: u32) -> Result<(), i64> {
+    use crate::{proc, signal};
+    if end.master {
+        return Ok(());
+    }
+    let leader = &p.group.leader;
+    let (pgid, sid) = leader.group();
+    {
+        let s = end.pty.state.lock();
+        if s.session != Some((leader.cell, sid)) || s.fg == pgid {
+            return Ok(());
+        }
+    }
+    if proc::blocked(&p.entry) & signal::bit(sig) != 0 || signal::is_ignored(p, sig) {
+        return if sig == signal::SIGTTIN {
+            Err(EIO)
+        } else {
+            Ok(())
+        };
+    }
+    if proc::in_orphaned_group(leader) {
+        return Err(EIO);
+    }
+    proc::signal_pgrp(leader.cell, pgid, sig);
+    Err(signal::ERESTARTSYS)
+}
+
+/// [`foreground`] for a write: only if the terminal asks for it (`TOSTOP`).
+pub(crate) fn may_write(p: &LinuxProcess, end: &End) -> Result<(), i64> {
+    const TOSTOP: u32 = 0o400;
+    if end.pty.state.lock().termios.lflag & TOSTOP == 0 {
+        return Ok(());
+    }
+    foreground(p, end, crate::signal::SIGTTOU)
+}
+
 impl Object for End {
     fn read(
         &self,
@@ -838,6 +881,7 @@ pub(crate) fn ioctl(p: &mut LinuxProcess, end: &End, request: u64, arg: u64) -> 
             if p.copy_from_user(arg, &mut b) != 36 {
                 return Err(EFAULT);
             }
+            foreground(p, end, crate::signal::SIGTTOU)?;
             {
                 let mut s = pty.state.lock();
                 if request == TCSETSF || request == TCSETSF2 {
@@ -919,6 +963,10 @@ pub(crate) fn ioctl(p: &mut LinuxProcess, end: &End, request: u64, arg: u64) -> 
             if g < 0 {
                 return Err(EINVAL);
             }
+            if pty.state.lock().session != Some(me) {
+                return Err(ENOTTY);
+            }
+            foreground(p, end, crate::signal::SIGTTOU)?;
             if !crate::proc::pgrp_in_session(me.0, g as u64, sid) {
                 return Err(EPERM);
             }

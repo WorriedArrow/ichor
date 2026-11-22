@@ -24,6 +24,7 @@ use crate::vfs::Kind;
 
 const E2BIG: i64 = 7;
 const ENOEXEC: i64 = 8;
+const EAGAIN: i64 = 11;
 const ENOMEM: i64 = 12;
 const EACCES: i64 = 13;
 const ENOENT: i64 = 2;
@@ -182,18 +183,6 @@ pub(crate) fn exec(
         None => None,
     };
 
-    // Every other thread of the process goes away first.
-    let others: Vec<_> = p
-        .group
-        .threads()
-        .into_iter()
-        .filter(|t| t.pid != p.entry.pid)
-        .collect();
-    for t in &others {
-        crate::proc::post(t, crate::signal::SIGKILL);
-    }
-    p.group.wait_threads(1);
-
     let mut mm = Mm::new(p.cell.account()).ok_or(ENOMEM)?;
     let loaded = loader::load(
         &mut mm,
@@ -212,6 +201,11 @@ pub(crate) fn exec(
     // Robust futexes held in the old image are released (and the list
     // forgotten) while that memory is still the process's, as Linux does.
     crate::futex::exit_robust_list(p);
+    // Every other thread of the process goes away, and this one becomes its
+    // first. Nothing fails from here on.
+    p.entry = p.group.sole_thread(&p.entry).ok_or(EAGAIN)?;
+    p.clear_tid = 0;
+    crate::itimer::exec(p);
     // Switch to the new space, then drop the old one (no longer active).
     mm.space().bind_to_current_task();
     drop(p.replace_mm(mm));

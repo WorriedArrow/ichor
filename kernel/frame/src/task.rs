@@ -136,6 +136,17 @@ impl Task {
         }
         true
     }
+
+    /// If the task is in ring 3 on another CPU, makes it leave with
+    /// [`UserEvent::Preempted`](crate::user::UserEvent::Preempted).
+    pub fn interrupt(&self) {
+        let on = self.running_on.load(Ordering::SeqCst);
+        if let Some(cpu) = cpu::online().find(|c| c.index() as u32 == on) {
+            let sched = SCHED.get_on(cpu);
+            sched.need_resched.store(true, Ordering::SeqCst);
+            kick(cpu);
+        }
+    }
 }
 
 impl fmt::Debug for Task {

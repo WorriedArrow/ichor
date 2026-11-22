@@ -67,10 +67,13 @@ static IDT: Idt = Idt([const { AtomicU64::new(0) }; 512]);
 
 fn set_gate(vector: u8, ist: u8) {
     let addr = entry::stub(vector);
+    // Present, 64-bit interrupt gate; `int 3` and `into` are the only ones
+    // ring 3 may raise by instruction (debuggers' and `abort`'s breakpoint).
+    let kind = if matches!(vector, 3 | 4) { 0xee } else { 0x8e };
     let low = (addr & 0xffff)
         | (u64::from(KERNEL_CS) << 16)
         | (u64::from(ist) << 32)
-        | (0x8e << 40) // present, DPL 0, 64-bit interrupt gate
+        | (kind << 40)
         | ((addr >> 16) & 0xffff) << 48;
     IDT.0[vector as usize * 2].store(low, Relaxed);
     IDT.0[vector as usize * 2 + 1].store(addr >> 32, Relaxed);

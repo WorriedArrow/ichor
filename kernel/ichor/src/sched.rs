@@ -112,8 +112,9 @@ impl Scheduler for FairScheduler {
     }
 
     fn tick(&self, cpu: CpuId, _current: &Arc<Task>) -> bool {
-        // Preempt only if someone else is waiting on this CPU.
-        !CPUS.get_on(cpu).rq.lock().is_empty()
+        // Preempt only if someone else is waiting on this CPU, or a
+        // CPU-time timer has to be looked at.
+        crate::itimer::watching_cpu_time() || !CPUS.get_on(cpu).rq.lock().is_empty()
     }
 
     fn timeslice(&self) -> Duration {

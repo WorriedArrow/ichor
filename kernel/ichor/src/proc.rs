@@ -8,9 +8,9 @@
 //! init and pid namespaces arrive with multi-cell scheduling (milestone 4);
 //! pids are global for now.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use frame::println;
 use frame::sync::SpinLock;
@@ -19,7 +19,7 @@ use frame::user::{UserContext, UserEvent, UserMode};
 
 use crate::linuxabi::{self, Outcome};
 use crate::process::LinuxProcess;
-use crate::signal;
+use crate::signal::{self, Info};
 
 const ECHILD: i64 = 10;
 const EAGAIN: i64 = 11;
@@ -29,6 +29,141 @@ const SIGILL: u32 = 4;
 const SIGTRAP: u32 = 5;
 const SIGFPE: u32 = 8;
 const ESRCH: i64 = 3;
+const EINTR: i64 = 4;
+
+/// `siginfo_t` codes for `SIGCHLD`.
+const CLD_EXITED: i32 = 1;
+const CLD_KILLED: i32 = 2;
+const CLD_DUMPED: i32 = 3;
+const CLD_STOPPED: i32 = 5;
+const CLD_CONTINUED: i32 = 6;
+
+/// Signals posted but not yet taken, and what each carries. Standard
+/// signals are pending once; real-time ones queue.
+#[derive(Debug)]
+struct Pending {
+    /// Which are pending (a summary of `queue`, readable without its lock).
+    set: AtomicU64,
+    queue: SpinLock<VecDeque<(u32, Info)>>,
+}
+
+impl Default for Pending {
+    fn default() -> Pending {
+        Pending {
+            set: AtomicU64::new(0),
+            queue: SpinLock::new(VecDeque::new()),
+        }
+    }
+}
+
+/// Most signals queued at once (Linux's `RLIMIT_SIGPENDING` plays this
+/// part); past it a real-time signal is refused.
+const QUEUE_MAX: usize = 4096;
+
+impl Pending {
+    fn set(&self) -> u64 {
+        self.set.load(Ordering::SeqCst)
+    }
+
+    /// Queues `sig`; false if there are too many.
+    fn add(&self, sig: u32, info: Info) -> bool {
+        const FIRST_REALTIME: u32 = 32;
+        let mut q = self.queue.lock();
+        if sig < FIRST_REALTIME && self.set() & signal::bit(sig) != 0 {
+            return true;
+        }
+        if q.len() >= QUEUE_MAX && sig >= FIRST_REALTIME {
+            return false;
+        }
+        q.push_back((sig, info));
+        self.set.fetch_or(signal::bit(sig), Ordering::SeqCst);
+        true
+    }
+
+    /// Takes the lowest-numbered signal of `wanted` (the first of its kind).
+    fn take(&self, wanted: u64) -> Option<(u32, Info)> {
+        if self.set() & wanted == 0 {
+            return None;
+        }
+        let mut q = self.queue.lock();
+        let sig = (self.set() & wanted).trailing_zeros() + 1;
+        let at = q.iter().position(|&(s, _)| s == sig)?;
+        let (_, info) = q.remove(at)?;
+        if !q.iter().any(|&(s, _)| s == sig) {
+            self.set.fetch_and(!signal::bit(sig), Ordering::SeqCst);
+        }
+        Some((sig, info))
+    }
+
+    /// Discards every pending signal of `which`.
+    fn clear(&self, which: u64) {
+        if self.set() & which == 0 {
+            return;
+        }
+        let mut q = self.queue.lock();
+        q.retain(|&(s, _)| signal::bit(s) & which == 0);
+        self.set.fetch_and(!which, Ordering::SeqCst);
+    }
+}
+
+/// Job control: whether a process is stopped, and what its parent has not
+/// been told of yet.
+#[derive(Debug, Default)]
+struct Stop {
+    /// The signal that stopped it, until it goes on.
+    by: Option<u32>,
+    /// Counts `SIGCONT`s, so that one sent between taking a stop signal and
+    /// stopping is not lost.
+    continues: u64,
+    /// Threads that have stopped.
+    parked: usize,
+    /// All of them have, and the parent was told.
+    complete: bool,
+    /// What `wait4(WUNTRACED)` and `waitid(WSTOPPED)` have to report.
+    stopped: Option<u32>,
+    /// What `wait4(WCONTINUED)` has to report.
+    continued: bool,
+}
+
+/// What a process's threads share of its signals.
+#[derive(Debug)]
+pub(crate) struct Shared {
+    /// Signals sent to the process: the first thread that does not block
+    /// one takes it.
+    pending: Pending,
+    stop: SpinLock<Stop>,
+    /// `stop.by` is set (readable without the lock).
+    stopping: AtomicBool,
+    /// `SA_NOCLDSTOP` and `SA_NOCLDWAIT` (or an ignored `SIGCHLD`), as this
+    /// process's children need to know.
+    pub(crate) nocldstop: AtomicBool,
+    pub(crate) nocldwait: AtomicBool,
+    /// Polled through pidfds: changes when the process exits.
+    pub(crate) exit: crate::poll::Watchers,
+    /// The process's CPU time (ns) at which one of its CPU-time timers may
+    /// be due (`itimer`).
+    pub(crate) cpu_due: AtomicU64,
+}
+
+impl Default for Shared {
+    fn default() -> Shared {
+        Shared {
+            pending: Pending::default(),
+            stop: SpinLock::new(Stop::default()),
+            stopping: AtomicBool::new(false),
+            nocldstop: AtomicBool::new(false),
+            nocldwait: AtomicBool::new(false),
+            exit: crate::poll::Watchers::new(),
+            cpu_due: AtomicU64::new(u64::MAX),
+        }
+    }
+}
+
+impl Drop for Shared {
+    fn drop(&mut self) {
+        crate::itimer::set_due(&self.cpu_due, u64::MAX);
+    }
+}
 
 /// A process's entry in the table.
 #[derive(Debug)]
@@ -56,12 +191,20 @@ pub(crate) struct ProcEntry {
     status: SpinLock<Option<u32>>,
     /// Woken whenever one of this process's children exits.
     children: WaitQueue,
-    /// Signals posted but not yet delivered.
-    pending: AtomicU64,
-    /// The process's signal mask and ignored set, mirrored from its
-    /// `Signals` so other tasks can decide whether a signal wakes it.
+    /// Signals sent to this thread and not yet taken.
+    pending: Pending,
+    /// What it shares with its process's other threads.
+    pub(crate) shared: Arc<Shared>,
+    /// The thread must end (its process is exiting, or another thread is
+    /// in `execve`), without ending the process.
+    ending: AtomicBool,
+    /// The thread's signal mask and its process's ignored set, mirrored
+    /// from its `Signals` so other tasks can decide whether a signal wakes
+    /// it.
     blocked: AtomicU64,
     ignored: AtomicU64,
+    /// The signals `rt_sigtimedwait` is waiting for.
+    awaited: AtomicU64,
     /// The task running the process, to wake it for a signal.
     task: SpinLock<Option<Arc<Task>>>,
     /// Woken when a signal is posted (`pause`, `rt_sigsuspend`).
@@ -179,6 +322,7 @@ pub(crate) fn send_group(
     me: &ProcEntry,
     pgid: Option<u64>,
     sig: u32,
+    info: Info,
     allowed: &dyn Fn((u32, u32)) -> bool,
 ) -> Result<(), i64> {
     const EPERM: i64 = 1;
@@ -200,14 +344,12 @@ pub(crate) fn send_group(
     for (pid, uids) in targets {
         if allowed(uids) {
             any = true;
-            let _ = send(me.cell, pid, sig);
+            let _ = send_info(me.cell, pid, sig, info);
         }
     }
     if any { Ok(()) } else { Err(EPERM) }
 }
 
-/// Posts `sig` to every live process of group `pgid` in `cell`: what a
-/// terminal sends (INTR, hangup, window change), with no sender to check.
 /// Posts `sig` to every live process of `cell` (the control plane's
 /// `Signal` and `Destroy`); returns how many.
 pub(crate) fn signal_cell(cell: u64, sig: u32) -> u64 {
@@ -224,6 +366,8 @@ pub(crate) fn signal_cell(cell: u64, sig: u32) -> u64 {
     n
 }
 
+/// Posts `sig` to every live process of group `pgid` in `cell`: what a
+/// terminal sends (INTR, hangup, window change), with no sender to check.
 pub(crate) fn signal_pgrp(cell: u64, pgid: u64, sig: u32) {
     let pids: alloc::vec::Vec<u64> = TABLE
         .lock()
@@ -257,13 +401,15 @@ static NEXT_PID: AtomicU64 = AtomicU64::new(1);
 
 /// Adds a thread of cell `cell` with parent process `ppid` (0: none) to
 /// the table, as a new process (`tgid` `None`) or a thread of process
-/// `tgid`. A new process starts in `group` = (pgid, sid), or in a group and
-/// session of its own.
+/// `tgid`, which shares the process's signals if it is given them (a kernel
+/// helper is not). A new process starts in `group` = (pgid, sid), or in a
+/// group and session of its own.
 pub(crate) fn register(
     cell: u64,
     ppid: u64,
     tgid: Option<u64>,
     group: Option<(u64, u64)>,
+    shared: Option<Arc<Shared>>,
 ) -> Arc<ProcEntry> {
     let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
     let (pgid, sid) = group.unwrap_or((pid, pid));
@@ -279,9 +425,12 @@ pub(crate) fn register(
         started: (frame::time::now().as_millis() / 10) as u64,
         status: SpinLock::new(None),
         children: WaitQueue::new(),
-        pending: AtomicU64::new(0),
+        pending: Pending::default(),
+        shared: shared.unwrap_or_default(),
+        ending: AtomicBool::new(false),
         blocked: AtomicU64::new(0),
         ignored: AtomicU64::new(signal::bit(signal::SIGCHLD)),
+        awaited: AtomicU64::new(0),
         task: SpinLock::new(None),
         signals: WaitQueue::new(),
         cpu_ns: AtomicU64::new(0),
@@ -301,86 +450,382 @@ pub(crate) fn blocked(e: &ProcEntry) -> u64 {
     e.blocked.load(Ordering::SeqCst)
 }
 
-/// Signals pending for `e`.
+/// Signals pending for thread `e` or its process.
 pub(crate) fn pending(e: &ProcEntry) -> u64 {
-    e.pending.load(Ordering::SeqCst)
+    e.pending.set() | e.shared.pending.set()
 }
 
+/// Takes a pending signal of `wanted`: the thread's own first, then its
+/// process's.
+pub(crate) fn take_signal(e: &ProcEntry, wanted: u64) -> Option<(u32, Info)> {
+    e.pending
+        .take(wanted)
+        .or_else(|| e.shared.pending.take(wanted))
+}
+
+/// Discards pending signals of `set`, the thread's and its process's.
 pub(crate) fn clear_pending(e: &ProcEntry, set: u64) {
-    e.pending.fetch_and(!set, Ordering::SeqCst);
+    e.pending.clear(set);
+    e.shared.pending.clear(set);
+}
+
+/// Whether thread `e` was told to end ([`end_thread`]).
+pub(crate) fn ending(e: &ProcEntry) -> bool {
+    e.ending.load(Ordering::SeqCst)
+}
+
+/// Tells thread `e` to end, without ending its process: the process is
+/// exiting already, or another of its threads is in `execve`.
+pub(crate) fn end_thread(e: &ProcEntry) {
+    e.ending.store(true, Ordering::SeqCst);
+    wake(e);
+}
+
+/// Whether `e` must stop what it is doing and end.
+pub(crate) fn dying(e: &ProcEntry) -> bool {
+    ending(e) || pending(e) & signal::bit(signal::SIGKILL) != 0
 }
 
 /// Whether a signal is pending that `e` would act on (not blocked, not
-/// ignored): blocking syscalls give up with `ERESTARTSYS` when it is.
+/// ignored), or it must stop or end: blocking syscalls give up with
+/// `ERESTARTSYS` when so.
 pub(crate) fn interrupted(e: &ProcEntry) -> bool {
-    let p = e.pending.load(Ordering::SeqCst);
-    let unblocked = !e.blocked.load(Ordering::SeqCst);
-    let kill = signal::bit(signal::SIGKILL);
-    p & unblocked & (!e.ignored.load(Ordering::SeqCst) | kill) != 0
+    let awaited = e.awaited.load(Ordering::SeqCst);
+    let open = !e.blocked.load(Ordering::SeqCst) | awaited;
+    let heeded = !e.ignored.load(Ordering::SeqCst) | awaited | signal::bit(signal::SIGKILL);
+    pending(e) & open & heeded != 0 || ending(e) || stopping(e)
 }
 
-/// Posts `sig` to `e` and wakes it if it is waiting.
-pub(crate) fn post(e: &ProcEntry, sig: u32) {
-    let b = signal::bit(sig);
-    let blocked = e.blocked.load(Ordering::SeqCst) & b != 0;
-    if sig != signal::SIGKILL && !blocked && e.ignored.load(Ordering::SeqCst) & b != 0 {
-        return; // discarded on arrival, as Linux does
-    }
-    e.pending.fetch_or(b, Ordering::SeqCst);
+/// Wakes thread `e`, whatever it is blocked on, or takes it out of user
+/// code.
+pub(crate) fn wake(e: &ProcEntry) {
     let task = e.task.lock().clone();
-    if let Some(t) = task {
-        t.wake();
+    if let Some(t) = task
+        && !t.wake()
+    {
+        t.interrupt();
     }
     e.signals.wake_all();
 }
 
-/// `kill`: posts `sig` to process `pid` (0 only checks that it exists).
-/// It goes to the thread `pid` if that is still running, else to another
-/// running thread of the process.
-pub(crate) fn send(cell: u64, pid: u64, sig: u32) -> Result<(), i64> {
-    let target = {
-        let t = TABLE.lock();
-        let e = t
-            .get(&pid)
-            .filter(|e| e.cell == cell)
-            .cloned()
-            .ok_or(ESRCH)?;
-        if e.status.lock().is_some() {
-            return Ok(()); // a zombie
-        }
-        if e.task.lock().is_some() {
-            e
-        } else {
-            // The thread has exited while others run (or has not started
-            // yet: then the signal waits for it in its pending set).
-            t.values()
-                .find(|c| c.tgid == e.tgid && c.task.lock().is_some())
-                .cloned()
-                .unwrap_or(e)
-        }
+/// Whether `sig`, arriving at thread `e`, is discarded at once (as on
+/// Linux: ignored, and neither blocked nor waited for).
+fn discarded(e: &ProcEntry, sig: u32) -> bool {
+    let b = signal::bit(sig);
+    let held = e.blocked.load(Ordering::SeqCst) | e.awaited.load(Ordering::SeqCst);
+    sig != signal::SIGKILL && held & b == 0 && e.ignored.load(Ordering::SeqCst) & b != 0
+}
+
+/// The threads of `e`'s process.
+fn threads_of(t: &BTreeMap<u64, Arc<ProcEntry>>, e: &ProcEntry) -> alloc::vec::Vec<Arc<ProcEntry>> {
+    t.values()
+        .filter(|c| Arc::ptr_eq(&c.shared, &e.shared))
+        .cloned()
+        .collect()
+}
+
+/// What sending `sig` to a process does before it is taken by anyone: a
+/// stop signal and `SIGCONT` cancel each other's pending instances, and
+/// `SIGCONT` makes a stopped process go on, even if it is ignored or
+/// blocked.
+fn job_control(t: &BTreeMap<u64, Arc<ProcEntry>>, e: &ProcEntry, sig: u32) {
+    let cancels = match sig {
+        signal::SIGCONT => signal::STOPS,
+        s if signal::bit(s) & signal::STOPS != 0 => signal::bit(signal::SIGCONT),
+        _ => return,
     };
-    if sig != 0 {
-        post(&target, sig);
+    let threads = threads_of(t, e);
+    e.shared.pending.clear(cancels);
+    for c in &threads {
+        c.pending.clear(cancels);
     }
-    Ok(())
+    if sig != signal::SIGCONT {
+        return;
+    }
+    let told = {
+        let mut s = e.shared.stop.lock();
+        s.continues += 1;
+        if s.by.take().is_none() {
+            return;
+        }
+        e.shared.stopping.store(false, Ordering::SeqCst);
+        let complete = core::mem::take(&mut s.complete);
+        if complete {
+            s.stopped = None;
+            s.continued = true;
+        }
+        complete
+    };
+    for c in &threads {
+        wake(c);
+    }
+    if told && let Some(leader) = t.get(&e.tgid) {
+        tell_parent(t, leader, CLD_CONTINUED, signal::SIGCONT);
+    }
+}
+
+/// Tells the parent of process `leader` that it stopped or went on, unless
+/// it does not want to know.
+fn tell_parent(t: &BTreeMap<u64, Arc<ProcEntry>>, leader: &ProcEntry, code: i32, status: u32) {
+    let Some(parent) = t.get(&leader.ppid()) else {
+        return;
+    };
+    if !parent.shared.nocldstop.load(Ordering::Relaxed) {
+        post_process(
+            t,
+            parent,
+            signal::SIGCHLD,
+            Info::child(leader, code, status),
+        );
+    }
+    parent.children.wake_all();
+}
+
+/// Posts `sig` to the process of thread `e` (under the table's lock), and
+/// wakes a thread that will take it. False if too many are queued.
+fn post_process(
+    t: &BTreeMap<u64, Arc<ProcEntry>>,
+    e: &Arc<ProcEntry>,
+    sig: u32,
+    info: Info,
+) -> bool {
+    job_control(t, e, sig);
+    if discarded(e, sig) {
+        return true;
+    }
+    if !e.shared.pending.add(sig, info) {
+        return false;
+    }
+    let b = signal::bit(sig);
+    let takes = |c: &ProcEntry| {
+        let open = !c.blocked.load(Ordering::SeqCst) | c.awaited.load(Ordering::SeqCst);
+        open & b != 0 && c.task.lock().is_some()
+    };
+    if sig == signal::SIGKILL {
+        for c in threads_of(t, e) {
+            wake(&c);
+        }
+    } else if takes(e) {
+        wake(e);
+    } else if let Some(c) = t
+        .values()
+        .find(|c| Arc::ptr_eq(&c.shared, &e.shared) && takes(c))
+    {
+        wake(c);
+    }
+    true
+}
+
+/// Posts `sig` to thread `e` itself and wakes it if it is waiting. False if
+/// too many are queued.
+pub(crate) fn post_info(e: &Arc<ProcEntry>, sig: u32, info: Info) -> bool {
+    {
+        let t = TABLE.lock();
+        job_control(&t, e, sig);
+    }
+    if discarded(e, sig) {
+        return true;
+    }
+    if !e.pending.add(sig, info) {
+        return false;
+    }
+    if sig == signal::SIGKILL {
+        // Whoever it is sent to, it ends the process.
+        let threads = threads_of(&TABLE.lock(), e);
+        for c in threads {
+            wake(&c);
+        }
+    }
+    wake(e);
+    true
+}
+
+/// Posts `sig` to thread `e`, from the kernel on its own behalf (SIGPIPE).
+pub(crate) fn post(e: &Arc<ProcEntry>, sig: u32) {
+    let (uid, _) = e.uids();
+    post_info(e, sig, Info::sent(signal::SI_USER, e.tgid, uid));
+}
+
+/// `kill`: posts `sig` to the process of thread `pid` (0 only checks that
+/// it exists); any of its threads may take it.
+pub(crate) fn send_info(cell: u64, pid: u64, sig: u32, info: Info) -> Result<(), i64> {
+    let t = TABLE.lock();
+    let e = t.get(&pid).filter(|e| e.cell == cell).ok_or(ESRCH)?;
+    if sig == 0 || e.status.lock().is_some() {
+        return Ok(()); // a zombie takes nothing
+    }
+    if post_process(&t, e, sig, info) {
+        Ok(())
+    } else {
+        Err(EAGAIN)
+    }
+}
+
+/// [`send_info`] from the kernel.
+pub(crate) fn send(cell: u64, pid: u64, sig: u32) -> Result<(), i64> {
+    send_info(cell, pid, sig, Info::kernel())
 }
 
 /// `tgkill`/`tkill`: posts `sig` to thread `tid` (of process `tgid`, if
 /// given).
-pub(crate) fn send_thread(cell: u64, tgid: Option<u64>, tid: u64, sig: u32) -> Result<(), i64> {
+pub(crate) fn send_thread(
+    cell: u64,
+    tgid: Option<u64>,
+    tid: u64,
+    sig: u32,
+    info: Info,
+) -> Result<(), i64> {
     let e = TABLE
         .lock()
         .get(&tid)
         .filter(|e| e.cell == cell)
         .cloned()
         .ok_or(ESRCH)?;
-    if tgid.is_some_and(|g| g != e.tgid) || e.task.lock().is_none() {
+    if tgid.is_some_and(|g| g != e.tgid) || e.status.lock().is_some() {
         return Err(ESRCH);
     }
-    if sig != 0 {
-        post(&e, sig);
+    if sig == 0 || post_info(&e, sig, info) {
+        Ok(())
+    } else {
+        Err(EAGAIN)
     }
-    Ok(())
+}
+
+/// The entry of live process or thread `pid` in `cell` (a zombie counts).
+pub(crate) fn find(cell: u64, pid: u64) -> Option<Arc<ProcEntry>> {
+    TABLE.lock().get(&pid).filter(|e| e.cell == cell).cloned()
+}
+
+/// How many `SIGCONT`s the process of `e` was sent: see [`begin_stop`].
+pub(crate) fn continues(e: &ProcEntry) -> u64 {
+    e.shared.stop.lock().continues
+}
+
+/// Stops the process of `e`, for `sig`: its threads park as they see it.
+/// Not if a `SIGCONT` came since `seen` ([`continues`]), nor, for a signal
+/// from a terminal, if nobody could continue it (an orphaned group).
+pub(crate) fn begin_stop(e: &ProcEntry, sig: u32, seen: u64) {
+    let t = TABLE.lock();
+    let Some(leader) = t.get(&e.tgid) else {
+        return;
+    };
+    if sig != signal::SIGSTOP && orphaned_group(&t, e.cell, leader.group()) {
+        return;
+    }
+    {
+        let mut s = e.shared.stop.lock();
+        if s.continues != seen || s.by.is_some() {
+            return;
+        }
+        s.by = Some(sig);
+        e.shared.stopping.store(true, Ordering::SeqCst);
+        s.complete = false;
+        s.continued = false;
+    }
+    for c in threads_of(&t, e) {
+        if c.pid != e.pid {
+            wake(&c);
+        }
+    }
+}
+
+/// Whether process group `pgid` of session `sid` is orphaned: no member's
+/// parent is in another group of the session (a shell that could continue
+/// it).
+fn orphaned_group(t: &BTreeMap<u64, Arc<ProcEntry>>, cell: u64, (pgid, sid): (u64, u64)) -> bool {
+    !t.values().any(|e| {
+        e.cell == cell
+            && e.pid == e.tgid
+            && e.group() == (pgid, sid)
+            && e.status.lock().is_none()
+            && t.get(&e.ppid()).is_some_and(|p| {
+                let (pg, ps) = p.group();
+                ps == sid && pg != pgid
+            })
+    })
+}
+
+/// Whether the caller's process group is orphaned (see [`orphaned_group`]).
+pub(crate) fn in_orphaned_group(leader: &ProcEntry) -> bool {
+    orphaned_group(&TABLE.lock(), leader.cell, leader.group())
+}
+
+/// Whether the process of `e` is stopped (or stopping).
+pub(crate) fn stopping(e: &ProcEntry) -> bool {
+    e.shared.stopping.load(Ordering::SeqCst)
+}
+
+/// Parks thread `e` of a stopped process, one of `live` threads, until the
+/// process goes on or the thread must end.
+pub(crate) fn park(e: &ProcEntry, live: usize) {
+    e.shared.stop.lock().parked += 1;
+    stop_progress(e, live);
+    e.signals
+        .wait_until(|| (!stopping(e) || dying(e)).then_some(()));
+    e.shared.stop.lock().parked -= 1;
+}
+
+/// Tells the parent once every one of a stopped process's `live` threads
+/// has parked (also looked at when one of them exits).
+pub(crate) fn stop_progress(e: &ProcEntry, live: usize) {
+    let t = TABLE.lock();
+    let sig = {
+        let mut s = e.shared.stop.lock();
+        let Some(sig) = s.by.filter(|_| !s.complete && s.parked >= live) else {
+            return;
+        };
+        s.complete = true;
+        s.stopped = Some(sig);
+        sig
+    };
+    if let Some(leader) = t.get(&e.tgid) {
+        tell_parent(&t, leader, CLD_STOPPED, sig);
+    }
+}
+
+/// `rt_sigtimedwait`: takes a pending signal of `set`, waiting for one
+/// until `deadline`. `Ok(None)` when that passes; EINTR if another signal
+/// is to be acted on first.
+pub(crate) fn await_signal(
+    e: &ProcEntry,
+    set: u64,
+    deadline: Option<core::time::Duration>,
+) -> Result<Option<(u32, Info)>, i64> {
+    e.awaited.store(set, Ordering::SeqCst);
+    let cond = || match take_signal(e, set) {
+        Some(s) => Some(Ok(s)),
+        None => interrupted(e).then_some(Err(EINTR)),
+    };
+    let r = match deadline {
+        None => Some(e.signals.wait_until(cond)),
+        Some(d) => e.signals.wait_until_deadline(d, cond),
+    };
+    e.awaited.store(0, Ordering::SeqCst);
+    r.transpose()
+}
+
+/// Puts `e`'s entry in the place of its process's first thread's, for a
+/// thread whose `execve` leaves it the only one: it has the process's id
+/// from here on. Returns that entry.
+pub(crate) fn take_over_leader(e: &Arc<ProcEntry>, leader: &Arc<ProcEntry>) -> Arc<ProcEntry> {
+    if e.pid == leader.pid {
+        return e.clone();
+    }
+    let mut t = TABLE.lock();
+    leader.ending.store(false, Ordering::SeqCst);
+    leader
+        .blocked
+        .store(e.blocked.load(Ordering::SeqCst), Ordering::SeqCst);
+    leader
+        .ignored
+        .store(e.ignored.load(Ordering::SeqCst), Ordering::SeqCst);
+    leader.pending.clear(u64::MAX);
+    while let Some((sig, info)) = e.pending.take(u64::MAX) {
+        leader.pending.add(sig, info);
+    }
+    *leader.task.lock() = e.task.lock().take();
+    t.remove(&e.pid);
+    leader.clone()
 }
 
 /// Sleeps until `deadline` (time since boot) or until `e` has a signal it
@@ -396,65 +841,102 @@ pub(crate) fn exit_status(e: &ProcEntry) -> Option<u32> {
     *e.status.lock()
 }
 
-/// Sleeps until `e` has a signal it would act on.
-/// Wakes `e` from a wait on its signal queue so it re-checks.
-pub(crate) fn wake(e: &ProcEntry) {
-    e.signals.wake_all();
-}
-
-/// Waits on `e`'s signal queue until `done` holds or `SIGKILL` is pending.
+/// Waits on `e`'s signal queue until `done` holds or the thread must end.
 pub(crate) fn wait_killable(e: &ProcEntry, done: impl Fn() -> bool) {
-    let kill = signal::bit(signal::SIGKILL);
-    e.signals
-        .wait_until(|| (done() || pending(e) & kill != 0).then_some(()));
+    e.signals.wait_until(|| (done() || dying(e)).then_some(()));
 }
 
+/// Sleeps until `e` has a signal it would act on.
 pub(crate) fn wait_for_signal(e: &ProcEntry) {
     e.signals.wait_until(|| interrupted(e).then_some(()));
 }
 
 /// Records that `e` exited with wait status `status`, orphans its children,
 /// and wakes its parent (posting `SIGCHLD`).
-fn exited(e: &ProcEntry, status: u32) {
+fn exited(e: &Arc<ProcEntry>, status: u32) {
     *e.task.lock() = None;
+    let mut t = TABLE.lock();
     *e.status.lock() = Some(status);
-    let parent = {
-        let mut t = TABLE.lock();
-        for c in t.values() {
-            if c.ppid() == e.pid {
-                c.ppid.store(0, Ordering::Release);
-                let sig = c.pdeathsig.load(Ordering::Acquire);
-                if sig != 0 && c.status.lock().is_none() {
-                    post(c, sig);
-                }
-            }
+    let orphans: alloc::vec::Vec<_> = t.values().filter(|c| c.ppid() == e.pid).cloned().collect();
+    for c in orphans {
+        c.ppid.store(0, Ordering::Release);
+        let sig = c.pdeathsig.load(Ordering::Acquire);
+        if sig != 0 && c.status.lock().is_none() {
+            let (uid, _) = e.uids();
+            post_process(&t, &c, sig, Info::sent(signal::SI_USER, e.pid, uid));
         }
-        // Orphans that already exited (and this process, if it has no
-        // parent) are reaped now; nobody will wait for them.
-        t.retain(|_, c| c.ppid() != 0 || c.status.lock().is_none());
-        t.get(&e.ppid()).cloned()
-    };
-    if let Some(p) = parent {
-        post(&p, signal::SIGCHLD);
-        p.children.wake_all();
     }
+    if let Some(parent) = t.get(&e.ppid()) {
+        let (code, st) = if status & 0x7f == 0 {
+            (CLD_EXITED, (status >> 8) & 0xff)
+        } else if status & 0x80 != 0 {
+            (CLD_DUMPED, status & 0x7f)
+        } else {
+            (CLD_KILLED, status & 0x7f)
+        };
+        post_process(&t, parent, signal::SIGCHLD, Info::child(e, code, st));
+        let parent = parent.clone();
+        if parent.shared.nocldwait.load(Ordering::Relaxed) {
+            e.ppid.store(0, Ordering::Release); // not to be waited for
+        }
+        parent.children.wake_all();
+    }
+    // Orphans that already exited (and this process, if it has no parent)
+    // are reaped now; nobody will wait for them.
+    t.retain(|_, c| c.ppid() != 0 || c.status.lock().is_none());
+    drop(t);
+    e.shared.exit.notify();
+}
+
+/// What a `wait4` or `waitid` looks for.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Wanted {
+    /// Children that exited, that stopped, that went on.
+    pub(crate) exited: bool,
+    pub(crate) stopped: bool,
+    pub(crate) continued: bool,
+    /// Do not wait for one.
+    pub(crate) nohang: bool,
+    /// Leave what is found to be found again (`WNOWAIT`).
+    pub(crate) keep: bool,
+}
+
+/// The wait status of a child that went on.
+pub(crate) const CONTINUED: u32 = 0xffff;
+
+/// What there is to report of child `c`, as a wait status.
+fn report(c: &ProcEntry, want: Wanted) -> Option<u32> {
+    if let Some(st) = *c.status.lock() {
+        return want.exited.then_some(st);
+    }
+    let mut s = c.shared.stop.lock();
+    if want.stopped
+        && let Some(sig) = s.stopped
+    {
+        if !want.keep {
+            s.stopped = None;
+        }
+        return Some(sig << 8 | 0x7f);
+    }
+    if want.continued && s.continued {
+        s.continued = want.keep;
+        return Some(CONTINUED);
+    }
+    None
 }
 
 /// `wait4` by thread `caller` of the process led by `leader`: reaps an
-/// exited child process matching `pid` (-1 or less: any child) and returns
-/// its pid and wait status, `Ok(None)` if `nohang` and none has exited yet,
-/// or `ECHILD` if there is no such child.
+/// exited child process matching `pid` (-1 or less: any child), or reports
+/// one that stopped or went on, and returns its pid, wait status and real
+/// uid; `Ok(None)` if there is none yet and `want.nohang`, or `ECHILD` if
+/// there is no such child.
 pub(crate) fn wait(
     leader: &ProcEntry,
     caller: &ProcEntry,
     pid: i64,
-    nohang: bool,
-    reap: bool,
-) -> Result<Option<(u64, u32)>, i64> {
+    want: Wanted,
+) -> Result<Option<(u64, u32, u32)>, i64> {
     leader.children.wait_until(|| {
-        if interrupted(caller) {
-            return Some(Err(signal::ERESTARTSYS));
-        }
         let mut t = TABLE.lock();
         let mut any = false;
         let mut found = None;
@@ -470,22 +952,26 @@ pub(crate) fn wait(
                 continue;
             }
             any = true;
-            if let Some(st) = *c.status.lock() {
-                found = Some((cpid, st));
+            if let Some(st) = report(c, want) {
+                let gone = c.status.lock().is_some();
+                found = Some(((cpid, st, c.uids().0), gone));
                 break;
             }
         }
-        if let Some((cpid, st)) = found {
-            // `waitid(WNOWAIT)` leaves the child waitable.
-            if reap {
-                t.remove(&cpid);
+        if let Some((r, gone)) = found {
+            if gone && !want.keep {
+                t.remove(&r.0);
             }
-            return Some(Ok(Some((cpid, st))));
+            return Some(Ok(Some(r)));
         }
         if !any {
             return Some(Err(ECHILD));
         }
-        nohang.then_some(Ok(None))
+        if want.nohang {
+            return Some(Ok(None));
+        }
+        drop(t);
+        interrupted(caller).then_some(Err(signal::ERESTARTSYS))
     })
 }
 
@@ -502,11 +988,14 @@ pub(crate) fn run(mut p: LinuxProcess, mut ctx: UserContext) -> (u32, u32) {
     let status = loop {
         let mut restart = None;
         let entered = frame::time::now();
-        let event = UserMode::new(&mut ctx).execute();
+        // Not into user code with a signal to act on: one posted from here
+        // on interrupts it (`wake`).
+        let event = UserMode::new(&mut ctx).execute_unless(|| interrupted(&p.entry));
         let ran = frame::time::now().saturating_sub(entered);
         p.entry
             .cpu_ns
             .fetch_add(ran.as_nanos() as u64, Ordering::Relaxed);
+        crate::itimer::check_cpu(&p);
         match event {
             UserEvent::Syscall => {
                 syscalls = syscalls.wrapping_add(1);
@@ -514,8 +1003,9 @@ pub(crate) fn run(mut p: LinuxProcess, mut ctx: UserContext) -> (u32, u32) {
                 if let Outcome::Exit(code) = linuxabi::dispatch(&mut p, &mut ctx) {
                     break (code as u32 & 0xff) << 8;
                 }
-                if ctx.rax as i64 == -signal::ERESTARTSYS {
-                    restart = Some(nr);
+                restart = signal::Restart::of(nr, ctx.rax as i64);
+                if restart.is_none() {
+                    p.resume_until = None;
                 }
             }
             UserEvent::Preempted => frame::task::yield_now(),
@@ -525,13 +1015,19 @@ pub(crate) fn run(mut p: LinuxProcess, mut ctx: UserContext) -> (u32, u32) {
                 cr2,
             } if p.mm().fault(cr2, error & 2 != 0, error & 16 != 0) => {}
             UserEvent::Exception { vector, cr2, .. } => {
-                let sig = match vector {
-                    0 | 16 | 19 => SIGFPE,
-                    3 => SIGTRAP,
-                    6 => SIGILL,
-                    _ => signal::SIGSEGV,
+                // The signal, its code and its address, as Linux reports.
+                let rip = ctx.rip;
+                let (sig, code, addr) = match vector {
+                    0 => (SIGFPE, signal::FPE_INTDIV, rip),
+                    16 | 19 => (SIGFPE, signal::FPE_FLTINV, rip),
+                    1 => (SIGTRAP, signal::TRAP_TRACE, rip),
+                    3 => (SIGTRAP, signal::SI_KERNEL, 0),
+                    6 => (SIGILL, signal::ILL_ILLOPN, rip),
+                    14 if p.mm().mapped(cr2) => (signal::SIGSEGV, signal::SEGV_ACCERR, cr2),
+                    14 => (signal::SIGSEGV, signal::SEGV_MAPERR, cr2),
+                    _ => (signal::SIGSEGV, signal::SI_KERNEL, 0),
                 };
-                if let Some(status) = signal::fault(&mut p, &mut ctx, sig, cr2) {
+                if let Some(status) = signal::fault(&mut p, &mut ctx, sig, code, addr) {
                     // The cell's memory with it: a fault the kernel could
                     // not serve is often a full account.
                     let acct = p.cell.account();
@@ -548,10 +1044,14 @@ pub(crate) fn run(mut p: LinuxProcess, mut ctx: UserContext) -> (u32, u32) {
                 }
             }
         }
-        if let Some(status) = signal::deliver(&mut p, &mut ctx, restart) {
+        match signal::deliver(&mut p, &mut ctx, restart) {
+            signal::Fate::Goes => {}
             // A fatal signal ends the whole process.
-            p.group.begin_exit(status, &p.entry);
-            break status;
+            signal::Fate::ProcessEnds(status) => {
+                p.group.begin_exit(status, &p.entry);
+                break status;
+            }
+            signal::Fate::ThreadEnds => break signal::SIGKILL,
         }
     };
     // Robust futexes the thread still holds are marked owner-dead first.
@@ -568,6 +1068,16 @@ pub(crate) fn run(mut p: LinuxProcess, mut ctx: UserContext) -> (u32, u32) {
     let group = p.group.clone();
     *entry.task.lock() = None;
     let last = group.thread_exited(&entry, status);
+    if last.is_none() {
+        stop_progress(&entry, group.threads().len());
+        // A signal this thread was woken to take may be left: it is the
+        // others' now.
+        for t in group.threads() {
+            if interrupted(&t) {
+                wake(&t);
+            }
+        }
+    }
     drop(p);
     if entry.pid != entry.tgid {
         TABLE.lock().remove(&entry.pid);

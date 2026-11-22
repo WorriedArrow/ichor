@@ -23,7 +23,7 @@ pub(super) const O_RDWR: u64 = 0o2;
 const O_CREAT: u64 = 0o100;
 const O_EXCL: u64 = 0o200;
 const O_TRUNC: u64 = 0o1000;
-const O_APPEND: u64 = 0o2000;
+pub(super) const O_APPEND: u64 = 0o2000;
 const O_DIRECTORY: u64 = 0o200_000;
 const O_NOFOLLOW: u64 = 0o400_000;
 pub(super) const O_NONBLOCK: u64 = 0o4000;
@@ -37,7 +37,11 @@ const ERANGE: i64 = 34;
 const ENXIO: i64 = 6;
 
 /// Copy chunk for file I/O.
-const CHUNK: usize = 4096;
+const CHUNK: usize = 64 * 1024;
+
+/// Most bytes one operation on a pipe, socket or device moves at a time
+/// (more than any datagram).
+const STREAM: usize = 256 * 1024;
 
 /// Copies a NUL-terminated path out of user memory. Paths are bytes; one
 /// that is not UTF-8 is carried escaped (`overlay::name`), and names going
@@ -322,12 +326,12 @@ fn read_file(
     let mut done = 0usize;
     while done < count {
         let want = chunk.len().min(count - done);
-        let n = p
-            .vfs
-            .read(f.ino, offset + done as u64, &mut chunk[..want])?;
-        if n == 0 {
-            break;
-        }
+        let n = match p.vfs.read(f.ino, offset + done as u64, &mut chunk[..want]) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if done == 0 => return Err(e),
+            Err(_) => break,
+        };
         let copied = p.copy_to_user(buf + done as u64, &chunk[..n]);
         done += copied;
         if copied < n {
@@ -394,38 +398,85 @@ fn write_file(
     Ok((done as u64, pos))
 }
 
+/// Reads up to `max` bytes (at most [`STREAM`]) from what is not a file:
+/// one read of a pipe, a socket or a device. `nonblock` adds to the
+/// descriptor's own.
+pub(super) fn stream_read(
+    p: &LinuxProcess,
+    f: &Fd,
+    max: usize,
+    nonblock: bool,
+) -> Result<Vec<u8>, i64> {
+    let max = max.min(STREAM);
+    let entry = p.entry.clone();
+    let interrupted = || proc::interrupted(&entry);
+    match f {
+        Fd::Console => Ok(Vec::new()), // No console input yet: EOF.
+        Fd::Object(o) => {
+            if let Some(end) = o.obj.tty() {
+                crate::pty::foreground(p, end, signal::SIGTTIN)?;
+            }
+            o.obj.read(max, o.nonblock || nonblock, &interrupted)
+        }
+        Fd::Dev(d) => {
+            let mut chunk = alloc::vec![0u8; max];
+            let n = d.read(&mut chunk);
+            chunk.truncate(n);
+            Ok(chunk)
+        }
+        Fd::Pipe(e) if e.write => Err(EBADF),
+        Fd::Pipe(e) => e.pipe.take(max, e.nonblock || nonblock, &interrupted),
+        Fd::File(_) => Err(EINVAL),
+    }
+}
+
+/// Writes `data` to what is not a file, in one write: a pipe, a socket (one
+/// datagram) or a device. Returns how much was taken; a reader or peer that
+/// is gone posts SIGPIPE.
+pub(super) fn stream_write(
+    p: &LinuxProcess,
+    f: &Fd,
+    data: &[u8],
+    nonblock: bool,
+) -> Result<usize, i64> {
+    let r = stream_put(p, f, data, nonblock);
+    if r == Err(EPIPE) {
+        proc::post(&p.entry, signal::SIGPIPE);
+    }
+    r
+}
+
+/// [`stream_write`] without the signal.
+fn stream_put(p: &LinuxProcess, f: &Fd, data: &[u8], nonblock: bool) -> Result<usize, i64> {
+    let entry = p.entry.clone();
+    let interrupted = || proc::interrupted(&entry);
+    match f {
+        Fd::Console => {
+            console_bytes(data);
+            Ok(data.len())
+        }
+        Fd::Dev(d) => d.write(data.len()).map(|_| data.len()),
+        Fd::Object(o) => {
+            if let Some(end) = o.obj.tty() {
+                crate::pty::may_write(p, end)?;
+            }
+            o.obj.write(data, o.nonblock || nonblock, &interrupted)
+        }
+        Fd::Pipe(e) if !e.write => Err(EBADF),
+        Fd::Pipe(_) if data.is_empty() => Ok(0),
+        Fd::Pipe(e) => e.pipe.write(data, e.nonblock || nonblock, &interrupted),
+        Fd::File(_) => Err(EINVAL),
+    }
+}
+
 pub(super) fn read(p: &mut LinuxProcess, fd: u64, buf: u64, count: usize) -> Result<u64, i64> {
     match p.fd(fd).ok_or(EBADF)? {
-        Fd::Console => Ok(0), // No console input yet: EOF.
-        Fd::Object(o) => {
-            let entry = p.entry.clone();
-            let bytes = o
-                .obj
-                .read(count, o.nonblock, &|| proc::interrupted(&entry))?;
+        f @ (Fd::Console | Fd::Object(_) | Fd::Dev(_) | Fd::Pipe(_)) => {
+            let bytes = stream_read(p, &f, count, false)?;
             if p.copy_to_user(buf, &bytes) != bytes.len() {
                 return Err(EFAULT);
             }
             Ok(bytes.len() as u64)
-        }
-        Fd::Dev(d) => {
-            let mut chunk = alloc::vec![0u8; CHUNK.min(count)];
-            let n = d.read(&mut chunk);
-            if p.copy_to_user(buf, &chunk[..n]) != n {
-                return Err(EFAULT);
-            }
-            Ok(n as u64)
-        }
-        Fd::Pipe(e) if e.write => Err(EBADF),
-        Fd::Pipe(e) => {
-            let mut chunk = alloc::vec![0u8; CHUNK.min(count)];
-            let entry = p.entry.clone();
-            let n = e
-                .pipe
-                .read(&mut chunk, e.nonblock, &|| proc::interrupted(&entry))?;
-            if p.copy_to_user(buf, &chunk[..n]) != n {
-                return Err(EFAULT);
-            }
-            Ok(n as u64)
         }
         Fd::File(_) => {
             // Hold the description across the read: its offset is shared.
@@ -445,23 +496,9 @@ pub(super) fn write(p: &mut LinuxProcess, fd: u64, buf: u64, count: usize) -> Re
     match p.fd(fd).ok_or(EBADF)? {
         Fd::Console => Ok(console_write(p, buf, count) as u64),
         Fd::Dev(d) => d.write(count).map(|n| n as u64),
-        Fd::Object(o) => {
-            let mut data = alloc::vec![0u8; count.min(CHUNK)];
-            if p.copy_from_user(buf, &mut data) != data.len() {
-                return Err(EFAULT);
-            }
-            let entry = p.entry.clone();
-            let r = o
-                .obj
-                .write(&data, o.nonblock, &|| proc::interrupted(&entry));
-            // A socket whose peer is gone (only sockets answer EPIPE here).
-            if r == Err(EPIPE) {
-                proc::post(&p.entry, signal::SIGPIPE);
-            }
-            r.map(|n| n as u64)
+        f @ (Fd::Object(_) | Fd::Pipe(_)) => {
+            stream_gather(p, &f, &[(buf, count)], false, true).map(|n| n as u64)
         }
-        Fd::Pipe(e) if !e.write => Err(EBADF),
-        Fd::Pipe(e) => pipe_write(p, &e, buf, count),
         Fd::File(_) => {
             let desc = p.desc(fd).ok_or(EBADF)?;
             let mut st = desc.state();
@@ -497,7 +534,87 @@ pub(super) fn pwrite(
     write_file(p, f, off, buf, count).map(|(n, _)| n)
 }
 
-/// `readv` (`write == false`) and `writev`.
+/// Writes the user memory of `iov` (base, length; see [`read_iov`]), taken
+/// together, to a pipe or an object: at most [`STREAM`] bytes a write, so
+/// whatever fits there is one (a datagram, or a pipe write of `PIPE_BUF`).
+/// Stops, with what went so far, at the first that is short or fails. EPIPE
+/// raises SIGPIPE if `sigpipe`.
+pub(super) fn stream_gather(
+    p: &mut LinuxProcess,
+    f: &Fd,
+    iov: &[(u64, usize)],
+    nonblock: bool,
+    sigpipe: bool,
+) -> Result<usize, i64> {
+    let total: usize = iov.iter().map(|&(_, n)| n).sum();
+    let mut data = alloc::vec![0u8; total.min(STREAM)];
+    let (mut i, mut at) = (0, 0); // where in `iov` the next byte is
+    let mut done = 0usize;
+    loop {
+        let want = data.len().min(total - done);
+        let mut have = 0;
+        while have < want {
+            let (base, len) = iov[i];
+            let n = (len - at).min(want - have);
+            let got = p.copy_from_user(base + at as u64, &mut data[have..have + n]);
+            have += got;
+            at += got;
+            if got < n {
+                break; // unreadable from here on
+            }
+            if at == len {
+                (i, at) = (i + 1, 0);
+            }
+        }
+        if have < want && have == 0 {
+            return if done == 0 { Err(EFAULT) } else { Ok(done) };
+        }
+        match stream_put(p, f, &data[..have], nonblock) {
+            Ok(n) => {
+                done += n;
+                if n < have || have < want || done == total {
+                    return Ok(done);
+                }
+            }
+            Err(e) => {
+                if e == EPIPE && sigpipe {
+                    proc::post(&p.entry, signal::SIGPIPE);
+                }
+                return if done == 0 { Err(e) } else { Ok(done) };
+            }
+        }
+    }
+}
+
+/// A `struct iovec` array: (base, length) of each.
+pub(super) fn read_iov(
+    p: &mut LinuxProcess,
+    iov: u64,
+    iovcnt: usize,
+) -> Result<Vec<(u64, usize)>, i64> {
+    const IOV_MAX: usize = 1024;
+    if iovcnt > IOV_MAX {
+        return Err(EINVAL);
+    }
+    let mut raw = alloc::vec![0u8; iovcnt * 16];
+    if p.copy_from_user(iov, &mut raw) != raw.len() {
+        return Err(EFAULT);
+    }
+    let mut total = 0usize;
+    let mut v = Vec::with_capacity(iovcnt);
+    for c in raw.as_chunks::<16>().0 {
+        let len = usize::try_from(le_u64(&c[8..16])).map_err(|_| EINVAL)?;
+        total = total
+            .checked_add(len)
+            .filter(|&t| t <= isize::MAX as usize)
+            .ok_or(EINVAL)?;
+        v.push((le_u64(&c[0..8]), len));
+    }
+    Ok(v)
+}
+
+/// `readv` (`write == false`) and `writev`: one operation on a pipe, a
+/// socket or a device, whatever the pieces.
 pub(super) fn vector(
     p: &mut LinuxProcess,
     fd: u64,
@@ -505,29 +622,46 @@ pub(super) fn vector(
     iovcnt: usize,
     is_write: bool,
 ) -> Result<u64, i64> {
-    if iovcnt > 1024 {
-        return Err(EINVAL);
+    let f = p.fd(fd).ok_or(EBADF)?;
+    let iov = read_iov(p, iov, iovcnt)?;
+    let total: usize = iov.iter().map(|&(_, n)| n).sum();
+    if total == 0 {
+        return Ok(0);
     }
-    p.fd(fd).ok_or(EBADF)?;
-    let mut total = 0u64;
-    for i in 0..iovcnt {
-        // struct iovec { void *iov_base; size_t iov_len; }
-        let mut hdr = [0u8; 16];
-        if p.copy_from_user(iov + i as u64 * 16, &mut hdr) != 16 {
-            return Err(EFAULT);
+    if !matches!(f, Fd::File(_) | Fd::Console | Fd::Dev(_)) {
+        if is_write {
+            return stream_gather(p, &f, &iov, false, true).map(|n| n as u64);
         }
-        let (base, len) = (le_u64(&hdr[0..8]), le_u64(&hdr[8..16]) as usize);
-        let n = if is_write {
-            write(p, fd, base, len)?
+        let bytes = stream_read(p, &f, total, false)?;
+        let mut at = 0;
+        for (base, len) in iov {
+            let n = len.min(bytes.len() - at);
+            if p.copy_to_user(base, &bytes[at..at + n]) != n {
+                return Err(EFAULT);
+            }
+            at += n;
+        }
+        return Ok(at as u64);
+    }
+    let mut done = 0u64;
+    for (base, len) in iov {
+        let r = if is_write {
+            write(p, fd, base, len)
         } else {
-            read(p, fd, base, len)?
+            read(p, fd, base, len)
         };
-        total += n;
-        if (n as usize) < len {
-            break;
+        match r {
+            Ok(n) => {
+                done += n;
+                if (n as usize) < len {
+                    break;
+                }
+            }
+            Err(e) if done == 0 => return Err(e),
+            Err(_) => break,
         }
     }
-    Ok(total)
+    Ok(done)
 }
 
 /// `preadv`/`pwritev` (and the `2` forms with no flags): the vector I/O
@@ -908,12 +1042,27 @@ pub(super) fn access(
     mode: u64,
     flags: u64,
 ) -> Result<u64, i64> {
-    let (start, path) = path_at(p, dirfd, addr)?;
-    if let Some(node) = procfs::lookup(p, &path, true) {
-        return node.map(|_| 0);
-    }
     // Checked with the real ids (AT_EACCESS: effective), as Linux does.
     const AT_EACCESS: u64 = 0x200;
+    if flags & !(AT_EACCESS | AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 || mode & !7 != 0 {
+        return Err(EINVAL);
+    }
+    let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
+    let path = user_path(p, addr)?;
+    let named = if flags & AT_EMPTY_PATH != 0 && path.is_empty() {
+        // The descriptor itself (the working directory, for AT_FDCWD).
+        match p.fd(dirfd as u64) {
+            _ if dirfd == AT_FDCWD => Ok(base(p, dirfd, "")?),
+            Some(Fd::File(f)) => Ok(f.ino),
+            Some(_) => return Ok(0),
+            None => return Err(EBADF),
+        }
+    } else {
+        Err(base(p, dirfd, &path)?)
+    };
+    if let Some(node) = procfs::lookup(p, &path, follow) {
+        return node.map(|_| 0);
+    }
     let c = p.group.creds();
     let cred = if flags & AT_EACCESS != 0 {
         c.fs()
@@ -921,7 +1070,10 @@ pub(super) fn access(
         c.real()
     };
     let mut fs = p.vfs.lock_as(cred);
-    let ino = fs.resolve(start, &path, true)?;
+    let ino = match named {
+        Ok(ino) => ino,
+        Err(start) => fs.resolve(start, &path, follow)?,
+    };
     let mask = (mode & 7) as u32;
     if mask != 0 {
         fs.permission(ino, mask)?;
@@ -1253,7 +1405,12 @@ pub(super) fn sendfile(
     offp: u64,
     count: usize,
 ) -> Result<u64, i64> {
-    let src = file(p, in_fd)?;
+    let src = match p.fd(in_fd).ok_or(EBADF)? {
+        Fd::File(f) => f,
+        Fd::Pipe(_) | Fd::Object(_) if offp != 0 => return Err(ESPIPE),
+        // Not something to read pages of (callers read and write instead).
+        _ => return Err(EINVAL),
+    };
     let out = p.fd(out_fd).ok_or(EBADF)?;
     if let Fd::File(o) = out
         && o.flags & O_ACCMODE == 0
@@ -1287,22 +1444,6 @@ pub(super) fn sendfile(
             break;
         }
         let wrote: Result<usize, i64> = match p.fd(out_fd).ok_or(EBADF)? {
-            Fd::Console => {
-                console_bytes(&buf[..n]);
-                Ok(n)
-            }
-            Fd::Dev(d) => d.write(n).map(|_| n),
-            Fd::Object(o) => {
-                let entry = p.entry.clone();
-                o.obj
-                    .write(&buf[..n], o.nonblock, &|| proc::interrupted(&entry))
-            }
-            Fd::Pipe(e) if !e.write => Err(EBADF),
-            Fd::Pipe(e) => {
-                let entry = p.entry.clone();
-                e.pipe
-                    .write(&buf[..n], e.nonblock, &|| proc::interrupted(&entry))
-            }
             Fd::File(o) => {
                 let at = if o.flags & O_APPEND != 0 {
                     p.fs().stat(o.ino)?.size
@@ -1317,6 +1458,7 @@ pub(super) fn sendfile(
                 }
                 r
             }
+            f => stream_write(p, &f, &buf[..n], false),
         };
         let m = match wrote {
             Ok(m) => m,
@@ -1335,40 +1477,6 @@ pub(super) fn sendfile(
         }
     } else {
         p.with_file(in_fd, |f| f.offset = offset);
-    }
-    Ok(done as u64)
-}
-
-/// Writes user memory to a pipe's write end, in chunks.
-fn pipe_write(p: &mut LinuxProcess, e: &PipeEnd, buf: u64, count: usize) -> Result<u64, i64> {
-    let mut chunk = alloc::vec![0u8; CHUNK.min(count.max(1))];
-    let mut done = 0usize;
-    while done < count {
-        let want = chunk.len().min(count - done);
-        let got = p.copy_from_user(buf + done as u64, &mut chunk[..want]);
-        if got == 0 {
-            return if done == 0 {
-                Err(EFAULT)
-            } else {
-                Ok(done as u64)
-            };
-        }
-        let entry = p.entry.clone();
-        match e
-            .pipe
-            .write(&chunk[..got], e.nonblock, &|| proc::interrupted(&entry))
-        {
-            Ok(n) => done += n,
-            Err(err) => {
-                if err == EPIPE {
-                    proc::post(&p.entry, signal::SIGPIPE);
-                }
-                if done == 0 {
-                    return Err(err);
-                }
-                break;
-            }
-        }
     }
     Ok(done as u64)
 }

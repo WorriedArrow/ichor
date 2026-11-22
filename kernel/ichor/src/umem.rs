@@ -528,6 +528,11 @@ impl Mm {
         self.files = kept;
     }
 
+    /// Whether anything is mapped at `addr` (with whatever permissions).
+    pub(crate) fn mapped(&self, addr: u64) -> bool {
+        self.regions.find(addr).is_some()
+    }
+
     /// Handles a user page fault at `addr`. Returns false if the access is
     /// not allowed (the process should get `SIGSEGV`).
     pub(crate) fn fault(&mut self, addr: u64, write: bool, exec: bool) -> bool {

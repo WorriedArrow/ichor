@@ -84,10 +84,7 @@ pub(crate) fn open(p: &mut LinuxProcess, num: u32, ino: Ino, flags: u64) -> Resu
         FULL => Fd::Dev(Device::Full),
         RANDOM | URANDOM => Fd::Dev(Device::Random),
         PTMX => return crate::pty::open_master(p, ino, nonblock),
-        TTY => match crate::pty::open_controlling(p, nonblock) {
-            Some(r) => return r,
-            None => Fd::Console,
-        },
+        TTY => return crate::pty::open_controlling(p, nonblock).unwrap_or(Err(ENXIO)),
         CONSOLE => Fd::Console,
         n if (crate::pty::PTS_MAJOR..crate::pty::PTS_MAJOR + 8).contains(&(n >> 8)) => {
             return crate::pty::open_slave(p, n, ino, flags & O_NOCTTY != 0, nonblock);

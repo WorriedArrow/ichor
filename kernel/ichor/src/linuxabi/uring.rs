@@ -628,7 +628,8 @@ fn syscall(p: &mut LinuxProcess, nr: u64, args: [u64; 6]) -> i64 {
     ctx.r9 = args[5];
     let _ = super::dispatch(p, &mut ctx);
     let r = ctx.rax as i64;
-    if r == -crate::signal::ERESTARTSYS {
+    if crate::signal::Restart::of(nr, r).is_some() {
+        p.resume_until = None;
         -EINTR
     } else {
         r
@@ -888,10 +889,13 @@ pub(super) fn enter(p: &mut LinuxProcess, a: &[u64; 6]) -> Result<u64, i64> {
             let ready = fds.iter().any(|(f, need)| poll::readiness(f) & need != 0);
             (ready || ring.cq_ready() >= min_complete).then_some(())
         });
-        match r {
-            Err(e) if submitted == 0 => return Err(e),
-            Err(_) => return Ok(u64::from(submitted)),
-            Ok(_) => {}
+        if r.is_err() {
+            p.resume_until = None;
+            return if submitted == 0 {
+                Err(EINTR)
+            } else {
+                Ok(u64::from(submitted))
+            };
         }
         ring.run(p);
         if deadline.is_some_and(|d| frame::time::now() >= d) && ring.cq_ready() < min_complete {

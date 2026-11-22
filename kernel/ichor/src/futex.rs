@@ -33,7 +33,6 @@ const EFAULT: i64 = 14;
 const EINVAL: i64 = 22;
 const ENOSYS: i64 = 38;
 const ETIMEDOUT: i64 = 110;
-const EINTR: i64 = 4;
 
 const FUTEX_WAIT: u64 = 0;
 const FUTEX_WAKE: u64 = 1;
@@ -218,6 +217,7 @@ fn wait(
     if bitset == 0 {
         return Err(EINVAL);
     }
+    let deadline = deadline.map(|d| p.resume_until.take().unwrap_or(d));
     p.mm().populate(addr, 4, false);
     let k = key(p, addr);
     let w = Arc::new(Waiter {
@@ -266,7 +266,16 @@ fn wait(
     if w.woken.load(Ordering::SeqCst) {
         return Ok(0); // woken while we were leaving
     }
-    Err(if timed_out { ETIMEDOUT } else { EINTR })
+    match deadline {
+        Some(_) if timed_out => Err(ETIMEDOUT),
+        // A timed wait goes on to its deadline if no handler runs (else
+        // EINTR), an untimed one restarts as any blocking call does.
+        Some(_) => {
+            p.resume_until = deadline;
+            Err(crate::signal::ERESTARTNOHAND)
+        }
+        None => Err(crate::signal::ERESTARTSYS),
+    }
 }
 
 fn requeue(

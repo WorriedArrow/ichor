@@ -288,6 +288,14 @@ impl<'a> UserMode<'a> {
     /// Enters ring 3 and returns when the thread traps, updating the context
     /// with the user's registers.
     pub fn execute(&mut self) -> UserEvent {
+        self.execute_unless(|| false)
+    }
+
+    /// [`Self::execute`], unless `hold` says not to enter: then
+    /// [`UserEvent::Preempted`] at once. It is asked with interrupts off, so
+    /// what becomes true later, announced with
+    /// [`Task::interrupt`](crate::task::Task::interrupt), ends the run.
+    pub fn execute_unless(&mut self, hold: impl FnOnce() -> bool) -> UserEvent {
         use core::sync::atomic::Ordering::Relaxed;
         // Never enter ring 3 with state `iretq` or `wrmsr` would fault on in
         // the kernel: RIP and RSP must be user addresses, and so must the FS
@@ -301,6 +309,9 @@ impl<'a> UserMode<'a> {
             };
         }
         let _guard = cpu::IrqGuard::new();
+        if hold() {
+            return UserEvent::Preempted;
+        }
         let block = cpu::this_block();
         self.ctx.rflags = (self.ctx.rflags & USER_RFLAGS_ALLOWED) | RFLAGS_IF | RFLAGS_RESERVED1;
         block
