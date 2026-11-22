@@ -558,7 +558,8 @@ pub fn run(
     cfg.capture = true;
     cfg.memory_mib = suite.memory_mib;
     cfg.smp = 4;
-    cfg.timeout = Some(Duration::from_secs(6 * 3600));
+    // (OpenJDK's tier 1 takes most of a night under emulation.)
+    cfg.timeout = Some(Duration::from_secs(21 * 3600));
     cfg_tweak(&mut cfg);
     let suite = *suite;
     let client = std::thread::spawn(move || -> Result<(String, u32)> {
@@ -591,7 +592,7 @@ pub fn run(
             &cell.cell_id,
             &a,
             suite.env,
-            Duration::from_secs(5 * 3600),
+            Duration::from_secs(20 * 3600),
             &mut |b| {
                 use std::io::Write;
                 let _ = file.write_all(b);
