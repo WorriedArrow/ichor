@@ -139,7 +139,12 @@ pub(crate) fn frame_race() {
     };
     let mut late = 0usize;
     let mut hit = 0usize;
-    for _ in 0..ROUNDS {
+    // On a loaded host the writer's CPU may not run in any of the rounds:
+    // more of them then, until it has (or plainly never will).
+    let patience = frame::time::now() + core::time::Duration::from_secs(20);
+    let mut rounds = 0;
+    while rounds < ROUNDS || (hit == 0 && frame::time::now() < patience) {
+        rounds += 1;
         let f = UFrame::alloc_zeroed().unwrap_or_else(|| fail("usercopy: no page"));
         if space.map(VA, &f, rw).is_err() {
             fail("usercopy: map");
@@ -162,14 +167,14 @@ pub(crate) fn frame_race() {
         fail("usercopy: the writer never reached a mapped page (the race test proves nothing)");
     }
     if late != 0 {
-        println!("ichor: usercopy: {late} of {ROUNDS} pages were written after unmap returned");
+        println!("ichor: usercopy: {late} of {rounds} pages were written after unmap returned");
         fail("usercopy: a kernel copy wrote into a page after it was unmapped");
     }
     if Arc::strong_count(&space) != 1 {
         fail("usercopy: the space is still referenced");
     }
     println!(
-        "ichor: usercopy: frame refuses kernel writes through read-only PTEs; no copy landed after unmap ({ROUNDS} rounds, {hit} written while mapped, {} ms)",
+        "ichor: usercopy: frame refuses kernel writes through read-only PTEs; no copy landed after unmap ({rounds} rounds, {hit} written while mapped, {} ms)",
         frame::time::now().saturating_sub(start).as_millis()
     );
 }

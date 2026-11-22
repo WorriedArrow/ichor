@@ -103,8 +103,8 @@ fn sha256(b: &[u8]) -> String {
 }
 
 /// Serves `body` to every HTTP request on 127.0.0.1 (the guest's
-/// 10.0.2.2) until the process ends; returns the port, and how often it
-/// was asked.
+/// 10.0.2.2), by a redirect under `/moved/`, until the process ends;
+/// returns the port, and how often it was asked.
 fn serve(body: Vec<u8>) -> (u16, Arc<AtomicU32>) {
     let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = l.local_addr().unwrap().port();
@@ -115,7 +115,14 @@ fn serve(body: Vec<u8>) -> (u16, Arc<AtomicU32>) {
             count.fetch_add(1, Ordering::SeqCst);
             let mut req = [0u8; 4096];
             let _ = s.set_read_timeout(Some(Duration::from_secs(10)));
-            let _ = s.read(&mut req);
+            let n = s.read(&mut req).unwrap_or(0);
+            // What was asked for is elsewhere, as release files often are.
+            if req[..n].starts_with(b"GET /moved/") {
+                let _ = s.write_all(
+                    b"HTTP/1.1 302 Found\r\nLocation: /extra.tar.gz\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+                continue;
+            }
             let head = format!(
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/gzip\r\nConnection: close\r\n\r\n",
                 body.len()
@@ -195,7 +202,7 @@ fn session(port: u16, layer_port: u16) -> Result<(Ran, Ran), String> {
 
     let body = extra_layer();
     let layer = |digest: String| control::LayerSource {
-        url: format!("http://10.0.2.2:{layer_port}/extra.tar.gz"),
+        url: format!("http://10.0.2.2:{layer_port}/moved/extra.tar.gz"),
         digest,
         from: "src/".into(),
         to: "/opt/extra/".into(),
@@ -460,6 +467,6 @@ fn the_control_plane_pulls_and_runs_an_image_from_docker_hub() {
          hello from an extra layer\n127.0.0.1\tlocalhost\nichor\n"
     );
     assert_eq!(exit, 3 << 8);
-    // Once refused, once for both layers.
-    assert_eq!(asked.load(Ordering::SeqCst), 2);
+    // Once refused, once for both layers, each after a redirect.
+    assert_eq!(asked.load(Ordering::SeqCst), 4);
 }

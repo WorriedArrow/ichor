@@ -123,6 +123,37 @@ struct Pull {
     /// Layers to add, and those fetched and verified so far.
     layers: Vec<control::LayerSource>,
     extras: Vec<Rc<Vec<u8>>>,
+    /// Where the layer being fetched was redirected to, and how often.
+    at: Option<(http::Url, u32)>,
+}
+
+/// Most redirects followed for one layer.
+const MAX_REDIRECTS: u32 = 5;
+
+/// Where a redirect of the layer at `url` leads, which was already
+/// redirected to `at`. (What is fetched there has to hash to the pinned
+/// digest all the same; a layer asked for over TLS stays on it.)
+fn moved(
+    url: &str,
+    at: Option<(http::Url, u32)>,
+    resp: &http::Response,
+) -> Result<(http::Url, u32), String> {
+    let (base, times) = match at {
+        Some(at) => at,
+        None => (
+            http::Url::parse(url).ok_or("a layer URL does not parse")?,
+            0,
+        ),
+    };
+    let to = resp.header("location").and_then(|l| base.join(l));
+    let to = to.ok_or_else(|| format!("layer {url}: a redirect to nowhere"))?;
+    if times >= MAX_REDIRECTS {
+        return Err(format!("layer {url}: too many redirects"));
+    }
+    if base.is_https() && !to.is_https() {
+        return Err(format!("layer {url}: redirected off TLS"));
+    }
+    Ok((to, times + 1))
 }
 
 /// Whether `d` is a digest we can check (`sha256:` and 64 hex digits).
@@ -560,6 +591,7 @@ impl Control {
                     pulled: None,
                     layers: req.layers,
                     extras: Vec::new(),
+                    at: None,
                 });
             }
             control::CREATE_CELL => {
@@ -763,6 +795,11 @@ impl Control {
                             rt::log!("control: {} answered {status} ({len} bytes)", p.reference);
                         } else {
                             let l = &p.layers[p.extras.len()];
+                            if (300..400).contains(&status) {
+                                p.at = Some(moved(&l.url, p.at.take(), &resp)?);
+                                continue;
+                            }
+                            p.at = None;
                             if status != 200 {
                                 return Err(format!("layer {}: HTTP {status}", l.url));
                             }
@@ -798,7 +835,10 @@ impl Control {
                     p.extras.push(data);
                     continue;
                 }
-                let url = http::Url::parse(&l.url).ok_or("a layer URL does not parse")?;
+                let url = match &p.at {
+                    Some((url, _)) => url.clone(),
+                    None => http::Url::parse(&l.url).ok_or("a layer URL does not parse")?,
+                };
                 p.fetch = Some(Fetch::start(http::Request::get(url), &mut self.net)?);
                 continue;
             }

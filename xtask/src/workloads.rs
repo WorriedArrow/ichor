@@ -197,8 +197,8 @@ pub const JVM: Suite = Suite {
     image: "docker.io/library/eclipse-temurin@sha256:a09e64f4976df9c4f2029c6abe64fc26f069a342ec9a7f147dce7b1933ebda16",
     layers: &[
         LayerPin {
-            url: "https://ci.adoptium.net/view/Dependencies/job/dependency_pipeline/lastSuccessfulBuild/artifact/jtreg/jtreg-7.5.2+1.tar.gz",
-            sha256: "sha256:50ec25adec1e6a4b1bc023fda2f706c524beec5d9f022a7901f009efa08033f8",
+            url: "https://ci.adoptium.net/view/Dependencies/job/dependency_pipeline/lastSuccessfulBuild/artifact/jtreg/jtreg-8.2.1+1.tar.gz",
+            sha256: "sha256:07d1a51162d5b60c2709fecb5438c7ba9d3d698a9ac7673256e4e6c5364a2201",
             from: "jtreg/",
             to: "/opt/jtreg/",
         },
@@ -211,6 +211,12 @@ pub const JVM: Suite = Suite {
         LayerPin {
             url: JDK_SOURCES,
             sha256: JDK_SHA256,
+            from: "jdk-21.0.13.1+2-src/test/jtreg-ext/",
+            to: "/usr/src/jdk/test/jtreg-ext/",
+        },
+        LayerPin {
+            url: JDK_SOURCES,
+            sha256: JDK_SHA256,
             from: "jdk-21.0.13.1+2-src/test/lib/",
             to: "/usr/src/jdk/test/lib/",
         },
@@ -218,10 +224,11 @@ pub const JVM: Suite = Suite {
     argv: &[
         "sh",
         "-c",
-        "cd /usr/src/jdk/test/jdk && [ $# -gt 0 ] || set -- :tier1; \
-         exec sh /opt/jtreg/bin/jtreg -jdk:\"$JAVA_HOME\" -agentvm -automatic -ignore:quiet \
-         -conc:4 -timeoutFactor:10 -verbose:summary -exclude:ProblemList.txt \
-         -w:/tmp/work -r:/tmp/report \"$@\"",
+        // Not as root, which is refused nothing: some tests want it to be.
+        "useradd -m jdk; cd /usr/src/jdk/test/jdk && { [ $# -gt 0 ] || set -- :tier1; } && \
+         exec su jdk -c 'exec sh /opt/jtreg/bin/jtreg -jdk:\"$JAVA_HOME\" -agentvm -automatic \
+         -ignore:quiet -conc:4 -timeoutFactor:10 -verbose:summary -exclude:ProblemList.txt \
+         -w:/tmp/work -r:/tmp/report \"$@\"' -- \"$0\" \"$@\"",
         "jvm",
     ],
     all: &[],
