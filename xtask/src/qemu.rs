@@ -88,6 +88,10 @@ impl Accel {
     pub fn cpu_model(self) -> &'static str {
         match self {
             Accel::Kvm | Accel::Hvf => "host",
+            // TCG computes a fused multiply-add with the host C library's
+            // `fma`, and mingw's rounds twice: programs that use FMA where
+            // there is one (libm, PostgreSQL, Go) get wrong last digits.
+            Accel::Tcg if cfg!(windows) => "max,-fma",
             _ => "max",
         }
     }

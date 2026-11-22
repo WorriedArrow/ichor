@@ -89,7 +89,129 @@ pub const GO: Suite = Suite {
     parse: parse_go,
 };
 
-pub const SUITES: &[Suite] = &[PYTHON, GO];
+/// PostgreSQL 16, `make check`: its regression suite needs `pg_regress` and
+/// `regress.so`, which the official image does not carry and only the
+/// source tree makes, so the suite builds the server too, in the official
+/// image Docker's own images are built on (a compiler, make, and Debian's
+/// libraries). Named tests run with the schedule's setup tests.
+pub const POSTGRES: Suite = Suite {
+    name: "postgres",
+    image: "docker.io/library/buildpack-deps@sha256:f53cd4c58cdb96a467b98696cd510a949ef4ccd7d23e07b75107de754773007a",
+    layers: &[LayerPin {
+        url: "https://ftp.postgresql.org/pub/source/v16.16/postgresql-16.16.tar.gz",
+        sha256: "sha256:3e930f3366f675ab26e873d16201201f8e9b6d9bc13686e4465380271145ea2d",
+        from: "postgresql-16.16/",
+        to: "/usr/src/postgresql/",
+    }],
+    argv: &[
+        "sh",
+        "-c",
+        // The server refuses to run as root, and its tests write where they
+        // are built.
+        "set -e; useradd -m pg; cp -r /usr/src/postgresql /home/pg/src; \
+         chown -R pg /home/pg/src; \
+         exec su pg -c 'set -e; cd ~/src; \
+         ./configure --prefix=/home/pg/inst --without-icu --without-readline \
+         --without-zlib CFLAGS=-O1 >../configure.log 2>&1 || { tail ../configure.log; exit 1; }; \
+         make -s -j4 >../make.log 2>&1 || { tail ../make.log; exit 1; }; \
+         echo built; cd src/test/regress; \
+         if [ $# -gt 0 ]; then make -s check-tests TESTS=\"test_setup $*\"; \
+         else make -s check; fi; s=$?; \
+         cat regression.diffs 2>/dev/null | head -c 2000000; exit $s' -- \"$0\" \"$@\"",
+        "postgres",
+    ],
+    all: &[],
+    env: &["HOME=/root"],
+    unit: "tests",
+    memory_mib: 10 * 1024,
+    cell_bytes: 5 << 30,
+    parse: parse_tap,
+};
+
+/// Node.js 24's `test/parallel` and `test/sequential`, from the release the
+/// image holds, run by its own `tools/test.py` (the full image, not the slim
+/// one, has the Python that needs).
+pub const NODE: Suite = Suite {
+    name: "node",
+    image: "docker.io/library/node@sha256:9d266751ca3d7fdbe651c878ffd5ad0a42fed49a18c283509267c97f025b7496",
+    layers: &[
+        LayerPin {
+            url: "https://nodejs.org/dist/v24.22.3/node-v24.22.3.tar.gz",
+            sha256: "sha256:4690edccae352134bbe31d844b37898f2a28b2c3d67901d0112fb6c4996d556a",
+            from: "node-v24.22.3/test/",
+            to: "/usr/src/node/test/",
+        },
+        LayerPin {
+            url: "https://nodejs.org/dist/v24.22.3/node-v24.22.3.tar.gz",
+            sha256: "sha256:4690edccae352134bbe31d844b37898f2a28b2c3d67901d0112fb6c4996d556a",
+            from: "node-v24.22.3/tools/",
+            to: "/usr/src/node/tools/",
+        },
+    ],
+    argv: &[
+        "sh",
+        "-c",
+        "cd /usr/src/node && [ $# -gt 0 ] || set -- parallel sequential; \
+         exec python3 tools/test.py -J --shell=/usr/local/bin/node -p tap --timeout 600 \"$@\"",
+        "node",
+    ],
+    all: &[],
+    env: &["HOME=/root"],
+    unit: "tests",
+    memory_mib: 10 * 1024,
+    cell_bytes: 4 << 30,
+    parse: parse_node,
+};
+
+/// Where Temurin publishes the sources of its JDK 21.
+const JDK_SOURCES: &str = "https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.13.1%2B2/OpenJDK21U-jdk-sources_21.0.13.1_2.tar.gz";
+const JDK_SHA256: &str = "sha256:427e3eaec042f61c93258b5a42c86f3ddbad45a2ba95132dd4a3e3c07414bc8c";
+
+/// OpenJDK 21's tier 1 tests of the libraries (java.lang, java.util, math,
+/// ...), from the sources Temurin built the image's JDK of, run by jtreg
+/// (Adoptium's build, which its own CI uses). Tests with native parts need
+/// libraries only an OpenJDK build has: they count as failed.
+pub const JVM: Suite = Suite {
+    name: "jvm",
+    image: "docker.io/library/eclipse-temurin@sha256:a09e64f4976df9c4f2029c6abe64fc26f069a342ec9a7f147dce7b1933ebda16",
+    layers: &[
+        LayerPin {
+            url: "https://ci.adoptium.net/view/Dependencies/job/dependency_pipeline/lastSuccessfulBuild/artifact/jtreg/jtreg-7.5.2+1.tar.gz",
+            sha256: "sha256:50ec25adec1e6a4b1bc023fda2f706c524beec5d9f022a7901f009efa08033f8",
+            from: "jtreg/",
+            to: "/opt/jtreg/",
+        },
+        LayerPin {
+            url: JDK_SOURCES,
+            sha256: JDK_SHA256,
+            from: "jdk-21.0.13.1+2-src/test/jdk/",
+            to: "/usr/src/jdk/test/jdk/",
+        },
+        LayerPin {
+            url: JDK_SOURCES,
+            sha256: JDK_SHA256,
+            from: "jdk-21.0.13.1+2-src/test/lib/",
+            to: "/usr/src/jdk/test/lib/",
+        },
+    ],
+    argv: &[
+        "sh",
+        "-c",
+        "cd /usr/src/jdk/test/jdk && [ $# -gt 0 ] || set -- :tier1; \
+         exec sh /opt/jtreg/bin/jtreg -jdk:\"$JAVA_HOME\" -agentvm -automatic -ignore:quiet \
+         -conc:4 -timeoutFactor:10 -verbose:summary -exclude:ProblemList.txt \
+         -w:/tmp/work -r:/tmp/report \"$@\"",
+        "jvm",
+    ],
+    all: &[],
+    env: &["HOME=/root"],
+    unit: "tests",
+    memory_mib: 10 * 1024,
+    cell_bytes: 5 << 30,
+    parse: parse_jtreg,
+};
+
+pub const SUITES: &[Suite] = &[PYTHON, GO, POSTGRES, NODE, JVM];
 
 /// A suite's result, from its own summary.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -167,6 +289,73 @@ pub fn parse_go(out: &str) -> Score {
             "FAIL" => s.failed.push(pkg),
             "?   " => s.skipped.push(pkg),
             _ => {}
+        }
+    }
+    s
+}
+
+/// Parses TAP as `pg_regress` 16 writes it ("ok 2         + boolean  59 ms",
+/// "not ok 5     - copy  10 ms"): a number, `+` or `-` (in a parallel group
+/// or not), the test's name.
+pub fn parse_tap(out: &str) -> Score {
+    let mut s = Score::default();
+    for line in out.lines() {
+        let (into, rest) = match (line.strip_prefix("ok "), line.strip_prefix("not ok ")) {
+            (Some(r), _) => (&mut s.passed, r),
+            (_, Some(r)) => (&mut s.failed, r),
+            _ => continue,
+        };
+        let mut f = rest.split_whitespace();
+        if let (Some(n), Some("+" | "-"), Some(name)) = (f.next(), f.next(), f.next())
+            && n.parse::<u32>().is_ok()
+        {
+            into.push(name.to_string());
+        }
+    }
+    s
+}
+
+/// Parses TAP as Node.js's `tools/test.py` writes it ("ok 3
+/// parallel/test-x", "not ok 4 ...", "ok 5 ... # skip why").
+pub fn parse_node(out: &str) -> Score {
+    let mut s = Score::default();
+    for line in out.lines() {
+        let (ok, rest) = match (line.strip_prefix("ok "), line.strip_prefix("not ok ")) {
+            (Some(r), _) => (true, r),
+            (_, Some(r)) => (false, r),
+            _ => continue,
+        };
+        let mut f = rest.split_whitespace();
+        let (Some(n), Some(name)) = (f.next(), f.next()) else {
+            continue;
+        };
+        if n.parse::<u32>().is_err() {
+            continue;
+        }
+        if rest.contains(" # skip") || rest.contains(" # SKIP") {
+            s.skipped.push(name.to_string());
+        } else if ok {
+            s.passed.push(name.to_string());
+        } else {
+            s.failed.push(name.to_string());
+        }
+    }
+    s
+}
+
+/// Parses `jtreg -verbose:summary`: "Passed: java/lang/X.java", "FAILED:
+/// ..." and "Error: ..." (a test that could not be run).
+pub fn parse_jtreg(out: &str) -> Score {
+    let mut s = Score::default();
+    for line in out.lines() {
+        let test = |head: &str| {
+            let t = line.strip_prefix(head)?.trim();
+            (t.contains('/') && !t.contains(' ')).then(|| t.to_string())
+        };
+        if let Some(t) = test("Passed: ") {
+            s.passed.push(t);
+        } else if let Some(t) = test("FAILED: ").or_else(|| test("Error: ")) {
+            s.failed.push(t);
         }
     }
     s
@@ -463,6 +652,49 @@ Result: FAILURE
         let s = parse_python("2 tests OK:\n    test_bool test_int\n\nTotal duration: 1 sec\n");
         assert_eq!(s.passed, ["test_bool", "test_int"]);
         assert!(s.failed.is_empty());
+    }
+
+    #[test]
+    fn pg_regress_tests_are_scored() {
+        let s = parse_tap(
+            "# initializing database system by copying initdb template\n\
+             ok 1         - test_setup                                480 ms\n\
+             # parallel group (2 tests):  boolean char\n\
+             ok 2         + boolean                                    59 ms\n\
+             not ok 3     + char                                       12 ms\n\
+             1..3\n\
+             # 1 of 3 tests failed.\n\
+             ok, whatever\n",
+        );
+        assert_eq!(s.passed, ["test_setup", "boolean"]);
+        assert_eq!(s.failed, ["char"]);
+    }
+
+    #[test]
+    fn jtreg_tests_are_scored() {
+        let s = parse_jtreg(
+            "Passed: java/lang/Math/Tests.java\nFAILED: java/util/Map/Get.java#id0\n\
+             Error: java/lang/Native.java\nPassed. Execution successful\n\
+             Error: Some tests failed or other problems occurred.\n\
+             Test results: passed: 1; failed: 1; error: 1\n",
+        );
+        assert_eq!(s.passed, ["java/lang/Math/Tests.java"]);
+        assert_eq!(
+            s.failed,
+            ["java/util/Map/Get.java#id0", "java/lang/Native.java"]
+        );
+    }
+
+    #[test]
+    fn node_tests_are_scored() {
+        let s = parse_node(
+            "TAP version 13\n1..3\nok 1 parallel/test-a\n  ---\n  duration_ms: 100\n  ...\n\
+             not ok 2 parallel/test-b\n  ---\n  severity: fail\n\
+             ok 3 sequential/test-c # skip missing crypto\n",
+        );
+        assert_eq!(s.passed, ["parallel/test-a"]);
+        assert_eq!(s.failed, ["parallel/test-b"]);
+        assert_eq!(s.skipped, ["sequential/test-c"]);
     }
 
     #[test]
