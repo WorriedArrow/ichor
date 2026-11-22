@@ -9,7 +9,7 @@
 //! two devices, with the same chunk share one page, and a device that
 //! returns wrong bytes yields EIO instead of corrupt data.
 //!
-//! The shared namespace is global and bounded ([`CAPACITY`] pages) with
+//! The shared namespace is global and bounded ([`capacity`] pages) with
 //! clock eviction. The loader and file mappings map cached pages into
 //! processes copy-on-write (see `file.rs`), so a library or executable that
 //! many processes run shares one physical copy; each mapping is charged to
@@ -23,7 +23,7 @@ use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use block::{BlockDevice, SECTOR_SIZE};
 use cell::Account;
@@ -31,8 +31,21 @@ use frame::mm::UFrame;
 use frame::sync::Mutex;
 use image::{CHUNK_SIZE, ChunkSource, Error, Extent, Hash, Image, SEGMENT};
 
-/// Most pages the cache holds (32 MiB).
-pub(crate) const CAPACITY: usize = 8192;
+/// Most pages a namespace holds: an eighth of memory, but at least 32 MiB,
+/// and at most 256 MiB (the clock is one list of their hashes, and no
+/// allocation may pass 4 MiB).
+fn capacity() -> usize {
+    static CAPACITY: AtomicUsize = AtomicUsize::new(0);
+    match CAPACITY.load(Ordering::Relaxed) {
+        0 => {
+            let n = (frame::mm::stats().total_pages / 8).clamp(8192, 65_536);
+            CAPACITY.store(n, Ordering::Relaxed);
+            n
+        }
+        n => n,
+    }
+}
+
 /// Largest image metadata read at mount and kept (Go's official image has
 /// 12 MiB, nearly all of it chunk hashes). Held in `image::SEGMENT` pieces.
 const MAX_METADATA: usize = 64 << 20;
@@ -98,7 +111,7 @@ struct Private {
 
 struct Cache {
     /// The namespace every sharing root reads through, bounded by
-    /// [`CAPACITY`].
+    /// [`capacity`].
     shared: Pool,
     /// Private namespaces by id.
     private: BTreeMap<u64, Private>,
@@ -162,7 +175,7 @@ fn insert(ns: u64, hash: Hash, frame: UFrame, disk: u64) {
         if pool.map.contains_key(&hash) {
             return; // another reader filled it meanwhile
         }
-        while pool.map.len() >= CAPACITY && pool.evict_one() {}
+        while pool.map.len() >= capacity() && pool.evict_one() {}
         pool.put(hash, frame, disk);
         return;
     }
@@ -178,7 +191,7 @@ fn insert(ns: u64, hash: Hash, frame: UFrame, disk: u64) {
     // per-namespace cap) it evicts its own, never another namespace's. A
     // cell with nothing left to evict reads uncached.
     loop {
-        if p.pages.map.len() < CAPACITY && p.account.charge(1).is_ok() {
+        if p.pages.map.len() < capacity() && p.account.charge(1).is_ok() {
             break;
         }
         if !p.pages.evict_one() {

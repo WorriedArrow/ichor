@@ -294,16 +294,27 @@ const KINDS: usize = 3;
 crate::cpu_local! {
     /// Absolute TSC deadlines per kind; 0 means unarmed.
     static DEADLINES: [AtomicU64; KINDS] = [const { AtomicU64::new(0) }; KINDS];
+    /// What the hardware is programmed for (an absolute TSC; 0: nothing).
+    static HARDWARE: AtomicU64 = AtomicU64::new(0);
 }
 
 fn ns_to_tsc(ns: u64) -> u64 {
     (u128::from(ns) * u128::from(tsc_hz()) / 1_000_000_000) as u64
 }
 
-/// Programs the hardware for the earliest armed deadline.
-fn program(d: &[AtomicU64; KINDS]) {
+/// Programs the hardware for the earliest armed deadline. If it is already
+/// programmed for an earlier time, that interrupt will program the rest: a
+/// context switch pushes the slice later every time, and each write is a VM
+/// exit. (One long overdue is not waited for.)
+fn program(g: &crate::cpu::IrqGuard, d: &[AtomicU64; KINDS]) {
     let next = d.iter().map(|x| x.load(Relaxed)).filter(|&x| x != 0).min();
     let Some(at) = next else { return };
+    let hardware = HARDWARE.get(g);
+    let set = hardware.load(Relaxed);
+    if set != 0 && set <= at && rdtsc() < set.wrapping_add(tsc_hz() / 100) {
+        return;
+    }
+    hardware.store(at, Relaxed);
     if DEADLINE_MODE.load(Relaxed) {
         // SAFETY: IA32_TSC_DEADLINE exists when CPUID reports TSC-deadline
         // support (checked in `init_timer`); writing it only arms this
@@ -335,7 +346,7 @@ pub(crate) fn arm(kind: TimerKind, ns: u64) {
     let g = crate::cpu::IrqGuard::new();
     let d = DEADLINES.get(&g);
     d[kind as usize].store(rdtsc().wrapping_add(ns_to_tsc(ns).max(1)), Relaxed);
-    program(d);
+    program(&g, d);
 }
 
 /// Handles this CPU's timer interrupt: fires expired deadlines, re-arms.
@@ -357,7 +368,8 @@ fn on_timer_interrupt() {
             fired(TimerKind::Kernel),
             fired(TimerKind::Sleep),
         );
-        program(d);
+        HARDWARE.get(&g).store(0, Relaxed);
+        program(&g, d);
         r
     };
     if kernel {
