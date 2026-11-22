@@ -43,7 +43,6 @@ for my $p (@BPIDS) {
     want("kill(B pid $p, 0)", "ESRCH", syscall(62, $p, 0));
     want("kill(B pid $p, SIGUSR1)", "ESRCH", syscall(62, $p, $SIGUSR1));
     want("kill(B pid $p, SIGTERM)", "ESRCH", syscall(62, $p, $SIGTERM));
-    want("kill(B pid $p, SIGKILL)", "ESRCH", syscall(62, $p, $SIGKILL));
     want("tkill(B tid $p, SIGUSR1)", "ESRCH", syscall(200, $p, $SIGUSR1));
     want("tgkill(B pid $p, B tid $p, SIGUSR1)", "ESRCH", syscall(234, $p, $p, $SIGUSR1));
     want("getpgid(B pid $p)", "ESRCH", syscall(121, $p));
@@ -171,8 +170,10 @@ same("kill(p, 0) for p in 1..$top finds only A's processes",
 my @bfound = grep { my $p = $_; grep { $_ == $p } @found } @BPIDS;
 same("the sweep found none of B's pids", scalar(@bfound), 0);
 
-# The last signal: SIGKILL to every process A may signal. Only A's child
+# SIGKILL last (were it delivered, B could not answer the checks above):
+# to each of B's pids, then to every process A may signal. Only A's child
 # dies (wait4 reaps it); B's helper must still be there afterwards.
+want("kill(B pid $_, SIGKILL)", "ESRCH", syscall(62, $_, $SIGKILL)) for @BPIDS;
 control("kill(-1, SIGKILL)", syscall(62, -1, $SIGKILL));
 my $st = "\0" x 4;
 same("wait4(B pid): control (A's child, killed by kill(-1, SIGKILL))", syscall(61, $kid, $st, 0, 0), $kid);

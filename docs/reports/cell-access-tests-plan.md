@@ -93,9 +93,11 @@ Status: [ ] to do, [x] done and committed.
   each section; memory returned for every run. Plus
   `a_destroyed_cell_leaves_no_shared_memory`, which **fails**: a
   documented bug (see notes).
-- [ ] **Scoping removal** (sections 1, 2, 3, futex in 4): each edit, the
-  failure seen, the restore checked with `git diff` (never committed).
-- [ ] **Review, report, AGENTS.md, push.**
+- [x] **Scoping removal** (sections 1, 2, futex in 4; not 3): each edit,
+  the failure seen, the restore checked with `git diff` (never
+  committed). Results in `cell-access-tests.md`.
+- [x] **Review, report, AGENTS.md, push.** Open: section 3, and bug 1's
+  check, which fails until the kernel is fixed.
 
 ## Notes as they come up
 

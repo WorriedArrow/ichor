@@ -45,8 +45,19 @@ the image, checked with `oci::digest_of` before `oci::convert_with`;
 tests/control.rs serves one from the host and refuses a wrong digest]; (6) ADR-0004's owed mitigations
 (VERW, IBPB on cross-cell switches, page-table isolation), logged at
 boot [done: VERW, IBPB, and page-table isolation (ADR-0004's second
-2026-11-16 amendment)]. The cell access-control suite is written in another worktree: do
-not write it; merge its branch when it lands.
+2026-11-16 amendment)].
+
+- Cell access-control suite (branch `claude/ichor-cell-access-tests-feb51a`,
+  `docs/reports/cell-access-tests.md`): `cell_access` runs
+  `kernel/ichor/src/cellaccess.rs`, two cells with their own roots, a helper
+  in B owning one object of each kind, and A's real syscalls on them with
+  exact errnos and controls (`tests/cell_access.rs`, one test per rule).
+  Sections 1, 2 and 4 to 9 are done. Open: section 3 (file systems) is
+  **not written** (a safety classifier stopped it; the owner decides), and
+  `a_destroyed_cell_leaves_no_shared_memory` **fails on purpose** until a
+  destroyed cell's System V segments are freed (`linuxabi/shm.rs`). A
+  syscall that stops being ENOSYS or changes errno there needs its check
+  updated.
 
 - M7 page-table isolation (`kernel/frame/src/arch/x86_64/entry.rs`): the
   entry area (`mm::ENTRY_BASE`, one PML4 slot) aliases the entry code, the
@@ -729,6 +740,8 @@ comment.
 | `trace_errors` | log every failing Linux syscall (pid, number, first arguments, errno) |
 | `trace_pid=N` | log every Linux syscall of pid N with its result |
 | `bench` | run the Phase E benchmarks (`bench.rs`) after the root disk's self-tests and print them |
+| `cell_access` | run the cell access-control suite (`cellaccess.rs`) after the Debian checks |
+| `cell_access_uplink` | with `cell_access`: check the uplink too; a host client must be connecting to a forward of port 7300 |
 | `net_echo_port=N` | the kernel's TCP, then a Debian cell through NAT, echo 256 KiB with the host's echo server at 10.0.2.2:N |
 | `net_publish=N` | publish uplink port N to a Debian cell's port 80 and serve one HTTP request from the host (QEMU forwards a host port to N) |
 | `control=PORT` | after the self-tests, run the control plane serving gRPC on PORT, on the system cell's loopback only, over TLS if there is `\ichor\apitls.pem` |
