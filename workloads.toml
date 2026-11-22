@@ -1,0 +1,7 @@
+# Pass-rate floors for `cargo xtask workloads SUITE` (ADR-0013 §2), per
+# mille of the suite's units (CPython: test modules) passed out of those
+# run. A full run below its floor fails. Raise a floor in the change that
+# earns it; leave a little room under the last result for flaky tests.
+
+# 2026-11-21: 403 of 445 modules (90.5%) under TCG on 4 vCPUs.
+python = 880
