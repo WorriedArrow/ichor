@@ -394,13 +394,14 @@ fn cmd_workloads(args: &[String]) -> Result<()> {
             other => return Err(format!("workloads: unknown option {other:?}")),
         }
     }
-    let suite = suite.ok_or("which suite? (python)")?;
+    let suite = suite.ok_or("which suite? (python, go)")?;
     let argv: Vec<String> = match &cmd {
         Some(c) => vec!["/bin/sh".into(), "-c".into(), c.clone()],
         None => {
             let mut v: Vec<String> = suite.argv.iter().map(|s| s.to_string()).collect();
-            if let Some(t) = &tests {
-                v.extend(t.split_whitespace().map(str::to_string));
+            match &tests {
+                Some(t) => v.extend(t.split_whitespace().map(str::to_string)),
+                None => v.extend(suite.all.iter().map(|s| s.to_string())),
             }
             v
         }
@@ -422,12 +423,13 @@ fn cmd_workloads(args: &[String]) -> Result<()> {
     if cmd.is_some() {
         return Ok(());
     }
-    let s = workloads::parse_python(&out);
+    let s = (suite.parse)(&out);
     let total = s.run();
     println!(
-        "workloads: {}: {} of {total} test modules passed ({} skipped); failed: {}",
+        "workloads: {}: {} of {total} {} passed ({} skipped); failed: {}",
         suite.name,
         s.passed.len(),
+        suite.unit,
         s.skipped.len(),
         s.failed.join(" ")
     );

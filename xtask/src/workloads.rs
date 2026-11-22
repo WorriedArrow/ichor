@@ -33,9 +33,18 @@ pub struct Suite {
     /// The official image, by index digest.
     pub image: &'static str,
     pub layers: &'static [LayerPin],
-    /// The suite's command; `{tests}` is replaced by the chosen tests.
+    /// The suite's command; the chosen tests are added, or `all` for a full
+    /// run.
     pub argv: &'static [&'static str],
+    pub all: &'static [&'static str],
     pub env: &'static [&'static str],
+    /// What the suite counts, in the plural.
+    pub unit: &'static str,
+    /// The machine's memory, and the cell's.
+    pub memory_mib: u32,
+    pub cell_bytes: u64,
+    /// Reads the score out of the suite's output.
+    pub parse: fn(&str) -> Score,
 }
 
 /// CPython 3.12.16: `python:3.12-slim-bookworm` strips `Lib/test`, so the
@@ -54,10 +63,32 @@ pub const PYTHON: Suite = Suite {
     // `-j0` (ADR-0013): each module in a worker process, so a module that
     // crashes or hangs its interpreter costs that module, not the run.
     argv: &["python3", "-m", "test", "-j0", "--timeout", "600"],
+    all: &[],
     env: &["PYTHONUNBUFFERED=1"],
+    unit: "modules",
+    memory_mib: 6144,
+    cell_bytes: 3 << 30,
+    parse: parse_python,
 };
 
-pub const SUITES: &[Suite] = &[PYTHON];
+/// Go 1.27: the image's own source tree has the standard library's tests.
+/// `-short` is what upstream's builders run on slow machines; vet checks
+/// the sources, not the platform. Compiling makes it heavy: the cell holds
+/// the build cache (its root's upper layer is in memory).
+pub const GO: Suite = Suite {
+    name: "go",
+    image: "docker.io/library/golang@sha256:4fa7c968ba93f1635670522dbb01a2c78150443e1385746924566079f36570ea",
+    layers: &[],
+    argv: &["go", "test", "-short", "-vet=off", "-timeout", "30m"],
+    all: &["std"],
+    env: &["HOME=/root", "GOFLAGS=-buildvcs=false"],
+    unit: "packages",
+    memory_mib: 12 * 1024,
+    cell_bytes: 6 << 30,
+    parse: parse_go,
+};
+
+pub const SUITES: &[Suite] = &[PYTHON, GO];
 
 /// A suite's result, from its own summary.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -119,6 +150,27 @@ pub fn parse_python(out: &str) -> Score {
     s
 }
 
+/// Parses `go test PACKAGES`: one line per package ("ok  \tstrings\t0.1s",
+/// "FAIL\tnet\t2s", "?   \terrors\t[no test files]"), tabs at fixed places.
+pub fn parse_go(out: &str) -> Score {
+    let mut s = Score::default();
+    for line in out.lines() {
+        let mut f = line.trim_end().split('\t');
+        let (Some(head), Some(pkg)) = (f.next(), f.next()) else {
+            continue;
+        };
+        // "FAIL\tnet/http [build failed]" has its remark after a space.
+        let pkg = pkg.split(' ').next().unwrap_or(pkg).to_string();
+        match head {
+            "ok  " => s.passed.push(pkg),
+            "FAIL" => s.failed.push(pkg),
+            "?   " => s.skipped.push(pkg),
+            _ => {}
+        }
+    }
+    s
+}
+
 impl Score {
     /// Modules run (passed or failed; skipped ones are not run).
     pub fn run(&self) -> usize {
@@ -155,11 +207,15 @@ pub fn section(suite: &Suite, s: &Score, secs: u64, floor: u32) -> String {
             l.url, l.sha256, l.from, l.to
         );
     }
-    out += &format!("- Command: `{}`\n", suite.argv.join(" "));
     out += &format!(
-        "- Result: {} of {} modules passed ({}.{}%), {} skipped; floor {}.{}%\n",
+        "- Command: `{}`\n",
+        [suite.argv, suite.all].concat().join(" ")
+    );
+    out += &format!(
+        "- Result: {} of {} {} passed ({}.{}%), {} skipped; floor {}.{}%\n",
         s.passed.len(),
         s.run(),
+        suite.unit,
         s.per_mille() / 10,
         s.per_mille() % 10,
         s.skipped.len(),
@@ -239,7 +295,7 @@ pub fn run(
     cfg.api_token = Some(token.clone());
     cfg.api_tls = Some(crate::api::TEST_IDENTITY.into());
     cfg.capture = true;
-    cfg.memory_mib = 6144;
+    cfg.memory_mib = suite.memory_mib;
     cfg.smp = 4;
     cfg.timeout = Some(Duration::from_secs(6 * 3600));
     cfg_tweak(&mut cfg);
@@ -258,7 +314,7 @@ pub fn run(
             pulled.image_id,
             pulled.size >> 20
         );
-        let cell = s.create_cell(&pulled.image_id, 3 << 30)?;
+        let cell = s.create_cell(&pulled.image_id, suite.cell_bytes)?;
         let a: Vec<&str> = argv.iter().map(String::as_str).collect();
         eprintln!("workloads: cell {} runs {a:?}", cell.cell_id);
         // The output also goes to a file as it comes, so a run that fails
@@ -365,6 +421,18 @@ Result: FAILURE
         let s = parse_python("2 tests OK:\n    test_bool test_int\n\nTotal duration: 1 sec\n");
         assert_eq!(s.passed, ["test_bool", "test_int"]);
         assert!(s.failed.is_empty());
+    }
+
+    #[test]
+    fn go_packages_are_scored() {
+        let s = parse_go(
+            "ok  \tarchive/tar\t0.512s\n--- FAIL: TestX (0.00s)\n    x_test.go:1: bad\nFAIL\n\
+             FAIL\tnet/http\t12.3s\nFAIL\tcmd/x [build failed]\n\
+             ?   \tcrypto/internal/cryptotest\t[no test files]\nok  \tstrings\t(cached)\nFAIL\n",
+        );
+        assert_eq!(s.passed, ["archive/tar", "strings"]);
+        assert_eq!(s.failed, ["net/http", "cmd/x"]);
+        assert_eq!(s.skipped, ["crypto/internal/cryptotest"]);
     }
 
     #[test]

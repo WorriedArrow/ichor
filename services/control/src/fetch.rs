@@ -16,8 +16,11 @@ use rt::{Error, Handle, WaitItem};
 
 /// Largest response body (a layer blob).
 const MAX_BODY: usize = 512 << 20;
-/// Give up on a request after this long.
-const TIMEOUT_NS: u64 = 180_000_000_000;
+/// Give up on a request when nothing has come for this long, or after this
+/// long in all (a large layer on a slow link takes a while; a server that
+/// trickles bytes must not hold a pull forever).
+const SILENCE_NS: u64 = 120_000_000_000;
+const TIMEOUT_NS: u64 = 3_600_000_000_000;
 /// Resend an unanswered DNS query after this long.
 const DNS_RETRY_NS: u64 = 2_000_000_000;
 
@@ -72,6 +75,8 @@ pub(crate) struct Fetch {
     /// Bytes for the socket that it has not taken yet.
     out: Vec<u8>,
     started: u64,
+    /// When the server last sent anything.
+    heard: u64,
 }
 
 impl core::fmt::Debug for Fetch {
@@ -116,6 +121,7 @@ impl Fetch {
             parser: ResponseParser::new(MAX_BODY),
             out: Vec::new(),
             started: rt::monotonic(),
+            heard: rt::monotonic(),
         })
     }
 
@@ -140,7 +146,7 @@ impl Fetch {
     /// Makes what progress it can; the response once it is complete.
     pub(crate) fn advance(&mut self, net: &mut Net) -> Result<Option<Response>, String> {
         let now = rt::monotonic();
-        if now - self.started > TIMEOUT_NS {
+        if now - self.started > TIMEOUT_NS || now - self.heard > SILENCE_NS {
             return Err(format!("{} timed out", self.req.url.host));
         }
         loop {
@@ -242,7 +248,10 @@ impl Fetch {
             }
             let (data, eof) = match rt::recv(sock, &mut buf) {
                 Ok(0) => (Vec::new(), true),
-                Ok(n) => (buf[..n].to_vec(), false),
+                Ok(n) => {
+                    self.heard = rt::monotonic();
+                    (buf[..n].to_vec(), false)
+                }
                 Err(Error::WouldBlock) => return Ok(None),
                 Err(e) => return Err(format!("receiving from {host}: {e:?}")),
             };
