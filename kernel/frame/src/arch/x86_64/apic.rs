@@ -171,9 +171,17 @@ pub(crate) fn init_tsc() -> Option<(u64, &'static str)> {
     found
 }
 
+/// The TSC against the ACPI PM timer: the median of three windows, since a
+/// vCPU descheduled at either end of one measures it wrong.
+fn calibrate_with_pm_timer(t: acpi::PmTimer) -> Option<u64> {
+    let mut hz = [pm_window(t)?, pm_window(t)?, pm_window(t)?];
+    hz.sort_unstable();
+    Some(hz[1])
+}
+
 /// Measures the TSC over 10 ms of the ACPI PM timer (3.579545 MHz). `None`
 /// if the counter does not advance (no timer at that port).
-fn calibrate_with_pm_timer(t: acpi::PmTimer) -> Option<u64> {
+fn pm_window(t: acpi::PmTimer) -> Option<u64> {
     let mask: u32 = if t.bits32 { u32::MAX } else { 0x00ff_ffff };
     // SAFETY: the FADT names this port as the PM timer, a read-only
     // free-running counter: reading it has no side effects on any device.
@@ -253,11 +261,20 @@ pub(crate) fn init_timer() {
     // One-shot mode: measure LAPIC ticks per millisecond against the TSC.
     write(MSR_TIMER_DIVIDE, 0b0011); // divide by 16
     write(MSR_LVT_TIMER, LVT_MASKED | u64::from(TIMER_VECTOR));
-    write(MSR_TIMER_INIT, u64::from(u32::MAX));
-    delay_us(10_000);
-    let ticks = u64::from(u32::MAX) - read(MSR_TIMER_CURRENT);
+    // The lowest of three: a vCPU descheduled between the reads of the two
+    // clocks measures too high (every timer would be late) or too low
+    // (timers fire early and are armed again, which costs little).
+    let mut per_ms = u64::MAX;
+    for _ in 0..3 {
+        write(MSR_TIMER_INIT, u64::from(u32::MAX));
+        let start = rdtsc();
+        delay_us(3_000);
+        let ticks = u64::from(u32::MAX) - read(MSR_TIMER_CURRENT);
+        let elapsed = rdtsc().wrapping_sub(start).max(1);
+        per_ms = per_ms.min(ticks * (tsc_hz() / 1000) / elapsed);
+    }
     write(MSR_TIMER_INIT, 0);
-    LAPIC_TICKS_PER_MS.store((ticks / 10).max(1), Relaxed);
+    LAPIC_TICKS_PER_MS.store(per_ms.max(1), Relaxed);
     write(MSR_LVT_TIMER, u64::from(TIMER_VECTOR));
 }
 

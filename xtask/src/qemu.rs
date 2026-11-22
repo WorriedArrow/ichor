@@ -14,7 +14,8 @@
 //! OVMF finds `BOOTX64.EFI` through the removable-media boot path, so no boot
 //! entries need to be configured.
 
-use std::io::Read;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -649,9 +650,67 @@ pub fn run(cfg: &RunConfig) -> Result<Outcome> {
     run_command(command(cfg)?, cfg.capture, cfg.timeout)
 }
 
+/// A loopback port nothing listens on right now.
+fn free_port() -> Option<u16> {
+    let l = TcpListener::bind(("127.0.0.1", 0)).ok()?;
+    l.local_addr().ok().map(|a| a.port())
+}
+
+/// What QEMU's human monitor on `port` answers to each command (with a
+/// half-second silence taken as the end of an answer).
+fn monitor(port: u16, commands: &[String]) -> std::io::Result<String> {
+    let mut s = TcpStream::connect(("127.0.0.1", port))?;
+    s.set_read_timeout(Some(Duration::from_millis(500)))?;
+    let mut out = Vec::new();
+    let mut buf = [0u8; 4096];
+    for c in core::iter::once("").chain(commands.iter().map(String::as_str)) {
+        if !c.is_empty() {
+            s.write_all(format!("{c}\n").as_bytes())?;
+        }
+        while let Ok(n) = s.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&buf[..n]);
+        }
+    }
+    Ok(String::from_utf8_lossy(&out).into_owned())
+}
+
+/// Where every vCPU of a run that will not end is: registers twice, a
+/// second apart (does it move? is it halted?), its local APIC's timer and
+/// pending interrupts, and the top of its stack.
+fn vcpu_state(port: u16) -> String {
+    let regs = ["info registers -a".to_string()];
+    let first = match monitor(port, &regs) {
+        Ok(t) => t,
+        Err(e) => return format!("(no monitor: {e})"),
+    };
+    thread::sleep(Duration::from_secs(1));
+    let cpus = first.matches("CPU#").count();
+    let mut commands = regs.to_vec();
+    for n in 0..cpus {
+        commands.push(format!("cpu {n}"));
+        commands.push("info lapic".into());
+        commands.push("x /8i $rip".into());
+        commands.push("x /96gx $rsp".into());
+    }
+    let second = monitor(port, &commands).unwrap_or_else(|e| format!("(monitor: {e})"));
+    format!("{first}\n--- one second later ---\n{second}")
+}
+
 /// Runs a prepared QEMU command to exit (or `timeout`), capturing its
-/// serial output on stdout if `capture`.
+/// serial output on stdout if `capture`. A run that times out has its
+/// vCPUs' state ([`vcpu_state`]) appended to the captured output.
 pub fn run_command(mut cmd: Command, capture: bool, timeout: Option<Duration>) -> Result<Outcome> {
+    let monitor_port = timeout
+        .filter(|_| capture)
+        .and_then(|_| free_port())
+        .inspect(|port| {
+            cmd.arg("-monitor")
+                .arg(format!("tcp:127.0.0.1:{port},server=on,wait=off"));
+        });
+    let mut stuck = String::new();
     if capture {
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -692,6 +751,12 @@ pub fn run_command(mut cmd: Command, capture: bool, timeout: Option<Duration>) -
             };
         }
         if timeout.is_some_and(|t| start.elapsed() > t) {
+            if let Some(port) = monitor_port {
+                stuck = format!(
+                    "\n=== vCPUs at the timeout ===\n{}\n",
+                    vcpu_state(port).replace('\r', "")
+                );
+            }
             let _ = child.kill();
             let _ = child.wait();
             break Exit::Timeout;
@@ -702,7 +767,8 @@ pub fn run_command(mut cmd: Command, capture: bool, timeout: Option<Duration>) -
     if let Some(reader) = reader {
         let _ = reader.join();
     }
-    let serial = String::from_utf8_lossy(&serial.lock().unwrap()).into_owned();
+    let mut serial = String::from_utf8_lossy(&serial.lock().unwrap()).into_owned();
+    serial.push_str(&stuck);
     Ok(Outcome {
         exit,
         serial,

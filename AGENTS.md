@@ -113,16 +113,19 @@ not write it; merge its branch when it lands.
   about six minutes in when the cell's 3 GiB account filled (under
   investigation). First recorded full run: 403 of 445 modules (90.5%),
   floor 88.0% in `workloads.toml`.
-- Open: intermittent boot hangs under the full gate's load on TCG (11
-  QEMUs at once), each passing on reruns alone: (2026-11-21) right after
-  `proc: native process ran`, i.e. in `copytest::frame_race`, in
-  `cloud_disk_boots_from_gpt_on_nvme` (2 vCPUs); and right after
-  `trap: breakpoint handled`, i.e. while the boot CPU waits for its own
-  timer ticks (`selftest::wait_for_ticks`, one-shot LAPIC mode), in
-  `stack_overflow_hits_the_guard_page`. A lost timer interrupt would
-  explain both; `apic::arm`/`program` and `on_timer_interrupt` read
-  correctly, and `start_aps` is bounded. Next step: a stall report (each
-  CPU's deadlines, `frame::time::deadlines`) from a watchdog.
+- Boot hangs under the full gate's load (2026-11-21), found by booting 30
+  VMs at a time until one stuck (1 in 60) and by reading. Fixed: a
+  blocking FIFO open missed a peer that opened, wrote and closed between
+  its count and its wait (reproduced: both CPUs halted, nothing armed;
+  `pipe::fifo_selftest`); the timer self-test could halt after its last
+  tick; `finish_switch` and a waker could both queue a task, and the stale
+  entry then ran it while marked blocked, to be lost at its next
+  preemption (`pick_and_claim` now refuses it; suspected for the one hang
+  seen in `copytest::frame_race`, not proven); and the LAPIC and PM timer
+  calibrations took one sample, which a descheduled vCPU spoils. A test
+  boot that times out now appends every vCPU's registers, LAPIC and stack
+  to its log (`qemu::vcpu_state`): read that first. Both CPUs at the idle
+  `hlt` with no timer armed means a lost wake-up, not a lost interrupt.
 - The uplink is any `net::link::Link` (`kernel/net/src/link.rs`:
   `mac`/`transmit`/`receive`): NIC drivers implement it (virtio-net), and
   a software link such as a VPN can wrap one. New NIC drivers (ENA,

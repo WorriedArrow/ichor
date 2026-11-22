@@ -503,11 +503,17 @@ fn pick_and_claim(s: &dyn Scheduler, cpu: CpuId) -> Option<Arc<Task>> {
         {
             continue;
         }
-        if t.state() == TaskState::Exited {
-            t.running_on.store(NOT_RUNNING, Ordering::SeqCst);
-            continue;
+        if t.state() == TaskState::Runnable {
+            return Some(t);
         }
-        return Some(t);
+        // A stale entry: `finish_switch` and a waker can both see a task
+        // become runnable, and the second queues it after it was picked,
+        // ran and blocked again. Running it would leave it marked blocked,
+        // lost at its next preemption. Put it back, as a switch out does.
+        t.running_on.store(NOT_RUNNING, Ordering::SeqCst);
+        if t.state() == TaskState::Runnable {
+            enqueue(t, Enqueue::Woken);
+        }
     }
 }
 

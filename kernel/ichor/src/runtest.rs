@@ -3297,6 +3297,7 @@ pub(crate) fn run() {
     }
     println!("ichor: linux: a robust futex held by an exiting process is marked FUTEX_OWNER_DIED");
 
+    crate::pipe::fifo_selftest();
     let (status, _) = run_linux(new_process(), &fifo_program(), None, &["fifotest"]);
     if status != 0 {
         println!("ichor: linux: fifotest failed check {status}");

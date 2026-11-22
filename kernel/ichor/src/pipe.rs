@@ -85,21 +85,27 @@ impl Pipe {
     }
 
     /// Adds a reference to one end (a FIFO opened for reading or writing),
-    /// waking opens waiting for it.
-    pub(crate) fn add_end(&self, write: bool) {
-        {
+    /// waking opens waiting for it. Returns how often the other end had
+    /// been opened, for [`Pipe::wait_peer`]: counted in the same step,
+    /// because the peer this wakes may open, write and close before the
+    /// caller gets to wait.
+    pub(crate) fn add_end(&self, write: bool) -> u64 {
+        let peer_opens = {
             let mut s = self.state.lock();
             if write {
                 s.writers += 1;
                 s.writer_opens += 1;
+                s.reader_opens
             } else {
                 s.readers += 1;
                 s.reader_opens += 1;
+                s.writer_opens
             }
-        }
+        };
         self.readable.wake_all();
         self.writable.wake_all();
         self.changed();
+        peer_opens
     }
 
     /// `F_GETPIPE_SZ`: the bytes the pipe holds.
@@ -137,8 +143,13 @@ impl Pipe {
     }
 
     /// Blocks a FIFO's open of one end until the other end is open, or has
-    /// been opened since this call began.
-    pub(crate) fn wait_peer(&self, write: bool, interrupted: &dyn Fn() -> bool) -> Result<(), i64> {
+    /// been opened more than `start` times (what [`Pipe::add_end`] gave).
+    pub(crate) fn wait_peer(
+        &self,
+        write: bool,
+        start: u64,
+        interrupted: &dyn Fn() -> bool,
+    ) -> Result<(), i64> {
         let opens = |s: &State| {
             if write {
                 s.reader_opens
@@ -146,7 +157,6 @@ impl Pipe {
                 s.writer_opens
             }
         };
-        let start = opens(&self.state.lock());
         let q = if write {
             &self.writable
         } else {
@@ -302,6 +312,27 @@ impl Pipe {
 /// FIFO's pipe lives while any end of it is open; opened again after that,
 /// it starts empty, as on Linux.
 static FIFOS: SpinLock<BTreeMap<u64, Weak<Pipe>>> = SpinLock::new(BTreeMap::new());
+
+/// A blocking FIFO open whose peer opens and closes again before the wait
+/// begins returns at once (it used to wait forever).
+pub(crate) fn fifo_selftest() {
+    for write in [false, true] {
+        let p = Pipe::new_fifo();
+        let opens = p.add_end(write);
+        p.add_end(!write);
+        p.drop_end(!write);
+        // "Interrupted" at once: a wait that would block fails instead.
+        if p.wait_peer(write, opens, &|| true) != Ok(()) {
+            crate::runtest::fail("pipe: a FIFO open missed a peer that came and went");
+        }
+        // With no peer at all it does wait.
+        let lone = Pipe::new_fifo();
+        let opens = lone.add_end(write);
+        if lone.wait_peer(write, opens, &|| true) != Err(ERESTARTSYS) {
+            crate::runtest::fail("pipe: a FIFO open did not wait for its peer");
+        }
+    }
+}
 
 /// The pipe behind FIFO `id`, made on its first open.
 pub(crate) fn fifo(id: u64) -> Arc<Pipe> {

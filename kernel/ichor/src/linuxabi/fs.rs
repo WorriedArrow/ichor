@@ -197,10 +197,10 @@ fn open_fifo(p: &mut LinuxProcess, id: u64, flags: u64) -> Result<u64, i64> {
     if write && nonblock && pipe.readers() == 0 {
         return Err(ENXIO);
     }
-    pipe.add_end(write);
+    let peer_opens = pipe.add_end(write);
     if !nonblock {
         let entry = p.entry.clone();
-        if let Err(e) = pipe.wait_peer(write, &|| proc::interrupted(&entry)) {
+        if let Err(e) = pipe.wait_peer(write, peer_opens, &|| proc::interrupted(&entry)) {
             pipe.drop_end(write);
             return Err(e);
         }

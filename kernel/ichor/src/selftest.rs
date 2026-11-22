@@ -71,10 +71,18 @@ frame::cpu_local! {
 /// Timer interrupts each CPU takes during the timer self-test.
 const TICKS_WANTED: u64 = 5;
 
+frame::cpu_local! {
+    /// This CPU has seen its ticks: no more needed.
+    static TICKS_SEEN: AtomicBool = AtomicBool::new(false);
+}
+
+/// Keeps ticking until the waiter has seen enough: one that stopped at the
+/// last tick wanted could be that tick arriving between the waiter's check
+/// and its halt, which then nothing would end.
 fn on_timer() {
     let guard = IrqGuard::new();
-    let ticks = TIMER_TICKS.get(&guard).fetch_add(1, Relaxed) + 1;
-    if ticks < TICKS_WANTED {
+    TIMER_TICKS.get(&guard).fetch_add(1, Relaxed);
+    if !TICKS_SEEN.get(&guard).load(Relaxed) {
         frame::time::arm_timer(Duration::from_millis(2));
     }
 }
@@ -85,7 +93,9 @@ pub(crate) fn wait_for_ticks() {
     loop {
         let done = {
             let guard = IrqGuard::new();
-            TIMER_TICKS.get(&guard).load(Relaxed) >= TICKS_WANTED
+            let done = TIMER_TICKS.get(&guard).load(Relaxed) >= TICKS_WANTED;
+            TICKS_SEEN.get(&guard).store(done, Relaxed);
+            done
         };
         if done {
             break;
