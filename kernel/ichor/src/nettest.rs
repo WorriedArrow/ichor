@@ -73,7 +73,7 @@ fn now() -> Duration {
 
 /// Moves frames between the device and the interface; returns the IP
 /// packets the interface hands up.
-fn pump(dev: &mut dyn Link, ifc: &mut Interface) -> Vec<net::iface::Packet> {
+pub(crate) fn pump(dev: &mut dyn Link, ifc: &mut Interface) -> Vec<net::iface::Packet> {
     ifc.poll(now());
     while let Some(f) = ifc.transmit() {
         dev.transmit(&f);
@@ -215,6 +215,7 @@ pub(crate) fn run() {
     if port != 0 {
         tcp_echo(&mut *dev, &mut ifc, port);
     }
+    crate::cloud::run(&mut *dev, &mut ifc);
     // From here on the device is the cell switch's uplink.
     let link = dev;
     let name = alloc::string::String::from(link.name());

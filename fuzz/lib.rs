@@ -615,6 +615,33 @@ fn dns_run(input: &[u8]) {
     let _ = dns::parse_a(input, 7, "registry-1.docker.io");
 }
 
+fn metadata_seeds() -> Vec<Vec<u8>> {
+    let answer = |h: &str, b: &str| format!("HTTP/1.0 200 OK\r\n{h}\r\n{b}").into_bytes();
+    vec![
+        answer(
+            "Metadata-Flavor: Google\r\nContent-Length: 13\r\n",
+            "control=50051",
+        ),
+        answer("", "AQAEAJ9x=="),
+        answer("", "Y29udHJvbD01MDA1MQ=="),
+        b"# x\ncontrol=1\napi-token = y\n-----BEGIN A-----\nMIIB\n-----END A-----\n".to_vec(),
+    ]
+}
+
+fn metadata_run(input: &[u8]) {
+    use net::metadata::{Client, Cloud, Config};
+    for cloud in Cloud::ALL {
+        let mut c = Client::new(cloud);
+        let _ = c.answer(input);
+        let req = c.request("h");
+        // Nothing an answer says makes another request of ours.
+        assert_eq!(req.windows(4).filter(|w| w == b"\r\n\r\n").count(), 1);
+        let _ = c.answer(input);
+    }
+    let _ = net::metadata::complete(input);
+    let _ = Config::parse(input);
+}
+
 const FUZZ_MAC: net::Mac = net::Mac([0x52, 0x54, 0, 0x12, 0x34, 0x56]);
 
 /// A DHCP reply of `kind` (2 OFFER, 5 ACK) to transaction 7 for
@@ -783,6 +810,11 @@ pub const TARGETS: &[Target] = &[
         name: "dns",
         seeds: dns_seeds,
         run: dns_run,
+    },
+    Target {
+        name: "metadata",
+        seeds: metadata_seeds,
+        run: metadata_run,
     },
     Target {
         name: "ethernet",

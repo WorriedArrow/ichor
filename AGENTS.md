@@ -708,7 +708,8 @@ and the control plane resolves through the lease's DNS server unless
 `dns=` is given. The uplink renews the lease at half its time, and moves
 address if the server says so (published ports stay, connections are
 cut); unrenewed past its end, it keeps the address and asks on. Not yet:
-the clouds' metadata servers, AWS ENA and GCP gVNIC, Hyper-V VMBus for Azure, Secure Boot.
+AWS ENA and GCP gVNIC, Hyper-V VMBus for Azure, Secure Boot; nothing has
+run on a real cloud or a real machine.
 
 ## Commands
 
@@ -775,6 +776,8 @@ comment.
 | `control_exit` | with `control`: stop when the first API client hangs up, then shut down (tests) |
 | `control_exit_after=SECONDS` | with `control`: stop after that long once no client is connected (tests) |
 | `uplink_mtu=N` | the uplink network's MTU, over the DHCP lease's (default: the lease's, else 1500); every TCP SYN crossing the uplink is clamped to MTU - 40 |
+| `metadata=CLOUD` | ask the cloud (`gcp`, `aws`, `azure`, or `auto`: each in turn) for the machine's configuration: `control*` and `dns` options, the API's token and certificate (`cloud.rs`, `net::metadata`, `docs/cloud.md`) |
+| `metadata_addr=IP:PORT` | ask there instead of at 169.254.169.254:80 (tests) |
 | `dhcp_lease=SECONDS` | the longest the uplink's DHCP lease is taken to last (tests: renewed sooner) |
 | `dns=A.B.C.D` | the control plane's DNS resolver (default: the uplink's DHCP lease's first DNS server, else `10.0.2.3`, QEMU's) |
 

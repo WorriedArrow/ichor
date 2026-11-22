@@ -17,6 +17,7 @@
 //!   software links such as a VPN wrapped around one).
 //! - [`dhcp`]: the client that gets the uplink its address, router and
 //!   DNS servers.
+//! - [`metadata`]: what clouds tell a machine about itself.
 //! - [`rtnl`]: answers to `NETLINK_ROUTE` requests (a cell's links,
 //!   addresses and routes).
 
@@ -28,6 +29,7 @@ extern crate alloc;
 pub mod dhcp;
 pub mod iface;
 pub mod link;
+pub mod metadata;
 pub mod nat;
 pub mod rtnl;
 pub mod switch;

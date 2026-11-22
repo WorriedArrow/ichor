@@ -363,6 +363,81 @@ fn lifecycle(s: &mut Session, id: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// A machine with nothing on its boot volume but where to ask: its cloud's
+/// metadata service (played by the host, as AWS's) says that it serves the
+/// API, with which token and certificate.
+#[test]
+fn a_machine_is_configured_by_its_clouds_metadata_service() {
+    let host_port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let metadata = l.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let config = format!(
+            "# what this machine is for\ncontrol=50051 control_publish=50051\ncontrol_exit\n\
+             api-token = {API_TOKEN}\n{TEST_IDENTITY}\n"
+        );
+        for mut s in l.incoming().flatten() {
+            let _ = s.set_read_timeout(Some(Duration::from_secs(10)));
+            let mut req = Vec::new();
+            let mut buf = [0u8; 2048];
+            while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                match s.read(&mut buf) {
+                    Ok(n) if n > 0 => req.extend_from_slice(&buf[..n]),
+                    _ => break,
+                }
+            }
+            let req = String::from_utf8_lossy(&req).into_owned();
+            let (status, body) = if req.starts_with("PUT /latest/api/token ")
+                && req.contains("\r\nX-aws-ec2-metadata-token-ttl-seconds: ")
+            {
+                ("200 OK", "AQAEAFtoken==")
+            } else if req.starts_with("GET /latest/user-data ")
+                && req.contains("\r\nX-aws-ec2-metadata-token: AQAEAFtoken==\r\n")
+            {
+                ("200 OK", config.as_str())
+            } else {
+                ("404 Not Found", "")
+            };
+            let _ = write!(
+                s,
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    let client = std::thread::spawn(move || -> Result<(), String> {
+        let trust = test_trust();
+        let until = Instant::now() + Duration::from_secs(600);
+        let mut s = Session::connect(host_port, Some(API_TOKEN), Some(&trust), until)?;
+        let bad = control::PullImageRequest {
+            reference: "UPPER/case!".into(),
+            layers: vec![],
+        };
+        let (_, code, _) = s.call(control::PULL_IMAGE, &bad.encode(), Duration::from_secs(60))?;
+        if code != grpc::status::INVALID_ARGUMENT {
+            return Err(format!("a bad reference gave status {code}"));
+        }
+        Ok(())
+    });
+    let cmdline = format!("metadata=auto metadata_addr=10.0.2.2:{metadata}");
+    let out = ichor_tests::boot_with("control-metadata", &cmdline, 2, |c| {
+        c.net_user_opts = format!("hostfwd=tcp:127.0.0.1:{host_port}-:50051");
+        c.timeout = Some(Duration::from_secs(600));
+    });
+    out.assert_exit(Exit::Success);
+    out.assert_in_order(&[
+        "ichor: cloud: aws: options [control control_publish control_exit], an API token, an API certificate",
+        "API token from the cloud, API certificate from the cloud)",
+        "published on uplink port 50051)",
+        "ichor: control: exited with Some(0)",
+    ]);
+    client.join().unwrap().unwrap();
+}
+
 /// The API is local to the system cell unless it is configured to be
 /// reachable: asked to publish without an API token, it stays there.
 #[test]
