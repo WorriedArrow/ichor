@@ -62,8 +62,11 @@ Check each command against the current AWS documentation; flags change.
 Two kinds of machine type work. The general-purpose ones (E2, N1, N2,
 N2D) attach persistent disks as targets of a virtio-scsi controller and,
 unless gVNIC is asked for, give the VM a virtio-net NIC: both have Ichor
-drivers, so these are the ones that can network once the uplink takes
-its address from DHCP (not yet: it is QEMU's fixed 10.0.2.15 today).
+drivers, so these are the ones that can network. The uplink takes its
+address, router and DNS server from the VPC's DHCP server (the boot log
+shows `ichor: net: DHCP lease ...`), and the control plane resolves
+through that DNS server unless `dns=` says otherwise. The lease is not
+renewed yet; GCP keeps a VM's internal address for its life.
 The newer ones (C3, C4, ...) boot from NVMe and require gVNIC, which
 Ichor does not drive yet: boot-only. Check the machine types' disk
 interfaces and NIC types against current GCP documentation.
@@ -83,7 +86,8 @@ with no NVMe at all.
 ## Not supported yet
 
 - Azure (Hyper-V VMBus storage and network).
-- Cloud NICs other than virtio-net (AWS ENA, GCP gVNIC), and taking the
-  uplink's address from DHCP or the cloud's metadata.
+- Cloud NICs other than virtio-net (AWS ENA, GCP gVNIC); renewing the
+  uplink's DHCP lease; the cloud's metadata server (instance attributes,
+  SSH keys, startup configuration).
 - Secure Boot: launch with it off (the default for custom AWS AMIs; on
   GCP, without Shielded VM Secure Boot).

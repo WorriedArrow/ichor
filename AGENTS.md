@@ -586,10 +586,12 @@ the disk and `--gcp` writes GCP's import archive; `cargo xtask run --disk
 FILE` boots any such image. Runbook for a first real-cloud boot:
 `docs/cloud.md`. `kernel/drivers/virtio-scsi` reads the disks of GCP's
 general-purpose machine types (`cloud_disk_boots_from_virtio_scsi`);
-with their virtio-net NIC those can network once the uplink takes its
-address from DHCP. Not yet: DHCP or metadata for the uplink (it is
-QEMU's fixed 10.0.2.15), AWS ENA and GCP gVNIC, Hyper-V VMBus for
-Azure, Secure Boot.
+with their virtio-net NIC those can network: the uplink takes its
+address, router and DNS server from DHCP (`net::dhcp`, host-tested;
+QEMU's slirp hands out 10.0.2.15, so the tests see the same address),
+and the control plane resolves through the lease's DNS server unless
+`dns=` is given. Not yet: renewing the lease, the clouds' metadata
+servers, AWS ENA and GCP gVNIC, Hyper-V VMBus for Azure, Secure Boot.
 
 ## Commands
 
@@ -654,7 +656,7 @@ comment.
 | `control_publish=PORT` | publish the API on uplink port PORT (without `control_listen`, listens on all addresses); needs an API token in `\ichor\apitoken` (`RunConfig::api_token`, `disk-image --api-token-file`), else the API stays on loopback |
 | `control_exit` | with `control`: stop when the first API client hangs up, then shut down (tests) |
 | `control_exit_after=SECONDS` | with `control`: stop after that long once no client is connected (tests) |
-| `dns=A.B.C.D` | the control plane's DNS resolver (default `10.0.2.3`, QEMU's) |
+| `dns=A.B.C.D` | the control plane's DNS resolver (default: the uplink's DHCP lease's first DNS server, else `10.0.2.3`, QEMU's) |
 
 ## Layout
 

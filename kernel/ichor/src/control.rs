@@ -11,7 +11,8 @@ use crate::kcell::{Object, System, rights};
 static CONTROL: &[u8] = include_bytes!(concat!(env!("ICHOR_SERVICES_DIR"), "/ichor-control"));
 
 /// The service's options from the kernel command line: `control=PORT`
-/// (required), `control_listen=ADDR`, `control_publish=PORT`, `dns=ADDR`,
+/// (required), `control_listen=ADDR`, `control_publish=PORT`, `dns=ADDR`
+/// (default: the uplink's DHCP-given DNS server, else QEMU's 10.0.2.3),
 /// `control_exit`, `control_exit_after=SECONDS`. Without `control_listen`
 /// or `control_publish` the API is local to the system cell.
 pub(crate) fn options(c: &cmdline::Cmdline<'_>) -> Option<alloc::vec::Vec<alloc::string::String>> {
@@ -24,7 +25,16 @@ pub(crate) fn options(c: &cmdline::Cmdline<'_>) -> Option<alloc::vec::Vec<alloc:
     if let Some(p) = c.get("control_publish") {
         o.push(format!("publish={p}"));
     }
-    o.push(format!("dns={}", c.get("dns").unwrap_or("10.0.2.3")));
+    // The resolver: `dns=`, else the one the uplink's DHCP lease named,
+    // else QEMU's.
+    let dns = match c.get("dns") {
+        Some(d) => alloc::string::String::from(d),
+        None => match crate::switch::uplink_dns() {
+            Some(ip) => format!("{ip}"),
+            None => "10.0.2.3".into(),
+        },
+    };
+    o.push(format!("dns={dns}"));
     if c.flag("control_exit") {
         o.push("exit-on-close".into());
     }

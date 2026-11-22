@@ -632,6 +632,7 @@ fn tcp_through_virtio_net_to_a_host_echo_server() {
     out.assert_exit(Exit::Success);
     out.assert_in_order(&[
         "ichor: net: virtio-net ",
+        "ichor: net: DHCP lease 10.0.2.15/24 via 10.0.2.2 from 10.0.2.2, DNS 10.0.2.3",
         "ichor: net: gateway 10.0.2.2 is at ",
         "ichor: net: tcp echo of 256 KiB through slirp ok",
         "ichor: net: uplink 10.0.2.15 on virtio-net is the cell switch's",

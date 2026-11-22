@@ -52,6 +52,19 @@ struct Uplink {
 
 static TABLE: SpinLock<Option<Table>> = SpinLock::new(None);
 static UPLINK: SpinLock<Option<Uplink>> = SpinLock::new(None);
+/// The DNS servers the uplink's network named (its DHCP lease), first
+/// one first.
+static UPLINK_DNS: SpinLock<Vec<Ipv4Addr>> = SpinLock::new(Vec::new());
+
+/// Records the uplink network's DNS servers.
+pub(crate) fn set_uplink_dns(dns: Vec<Ipv4Addr>) {
+    *UPLINK_DNS.lock() = dns;
+}
+
+/// The uplink network's first DNS server, if it named one.
+pub(crate) fn uplink_dns() -> Option<Ipv4Addr> {
+    UPLINK_DNS.lock().first().copied()
+}
 
 /// What the uplink has done with inbound traffic, for diagnostics.
 #[derive(Clone, Copy, Debug, Default)]
