@@ -3213,10 +3213,11 @@ fn avx_program(magic: u64) -> Vec<u8> {
     a.bind(bad);
     a.mov(Reg::Rdi, Reg::R15);
     a.sys(sys::EXIT_GROUP);
-    // The handler: rdx = ucontext; fpstate = uc_mcontext (40) + 192.
+    // The handler: rdx = ucontext; fpstate = uc_mcontext (40) + 184 (glibc's
+    // `uc_mcontext.fpregs`, after 23 registers).
     let h_bad = a.label();
     a.bind(handler);
-    a.load(Reg::Rax, Reg::Rdx, 40 + 192);
+    a.load(Reg::Rax, Reg::Rdx, 40 + 184);
     a.load(Reg::R14, Reg::Rax, 464);
     a.mov_imm(Reg::R13, magic);
     a.cmp(Reg::R14, Reg::R13);

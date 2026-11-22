@@ -775,7 +775,7 @@ pub(crate) fn deliver(
                     }
                 }
                 p.resume_until = None;
-                return match setup_frame(p, ctx, sig, info, 0, &act) {
+                return match setup_frame(p, ctx, sig, info, Trap::default(), &act) {
                     Ok(()) => Fate::Goes,
                     Err(status) => Fate::ProcessEnds(status),
                 };
@@ -793,24 +793,40 @@ pub(crate) fn fault(
     sig: u32,
     code: i32,
     addr: u64,
+    trap: Trap,
 ) -> Option<u32> {
     let act = p.group.actions.lock().get(sig);
     let caught = act.handler != SIG_DFL && act.handler != SIG_IGN && p.sig.mask & bit(sig) == 0;
     if !caught {
         return Some(sig | 0x80);
     }
-    setup_frame(p, ctx, sig, Info::fault(code, addr), addr, &act).err()
+    setup_frame(p, ctx, sig, Info::fault(code, addr), trap, &act).err()
+}
+
+/// The CPU exception behind a signal, as its frame shows it.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Trap {
+    pub(crate) vector: u64,
+    pub(crate) error: u64,
+    pub(crate) cr2: u64,
 }
 
 // Signal frame layout (x86-64 Linux `struct rt_sigframe`).
 const UC_SIZE: u64 = 304; // uc_flags, uc_link, uc_stack, uc_mcontext, uc_sigmask
 const MCONTEXT: usize = 40;
+/// In `struct sigcontext`, after the registers, flags and segments: err,
+/// trapno, oldmask, cr2, then the pointer to the extended state.
+const MCONTEXT_ERR: usize = 152;
+const MCONTEXT_FPSTATE: usize = 184;
 const SIGMASK: usize = MCONTEXT + 256;
 const INFO_SIZE: u64 = 128;
 const FRAME_SIZE: u64 = 8 + UC_SIZE + INFO_SIZE;
 const REDZONE: u64 = 128;
 /// `uc_flags`: the frame's `fpstate` is an XSAVE area (sw bytes valid).
 const UC_FP_XSTATE: u64 = 1;
+/// The frame says what SS was.
+const UC_SIGCONTEXT_SS: u64 = 2;
+const UC_STRICT_RESTORE_SS: u64 = 4;
 /// `struct _fpx_sw_bytes` markers (ADR-0008 §6).
 const FP_XSTATE_MAGIC1: u32 = 0x4650_5853;
 const FP_XSTATE_MAGIC2: u32 = 0x4650_5845;
@@ -858,7 +874,7 @@ fn setup_frame(
     ctx: &mut UserContext,
     sig: u32,
     info_fields: Info,
-    addr: u64,
+    trap: Trap,
     act: &Action,
 ) -> Result<(), u32> {
     let die = SIGSEGV | 0x80;
@@ -880,9 +896,11 @@ fn setup_frame(
     let mut f = alloc::vec![0u8; FRAME_SIZE as usize];
     f[0..8].copy_from_slice(&act.restorer.to_le_bytes());
     let u = 8usize;
+    let mut uc_flags = UC_SIGCONTEXT_SS | UC_STRICT_RESTORE_SS;
     if frame::cpu::xstate_features() != 0 {
-        f[u..u + 8].copy_from_slice(&UC_FP_XSTATE.to_le_bytes());
+        uc_flags |= UC_FP_XSTATE;
     }
+    f[u..u + 8].copy_from_slice(&uc_flags.to_le_bytes());
     // uc_stack: the alternate stack as it stood when the signal came.
     let (ss_sp, ss_flags, ss_size) = match p.sig.alt {
         None => (0, SS_DISABLE, 0),
@@ -898,9 +916,11 @@ fn setup_frame(
     f[m + 136..m + 144].copy_from_slice(&ctx.rflags().to_le_bytes());
     let segs: u64 = 0x33 | (0x2b << 48); // cs, gs, fs, ss
     f[m + 144..m + 152].copy_from_slice(&segs.to_le_bytes());
-    f[m + 176..m + 184].copy_from_slice(&old_mask.to_le_bytes()); // oldmask
-    f[m + 184..m + 192].copy_from_slice(&addr.to_le_bytes()); // cr2
-    f[m + 192..m + 200].copy_from_slice(&fpstate.to_le_bytes());
+    let words = [trap.error, trap.vector, old_mask, trap.cr2, fpstate];
+    for (i, w) in words.iter().enumerate() {
+        let at = m + MCONTEXT_ERR + i * 8;
+        f[at..at + 8].copy_from_slice(&w.to_le_bytes());
+    }
     f[u + SIGMASK..u + SIGMASK + 8].copy_from_slice(&old_mask.to_le_bytes());
     let i = (8 + UC_SIZE) as usize;
     f[i..].copy_from_slice(&info_fields.bytes(sig));
@@ -945,7 +965,7 @@ pub(crate) fn sigreturn(p: &mut LinuxProcess, ctx: &mut UserContext) -> Result<(
         ctx.rbp, ctx.rbx, ctx.rdx, ctx.rax, ctx.rcx, ctx.rsp, ctx.rip,
     ] = r;
     ctx.set_rflags(word(m + 136));
-    let fpstate = word(m + 192);
+    let fpstate = word(m + MCONTEXT_FPSTATE);
     if fpstate != 0 {
         let mut fx = alloc::vec![0u8; 512];
         if p.copy_from_user(fpstate, &mut fx) != fx.len() {

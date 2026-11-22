@@ -493,9 +493,13 @@ fn check_name(name: &str) -> Result<(), i64> {
     Ok(())
 }
 
+/// A path's components; a trailing slash is a `.` after the last, so that
+/// has to be a directory, or a symlink to one, which is followed.
 fn components(path: &str) -> impl Iterator<Item = String> + '_ {
+    let dir = path.ends_with('/').then_some(".");
     path.split('/')
         .filter(|c| !c.is_empty())
+        .chain(dir)
         .map(ToString::to_string)
 }
 
@@ -1516,7 +1520,8 @@ impl<'a, A: Pages> Overlay<'a, A> {
             self.permission(cur, MAY_EXEC)?;
             if self.is_elsewhere(cur) && comp != "." && comp != ".." {
                 let mut to = self.path(cur)?;
-                for c in core::iter::once(&comp).chain(&pending) {
+                let rest = core::iter::once(&comp).chain(&pending);
+                for c in rest.filter(|c| *c != ".") {
                     to.push('/');
                     to.push_str(c);
                 }
@@ -1541,10 +1546,29 @@ impl<'a, A: Pages> Overlay<'a, A> {
             }
             cur = child;
         }
-        if path.ends_with('/') && self.get(cur)?.kind() != Kind::Directory {
-            return Err(ENOTDIR);
-        }
         Ok(cur)
+    }
+
+    /// Where creating `path` from `cwd` would put it: as
+    /// [`Self::resolve_parent`], but through symlinks that name nothing yet
+    /// in the final component, if `follow` (`open` with `O_CREAT` makes
+    /// what they name).
+    pub fn resolve_create(
+        &mut self,
+        cwd: Ino,
+        path: &str,
+        follow: bool,
+    ) -> Result<(Ino, String), i64> {
+        let (mut dir, mut name) = self.resolve_parent(cwd, path)?;
+        for _ in 0..=MAX_SYMLINK_HOPS {
+            let link = match self.find(dir, &name)? {
+                Some(i) if follow && self.get(i)?.kind() == Kind::Symlink => i,
+                _ => return Ok((dir, name)),
+            };
+            let target = self.readlink(link)?;
+            (dir, name) = self.resolve_parent(dir, &target)?;
+        }
+        Err(ELOOP)
     }
 
     /// Resolves all but the last component of `path`; returns the parent
@@ -1567,10 +1591,23 @@ impl<'a, A: Pages> Overlay<'a, A> {
             None => ("", trimmed),
         };
         let dir = if dir_part.is_empty() {
-            cwd
+            Ok(cwd)
         } else {
-            self.resolve(cwd, dir_part, true)?
+            self.resolve(cwd, dir_part, true)
         };
+        let dir = match dir {
+            Ok(d) if self.is_elsewhere(d) => {
+                self.crossing = self.path(d)?;
+                Err(ELSEWHERE)
+            }
+            r => r,
+        }
+        .inspect_err(|&e| {
+            if e == ELSEWHERE {
+                self.crossing.push('/');
+                self.crossing.push_str(name);
+            }
+        })?;
         if self.get(dir)?.kind() != Kind::Directory {
             return Err(ENOTDIR);
         }
@@ -1628,6 +1665,31 @@ mod tests {
     }
 
     #[test]
+    fn a_trailing_slash_means_a_directory() {
+        let mut fs = Overlay::empty(1 << 20);
+        let d = fs.mkdir(ROOT, "d", 0o755).unwrap();
+        let f = fs.create(ROOT, "f", 0o644).unwrap();
+        let l = fs.symlink(ROOT, "l", "d").unwrap();
+        fs.symlink(ROOT, "lf", "f").unwrap();
+        fs.symlink(ROOT, "slash", "f/").unwrap();
+        fs.symlink(d, "up", "../new").unwrap();
+        assert_eq!(fs.resolve(ROOT, "l", false), Ok(l));
+        assert_eq!(fs.resolve(ROOT, "l/", false), Ok(d));
+        assert_eq!(fs.resolve(ROOT, "lf", true), Ok(f));
+        assert_eq!(fs.resolve(ROOT, "lf/", false), Err(ENOTDIR));
+        assert_eq!(fs.resolve(ROOT, "slash", true), Err(ENOTDIR));
+        assert_eq!(fs.resolve(ROOT, "f/", true), Err(ENOTDIR));
+        assert_eq!(fs.resolve(ROOT, "/", true), Ok(ROOT));
+        // Creating through a dangling symlink creates what it names.
+        let made = |n: &str| Ok((ROOT, n.to_string()));
+        assert_eq!(fs.resolve_create(ROOT, "d/up", true), made("new"));
+        let (dir, name) = fs.resolve_create(ROOT, "d/up", false).unwrap();
+        assert_eq!((dir, name.as_str()), (d, "up"));
+        fs.symlink(ROOT, "loop", "loop").unwrap();
+        assert_eq!(fs.resolve_create(ROOT, "loop", true), Err(ELOOP));
+    }
+
+    #[test]
     fn paths_cross_into_what_is_served_elsewhere() {
         let mut fs = Overlay::empty(1 << 20);
         let proc = fs.mkdir(ROOT, "proc", 0o555).unwrap();
@@ -1644,6 +1706,20 @@ mod tests {
         assert_eq!(to(dev, "mounts", true), crossed("/proc/self/mounts"));
         assert_eq!(to(proc, "1/stat", true), crossed("/proc/1/stat"));
         assert!(to(dev, "mounts", false).0.is_ok(), "the link itself");
+        let r = fs.resolve_create(dev, "mounts", true);
+        assert_eq!(
+            (r, fs.take_crossing()),
+            (Err(ELSEWHERE), "/proc/self/mounts".to_string())
+        );
+        let r = fs.resolve_parent(dev, "../proc/new");
+        assert_eq!(
+            (r, fs.take_crossing()),
+            (Err(ELSEWHERE), "/proc/new".to_string())
+        );
+        let mut to = |from: Ino, path: &str, follow: bool| {
+            let r = fs.resolve(from, path, follow);
+            (r, fs.take_crossing())
+        };
         assert_eq!(to(ROOT, "proc", true).0, Ok(proc));
         assert_eq!(to(proc, "../dev", true).0, Ok(dev));
     }

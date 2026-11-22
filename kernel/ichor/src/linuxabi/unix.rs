@@ -849,6 +849,39 @@ fn write_sun(p: &mut LinuxProcess, addr: u64, lenp: u64, name: Option<&Name>) ->
     if lenp == 0 {
         return Ok(());
     }
+    let b = sun(name);
+    let mut lb = [0u8; 4];
+    if p.copy_from_user(lenp, &mut lb) != 4 {
+        return Err(EFAULT);
+    }
+    let n = (u32::from_le_bytes(lb) as usize).min(b.len());
+    if (addr != 0 && p.copy_to_user(addr, &b[..n]) != n)
+        || p.copy_to_user(lenp, &(b.len() as u32).to_le_bytes()) != 4
+    {
+        return Err(EFAULT);
+    }
+    Ok(())
+}
+
+/// Writes a message's source to a user `sockaddr`: a sender with no name has
+/// no address at all (length 0), not an empty one.
+fn write_source(
+    p: &mut LinuxProcess,
+    addr: u64,
+    lenp: u64,
+    name: Option<&Name>,
+) -> Result<(), i64> {
+    if name.is_some() {
+        return write_sun(p, addr, lenp, name);
+    }
+    if lenp != 0 && p.copy_to_user(lenp, &[0u8; 4]) != 4 {
+        return Err(EFAULT);
+    }
+    Ok(())
+}
+
+/// `name` as a `struct sockaddr_un`, as long as it is.
+fn sun(name: Option<&Name>) -> Vec<u8> {
     let mut b = (AF_UNIX as u16).to_le_bytes().to_vec();
     match name {
         Some(Name::Path(s, _)) => {
@@ -861,17 +894,7 @@ fn write_sun(p: &mut LinuxProcess, addr: u64, lenp: u64, name: Option<&Name>) ->
         }
         None => {}
     }
-    let mut lb = [0u8; 4];
-    if p.copy_from_user(lenp, &mut lb) != 4 {
-        return Err(EFAULT);
-    }
-    let n = (u32::from_le_bytes(lb) as usize).min(b.len());
-    if (addr != 0 && p.copy_to_user(addr, &b[..n]) != n)
-        || p.copy_to_user(lenp, &(b.len() as u32).to_le_bytes()) != 4
-    {
-        return Err(EFAULT);
-    }
-    Ok(())
+    b
 }
 
 /// The endpoint a name reaches from `p`.
@@ -1454,7 +1477,7 @@ pub(super) fn recvfrom(
         return Err(EFAULT);
     }
     if a[4] != 0 {
-        write_sun(p, a[4], a[5], r.from.as_ref())?;
+        write_source(p, a[4], a[5], r.from.as_ref())?;
     }
     let n = if a[3] & MSG_TRUNC != 0 {
         r.full
@@ -1495,7 +1518,7 @@ pub(super) fn recvmsg(
         at += n;
     }
     if h.name != 0 {
-        write_sun(p, h.name, msg + 8, r.from.as_ref())?;
+        write_source(p, h.name, msg + 8, r.from.as_ref())?;
     } else if p.copy_to_user(msg + 8, &[0u8; 4]) != 4 {
         return Err(EFAULT);
     }

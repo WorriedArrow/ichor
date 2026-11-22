@@ -1072,8 +1072,13 @@ pub(crate) fn run(mut p: LinuxProcess, mut ctx: UserContext) -> (u32, u32) {
                 error,
                 cr2,
             } if p.mm().fault(cr2, error & 2 != 0, error & 16 != 0) => {}
-            UserEvent::Exception { vector, cr2, .. } => {
+            UserEvent::Exception { vector, error, cr2 } => {
                 // The signal, its code and its address, as Linux reports.
+                let trap = signal::Trap {
+                    vector: u64::from(vector),
+                    error,
+                    cr2,
+                };
                 let rip = ctx.rip;
                 let (sig, code, addr) = match vector {
                     0 => (SIGFPE, signal::FPE_INTDIV, rip),
@@ -1085,7 +1090,7 @@ pub(crate) fn run(mut p: LinuxProcess, mut ctx: UserContext) -> (u32, u32) {
                     14 => (signal::SIGSEGV, signal::SEGV_MAPERR, cr2),
                     _ => (signal::SIGSEGV, signal::SI_KERNEL, 0),
                 };
-                if let Some(status) = signal::fault(&mut p, &mut ctx, sig, code, addr) {
+                if let Some(status) = signal::fault(&mut p, &mut ctx, sig, code, addr, trap) {
                     // The cell's memory with it: a fault the kernel could
                     // not serve is often a full account.
                     let acct = p.cell.account();

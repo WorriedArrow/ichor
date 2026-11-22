@@ -150,10 +150,12 @@ fn open_path(
             if flags & O_CREAT == 0 {
                 return fs.resolve(start, path, follow);
             }
-            let (dir, name) = fs.resolve_parent(start, path)?;
+            let through = follow && flags & O_EXCL == 0;
+            let (dir, name) = fs.resolve_create(start, path, through)?;
             match fs.lookup(dir, &name) {
                 Ok(_) if flags & O_EXCL != 0 => Err(EEXIST),
                 Ok(_) => fs.resolve(start, path, follow),
+                Err(ENOENT) if path.ends_with('/') => Err(EISDIR),
                 Err(ENOENT) => {
                     created = true;
                     fs.create(dir, &name, mode as u32 & !umask)
