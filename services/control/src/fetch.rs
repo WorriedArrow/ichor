@@ -16,6 +16,8 @@ use rt::{Error, Handle, WaitItem};
 
 /// Largest response body (a layer blob).
 const MAX_BODY: usize = 512 << 20;
+/// Left for everything else while a response comes.
+const SPARE: usize = 16 << 20;
 /// Give up on a request when nothing has come for this long, or after this
 /// long in all (a large layer on a slow link takes a while; a server that
 /// trickles bytes must not hold a pull forever).
@@ -274,6 +276,14 @@ impl Fetch {
                 .map_err(|e| format!("HTTP from {host}: {e:?}"))?
             {
                 return Ok(Some(resp));
+            }
+            // What does not fit in memory would end the control plane.
+            let wants = self.parser.wants();
+            if rt::memory_available() < wants.saturating_add(SPARE) {
+                return Err(format!(
+                    "a response of {host} ({} KiB more) does not fit in memory",
+                    wants / 1024
+                ));
             }
             if closed {
                 return self

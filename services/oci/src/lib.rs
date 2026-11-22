@@ -464,7 +464,7 @@ fn encode(v: &str) -> String {
 
 /// The pulled layers as one Ichor image.
 pub fn convert(p: &Pulled) -> Result<Vec<u8>, Error> {
-    convert_with(p, &[])
+    convert_with(&mut p.clone(), &[], layer::ANY)
 }
 
 /// A layer added on top of an image's own, already verified against its
@@ -478,18 +478,27 @@ pub struct Extra<'a> {
     pub to: &'a str,
 }
 
-/// The pulled layers, then `extras` above them, as one Ichor image.
-pub fn convert_with(p: &Pulled, extras: &[Extra<'_>]) -> Result<Vec<u8>, Error> {
+/// The pulled layers, then `extras` above them, as one Ichor image, if what
+/// that takes fits in `room`. Each layer is let go of once it is unpacked.
+pub fn convert_with(
+    p: &mut Pulled,
+    extras: &[Extra<'_>],
+    room: layer::Room<'_>,
+) -> Result<Vec<u8>, Error> {
+    let bad = |e: layer::Error| Error::Unsupported(e.0);
     let mut t = layer::Tree::new();
-    for (d, data) in &p.layers {
+    for (d, data) in &mut p.layers {
+        let data = core::mem::take(data);
         let tar = if d.media_type.ends_with("gzip") || data.starts_with(&[0x1f, 0x8b]) {
-            layer::gunzip(data).map_err(|e| Error::Unsupported(e.0))?
+            let tar = layer::gunzip_within(&data, room).map_err(bad)?;
+            drop(data);
+            tar
         } else if d.media_type.ends_with(".tar") || d.media_type.is_empty() {
-            data.clone()
+            data
         } else {
             return Err(Error::Unsupported(d.media_type.clone()));
         };
-        t.add_tar(&tar).map_err(|e| Error::Unsupported(e.0))?;
+        t.add_tar_within(&tar, room).map_err(bad)?;
     }
     // Extras in a row from one archive: it is unpacked once.
     let mut last: (&[u8], Vec<u8>) = (&[], Vec::new());
@@ -499,19 +508,20 @@ pub fn convert_with(p: &Pulled, extras: &[Extra<'_>]) -> Result<Vec<u8>, Error> 
         } else {
             if !core::ptr::eq(last.0, x.data) {
                 drop(core::mem::take(&mut last.1)); // before the next is made
-                let tar = layer::gunzip_all(x.data).map_err(|e| Error::Unsupported(e.0))?;
+                let tar = layer::gunzip_within(x.data, room).map_err(bad)?;
                 last = (x.data, tar);
             }
             &last.1
         };
         let r = if x.from.is_empty() && x.to.is_empty() {
-            t.add_tar(tar)
+            t.add_tar_within(tar, room)
         } else {
-            t.add_tar_at(tar, x.from, x.to)
+            t.add_tar_at_within(tar, x.from, x.to, room)
         };
-        r.map_err(|e| Error::Unsupported(e.0))?;
+        r.map_err(bad)?;
     }
-    Ok(t.image())
+    drop(last);
+    t.into_image(room).map_err(bad)
 }
 
 /// What the image config says to run.

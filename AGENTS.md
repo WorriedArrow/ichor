@@ -173,10 +173,13 @@ not write it; merge its branch when it lands.
   threads). It found the `execve` race (`/proc/<pid>/cmdline` read
   the old arguments' address in the new memory) and that a TCP socket whose
   connect was refused could not connect again.
-- Known weakness: a pull whose image does not fit in memory kills the
-  control plane (a page its heap touches cannot be charged, and the native
-  process ends) instead of failing the pull. It holds layers and the
-  converted image at once: about three times the image.
+- A pull that does not fit in memory fails, and the control plane lives
+  on: `rt::memory_available` (`MEM_AVAILABLE`) is asked before large work,
+  through `layer::Room` (`gunzip_within`, `add_tar_within`, `into_image`).
+  Asking matters because a native process's heap does not fail: touching a
+  page the cell cannot pay for ends the process. Converting takes the image
+  about twice; layers may have several gzip members. Images are never freed
+  (`IMAGE_CREATE` leaks them).
 - WHPX (Windows) does not work with QEMU 9.0: it has no x2APIC, which frame
   requires (and it cannot run firmware from pflash; `-bios` with the two
   images concatenated gets as far as that).

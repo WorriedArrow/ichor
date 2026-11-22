@@ -124,6 +124,12 @@ pub(crate) fn mem_unmap(ptr: *mut u8, len: usize) {
     let _ = call(sys::MEM_UNMAP, [ptr as u64, len as u64, 0, 0, 0]);
 }
 
+/// Bytes of memory the cell may still use. Allocating more than that does
+/// not fail: using it ends the process. So ask first.
+pub fn memory_available() -> usize {
+    call(sys::MEM_AVAILABLE, [0; 5]).map_or(0, |n| usize::try_from(n).unwrap_or(usize::MAX))
+}
+
 /// Waits until one of `items` is ready or `timeout_ns` passes
 /// (`u64::MAX`: no limit); sets each item's `revents` and returns how many
 /// are ready.

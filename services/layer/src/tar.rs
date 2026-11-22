@@ -8,12 +8,13 @@
 //! OCI whiteouts: `.wh.NAME` removes `NAME` from the layers below, and
 //! `.wh..wh..opq` empties its directory of what the layers below put there.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
+use alloc::rc::Rc;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use crate::Result;
+use crate::{ANY, Result, Room, fits};
 
 /// Owner, group and modification time of an entry.
 #[derive(Debug, Clone, Copy, Default)]
@@ -27,7 +28,8 @@ struct Own {
 #[derive(Debug, Clone)]
 enum Entry {
     File {
-        data: Vec<u8>,
+        /// Shared by its hard links.
+        data: Rc<Vec<u8>>,
         mode: u32,
         own: Own,
     },
@@ -260,7 +262,12 @@ impl Tree {
     /// its whiteouts first, against the layers below, then its entries in
     /// order (a later entry replaces an earlier one).
     pub fn add_tar(&mut self, tar: &[u8]) -> Result<()> {
-        self.apply(members(tar)?)
+        self.add_tar_within(tar, ANY)
+    }
+
+    /// [`Tree::add_tar`], if what it holds fits in `room`.
+    pub fn add_tar_within(&mut self, tar: &[u8], room: Room<'_>) -> Result<()> {
+        self.apply(members(tar)?, room)
     }
 
     /// [`Tree::add_tar`] for an archive that is not an image layer (a
@@ -268,6 +275,17 @@ impl Tree {
     /// to `to` (`Python-3.12.7/Lib/` to `usr/local/lib/python3.12/`, say).
     /// Hard link targets move with them.
     pub fn add_tar_at(&mut self, tar: &[u8], from: &str, to: &str) -> Result<()> {
+        self.add_tar_at_within(tar, from, to, ANY)
+    }
+
+    /// [`Tree::add_tar_at`], if what it holds fits in `room`.
+    pub fn add_tar_at_within(
+        &mut self,
+        tar: &[u8],
+        from: &str,
+        to: &str,
+        room: Room<'_>,
+    ) -> Result<()> {
         let norm = |s: &str| {
             s.trim_start_matches("./")
                 .trim_start_matches('/')
@@ -295,10 +313,14 @@ impl Tree {
             }
             ms.push(m);
         }
-        self.apply(ms)
+        self.apply(ms, room)
     }
 
-    fn apply(&mut self, ms: Vec<Member<'_>>) -> Result<()> {
+    fn apply(&mut self, ms: Vec<Member<'_>>, room: Room<'_>) -> Result<()> {
+        /// What an entry takes beside its data.
+        const ENTRY: usize = 512;
+        let data: usize = ms.iter().map(|m| m.data.len()).sum();
+        fits(data.saturating_add(ms.len() * ENTRY), room)?;
         for m in &ms {
             let ps = parts(&m.name)?;
             let Some((base, dir)) = ps.split_last() else {
@@ -324,7 +346,7 @@ impl Tree {
                 b'0' | 0 | b'7' => self.put(
                     &m.name,
                     Entry::File {
-                        data: m.data.to_vec(),
+                        data: Rc::new(m.data.to_vec()),
                         mode,
                         own,
                     },
@@ -363,7 +385,7 @@ impl Tree {
         self.put(
             path,
             Entry::File {
-                data: data.to_vec(),
+                data: Rc::new(data.to_vec()),
                 mode,
                 own: Own::default(),
             },
@@ -372,27 +394,61 @@ impl Tree {
 
     /// Builds the Ichor image (padded to whole 4 KiB blocks).
     pub fn image(&self) -> Vec<u8> {
-        fn emit(b: &mut image::builder::Builder, name: &str, e: &Entry) -> image::builder::NodeId {
+        let copy = Tree {
+            root: self.root.clone(),
+        };
+        // (There is room for anything.)
+        copy.into_image(ANY).unwrap_or_default()
+    }
+
+    /// [`Tree::image`], if it fits in `room`: files are let go of as they
+    /// are written, so this takes little more than the image twice.
+    pub fn into_image(self, room: Room<'_>) -> Result<Vec<u8>> {
+        /// What the image's tables take for one chunk, while built.
+        const CHUNK: usize = 256;
+        /// Data of at least this much goes back when it is let go of.
+        const LARGE: usize = 4096;
+        fn emit(b: &mut image::builder::Builder, name: &str, e: Entry) -> image::builder::NodeId {
             let (id, own) = match e {
-                Entry::File { data, mode, own } => (b.file(name, data, *mode), own),
-                Entry::Symlink(t, own) => (b.symlink(name, t), own),
+                Entry::File { data, mode, own } => (b.file(name, &data, mode), own),
+                Entry::Symlink(t, own) => (b.symlink(name, &t), own),
                 Entry::Dir {
                     mode,
                     own,
                     children,
                 } => {
-                    let ids: Vec<_> = children.iter().map(|(n, c)| emit(b, n, c)).collect();
-                    (b.dir(name, &ids, *mode), own)
+                    let ids: Vec<_> = children.into_iter().map(|(n, c)| emit(b, &n, c)).collect();
+                    (b.dir(name, &ids, mode), own)
                 }
             };
             b.set_owner(id, own.uid, own.gid, own.mtime);
             id
         }
-        let mut b = image::builder::Builder::new();
-        let root = emit(&mut b, "/", &self.root);
+        /// The bytes of chunks under `e`, and those that come back.
+        fn weigh(e: &Entry, seen: &mut BTreeSet<usize>, sum: &mut (usize, usize)) {
+            match e {
+                Entry::File { data, .. } if seen.insert(Rc::as_ptr(data) as usize) => {
+                    sum.0 += data.len().next_multiple_of(4096);
+                    if data.len() >= LARGE {
+                        sum.1 += data.len();
+                    }
+                }
+                Entry::Dir { children, .. } => {
+                    children.values().for_each(|c| weigh(c, seen, sum));
+                }
+                _ => {}
+            }
+        }
+        let mut sum = (0, 0);
+        weigh(&self.root, &mut BTreeSet::new(), &mut sum);
+        let (chunks, back) = sum;
+        fits((chunks - back.min(chunks)) + chunks / 4096 * CHUNK, room)?;
+        let mut b = image::builder::Builder::with_capacity(chunks);
+        let root = emit(&mut b, "/", self.root);
+        fits(b.finished_len(), room)?;
         let mut img = b.finish(root);
         img.resize(img.len().next_multiple_of(4096), 0);
-        img
+        Ok(img)
     }
 }
 
@@ -454,6 +510,15 @@ mod tests {
         );
         assert_eq!(image.lookup("/bin/hard").unwrap().size(), 4);
         assert!(image.lookup("/dev/null").is_none());
+        // Built from the tree itself, it is the same; where there is no
+        // room, it is not built, nor the tree.
+        let mut t = Tree::new();
+        assert!(t.add_tar_within(&tar, &|| 1000).is_err());
+        t.add_tar_within(&tar, &|| 1 << 30).unwrap();
+        assert_eq!(t.into_image(&|| 1 << 30).unwrap(), img);
+        let mut t = Tree::new();
+        t.add_tar(&tar).unwrap();
+        assert!(t.into_image(&|| 1000).is_err());
     }
 
     #[test]

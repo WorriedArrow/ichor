@@ -98,24 +98,50 @@ fn extra_layer() -> Vec<u8> {
     ))
 }
 
+/// A layer of one file of a GiB of zeros, in a few MiB: more than the guest
+/// has memory for.
+fn huge_layer() -> Vec<u8> {
+    const PART: usize = 8 << 20;
+    const PARTS: usize = 128;
+    let mut h = xtask::deflate::tar("src/zeros", b"")[..512].to_vec();
+    h[124..136].copy_from_slice(format!("{:011o}\0", PART * PARTS).as_bytes());
+    h[148..156].fill(b' ');
+    let sum: u32 = h.iter().map(|&b| u32::from(b)).sum();
+    h[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+    // The members of a gzip stream are one stream.
+    let mut out = xtask::deflate::gzip(&h);
+    let part = xtask::deflate::gzip(&vec![0u8; PART]);
+    for _ in 0..PARTS {
+        out.extend_from_slice(&part);
+    }
+    out
+}
+
 fn sha256(b: &[u8]) -> String {
     format!("sha256:{}", xtask::sha256::hex(&xtask::sha256::digest(b)))
 }
 
 /// Serves `body` to every HTTP request on 127.0.0.1 (the guest's
 /// 10.0.2.2), by a redirect under `/moved/`, until the process ends;
-/// returns the port, and how often it was asked.
+/// returns the port, and how often it was asked. `/huge` is
+/// [`huge_layer`], and not counted.
 fn serve(body: Vec<u8>) -> (u16, Arc<AtomicU32>) {
+    let huge = huge_layer();
     let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = l.local_addr().unwrap().port();
     let asked = Arc::new(AtomicU32::new(0));
     let count = asked.clone();
     std::thread::spawn(move || {
         for mut s in l.incoming().flatten() {
-            count.fetch_add(1, Ordering::SeqCst);
             let mut req = [0u8; 4096];
             let _ = s.set_read_timeout(Some(Duration::from_secs(10)));
             let n = s.read(&mut req).unwrap_or(0);
+            let body = if req[..n].starts_with(b"GET /huge") {
+                &huge
+            } else {
+                count.fetch_add(1, Ordering::SeqCst);
+                &body
+            };
             // What was asked for is elsewhere, as release files often are.
             if req[..n].starts_with(b"GET /moved/") {
                 let _ = s.write_all(
@@ -128,7 +154,7 @@ fn serve(body: Vec<u8>) -> (u16, Arc<AtomicU32>) {
                 body.len()
             );
             let _ = s.write_all(head.as_bytes());
-            let _ = s.write_all(&body);
+            let _ = s.write_all(body);
         }
     });
     (port, asked)
@@ -220,6 +246,22 @@ fn session(port: u16, layer_port: u16) -> Result<(Ran, Ran), String> {
         ));
     }
     eprintln!("host: refused as it should be: {msg}");
+
+    // One that does not fit in memory fails the pull, and only that.
+    let req = control::PullImageRequest {
+        reference: IMAGE.into(),
+        layers: vec![control::LayerSource {
+            url: format!("http://10.0.2.2:{layer_port}/huge.tar.gz"),
+            digest: sha256(&huge_layer()),
+            from: "src/".into(),
+            to: "/opt/huge/".into(),
+        }],
+    };
+    let (_, code, msg) = s.call(control::PULL_IMAGE, &req.encode(), Duration::from_secs(600))?;
+    if code == 0 || !msg.contains("do not fit in memory") {
+        return Err(format!("a huge layer was not refused: ({code}) {msg}"));
+    }
+    eprintln!("host: too large, as it should be: {msg}");
 
     // Two layers from one archive: it is fetched once.
     let again = control::LayerSource {

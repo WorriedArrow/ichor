@@ -5,7 +5,7 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
-use crate::Result;
+use crate::{ANY, Result, Room, fits};
 
 const MAXBITS: usize = 15;
 
@@ -105,8 +105,34 @@ const DIST_EXTRA: [u8; 30] = [
     13,
 ];
 
-fn codes(s: &mut Bits<'_>, out: &mut Vec<u8>, lit: &Huffman, dist: &Huffman) -> Result<()> {
+/// Makes room for `more` bytes in `out`.
+fn reserve(out: &mut Vec<u8>, more: usize, room: Room<'_>) -> Result<()> {
+    let need = out.len() + more;
+    if need <= out.capacity() {
+        return Ok(());
+    }
+    // It moves: for that, both are there. What was the old one's is for
+    // the second half of the new one.
+    fits(need, room)?;
+    let want = need.max(out.capacity() * 2).max(64 * 1024);
+    out.try_reserve_exact(want - out.len())
+        .map_err(|_| "a layer does not fit in memory".into())
+}
+
+/// Longest match.
+const MATCH: usize = 258;
+
+/// Decodes one block's symbols into `out`, whose stream began at `from`.
+fn codes(
+    s: &mut Bits<'_>,
+    out: &mut Vec<u8>,
+    from: usize,
+    lit: &Huffman,
+    dist: &Huffman,
+    room: Room<'_>,
+) -> Result<()> {
     loop {
+        reserve(out, MATCH, room)?;
         let sym = lit.decode(s)?;
         match sym {
             0..=255 => out.push(sym as u8),
@@ -118,7 +144,7 @@ fn codes(s: &mut Bits<'_>, out: &mut Vec<u8>, lit: &Huffman, dist: &Huffman) -> 
                 let d = usize::from(dist.decode(s)?);
                 let back = usize::from(*DIST_BASE.get(d).ok_or("deflate: bad distance")?)
                     + s.need(u32::from(DIST_EXTRA[d]))? as usize;
-                if back > out.len() {
+                if back > out.len() - from {
                     return Err("deflate: distance too far back".into());
                 }
                 let start = out.len() - back;
@@ -132,13 +158,22 @@ fn codes(s: &mut Bits<'_>, out: &mut Vec<u8>, lit: &Huffman, dist: &Huffman) -> 
 
 /// Inflates a raw DEFLATE stream; returns the output and the bytes consumed.
 pub fn inflate(data: &[u8]) -> Result<(Vec<u8>, usize)> {
+    let mut out = Vec::new();
+    let used = inflate_into(data, &mut out, ANY)?;
+    Ok((out, used))
+}
+
+/// Inflates a stream onto the end of `out`; returns the bytes consumed.
+fn inflate_into(data: &[u8], out: &mut Vec<u8>, room: Room<'_>) -> Result<usize> {
+    let from = out.len();
     let mut s = Bits {
         data,
         pos: 0,
         bitbuf: 0,
         bitcnt: 0,
     };
-    let mut out = Vec::with_capacity(data.len().saturating_mul(3));
+    // A guess, if it fits.
+    let _ = reserve(out, data.len().saturating_mul(3), room);
     loop {
         let last = s.need(1)?;
         match s.need(2)? {
@@ -158,6 +193,7 @@ pub fn inflate(data: &[u8]) -> Result<(Vec<u8>, usize)> {
                 let bytes = data
                     .get(s.pos..s.pos + len)
                     .ok_or("deflate: short stored data")?;
+                reserve(out, len, room)?;
                 out.extend_from_slice(bytes);
                 s.pos += len;
             }
@@ -169,7 +205,7 @@ pub fn inflate(data: &[u8]) -> Result<(Vec<u8>, usize)> {
                 l[280..].fill(8);
                 let lit = Huffman::new(&l)?;
                 let dist = Huffman::new(&[5u8; 30])?;
-                codes(&mut s, &mut out, &lit, &dist)?;
+                codes(&mut s, out, from, &lit, &dist, room)?;
             }
             2 => {
                 let nlen = s.need(5)? as usize + 257;
@@ -213,12 +249,12 @@ pub fn inflate(data: &[u8]) -> Result<(Vec<u8>, usize)> {
                 }
                 let lit = Huffman::new(&lengths[..nlen])?;
                 let dist = Huffman::new(&lengths[nlen..])?;
-                codes(&mut s, &mut out, &lit, &dist)?;
+                codes(&mut s, out, from, &lit, &dist, room)?;
             }
             _ => return Err("deflate: invalid block type".into()),
         }
         if last == 1 {
-            return Ok((out, s.pos));
+            return Ok(s.pos);
         }
     }
 }
@@ -246,25 +282,33 @@ pub fn crc32(data: &[u8]) -> u32 {
 
 /// Decompresses a gzip file (one member), checking its CRC and length.
 pub fn gunzip(data: &[u8]) -> Result<Vec<u8>> {
-    Ok(gunzip_member(data)?.0)
+    let mut out = Vec::new();
+    gunzip_member(data, &mut out, ANY)?;
+    Ok(out)
 }
 
 /// Decompresses every member of a multi-member gzip stream and joins them
 /// (an Alpine `.apk` is a signature, a control and a data member, each a
 /// tar fragment, which together make one tar stream).
-pub fn gunzip_all(mut data: &[u8]) -> Result<Vec<u8>> {
+pub fn gunzip_all(data: &[u8]) -> Result<Vec<u8>> {
+    gunzip_within(data, ANY)
+}
+
+/// [`gunzip_all`] of something of unknown size, if it fits in `room`. (A
+/// layer may have several members too: what makes it seekable.)
+pub fn gunzip_within(mut data: &[u8], room: Room<'_>) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     while !data.is_empty() {
-        let (part, used) = gunzip_member(data)?;
-        out.extend_from_slice(&part);
+        let used = gunzip_member(data, &mut out, room)?;
         data = &data[used..];
     }
     Ok(out)
 }
 
-/// One gzip member at the start of `data`: its bytes, and how much of
-/// `data` it took (header, body and trailer).
-fn gunzip_member(data: &[u8]) -> Result<(Vec<u8>, usize)> {
+/// One gzip member at the start of `data`, onto the end of `out`; returns
+/// how much of `data` it took (header, body and trailer).
+fn gunzip_member(data: &[u8], out: &mut Vec<u8>, room: Room<'_>) -> Result<usize> {
+    let from = out.len();
     if data.len() < 18 || data[0] != 0x1f || data[1] != 0x8b || data[2] != 8 {
         return Err("gzip: not a deflate gzip file".into());
     }
@@ -288,14 +332,15 @@ fn gunzip_member(data: &[u8]) -> Result<(Vec<u8>, usize)> {
         pos += 2; // FHCRC
     }
     let body = data.get(pos..).ok_or("gzip: bad header")?;
-    let (out, used) = inflate(body)?;
+    let used = inflate_into(body, out, room)?;
+    let out = &out[from..];
     let trailer = body.get(used..used + 8).ok_or("gzip: missing trailer")?;
     let crc = u32::from_le_bytes([trailer[0], trailer[1], trailer[2], trailer[3]]);
     let isize = u32::from_le_bytes([trailer[4], trailer[5], trailer[6], trailer[7]]);
-    if crc != crc32(&out) || isize != out.len() as u32 {
+    if crc != crc32(out) || isize != out.len() as u32 {
         return Err("gzip: CRC or length mismatch".into());
     }
-    Ok((out, pos + used + 8))
+    Ok(pos + used + 8)
 }
 
 #[cfg(test)]
@@ -360,6 +405,16 @@ mod tests {
         bad[n - 5] ^= 1; // corrupt the CRC
         assert!(gunzip(&bad).is_err());
         assert!(gunzip_all(&[g.as_slice(), bad.as_slice()].concat()).is_err());
+        // What there is no memory for is an error before it is made.
+        assert!(gunzip_within(&two, &|| 1 << 30).is_ok());
+        let e = gunzip_within(&two, &|| 1 << 20).unwrap_err();
+        assert!(e.0.contains("do not fit in memory"), "{e}");
+        // A member does not reach back into the one before it: its first
+        // match here would be 5 bytes back, with nothing written yet.
+        let early = [0x03, 0x12, 0x00];
+        let mut out = b"hello".to_vec();
+        let e = inflate_into(&early, &mut out, ANY).unwrap_err();
+        assert!(e.0.contains("too far back"), "{e}");
     }
 
     #[test]

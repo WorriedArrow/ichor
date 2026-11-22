@@ -243,6 +243,10 @@ pub(crate) fn call(cell: &Arc<Cell>, mm: &mut Mm, nr: u64, a: [u64; 6]) -> Resul
                 .map_err(|_| Error::NoMemory)
         }
         sys::MEM_UNMAP => mm.munmap(a[0], a[1]).map_err(|_| Error::Invalid),
+        sys::MEM_AVAILABLE => {
+            let free = frame::mm::stats().free_pages as u64;
+            Ok(cell.account().available().min(free) * PAGE_SIZE)
+        }
         sys::OBJECT_WAIT => object_wait(cell, mm, a[0], a[1], a[2]),
         sys::TCP_CONNECT => {
             let s = sock::tcp_connect(cell, addr(a[0], a[1])?).map_err(errno)?;

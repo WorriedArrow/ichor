@@ -104,6 +104,10 @@ pub mod sys {
     /// Write cell `arg0`'s state to the [`super::CELL_INFO_LEN`] bytes at
     /// `arg1` (a [`super::CellInfo`]); needs INSPECT.
     pub const CELL_INSPECT: u64 = 29;
+    /// Bytes of memory the cell may still use: what is left of its account
+    /// and of the machine. Touching a mapped page past it ends the process
+    /// (`MEM_MAP` itself takes nothing), so ask before large work.
+    pub const MEM_AVAILABLE: u64 = 30;
 }
 
 /// [`sys::CLOCK`] clocks.
