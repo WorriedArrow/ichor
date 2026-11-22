@@ -39,6 +39,15 @@ static IBPB_ON: AtomicBool = AtomicBool::new(false);
 /// IBPBs issued (all CPUs).
 static IBPBS: AtomicU64 = AtomicU64::new(0);
 
+/// `IA32_SPEC_CTRL`, and the bits Ichor sets in it.
+const MSR_SPEC_CTRL: u32 = 0x48;
+const SPEC_CTRL_IBRS: u64 = 1;
+const SPEC_CTRL_BHI_DIS_S: u64 = 1 << 10;
+/// What every CPU writes to `IA32_SPEC_CTRL` as it comes up (0: nothing).
+/// Set only on CPUs that enumerate enhanced IBRS (ADR-0004 §2: Spectre v2
+/// and BHI in the kernel), where IBRS is set once and left on.
+static SPEC_CTRL: AtomicU64 = AtomicU64::new(0);
+
 /// What the boot CPU's vulnerabilities call for, switched on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Mitigations {
@@ -53,6 +62,9 @@ pub(crate) struct Mitigations {
     /// Page-table isolation (Meltdown), and whether it uses PCID.
     pub pti: bool,
     pub pcid: bool,
+    /// Enhanced IBRS on (Spectre v2 in the kernel), and BHI_DIS_S with it.
+    pub eibrs: bool,
+    pub bhi_dis_s: bool,
 }
 
 /// Switches on the mitigations `v` calls for (once, on the boot CPU,
@@ -74,6 +86,15 @@ pub(crate) fn enable_mitigations(
     if pti {
         super::entry::enable()?;
     }
+    // Enhanced IBRS: set once per CPU and left on, it keeps user-trained
+    // branch predictions out of the kernel's indirect branches; BHI_DIS_S
+    // does the same for branch history. Written only where enumerated
+    // (`IA32_SPEC_CTRL` needs CPUID.7:EDX[26]; a reserved bit would fault).
+    let eibrs = v.eibrs && v.ibpb;
+    let bhi_dis_s = eibrs && v.bhi_ctrl;
+    let spec =
+        if eibrs { SPEC_CTRL_IBRS } else { 0 } | if bhi_dis_s { SPEC_CTRL_BHI_DIS_S } else { 0 };
+    SPEC_CTRL.store(spec, Relaxed);
     enable_cpu_mitigations();
     Ok(Mitigations {
         verw,
@@ -81,6 +102,8 @@ pub(crate) fn enable_mitigations(
         ibpb: v.ibpb,
         pti,
         pcid: pti && super::entry::pcid(),
+        eibrs,
+        bhi_dis_s,
     })
 }
 
@@ -91,6 +114,17 @@ pub(crate) fn enable_cpu_mitigations() {
     let block = cpu::this_block();
     block.verw.store(u64::from(VERW_ON.load(Relaxed)), Relaxed);
     super::entry::enable_cpu(block);
+    let spec = SPEC_CTRL.load(Relaxed);
+    if spec != 0 {
+        // SAFETY: `spec` is nonzero only when CPUID enumerates
+        // IA32_SPEC_CTRL (on the boot CPU; all CPUs are assumed alike).
+        // Reading it has no side effects.
+        let firmware = unsafe { rdmsr(MSR_SPEC_CTRL) };
+        // SAFETY: the MSR exists, as above, and so does every bit set:
+        // those firmware set, IBRS (with the MSR) and BHI_DIS_S (only with
+        // its own CPUID bit). They only restrict speculation on this CPU.
+        unsafe { wrmsr(MSR_SPEC_CTRL, firmware | spec) };
+    }
 }
 
 /// How many IBPBs cross-cell switches have issued since boot.

@@ -565,17 +565,19 @@ Suggested order for milestone 4:
    Next: Alpine `apk` and debian-slim `apt` against a local mirror (needs
    sockets or a file-backed mirror, more `/proc`, and glibc's `ld-linux`).
 
-ADR-0004 records the side-channel posture; its per-CPU mitigations (VERW,
-IBPB on cross-cell switch, page-table isolation for Meltdown-affected CPUs)
-are all built. Boot logs which apply.
+ADR-0004 records the side-channel posture. Built: VERW, IBPB on cross-cell
+switch, page-table isolation for Meltdown-affected CPUs, and enhanced IBRS
+with BHI_DIS_S where enumerated (not yet run on hardware that has it: no
+test machine reports it). Owed: BHB clearing, IBRS on entry without eIBRS,
+RSB filling, masked indices, AMD's measures. Boot logs which apply.
 
 Frame budget: ADR-0005 sets the milestone 3 ceiling at 8,500 lines / 380
 sites; ADR-0007 raises it to 9,500 / 420 for milestone 4 (TLB shootdown,
 atomic user ops for futexes, PCID). `audit.toml` is at step 7 (6,250 / 265,
-ADR-0004's isolation amendment); frame is at 6,169 / 259 (A5 added
+ADR-0004's isolation amendment); frame is at 6,209 / 261 (A5 added
 RDSEED/RDRAND and UEFI GetTime; B added XSAVE; C the frames tree and
 request tracking; M6 reading `\ichor\roots.pem`; ADR-0011 the checked user
-copy; ADR-0004 VERW/IBPB and page-table isolation). `services/rt` has
+copy; ADR-0004 VERW/IBPB, page-table isolation and eIBRS). `services/rt` has
 its own budget (`services/rt/audit.toml`: 500 / 40; at 402 / 29).
 
 The goal set for this effort is milestone 8, whose acceptance test needs

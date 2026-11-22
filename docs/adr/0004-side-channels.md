@@ -203,6 +203,26 @@ What §2 owed for Meltdown-affected CPUs, as built in frame
   per address space under isolation. Frame's audit step 7 is 6,250 lines /
   265 unsafe sites, within ADR-0007's ceiling of 9,500 / 420.
 
+## Amendment (2026-11-21): enhanced IBRS
+
+What §2 says for Spectre v2 and BHI on CPUs with enhanced IBRS, as built:
+
+- Where CPUID enumerates `IA32_SPEC_CTRL` (leaf 7 EDX[26]) and
+  `IA32_ARCH_CAPABILITIES` reports `IBRS_ALL`, every CPU sets IBRS once as
+  it comes up and leaves it on, with `BHI_DIS_S` where CPUID.(7,2):EDX[4]
+  enumerates it. Bits firmware set are kept. Nothing is written on any
+  other CPU.
+- The boot log's mitigations line ends with `Spectre v2 in the kernel`
+  and one of `eIBRS + BHI_DIS_S`, `eIBRS`, `eIBRS (BHI NOT MITIGATED: no
+  BHI_DIS_S)`, or `NOT MITIGATED (no enhanced IBRS)`.
+- **Not verified on hardware.** Neither TCG nor CI's KVM guests report
+  enhanced IBRS, so tests cover only the CPUs where nothing is written.
+  The first cloud boot on a CPU that has it is the first run of this code.
+- Still owed from §2: the BHB-clearing sequence for affected CPUs without
+  `BHI_DIS_S` (Cascade Lake, Ice Lake), IBRS on entry for CPUs without
+  enhanced IBRS, RSB filling, masked indices for Spectre v1, and AMD's
+  AutoIBRS, Retbleed and SRSO measures.
+
 ## Consequences
 
 - Nodes on modern cloud CPUs (Ice Lake and later, EPYC Milan and later)

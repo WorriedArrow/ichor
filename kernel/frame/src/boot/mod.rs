@@ -246,7 +246,7 @@ pub(crate) extern "sysv64" fn kernel_space_entry() -> ! {
     let on = |b: bool| if b { "on" } else { "off (not needed)" };
     let pcid = if m.pcid { "PCID" } else { "no PCID" };
     println!(
-        "ichor: frame: mitigations (ADR-0004): VERW on return to ring 3 {}, IBPB between cells {}, page-table isolation {}",
+        "ichor: frame: mitigations (ADR-0004): VERW on return to ring 3 {}, IBPB between cells {}, page-table isolation {}, Spectre v2 in the kernel {}",
         // Forced, VERW runs whatever the CPU; it clears the buffers only
         // with MD_CLEAR microcode.
         match (m.verw, m.verw_missing, force_verw) {
@@ -266,6 +266,12 @@ pub(crate) extern "sysv64" fn kernel_space_entry() -> ! {
             alloc::format!("on ({pcid})")
         } else {
             alloc::format!("on (forced, {pcid})")
+        },
+        match (m.eibrs, m.bhi_dis_s) {
+            (true, true) => "eIBRS + BHI_DIS_S",
+            (true, false) if v.bhi => "eIBRS (BHI NOT MITIGATED: no BHI_DIS_S)",
+            (true, false) => "eIBRS",
+            (false, _) => "NOT MITIGATED (no enhanced IBRS)",
         },
     );
     enter_kernel(BootInfo {

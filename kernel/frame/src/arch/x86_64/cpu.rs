@@ -138,8 +138,10 @@ pub struct Vulnerabilities {
     pub bhi: bool,
     /// Gather data sampling (Downfall).
     pub gds: bool,
-    /// The CPU supports IBRS/IBPB.
+    /// The CPU supports IBRS/IBPB (and so `IA32_SPEC_CTRL`).
     pub ibpb: bool,
+    /// `IA32_SPEC_CTRL.BHI_DIS_S` exists (CPUID.(7,2):EDX[4]).
+    pub bhi_ctrl: bool,
     /// VERW clears CPU buffers (MD_CLEAR microcode).
     pub md_clear: bool,
 }
@@ -161,6 +163,7 @@ pub fn vulnerabilities() -> Vulnerabilities {
     };
     let ibpb = edx7 & (1 << 26) != 0;
     let md_clear = edx7 & (1 << 10) != 0;
+    let bhi_ctrl = max_leaf >= 7 && cpuid(7, 0)[0] >= 2 && cpuid(7, 2)[3] & (1 << 4) != 0;
     if !intel {
         // AMD and others are not affected by Meltdown, MDS or TAA; their
         // own issues (Retbleed, SRSO) are handled per ADR-0004 §2.
@@ -168,6 +171,7 @@ pub fn vulnerabilities() -> Vulnerabilities {
             intel,
             eibrs: bit(caps, 1),
             ibpb,
+            bhi_ctrl,
             md_clear,
             ..Vulnerabilities::default()
         };
@@ -181,6 +185,7 @@ pub fn vulnerabilities() -> Vulnerabilities {
         bhi: !bit(caps, 20),
         gds: !bit(caps, 26),
         ibpb,
+        bhi_ctrl,
         md_clear,
     }
 }
