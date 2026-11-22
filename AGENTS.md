@@ -12,6 +12,9 @@ a framekernel. The founding brief is the source of truth until an ADR in
   model, frame's planned API surface, the unsafe policy, and the frame budget.
 - `docs/adr/0002-cells-and-capabilities.md`: cells, capabilities, and how the
   Linux ABI's namespaces and cgroups map onto them.
+- `docs/architecture.md`: the map: layers, a container's path, storage,
+  networking, and where Ichor is meant to be extended (diagrams in
+  `docs/architecture/`, Excalidraw sources beside their SVGs).
 
 ## Status
 
