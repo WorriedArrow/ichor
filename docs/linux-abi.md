@@ -52,7 +52,7 @@ stale. Do not edit by hand.
 | 39 | `getpid` | implemented |  |
 | 40 | `sendfile` | implemented |  |
 | 41 | `socket` | partial | AF_INET (TCP, UDP) and AF_UNIX (stream, dgram, seqpacket); AF_NETLINK (NETLINK_ROUTE reads); no AF_INET6 |
-| 42 | `connect` | partial | no ICMP errors, so a connected UDP socket never sees ECONNREFUSED |
+| 42 | `connect` | partial | a connected UDP socket sees no ICMP errors from beyond the uplink |
 | 43 | `accept` | implemented |  |
 | 44 | `sendto` | partial | no out-of-band data |
 | 45 | `recvfrom` | partial | no out-of-band data |

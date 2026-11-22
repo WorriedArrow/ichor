@@ -72,7 +72,7 @@ mod nr {
     pub(super) const GETPID: u64 = 39;
     pub(super) const SENDFILE: u64 = 40;
     pub(super) const SOCKET: u64 = 41; // partial: AF_INET (TCP, UDP) and AF_UNIX (stream, dgram, seqpacket); AF_NETLINK (NETLINK_ROUTE reads); no AF_INET6
-    pub(super) const CONNECT: u64 = 42; // partial: no ICMP errors, so a connected UDP socket never sees ECONNREFUSED
+    pub(super) const CONNECT: u64 = 42; // partial: a connected UDP socket sees no ICMP errors from beyond the uplink
     pub(super) const ACCEPT: u64 = 43;
     pub(super) const SENDTO: u64 = 44; // partial: no out-of-band data
     pub(super) const RECVFROM: u64 = 45; // partial: no out-of-band data

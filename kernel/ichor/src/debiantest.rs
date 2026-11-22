@@ -206,6 +206,21 @@ listen($u4, 1) and fail("listen on udp worked");
 fcntl($u2, F_SETFL, O_NONBLOCK) or fail("F_SETFL: $!");
 defined(sysread($u2, $m, 100)) and fail("empty udp read returned");
 $!{EAGAIN} or fail("empty non-blocking udp read: $!");
+# A connected socket learns that nobody listens, once; another does not.
+my $gone = udp();
+bind($gone, pack_sockaddr_in(0, $lo)) or fail("udp bind: $!");
+my $dead = getsockname($gone);
+close $gone;
+my $u5 = udp();
+connect($u5, $dead) or fail("udp connect: $!");
+syswrite($u5, "anyone?") == 7 or fail("udp write to a closed port: $!");
+my $rin5 = ""; vec($rin5, fileno($u5), 1) = 1;
+select(my $rout5 = $rin5, undef, undef, 5) == 1 or fail("an error does not make a socket ready");
+defined(sysread($u5, $m, 100)) and fail("read from a closed port");
+$!{ECONNREFUSED} or fail("a closed udp port: $!");
+unpack("i", getsockopt($u5, SOL_SOCKET, SO_ERROR)) == 0 or fail("the error stayed");
+send($u3, "anyone?", 0, $dead) == 7 or fail("udp send to a closed port: $!");
+unpack("i", getsockopt($u3, SOL_SOCKET, SO_ERROR)) == 0 or fail("an unconnected socket got an error");
 print "debian: udp: datagrams keep boundaries and sources, truncate, connect filters, ports are per protocol\n";
 "#;
 
@@ -726,6 +741,14 @@ my $reply = "";
 while (1) { my $r = sysread($s, my $buf, 4096); defined $r or fail("read: $!"); last if !$r; $reply .= $buf }
 $reply eq "$me $n\n" or fail("reply [$reply]");
 print "debian: cells: $me sent 1 MiB to $server through the switch; loopback is per cell\n";
+# The other cell says so when nobody has a port there.
+socket(my $v, AF_INET, SOCK_DGRAM, 0) or fail("udp socket: $!");
+connect($v, pack_sockaddr_in($port + 1, inet_aton($server))) or fail("udp connect: $!");
+syswrite($v, "anyone?") == 7 or fail("udp write: $!");
+my $vin = ""; vec($vin, fileno($v), 1) = 1;
+select(my $vout = $vin, undef, undef, 30) == 1 or fail("no word of a closed port in the other cell");
+defined(sysread($v, my $nothing, 10)) and fail("read from a closed port in the other cell");
+$!{ECONNREFUSED} or fail("a closed port in the other cell: $!");
 socket(my $u, AF_INET, SOCK_DGRAM, 0) or fail("udp socket: $!");
 my $to = pack_sockaddr_in($port, inet_aton($server));
 send($u, "ping", 0, $to) == 4 or fail("udp send: $!");

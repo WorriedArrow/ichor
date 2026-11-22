@@ -278,6 +278,54 @@ impl<'a> Echo<'a> {
     }
 }
 
+pub const ICMP_UNREACHABLE: u8 = 3;
+/// The codes of [`ICMP_UNREACHABLE`] told apart: a host, and a port nobody
+/// listens on.
+pub const UNREACHABLE_HOST: u8 = 1;
+pub const UNREACHABLE_PORT: u8 = 3;
+
+/// An ICMP "destination unreachable" (checksum verified), and what it
+/// quotes of the packet it is about: its addresses, its protocol and the
+/// first eight bytes of its payload (a UDP header).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Unreachable {
+    pub code: u8,
+    pub src: Ipv4Addr,
+    pub dst: Ipv4Addr,
+    pub protocol: u8,
+    pub head: [u8; 8],
+}
+
+impl Unreachable {
+    pub fn parse(b: &[u8]) -> Option<Unreachable> {
+        if *b.first()? != ICMP_UNREACHABLE || checksum(b) != 0 {
+            return None;
+        }
+        // The quoted packet is cut short: only its header is checked.
+        let quoted = b.get(8..)?;
+        let first = *quoted.first()?;
+        let ihl = usize::from(first & 0xf) * 4;
+        if first >> 4 != 4 || ihl < 20 {
+            return None;
+        }
+        Some(Unreachable {
+            code: *b.get(1)?,
+            src: ip(quoted, 12)?,
+            dst: ip(quoted, 16)?,
+            protocol: *quoted.get(9)?,
+            head: *quoted.get(ihl..)?.first_chunk::<8>()?,
+        })
+    }
+
+    pub fn emit(&self) -> Vec<u8> {
+        let mut b = alloc::vec![ICMP_UNREACHABLE, self.code, 0, 0, 0, 0, 0, 0];
+        b.extend_from_slice(&ipv4(self.src, self.dst, self.protocol, 0, &self.head));
+        let c = checksum(&b);
+        b[2..4].copy_from_slice(&c.to_be_bytes());
+        b
+    }
+}
+
 // ---------------------------------------------------------------------------
 // UDP.
 // ---------------------------------------------------------------------------
@@ -365,6 +413,35 @@ mod tests {
                 assert_eq!(fold(sum(sum(0, a), b)), fold(plain));
             }
         }
+    }
+
+    #[test]
+    fn unreachable_round_trips_and_rejects_damage() {
+        let u = Unreachable {
+            code: UNREACHABLE_PORT,
+            src: A,
+            dst: B,
+            protocol: PROTO_UDP,
+            head: [1, 2, 3, 4, 5, 6, 7, 8],
+        };
+        let b = u.emit();
+        assert_eq!(Unreachable::parse(&b), Some(u));
+        for i in 0..b.len() {
+            let mut bad = b.clone();
+            bad[i] ^= 0x40;
+            assert_eq!(Unreachable::parse(&bad), None, "byte {i}");
+            assert_eq!(Unreachable::parse(&b[..i]), None, "{i} bytes");
+        }
+        // An echo is not one, and a quoted header may have options.
+        assert_eq!(Unreachable::parse(&[8, 0, 0xf7, 0xff, 0, 0, 0, 0]), None);
+        let mut long = b[..28].to_vec();
+        long[8] = 0x46;
+        long.extend_from_slice(&[9; 4]);
+        long.extend_from_slice(&u.head);
+        long[2..4].copy_from_slice(&[0, 0]);
+        let c = checksum(&long);
+        long[2..4].copy_from_slice(&c.to_be_bytes());
+        assert_eq!(Unreachable::parse(&long), Some(u));
     }
 
     #[test]

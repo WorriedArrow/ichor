@@ -152,8 +152,15 @@ not write it; merge its branch when it lands.
   `test/parallel` and `test/sequential`; first run (2026-11-22, 130 min
   under TCG) 4365 of 4400. Most of the 35 are fixed since, or were sources
   the suite did not have; `cpu-prof-*worker*` livelock under TCG (V8
-  samples every 100 us). The `jvm` suite (jtreg, OpenJDK 21's tier 1) is
-  defined, not run yet.
+  samples every 100 us).
+- M7 JVM (fifth suite): `cargo xtask workloads jvm` (jtreg, OpenJDK 21's
+  tier 1). Not scored: under TCG about one JVM in twenty dies, since QEMU
+  fetches an instruction in pieces while the JVM patches it (an `hs_err`
+  whose fault address decodes from the old first bytes and the new last
+  ones; memory is right). Score it on KVM (`workloads.yml`). A sample of
+  other directories passed 247 of 274; its failures are the list to work
+  on: `ProcessHandle` (`/proc`), multicast, urgent data, NIO on files.
+  Leave NIO's large-file tests out of a 5 GiB cell.
 - M7 storage (ADR-0006's 2026-11-21 amendment): a cell's root writes are
   frames charged to its account (`page.rs`: one charged-page type for
   process memory and file pages; `overlay::Pages` is where the overlay
@@ -277,8 +284,8 @@ other and to the host through a published port. The design is ADR-0010:
 our own sans-I/O stack in `kernel/net` (host-tested), one stack per cell,
 an in-kernel cell switch with assigned addresses, anti-spoofing, rate
 limits, a cross-cell fast path, and NAT plus published ports at the
-uplink; virtio-net (polled). Open from it: IPv6, ICMP errors for UDP,
-`MSG_PEEK`, interrupt-driven virtio-net (milestone 8 with cloud NICs).
+uplink; virtio-net (polled). Open from it: IPv6, ICMP errors through the
+NAT, interrupt-driven virtio-net (milestone 8 with cloud NICs).
 
 - M5 so far: `kernel/net` (wire formats, an IPv4 interface with ARP, a
   TCP state machine tested over a lossy, reordering simulated link),
@@ -313,7 +320,8 @@ uplink; virtio-net (polled). Open from it: IPv6, ICMP errors for UDP,
   space, 256 KiB receive queue that drops when full, autobind on first
   send, connect/AF_UNSPEC, MSG_TRUNC, msg_name in sendmsg/recvmsg).
   Tested on loopback (Debian perl), across the switch between cells, and
-  through the uplink's NAT to a host UDP echo. No ICMP errors yet.
+  through the uplink's NAT to a host UDP echo. A closed port is
+  ECONNREFUSED to a connected socket, in its cell or another.
 - M5 `AF_UNIX` (`linuxabi/unix.rs`): stream, datagram and seqpacket
   sockets, `socketpair`, path names (a socket node in the cell's root,
   `overlay::Kind::Socket`, checked for write permission; open is ENXIO)
