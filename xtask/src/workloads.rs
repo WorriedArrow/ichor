@@ -240,7 +240,42 @@ pub const JVM: Suite = Suite {
     parse: parse_jtreg,
 };
 
-pub const SUITES: &[Suite] = &[PYTHON, GO, POSTGRES, NODE, JVM];
+/// liburing 2.5's own tests of io_uring (ADR-0013 §1), from the release of
+/// Linux 6.6's time, which is the kernel version a cell sees. Built in the
+/// image PostgreSQL's suite is built in; one at a time, as upstream's
+/// `runtests.sh` does (77 is its "skipped"), but each has two minutes.
+pub const URING: Suite = Suite {
+    name: "uring",
+    image: POSTGRES.image,
+    layers: &[LayerPin {
+        url: "https://brick.kernel.dk/snaps/liburing-2.5.tar.gz",
+        sha256: "sha256:0100cfbf68943dfa869e02c99f8724c69182b09f7a90f1955e709bc914c7ebf9",
+        from: "liburing-2.5/",
+        to: "/usr/src/liburing/",
+    }],
+    argv: &[
+        "sh",
+        "-c",
+        "cp -r /usr/src/liburing /root/liburing; cd /root/liburing; \
+         { ./configure && make -j4 -C src && make -j4 -C test; } >../make.log 2>&1 || \
+         { tail -40 ../make.log; exit 1; }; echo built; cd test; \
+         [ $# -gt 0 ] || set -- $(ls *.t); n=0; bad=0; \
+         for t in \"$@\"; do t=${t%.t}; n=$((n+1)); \
+         timeout -s INT -k 10 120 ./$t.t >/tmp/out 2>&1 </dev/null; s=$?; \
+         case $s in 0) echo \"ok $n $t\";; 77) echo \"ok $n $t # skip\";; \
+         *) echo \"not ok $n $t ($s)\"; tail -20 /tmp/out | sed 's/^/# /'; bad=1;; esac; done; \
+         exit $bad",
+        "uring",
+    ],
+    all: &[],
+    env: &["HOME=/root"],
+    unit: "tests",
+    memory_mib: 8192,
+    cell_bytes: 3 << 30,
+    parse: parse_node,
+};
+
+pub const SUITES: &[Suite] = &[PYTHON, GO, POSTGRES, NODE, JVM, URING];
 
 /// A suite's result, from its own summary.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]

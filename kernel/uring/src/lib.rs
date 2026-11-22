@@ -9,7 +9,7 @@
 
 extern crate alloc;
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 
 /// Linux's constants (`include/uapi/linux/io_uring.h`).
@@ -34,19 +34,30 @@ pub mod abi {
     pub const SETUP_CQE32: u32 = 1 << 11;
     pub const SETUP_SINGLE_ISSUER: u32 = 1 << 12;
     pub const SETUP_DEFER_TASKRUN: u32 = 1 << 13;
+    pub const SETUP_NO_SQARRAY: u32 = 1 << 16;
 
     /// `io_uring_params.features`.
     pub const FEAT_SINGLE_MMAP: u32 = 1 << 0;
     pub const FEAT_NODROP: u32 = 1 << 1;
     pub const FEAT_SUBMIT_STABLE: u32 = 1 << 2;
     pub const FEAT_RW_CUR_POS: u32 = 1 << 3;
+    pub const FEAT_CUR_PERSONALITY: u32 = 1 << 4;
+    pub const FEAT_FAST_POLL: u32 = 1 << 5;
+    pub const FEAT_POLL_32BITS: u32 = 1 << 6;
+    pub const FEAT_SQPOLL_NONFIXED: u32 = 1 << 7;
     pub const FEAT_EXT_ARG: u32 = 1 << 8;
+    pub const FEAT_NATIVE_WORKERS: u32 = 1 << 9;
+    pub const FEAT_RSRC_TAGS: u32 = 1 << 10;
+    pub const FEAT_CQE_SKIP: u32 = 1 << 11;
+    pub const FEAT_LINKED_FILE: u32 = 1 << 12;
+    pub const FEAT_REG_REG_RING: u32 = 1 << 13;
 
     /// `io_uring_enter` flags.
     pub const ENTER_GETEVENTS: u32 = 1 << 0;
     pub const ENTER_SQ_WAKEUP: u32 = 1 << 1;
     pub const ENTER_SQ_WAIT: u32 = 1 << 2;
     pub const ENTER_EXT_ARG: u32 = 1 << 3;
+    pub const ENTER_REGISTERED_RING: u32 = 1 << 4;
 
     /// SQE flags.
     pub const SQE_FIXED_FILE: u8 = 1 << 0;
@@ -78,15 +89,65 @@ pub mod abi {
     pub const OP_FALLOCATE: u8 = 17;
     pub const OP_OPENAT: u8 = 18;
     pub const OP_CLOSE: u8 = 19;
+    pub const OP_FILES_UPDATE: u8 = 20;
     pub const OP_STATX: u8 = 21;
     pub const OP_READ: u8 = 22;
     pub const OP_WRITE: u8 = 23;
+    pub const OP_FADVISE: u8 = 24;
+    pub const OP_MADVISE: u8 = 25;
     pub const OP_SEND: u8 = 26;
     pub const OP_RECV: u8 = 27;
+    pub const OP_OPENAT2: u8 = 28;
+    pub const OP_EPOLL_CTL: u8 = 29;
+    pub const OP_SPLICE: u8 = 30;
+    pub const OP_PROVIDE_BUFFERS: u8 = 31;
+    pub const OP_REMOVE_BUFFERS: u8 = 32;
+    pub const OP_TEE: u8 = 33;
     pub const OP_SHUTDOWN: u8 = 34;
     pub const OP_RENAMEAT: u8 = 35;
     pub const OP_UNLINKAT: u8 = 36;
     pub const OP_MKDIRAT: u8 = 37;
+    pub const OP_SYMLINKAT: u8 = 38;
+    pub const OP_LINKAT: u8 = 39;
+    pub const OP_MSG_RING: u8 = 40;
+    pub const OP_SOCKET: u8 = 45;
+
+    /// What opcodes' flags (`Sqe::op_flags`) ask for.
+    pub const FSYNC_DATASYNC: u32 = 1 << 0;
+    pub const TIMEOUT_ABS: u32 = 1 << 0;
+    pub const TIMEOUT_UPDATE: u32 = 1 << 1;
+    pub const TIMEOUT_BOOTTIME: u32 = 1 << 2;
+    pub const TIMEOUT_REALTIME: u32 = 1 << 3;
+    pub const LINK_TIMEOUT_UPDATE: u32 = 1 << 4;
+    pub const TIMEOUT_ETIME_SUCCESS: u32 = 1 << 5;
+    pub const TIMEOUT_MULTISHOT: u32 = 1 << 6;
+    pub const ASYNC_CANCEL_ALL: u32 = 1 << 0;
+    pub const ASYNC_CANCEL_FD: u32 = 1 << 1;
+    pub const ASYNC_CANCEL_ANY: u32 = 1 << 2;
+    pub const ASYNC_CANCEL_FD_FIXED: u32 = 1 << 3;
+    pub const SPLICE_F_FD_IN_FIXED: u32 = 1 << 31;
+    pub const MSG_RING_CQE_SKIP: u32 = 1 << 0;
+    pub const MSG_RING_FLAGS_PASS: u32 = 1 << 1;
+    /// `Sqe::addr` of MSG_RING.
+    pub const MSG_DATA: u64 = 0;
+    pub const MSG_SEND_FD: u64 = 1;
+    /// `Sqe::len` of POLL_ADD and POLL_REMOVE.
+    pub const POLL_ADD_MULTI: u32 = 1 << 0;
+    pub const POLL_UPDATE_EVENTS: u32 = 1 << 1;
+    pub const POLL_UPDATE_USER_DATA: u32 = 1 << 2;
+    pub const POLL_ADD_LEVEL: u32 = 1 << 3;
+    /// `Sqe::ioprio` of the socket opcodes.
+    pub const RECVSEND_POLL_FIRST: u16 = 1 << 0;
+    pub const RECV_MULTISHOT: u16 = 1 << 1;
+    pub const ACCEPT_MULTISHOT: u16 = 1 << 0;
+    /// `Sqe::file_index`: any free slot.
+    pub const FILE_INDEX_ALLOC: u32 = u32::MAX;
+
+    /// `Cqe::flags`.
+    pub const CQE_F_BUFFER: u32 = 1 << 0;
+    pub const CQE_F_MORE: u32 = 1 << 1;
+    pub const CQE_F_SOCK_NONEMPTY: u32 = 1 << 2;
+    pub const CQE_BUFFER_SHIFT: u32 = 16;
 
     /// `io_uring_register` opcodes.
     pub const REGISTER_BUFFERS: u32 = 0;
@@ -95,11 +156,42 @@ pub mod abi {
     pub const UNREGISTER_FILES: u32 = 3;
     pub const REGISTER_EVENTFD: u32 = 4;
     pub const UNREGISTER_EVENTFD: u32 = 5;
+    pub const REGISTER_FILES_UPDATE: u32 = 6;
+    pub const REGISTER_EVENTFD_ASYNC: u32 = 7;
     pub const REGISTER_PROBE: u32 = 8;
+    pub const REGISTER_RESTRICTIONS: u32 = 11;
+    pub const REGISTER_ENABLE_RINGS: u32 = 12;
+    pub const REGISTER_FILES2: u32 = 13;
+    pub const REGISTER_FILES_UPDATE2: u32 = 14;
+    pub const REGISTER_BUFFERS2: u32 = 15;
+    pub const REGISTER_BUFFERS_UPDATE: u32 = 16;
+    pub const REGISTER_IOWQ_MAX_WORKERS: u32 = 19;
+    pub const REGISTER_RING_FDS: u32 = 20;
+    pub const UNREGISTER_RING_FDS: u32 = 21;
+    pub const REGISTER_PBUF_RING: u32 = 22;
+    pub const UNREGISTER_PBUF_RING: u32 = 23;
+    pub const REGISTER_SYNC_CANCEL: u32 = 24;
+    pub const REGISTER_FILE_ALLOC_RANGE: u32 = 25;
+    /// Beside the opcode: `fd` is a registered ring.
+    pub const REGISTER_USE_REGISTERED_RING: u32 = 1 << 31;
+    /// `io_uring_rsrc_register.flags`: no slot filled.
+    pub const RSRC_REGISTER_SPARSE: u32 = 1 << 0;
+    /// A file slot to leave alone in an update.
+    pub const REGISTER_FILES_SKIP: i32 = -2;
+    /// `io_uring_buf_reg.flags`: the kernel has the ring's memory.
+    pub const PBUF_RING_MMAP: u16 = 1;
 
     /// SQ ring flags.
     pub const SQ_NEED_WAKEUP: u32 = 1 << 0;
     pub const SQ_CQ_OVERFLOW: u32 = 1 << 1;
+    pub const SQ_TASKRUN: u32 = 1 << 2;
+    /// CQ ring flags.
+    pub const CQ_EVENTFD_DISABLED: u32 = 1 << 0;
+
+    /// `mmap` of a provided-buffer ring: this, and its group above.
+    pub const OFF_PBUF_RING: u64 = 0x8000_0000;
+    pub const OFF_PBUF_SHIFT: u32 = 16;
+    pub const OFF_MMAP_MASK: u64 = 0xf800_0000;
 
     /// `io_uring_probe_op.flags`: the opcode is supported.
     pub const OP_SUPPORTED: u16 = 1;
@@ -112,23 +204,39 @@ pub const MAX_ENTRIES: u32 = 32768;
 /// Most CQ entries.
 pub const MAX_CQ_ENTRIES: u32 = 2 * MAX_ENTRIES;
 
-/// Setup flags this kernel accepts. The others ask for kernel polling
-/// threads (ADR-0013 §1 refuses them), larger entries, or sharing worker
-/// pools.
-const ACCEPTED: u32 = abi::SETUP_CQSIZE
+/// Setup flags this kernel accepts. The others ask for memory the
+/// application brings.
+const ACCEPTED: u32 = abi::SETUP_IOPOLL
+    | abi::SETUP_SQPOLL
+    | abi::SETUP_SQ_AFF
+    | abi::SETUP_ATTACH_WQ
+    | abi::SETUP_CQSIZE
     | abi::SETUP_CLAMP
+    | abi::SETUP_R_DISABLED
     | abi::SETUP_SUBMIT_ALL
     | abi::SETUP_COOP_TASKRUN
     | abi::SETUP_TASKRUN_FLAG
+    | abi::SETUP_SQE128
+    | abi::SETUP_CQE32
     | abi::SETUP_SINGLE_ISSUER
-    | abi::SETUP_DEFER_TASKRUN;
+    | abi::SETUP_DEFER_TASKRUN
+    | abi::SETUP_NO_SQARRAY;
 
 /// The features this kernel offers.
 pub const FEATURES: u32 = abi::FEAT_SINGLE_MMAP
     | abi::FEAT_NODROP
     | abi::FEAT_SUBMIT_STABLE
     | abi::FEAT_RW_CUR_POS
-    | abi::FEAT_EXT_ARG;
+    | abi::FEAT_CUR_PERSONALITY
+    | abi::FEAT_FAST_POLL
+    | abi::FEAT_POLL_32BITS
+    | abi::FEAT_SQPOLL_NONFIXED
+    | abi::FEAT_EXT_ARG
+    | abi::FEAT_NATIVE_WORKERS
+    | abi::FEAT_RSRC_TAGS
+    | abi::FEAT_CQE_SKIP
+    | abi::FEAT_LINKED_FILE
+    | abi::FEAT_REG_REG_RING;
 
 /// Where the SQ ring's fields are in the ring mapping (byte offsets, as
 /// `io_sqring_offsets` reports them).
@@ -162,6 +270,10 @@ pub struct Layout {
     pub sq_entries: u32,
     pub cq_entries: u32,
     pub flags: u32,
+    /// 16, or 32 (`SETUP_CQE32`).
+    pub cqe_bytes: u32,
+    /// 64, or 128 (`SETUP_SQE128`).
+    pub sqe_bytes: u32,
     pub sq: SqOffsets,
     pub cq: CqOffsets,
     /// Bytes of the ring mapping (whole pages).
@@ -175,7 +287,19 @@ const PAGE: u64 = 4096;
 /// `io_uring_setup(entries, params)`: the layout for `entries` SQEs, with
 /// `params.flags` and (with `SETUP_CQSIZE`) `params.cq_entries`.
 pub fn setup(entries: u32, flags: u32, cq_entries: u32) -> Result<Layout, i64> {
-    if flags & !ACCEPTED != 0 {
+    let has = |f: u32| flags & f != 0;
+    if flags & !ACCEPTED != 0
+        // A thread that runs the completions is told of them by one that
+        // would be interrupted for them.
+        || (has(abi::SETUP_TASKRUN_FLAG)
+            && !has(abi::SETUP_COOP_TASKRUN | abi::SETUP_DEFER_TASKRUN))
+        || (has(abi::SETUP_SQPOLL)
+            && has(abi::SETUP_COOP_TASKRUN
+                | abi::SETUP_TASKRUN_FLAG
+                | abi::SETUP_DEFER_TASKRUN))
+        || (has(abi::SETUP_DEFER_TASKRUN) && !has(abi::SETUP_SINGLE_ISSUER))
+        || (has(abi::SETUP_SQ_AFF) && !has(abi::SETUP_SQPOLL))
+    {
         return Err(EINVAL);
     }
     let clamp = flags & abi::SETUP_CLAMP != 0;
@@ -201,7 +325,9 @@ pub fn setup(entries: u32, flags: u32, cq_entries: u32) -> Result<Layout, i64> {
     // Fields grouped by writer, one 64-byte line each: the kernel's (the
     // SQ head, the CQ tail, the counters) from 0, the application's (the
     // SQ tail, the CQ head, the CQ flags) and the constants from 64. CQEs
-    // (16 bytes each) from 128, then the SQ index array.
+    // (16 bytes each, or 32) from 128, then the SQ index array.
+    let cqe_bytes = if has(abi::SETUP_CQE32) { 32 } else { 16 };
+    let sqe_bytes = if has(abi::SETUP_SQE128) { 128 } else { 64 };
     let sq = SqOffsets {
         head: 0,
         tail: 64,
@@ -209,7 +335,7 @@ pub fn setup(entries: u32, flags: u32, cq_entries: u32) -> Result<Layout, i64> {
         ring_entries: 80,
         flags: 8,
         dropped: 12,
-        array: 128 + cq_entries * 16,
+        array: 128 + cq_entries * cqe_bytes,
     };
     let cq = CqOffsets {
         head: 68,
@@ -225,14 +351,20 @@ pub fn setup(entries: u32, flags: u32, cq_entries: u32) -> Result<Layout, i64> {
         sq_entries,
         cq_entries,
         flags,
+        cqe_bytes,
+        sqe_bytes,
         sq,
         cq,
         ring_bytes,
-        sqes_bytes: (u64::from(sq_entries) * 64).next_multiple_of(PAGE),
+        sqes_bytes: (u64::from(sq_entries) * u64::from(sqe_bytes)).next_multiple_of(PAGE),
     })
 }
 
 impl Layout {
+    pub fn has(&self, flag: u32) -> bool {
+        self.flags & flag != 0
+    }
+
     /// `struct io_uring_params` as `io_uring_setup` writes it back (120
     /// bytes).
     pub fn params(&self) -> [u8; 120] {
@@ -396,28 +528,51 @@ pub fn cq_space(head: u32, tail: u32, entries: u32) -> u32 {
     entries.saturating_sub(tail.wrapping_sub(head))
 }
 
+/// An SQE that is not complete.
 #[derive(Debug)]
 struct Node {
-    flags: u8,
-    /// The chain member before this one.
+    /// The chain member before this one, while that is not complete.
     prev: Option<u64>,
     next: Option<u64>,
     /// May the next member run if this one fails? (`IO_HARDLINK`)
     hard: bool,
     started: bool,
-    done: bool,
+    /// The LINK_TIMEOUT that limits this one.
+    timeout: Option<u64>,
+    /// For a LINK_TIMEOUT: the SQE it limits. It is beside the chain, not
+    /// in it: it starts with that one, and the next member follows that
+    /// one.
+    limits: Option<u64>,
+}
+
+/// What completing an SQE did to others.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Cancelled {
+    /// Members of its chain, cancelled because a soft link broke, with
+    /// their LINK_TIMEOUTs.
+    pub chain: Vec<u64>,
+    /// Its own LINK_TIMEOUT, which has nothing left to limit.
+    pub timeout: Option<u64>,
 }
 
 /// The order submissions may run in (ADR-0013 §1): SQEs run concurrently
 /// unless linked (`IO_LINK`: one after another, the rest cancelled if one
 /// fails; `IO_HARDLINK`: one after another regardless) or drained
 /// (`IO_DRAIN`: after everything before it, and before everything after).
+/// Only SQEs that are not complete are kept.
 #[derive(Debug, Default)]
 pub struct Order {
     next_id: u64,
     nodes: BTreeMap<u64, Node>,
-    /// The last SQE, if it asked to be linked to the next one.
-    open_link: Option<u64>,
+    /// SQEs that have not started, LINK_TIMEOUTs aside.
+    waiting: BTreeSet<u64>,
+    /// Drained SQEs that are not complete.
+    drains: BTreeSet<u64>,
+    /// The chain being assembled: its first member and its last, which
+    /// asked to be linked to the next SQE.
+    open: Option<(u64, u64)>,
+    /// The last SQE was a LINK_TIMEOUT that asked to be linked.
+    after_timeout: bool,
 }
 
 impl Order {
@@ -429,112 +584,166 @@ impl Order {
     pub fn submit(&mut self, flags: u8) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
-        let prev = self.open_link.take();
-        if let Some(p) = prev
-            && let Some(n) = self.nodes.get_mut(&p)
-        {
+        let open = self.open.take();
+        self.after_timeout = false;
+        let prev = open.map(|(_, last)| last);
+        if let Some(n) = prev.and_then(|p| self.nodes.get_mut(&p)) {
             n.next = Some(id);
         }
-        let links = flags & (abi::SQE_IO_LINK | abi::SQE_IO_HARDLINK) != 0;
+        let first = open.map_or(id, |(first, _)| first);
         self.nodes.insert(
             id,
             Node {
-                flags,
                 prev,
                 next: None,
                 hard: flags & abi::SQE_IO_HARDLINK != 0,
                 started: false,
-                done: false,
+                timeout: None,
+                limits: None,
             },
         );
-        if links {
-            self.open_link = Some(id);
+        self.waiting.insert(id);
+        if flags & abi::SQE_IO_DRAIN != 0 {
+            // A chain is drained as a whole.
+            self.drains.extend([first, id]);
+        }
+        if flags & (abi::SQE_IO_LINK | abi::SQE_IO_HARDLINK) != 0 {
+            self.open = Some((first, id));
         }
         id
+    }
+
+    /// Records a LINK_TIMEOUT, which limits the SQE before it: `None` if
+    /// that is not linked to it, or is one itself.
+    pub fn submit_timeout(&mut self, flags: u8) -> Option<u64> {
+        let (first, last) = self.open.filter(|_| !self.after_timeout)?;
+        let id = self.next_id;
+        self.next_id += 1;
+        self.nodes.get_mut(&last)?.timeout = Some(id);
+        self.nodes.insert(
+            id,
+            Node {
+                prev: None,
+                next: None,
+                hard: false,
+                started: false,
+                timeout: None,
+                limits: Some(last),
+            },
+        );
+        if flags & (abi::SQE_IO_LINK | abi::SQE_IO_HARDLINK) != 0 {
+            self.after_timeout = true;
+            self.open = Some((first, last));
+        } else {
+            self.open = None;
+        }
+        Some(id)
+    }
+
+    /// The first member of the chain being assembled.
+    pub fn chain(&self) -> Option<u64> {
+        self.open.map(|(first, _)| first)
+    }
+
+    /// What a LINK_TIMEOUT limits, if that is not complete.
+    pub fn limited_by(&self, id: u64) -> Option<u64> {
+        self.nodes.get(&id)?.limits
     }
 
     /// The end of one `io_uring_enter`'s submissions: a link chain does not
     /// continue into the next call.
     pub fn end_batch(&mut self) {
-        self.open_link = None;
+        self.open = None;
+        self.after_timeout = false;
     }
 
     /// The SQEs that may start now, each reported once, in order.
     pub fn ready(&mut self) -> Vec<u64> {
         let mut out = Vec::new();
-        // Whether every earlier SQE is done (for a drain), and whether an
-        // unfinished drain blocks everything after it.
-        let mut all_before_done = true;
-        let mut ids = Vec::new();
-        for (&id, n) in &self.nodes {
-            let drain = n.flags & abi::SQE_IO_DRAIN != 0;
-            if drain && !all_before_done {
-                break;
+        for &id in &self.waiting {
+            match self.drains.first() {
+                // Nothing after an unfinished drain may start, ...
+                Some(&d) if d < id => break,
+                // ... nor the drain before everything earlier is done.
+                Some(&d) if d == id && self.nodes.keys().next() != Some(&id) => break,
+                _ => {}
             }
-            let after_prev = n
-                .prev
-                .is_none_or(|p| self.nodes.get(&p).is_none_or(|pn| pn.done));
-            if !n.started && after_prev {
-                ids.push(id);
+            let Some(n) = self.nodes.get_mut(&id) else {
+                continue;
+            };
+            if n.prev.is_some() {
+                continue;
             }
-            all_before_done &= n.done;
-            if drain && !n.done {
-                // Nothing after an unfinished drain may start.
-                break;
+            n.started = true;
+            out.push(id);
+            if let Some(t) = n.timeout {
+                if let Some(tn) = self.nodes.get_mut(&t) {
+                    tn.started = true;
+                }
+                out.push(t);
             }
         }
-        for id in ids {
-            if let Some(n) = self.nodes.get_mut(&id) {
-                n.started = true;
-                out.push(id);
-            }
+        for id in &out {
+            self.waiting.remove(id);
         }
         out
     }
 
-    /// Records that `id` completed (`ok`: as the operation asked). Returns
-    /// the SQEs cancelled because a soft link broke, which complete with
-    /// `-ECANCELED`.
-    pub fn complete(&mut self, id: u64, ok: bool) -> Vec<u64> {
-        let mut cancelled = Vec::new();
-        let Some(n) = self.nodes.get_mut(&id) else {
-            return cancelled;
-        };
-        n.done = true;
-        let (mut next, hard) = (n.next, n.hard);
-        if !ok && !hard {
-            while let Some(c) = next {
-                match self.nodes.get_mut(&c) {
-                    Some(cn) if !cn.started => {
-                        cn.started = true;
-                        cn.done = true;
-                        cancelled.push(c);
-                        next = cn.next;
-                    }
-                    _ => break,
-                }
-            }
+    /// Records that `id`, which was refused, is over: even a hard link ends
+    /// with it.
+    pub fn refuse(&mut self, id: u64) -> Cancelled {
+        if let Some(n) = self.nodes.get_mut(&id) {
+            n.hard = false;
         }
-        self.forget();
-        cancelled
+        self.complete(id, false)
     }
 
-    /// Drops finished SQEs nothing can wait on any more.
-    fn forget(&mut self) {
-        while let Some((&id, n)) = self.nodes.first_key_value() {
-            let needed = n
-                .next
-                .is_some_and(|x| self.nodes.get(&x).is_some_and(|m| !m.done));
-            if !n.done || needed || self.open_link == Some(id) {
-                break;
-            }
-            self.nodes.remove(&id);
+    /// Records that `id` completed (`ok`: as the operation asked). Returns
+    /// the SQEs that ends, which complete with `-ECANCELED`.
+    pub fn complete(&mut self, id: u64, ok: bool) -> Cancelled {
+        let mut gone = Cancelled::default();
+        let Some(n) = self.remove(id) else {
+            return gone;
+        };
+        if let Some(t) = n.timeout
+            && self.remove(t).is_some()
+        {
+            gone.timeout = Some(t);
         }
+        let mut next = n.next;
+        if let Some(c) = next.and_then(|c| self.nodes.get_mut(&c)) {
+            c.prev = None;
+        }
+        if !ok && !n.hard {
+            while let Some(c) = next {
+                let Some(cn) = self.remove(c) else {
+                    break;
+                };
+                gone.chain.push(c);
+                if let Some(t) = cn.timeout
+                    && self.remove(t).is_some()
+                {
+                    gone.chain.push(t);
+                }
+                next = cn.next;
+            }
+        }
+        gone
+    }
+
+    fn remove(&mut self, id: u64) -> Option<Node> {
+        self.waiting.remove(&id);
+        self.drains.remove(&id);
+        let n = self.nodes.remove(&id)?;
+        if let Some(limited) = n.limits.and_then(|l| self.nodes.get_mut(&l)) {
+            limited.timeout = None;
+        }
+        Some(n)
     }
 
     /// SQEs submitted and not yet complete.
     pub fn in_flight(&self) -> usize {
-        self.nodes.values().filter(|n| !n.done).count()
+        self.nodes.len()
     }
 }
 
@@ -556,8 +765,14 @@ mod tests {
         );
         assert_eq!(setup(8, SETUP_CQSIZE, 100).unwrap().cq_entries, 128);
         assert_eq!(setup(8, SETUP_CQSIZE, 4), Err(EINVAL));
-        assert_eq!(setup(8, SETUP_SQPOLL, 0), Err(EINVAL));
-        assert_eq!(setup(8, SETUP_IOPOLL, 0), Err(EINVAL));
+        assert_eq!(setup(8, 1 << 14, 0), Err(EINVAL)); // NO_MMAP
+        assert_eq!(setup(8, SETUP_SQ_AFF, 0), Err(EINVAL));
+        assert_eq!(setup(8, SETUP_DEFER_TASKRUN, 0), Err(EINVAL));
+        assert!(setup(8, SETUP_DEFER_TASKRUN | SETUP_SINGLE_ISSUER, 0).is_ok());
+        assert_eq!(setup(8, SETUP_SQPOLL | SETUP_COOP_TASKRUN, 0), Err(EINVAL));
+        let l = setup(64, SETUP_SQE128 | SETUP_CQE32, 0).unwrap();
+        assert_eq!((l.sqe_bytes, l.cqe_bytes), (128, 32));
+        assert_eq!((l.sqes_bytes, l.sq.array), (8192, 128 + 128 * 32));
     }
 
     #[test]
@@ -628,9 +843,73 @@ mod tests {
         assert_eq!(o.ready(), ids);
         assert!(o.ready().is_empty());
         for id in ids {
-            assert!(o.complete(id, true).is_empty());
+            assert_eq!(o.complete(id, true), Cancelled::default());
         }
         assert_eq!(o.in_flight(), 0);
+    }
+
+    #[test]
+    fn link_timeouts_stand_beside_the_chain() {
+        let mut o = Order::new();
+        assert_eq!(o.submit_timeout(0), None);
+        let a = o.submit(SQE_IO_LINK);
+        let t = o.submit_timeout(SQE_IO_LINK).unwrap();
+        // One limits one.
+        assert_eq!(o.submit_timeout(0), None);
+        let b = o.submit(SQE_IO_LINK);
+        let u = o.submit_timeout(0).unwrap();
+        let c = o.submit(0);
+        o.end_batch();
+        assert_eq!(o.ready(), [a, t, c]);
+        assert_eq!(o.limited_by(t), Some(a));
+        // `a` is done in time: its timeout is over, and `b` follows it.
+        let gone = o.complete(a, true);
+        assert_eq!((gone.timeout, gone.chain), (Some(t), Vec::new()));
+        assert_eq!(o.ready(), [b, u]);
+        // The timeout of `b` fires: it completes, then what it limits.
+        assert_eq!(o.complete(u, true), Cancelled::default());
+        assert_eq!(o.complete(b, false), Cancelled::default());
+        o.complete(c, true);
+        assert_eq!(o.in_flight(), 0);
+        // A broken chain takes the timeouts of what it cancels with it.
+        let a = o.submit(SQE_IO_LINK);
+        let b = o.submit(SQE_IO_LINK);
+        let t = o.submit_timeout(0).unwrap();
+        o.end_batch();
+        assert_eq!(o.ready(), [a]);
+        assert_eq!(o.complete(a, false).chain, [b, t]);
+        assert_eq!(o.in_flight(), 0);
+    }
+
+    #[test]
+    fn a_drained_chain_is_drained_as_a_whole() {
+        let mut o = Order::new();
+        let a = o.submit(0);
+        let b = o.submit(SQE_IO_LINK);
+        let c = o.submit(SQE_IO_DRAIN);
+        let d = o.submit(0);
+        o.end_batch();
+        assert_eq!(o.ready(), [a]);
+        o.complete(a, true);
+        assert_eq!(o.ready(), [b]);
+        o.complete(b, true);
+        assert_eq!(o.ready(), [c]);
+        o.complete(c, true);
+        assert_eq!(o.ready(), [d]);
+    }
+
+    #[test]
+    fn what_is_complete_is_forgotten() {
+        let mut o = Order::new();
+        let long = o.submit(0);
+        for _ in 0..1000 {
+            let id = o.submit(0);
+            o.ready();
+            o.complete(id, true);
+        }
+        assert_eq!((o.in_flight(), o.nodes.len()), (1, 1));
+        o.complete(long, true);
+        assert!(o.nodes.is_empty() && o.waiting.is_empty());
     }
 
     #[test]
@@ -642,10 +921,10 @@ mod tests {
         let d = o.submit(0);
         o.end_batch();
         assert_eq!(o.ready(), [a, d]);
-        assert!(o.complete(a, true).is_empty());
+        assert_eq!(o.complete(a, true), Cancelled::default());
         assert_eq!(o.ready(), [b]);
         // b fails: c is cancelled.
-        assert_eq!(o.complete(b, false), [c]);
+        assert_eq!(o.complete(b, false).chain, [c]);
         assert!(o.ready().is_empty());
         o.complete(d, true);
         assert_eq!(o.in_flight(), 0);
@@ -658,8 +937,13 @@ mod tests {
         let b = o.submit(0);
         o.end_batch();
         assert_eq!(o.ready(), [a]);
-        assert!(o.complete(a, false).is_empty());
+        assert_eq!(o.complete(a, false), Cancelled::default());
         assert_eq!(o.ready(), [b]);
+        // But not its being refused.
+        let a = o.submit(SQE_IO_HARDLINK);
+        let b = o.submit(0);
+        o.end_batch();
+        assert_eq!(o.refuse(a).chain, [b]);
     }
 
     #[test]
@@ -686,6 +970,6 @@ mod tests {
         o.end_batch();
         let b = o.submit(0);
         assert_eq!(o.ready(), [a, b]);
-        assert!(o.complete(a, false).is_empty());
+        assert_eq!(o.complete(a, false), Cancelled::default());
     }
 }

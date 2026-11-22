@@ -159,6 +159,8 @@ pub(crate) const UDP_MAX: usize = 65507;
 struct Sock {
     kind: Kind,
     local: Option<Addr>,
+    /// `connect` picked `local`: nobody bound it.
+    picked: bool,
     wait: Arc<Waiters>,
     reuse_addr: bool,
     reuse_port: bool,
@@ -706,6 +708,7 @@ impl Inner {
                                 queued: false,
                             },
                             local: Some(local),
+                            picked: false,
                             wait: Arc::new(Waiters::default()),
                             reuse_addr: false,
                             reuse_port: false,
@@ -932,6 +935,7 @@ impl Stack {
                     Kind::Fresh
                 },
                 local: None,
+                picked: false,
                 wait: wait.clone(),
                 reuse_addr: false,
                 reuse_port: false,
@@ -1029,6 +1033,7 @@ impl Stack {
                 Kind::Conn { .. } => return Err(EISCONN),
                 Kind::Listening { .. } => return Err(EINVAL),
             };
+            let picked = i.sock(id)?.local.is_none();
             let local = i.source_for(id, remote.0)?;
             if udp {
                 let s = i.sock(id)?;
@@ -1041,6 +1046,7 @@ impl Stack {
             let tcp = Box::new(Tcp::connect(local, remote, random_iss(), now()));
             let s = i.sock(id)?;
             s.local = Some(local);
+            s.picked = picked;
             s.kind = Kind::Conn {
                 tcp,
                 parent: None,
@@ -1059,7 +1065,14 @@ impl Stack {
         match &s.kind {
             Kind::Conn { tcp, .. } => match tcp.state() {
                 State::SynSent | State::SynReceived => None,
-                State::Closed => Some(Err(s.error.take().unwrap_or(ECONNREFUSED))),
+                State::Closed => {
+                    // It may try again, from where it is bound (if it is).
+                    s.kind = Kind::Fresh;
+                    if s.picked {
+                        s.local = None;
+                    }
+                    Some(Err(s.error.take().unwrap_or(ECONNREFUSED)))
+                }
                 _ => Some(Ok(())),
             },
             _ => Some(Err(ENOTCONN)),

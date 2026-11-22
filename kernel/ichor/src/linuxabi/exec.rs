@@ -205,10 +205,14 @@ pub(crate) fn exec(
     // first. Nothing fails from here on.
     p.entry = p.group.sole_thread(&p.entry).ok_or(EAGAIN)?;
     p.clear_tid = 0;
+    p.uring = Default::default();
     crate::itimer::exec(p);
     // Switch to the new space, then drop the old one (no longer active).
     mm.space().bind_to_current_task();
-    drop(p.replace_mm(mm));
+    // `/proc/self/exe` is the file's own path; the name is the one given.
+    let real = image.path().unwrap_or_else(|| exe_path.clone());
+    let name = path.rsplit('/').next().unwrap_or("");
+    drop(p.replace_mm(mm, &real, name, loaded.args));
     p.group.actions.lock().exec_reset();
     p.close_on_exec();
     let _ = p.group.update_creds(|c| {
@@ -219,10 +223,6 @@ pub(crate) fn exec(
         v.release(); // the vfork parent goes on
     }
     p.sig.clear_alt_stack();
-    // `/proc/self/exe` is the file's own path; the name is the one given.
-    let real = image.path().unwrap_or_else(|| exe_path.clone());
-    let name = path.rsplit('/').next().unwrap_or("");
-    p.group.set_exec(&real, name, loaded.args);
     crate::signal::sync(p);
     *ctx = UserContext::new(loaded.entry, loaded.stack_pointer);
     Ok(())

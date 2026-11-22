@@ -114,6 +114,17 @@ impl Reserved {
             pages,
         })
     }
+
+    /// Charges for `pages` from now on; false (and nothing changes) if the
+    /// account cannot pay for more.
+    pub(crate) fn resize(&mut self, pages: u64) -> bool {
+        if pages > self.pages && self.account.charge(pages - self.pages).is_err() {
+            return false;
+        }
+        self.account.release(self.pages.saturating_sub(pages));
+        self.pages = pages;
+        true
+    }
 }
 
 impl Drop for Reserved {

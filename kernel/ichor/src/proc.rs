@@ -1070,6 +1070,7 @@ pub(crate) fn run(mut p: LinuxProcess, mut ctx: UserContext) -> (u32, u32) {
                 if restart.is_none() {
                     p.resume_until = None;
                 }
+                linuxabi::uring::task_work(&mut p);
             }
             UserEvent::Preempted => frame::task::yield_now(),
             UserEvent::Exception {

@@ -73,28 +73,25 @@ not write it; merge its branch when it lands.
   gaps. Verification now builds paths with backtracking and enforces name
   constraints, leaf serverAuth EKU and not-a-CA, DNS SAN syntax, serial
   and RSA key rules (98.4% accept / 99.4% refuse agreement).
-- M7 io_uring, first step: `kernel/uring` (host-tested) has the ABI, this
-  kernel's ring layout (one mapping for both rings, fields grouped by
-  writer) and the ordering rules (`Order`: links, hard links, drains,
-  chains cut at each submission's end). `linuxabi/uring.rs`: setup,
-  `mmap` of the ring descriptor (`Mm::map_frames`: kernel pages shared
-  with the process, kept across fork), enter (with GETEVENTS waits on
-  armed objects, EXT_ARG timeouts, overflow kept per NODROP) and register
-  (probe, eventfd). SQEs run on the submitting thread through
-  `linuxabi::dispatch` (the synchronous syscalls' code); one on a pipe or
-  socket that is not ready is armed and completes during a later enter.
-  Ops: NOP, READ/WRITE(V) (positional on files), FSYNC, POLL_ADD/REMOVE,
-  SEND/RECV(MSG), ACCEPT, CONNECT, SHUTDOWN, CLOSE, OPENAT, STATX,
-  RENAMEAT/UNLINKAT/MKDIRAT, TIMEOUT/TIMEOUT_REMOVE, ASYNC_CANCEL.
-  `runtest::uring_program` checks it from ring 3 on every boot. The
-  ring's worker (`uring::worker`, a `LinuxProcess::helper` thread: shares
-  the process, blocks signals but SIGKILL, is not one of the group's
-  threads, ends when the ring closes or the process has no threads)
-  completes armed SQEs with nobody in `io_uring_enter`; armed SQEs are
-  claimed (`running`) so they run once. `runtest::uring_worker_program`
-  checks completion while blocked on a registered eventfd and on
-  `epoll_wait` of the ring fd. Not yet: registered files/buffers,
-  LINK_TIMEOUT, the EXT_ARG signal mask, liburing's tests.
+- M7 io_uring (ADR-0013 and its 2026-11-22 amendment): `kernel/uring`
+  (host-tested) has the ABI, this kernel's ring layout and the ordering
+  rules (`Order`: links, hard links, link timeouts, drains; what is
+  complete is forgotten at once). `linuxabi/uring.rs` is the ring,
+  `uring/ops.rs` what an SQE may say and does (the synchronous syscalls'
+  code, through `linuxabi::dispatch`), `uring/tables.rs` what is
+  registered (files with tags, buffers, provided-buffer groups, rings,
+  restrictions). An SQE is tried without blocking on the description it
+  named when it began, lent to the thread as descriptor `LENT`; what it
+  points to is read when it is submitted (`Kept`); one that cannot go on is
+  armed with its own registration on its object (`poll::Hub::watch`), and
+  tried again when that changes: by a thread in `io_uring_enter`, by any
+  thread of its process after a system call (`uring::task_work`), or by the
+  ring's worker for that process (`LinuxProcess::helper`). Claimed while
+  tried, so it runs once. DEFER_TASKRUN rings only run when asked
+  (`nudge` tells the program); SQPOLL rings always say NEED_WAKEUP.
+  `runtest::uring_program` and `uring_worker_program` check it on every
+  boot; `cargo xtask workloads uring` runs liburing 2.5's tests. Not yet:
+  personalities, URING_CMD, zero-copy sends, NO_MMAP, xattr operations.
 - M7 CPython (first suite): `cargo xtask workloads python` pulls
   `python:3.12-slim-bookworm` plus the 3.12.16 source tree's `Lib/test`
   as a pinned layer and runs `python -m test -j0` in a cell. Fixed on
@@ -132,8 +129,11 @@ not write it; merge its branch when it lands.
   `linuxabi/netlink.rs`); CPU-time and POSIX timers (`itimer.rs`); pidfds
   and `clone3`. Debian's perl checks most of it on every boot
   (`SIGNAL_SCRIPT`, `MOVE_SCRIPT`). Explore with
-  `--cmd "go version" --follow FILE` (append shell lines to FILE). Under
-  TCG only: `crypto/sha1` (QEMU reads 32 bytes for a 16-byte AVX2 operand).
+  `--cmd "go version" --follow FILE` (append shell lines to FILE; with
+  `--image REF --memory MiB` on a machine too small for the suite's own).
+  Latest full run (2026-11-22): 260 of 262 packages. The two: `crypto/sha1`
+  (under TCG: QEMU reads 32 bytes for a 16-byte AVX2 operand) and `syscall`
+  (ptrace).
 - M7 PostgreSQL (third suite): `cargo xtask workloads postgres` builds
   16.16 in `buildpack-deps` (the official image carries no `pg_regress`)
   and runs `make check`; first run 223 of 224 (the other was QEMU's FMA on
@@ -151,10 +151,10 @@ not write it; merge its branch when it lands.
   `/proc/<pid>/cmdline` read from the process's memory (titles written over
   argv), 2 MiB of arguments.
 - M7 Node.js (fourth suite): `cargo xtask workloads node` runs its
-  `test/parallel` and `test/sequential`; first run (2026-11-22, 130 min
-  under TCG) 4365 of 4400. Most of the 35 are fixed since, or were sources
-  the suite did not have; `cpu-prof-*worker*` livelock under TCG (V8
-  samples every 100 us).
+  `test/parallel` and `test/sequential`; 4398 of 4404 (2026-11-22, 98 min
+  under TCG). The six: four CPU-profiler tests (V8 samples every 100 us,
+  which TCG cannot keep up with), `net-boundsocket` (wants port 1 refused;
+  any user may bind any port in a cell, as in Docker), and `watch-mode`.
 - M7 JVM (fifth suite): `cargo xtask workloads jvm` (jtreg, OpenJDK 21's
   tier 1). Not scored: under TCG about one JVM in twenty dies, since QEMU
   fetches an instruction in pieces while the JVM patches it (an `hs_err`
@@ -163,6 +163,18 @@ not write it; merge its branch when it lands.
   other directories passed 247 of 274; its failures are the list to work
   on: `ProcessHandle` (`/proc`), multicast, urgent data, NIO on files.
   Leave NIO's large-file tests out of a 5 GiB cell.
+- M7 liburing (sixth suite): `cargo xtask workloads uring` builds
+  liburing 2.5 (of Linux 6.6's time) in `buildpack-deps` and runs its
+  tests one by one. It found the `execve` race (`/proc/<pid>/cmdline` read
+  the old arguments' address in the new memory) and that a TCP socket whose
+  connect was refused could not connect again.
+- Known weakness: a pull whose image does not fit in memory kills the
+  control plane (a page its heap touches cannot be charged, and the native
+  process ends) instead of failing the pull. It holds layers and the
+  converted image at once: about three times the image.
+- WHPX (Windows) does not work with QEMU 9.0: it has no x2APIC, which frame
+  requires (and it cannot run firmware from pflash; `-bios` with the two
+  images concatenated gets as far as that).
 - M7 storage (ADR-0006's 2026-11-21 amendment): a cell's root writes are
   frames charged to its account (`page.rs`: one charged-page type for
   process memory and file pages; `overlay::Pages` is where the overlay

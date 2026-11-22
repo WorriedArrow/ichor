@@ -234,7 +234,8 @@ fn session(port: u16, layer_port: u16) -> Result<(Ran, Ran), String> {
             "sh",
             "-c",
             "cat /etc/alpine-release; echo \"$((6 * 7)) from $(uname -s)\"; ls /bin/busybox; cat /opt/extra/greeting; \
-             cat /opt/again/greeting; head -1 /etc/hosts; cat /etc/hostname; exit 3",
+             cat /opt/again/greeting; head -1 /etc/hosts; cat /etc/hostname /etc/resolv.conf; \
+             nslookup registry-1.docker.io >/dev/null 2>&1 && echo a name was found; exit 3",
         ],
     )?;
     lifecycle(&mut s, "2")?;
@@ -464,7 +465,8 @@ fn the_control_plane_pulls_and_runs_an_image_from_docker_hub() {
     assert_eq!(
         text,
         "3.20.3\n42 from Linux\n/bin/busybox\nhello from an extra layer\n\
-         hello from an extra layer\n127.0.0.1\tlocalhost\nichor\n"
+         hello from an extra layer\n127.0.0.1\tlocalhost\nichor\n\
+         nameserver 10.0.2.3\na name was found\n"
     );
     assert_eq!(exit, 3 << 8);
     // Once refused, once for both layers, each after a redirect.

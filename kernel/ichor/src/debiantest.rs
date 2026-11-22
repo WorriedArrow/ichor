@@ -96,7 +96,8 @@ my $lo = inet_aton("127.0.0.1");
 my $c = tcp();
 connect($c, pack_sockaddr_in(1, $lo)) and fail("connect to a closed port worked");
 $!{ECONNREFUSED} or fail("closed port: $!");
-close $c;
+connect($c, pack_sockaddr_in(1, $lo)) and fail("connect to a closed port worked the second time");
+$!{ECONNREFUSED} or fail("closed port, again: $!");
 # A listener on an ephemeral port; a second bind to it is refused.
 my $l = tcp();
 setsockopt($l, SOL_SOCKET, SO_REUSEADDR, 1) or fail("SO_REUSEADDR: $!");
@@ -104,6 +105,10 @@ bind($l, pack_sockaddr_in(0, $lo)) or fail("bind: $!");
 listen($l, 16) or fail("listen: $!");
 my ($port) = unpack_sockaddr_in(getsockname($l));
 $port >= 32768 or fail("ephemeral port $port");
+# The socket that was refused may connect after all.
+connect($c, pack_sockaddr_in($port, $lo)) or fail("connect after a refusal: $!");
+accept(my $ca, $l) or fail("accept after a refusal: $!");
+close $ca; close $c;
 -S $l or fail("fstat: not a socket");
 readlink("/proc/self/fd/" . fileno($l)) =~ /^socket:\[\d+\]$/ or fail("/proc/self/fd link");
 unpack("i", getsockopt($l, SOL_SOCKET, SO_TYPE)) == SOCK_STREAM or fail("SO_TYPE");
@@ -577,6 +582,18 @@ for my $when (time + 1, time - 100) {
     syscall(202, $word, 9 | 256, 5, $ts, 0, 0xffffffff) == -1 && $!{ETIMEDOUT} or fail("a wall-clock futex wait: $!");
     time - $when < 30 or $when < time - 50 or fail("a wall-clock futex wait was late");
 }
+# A process's files in /proc are its user's; with the machine's boot time
+# they say when it began.
+my $kid = fork // fail("fork: $!");
+if ($kid == 0) { $) = "33 33"; $> = 33; sleep 60; exit 0 }
+for (1 .. 3000) { last if (stat "/proc/$kid")[4] == 33; select undef, undef, undef, 0.01 }
+(stat "/proc/$kid/status")[4] == 33 && (stat "/proc/$kid")[5] == 33 or fail("/proc/<pid> is not its user's");
+open(my $kst, "<", "/proc/$kid/stat") or fail("stat: $!");
+(stat $kst)[4] == 33 && (stat $kst)[1] == (stat "/proc/$kid/stat")[1] or fail("fstat in /proc");
+my $began = (split / /, (<$kst> =~ /.*\) (.*)/s)[0])[19] / 100;
+my ($btime) = `cat /proc/stat` =~ /^btime (\d+)$/m;
+abs($btime + $began - time) < 120 or fail("booted at $btime, began $began later");
+kill "KILL", $kid; waitpid($kid, 0);
 { local $SIG{PIPE} = "IGNORE"; defined(syswrite($one, "x")) and fail("a write with no reader left"); $!{EPIPE} or fail("no reader: $!") }
 # A title written over argv is what /proc shows; many arguments, long ones.
 $0 = "a title";

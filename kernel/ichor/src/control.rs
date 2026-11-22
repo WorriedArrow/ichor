@@ -5,10 +5,19 @@
 
 use cap::{Cap, Rights};
 use frame::println;
+use frame::sync::SpinLock;
 
 use crate::kcell::{Object, System, rights};
 
 static CONTROL: &[u8] = include_bytes!(concat!(env!("ICHOR_SERVICES_DIR"), "/ichor-control"));
+
+/// The control plane's DNS resolver, which its cells use too.
+static RESOLVER: SpinLock<Option<alloc::string::String>> = SpinLock::new(None);
+
+/// The resolver for a cell's `/etc/resolv.conf`.
+pub(crate) fn resolver() -> Option<alloc::string::String> {
+    RESOLVER.lock().clone()
+}
 
 /// The service's options from the kernel command line: `control=PORT`
 /// (required), `control_listen=ADDR`, `control_publish=PORT`, `dns=ADDR`
@@ -36,6 +45,7 @@ pub(crate) fn options(c: &cmdline::Cmdline<'_>) -> Option<alloc::vec::Vec<alloc:
         },
     };
     o.push(format!("dns={dns}"));
+    *RESOLVER.lock() = Some(dns);
     if c.flag("control_plaintext") {
         o.push("plaintext".into());
     }

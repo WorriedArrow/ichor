@@ -451,10 +451,10 @@ fn open_proc(
         _ if flags & O_DIRECTORY != 0 => return Err(ENOTDIR),
         _ if flags & O_ACCMODE != 0 => return Err(EACCES),
         procfs::Node::File(d) => {
-            let file = procfs::ProcFile::new(d, p).ok_or(crate::vfs::errno::ENOMEM)?;
+            let file = procfs::ProcFile::new(path, d, p).ok_or(crate::vfs::errno::ENOMEM)?;
             alloc::sync::Arc::new(file)
         }
-        procfs::Node::Maps(g) => alloc::sync::Arc::new(procfs::ProcFile::maps(g)),
+        procfs::Node::Maps(g) => alloc::sync::Arc::new(procfs::ProcFile::maps(path, g)),
     };
     p.install_flags(
         Fd::Object(crate::process::ObjectEnd {
@@ -534,13 +534,34 @@ fn stat_proc(p: &mut LinuxProcess, path: &str, follow: bool, hops: u32) -> Resul
         }
         procfs::Node::Link(t) => {
             let len = t.len() as u64;
-            apart(DEV_PROC, path_ino(path), S_IFLNK | 0o777, 1, len)
+            proc_stat(p, path, S_IFLNK | 0o777, len)
         }
-        procfs::Node::Dir(_) => apart(DEV_PROC, path_ino(path), S_IFDIR | 0o555, 2, 0),
-        procfs::Node::File(_) | procfs::Node::Maps(_) => {
-            apart(DEV_PROC, path_ino(path), S_IFREG | 0o444, 1, 0)
-        }
+        procfs::Node::Dir(_) => proc_stat(p, path, S_IFDIR | 0o555, 0),
+        procfs::Node::File(_) | procfs::Node::Maps(_) => proc_stat(p, path, S_IFREG | 0o444, 0),
     })
+}
+
+/// The `struct stat` of the `/proc` file at `path`: a process's is its
+/// owner's, and as old as the look at it.
+fn proc_stat(p: &LinuxProcess, path: &str, mode: u32, size: u64) -> [u8; 144] {
+    let path = path.trim_end_matches('/');
+    let dir = mode & 0o170_000 == S_IFDIR;
+    let mut st = apart(
+        DEV_PROC,
+        path_ino(path),
+        mode,
+        if dir { 2 } else { 1 },
+        size,
+    );
+    let (uid, gid) = procfs::owner(p, path);
+    st[28..32].copy_from_slice(&uid.to_le_bytes());
+    st[32..36].copy_from_slice(&gid.to_le_bytes());
+    let now = crate::vfs::realtime();
+    for off in [72, 88, 104] {
+        st[off..off + 8].copy_from_slice(&now.sec.to_le_bytes());
+        st[off + 8..off + 16].copy_from_slice(&u64::from(now.nsec).to_le_bytes());
+    }
+    st
 }
 
 /// `st_dev` of what is not the root's (1): programs tell files apart by
@@ -1218,9 +1239,8 @@ fn fstat_raw(p: &mut LinuxProcess, fd: u64) -> Result<[u8; 144], i64> {
         // A terminal stats as the node it was opened through, which
         // `ttyname` checks.
         Fd::Object(o) if let Some(t) = o.obj.tty() => to_stat(&p.fs().stat(t.ino())?),
-        Fd::Object(o) if let Some(d) = o.obj.proc_dir() => {
-            apart(DEV_PROC, path_ino(d), S_IFDIR | 0o555, 2, 0)
-        }
+        Fd::Object(o) if let Some(d) = o.obj.proc_dir() => proc_stat(p, d, S_IFDIR | 0o555, 0),
+        Fd::Object(o) if let Some(f) = o.obj.proc_file() => proc_stat(p, f, S_IFREG | 0o444, 0),
         Fd::Object(o) => {
             let ino = match (o.obj.socket(), o.obj.unix()) {
                 (Some(s), _) => s.inode(),

@@ -63,6 +63,29 @@ pub(crate) fn own_fd(p: &LinuxProcess, path: &str) -> Option<u64> {
     n.parse().ok().filter(|_| mine)
 }
 
+/// Whose the `/proc` file at `path` is: a process's, that of the user it
+/// acts as.
+pub(crate) fn owner(p: &LinuxProcess, path: &str) -> (u32, u32) {
+    let who = path
+        .strip_prefix("/proc/")
+        .and_then(|rest| rest.split('/').next());
+    let group = match who {
+        // (The link itself is nobody's in particular.)
+        Some("self" | "thread-self") if path.matches('/').count() > 2 => Some(p.group.clone()),
+        Some(pid) => pid
+            .parse()
+            .ok()
+            .and_then(|pid| proc::find(p.entry.cell, pid))
+            .and_then(|e| proc::find(p.entry.cell, e.tgid))
+            .and_then(|e| e.process()),
+        None => None,
+    };
+    group.map_or((0, 0), |g| {
+        let c = g.creds();
+        (c.euid, c.egid)
+    })
+}
+
 /// Answers `path` if it is under `/proc` (`None` otherwise). With
 /// `follow_last`, a link in the final component is reported as the link
 /// (the caller follows it; `self` is followed here).
@@ -414,8 +437,10 @@ fn stat_global(p: &LinuxProcess) -> Vec<u8> {
         s.push_str(&format!("cpu{i} 0 0 0 0 0 0 0 0 0 0\n"));
     }
     let (_, _, last) = crate::proc::census(p.entry.cell);
+    let boot = crate::vfs::wall_clock().saturating_sub(frame::time::now());
     s.push_str(&format!(
-        "btime 0\nprocesses {last}\nprocs_running 1\nprocs_blocked 0\n"
+        "btime {}\nprocesses {last}\nprocs_running 1\nprocs_blocked 0\n",
+        boot.as_secs()
     ));
     s.into_bytes()
 }
@@ -512,6 +537,7 @@ fn stat_process(g: &Group, t: &ProcEntry) -> Vec<u8> {
 /// made a piece at a time.
 #[derive(Debug)]
 pub(crate) struct ProcFile {
+    path: String,
     state: Mutex<Text>,
     maps: Option<Weak<Group>>,
     /// What the snapshot costs its opener's cell.
@@ -536,9 +562,10 @@ pub(crate) struct ProcDir {
 
 impl ProcFile {
     /// A snapshot, which `p`'s cell pays for; `None` if it cannot.
-    pub(crate) fn new(data: Vec<u8>, p: &LinuxProcess) -> Option<ProcFile> {
+    pub(crate) fn new(path: &str, data: Vec<u8>, p: &LinuxProcess) -> Option<ProcFile> {
         let pages = data.len().div_ceil(4096) as u64;
         Some(ProcFile {
+            path: path.to_string(),
             state: Mutex::new(Text {
                 data,
                 ..Text::default()
@@ -548,8 +575,9 @@ impl ProcFile {
         })
     }
 
-    pub(crate) fn maps(of: Weak<Group>) -> ProcFile {
+    pub(crate) fn maps(path: &str, of: Weak<Group>) -> ProcFile {
         ProcFile {
+            path: path.to_string(),
             state: Mutex::new(Text {
                 next: Some(0),
                 ..Text::default()
@@ -619,6 +647,9 @@ impl Object for ProcFile {
     }
     fn mode(&self) -> u32 {
         0o100_000 // S_IFREG
+    }
+    fn proc_file(&self) -> Option<&str> {
+        Some(&self.path)
     }
 }
 

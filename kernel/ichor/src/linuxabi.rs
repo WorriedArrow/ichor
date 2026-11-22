@@ -287,9 +287,9 @@ mod nr {
     pub(super) const COPY_FILE_RANGE: u64 = 326;
     pub(super) const SENDMMSG: u64 = 307; // partial: as sendmsg
     pub(super) const RECVMMSG: u64 = 299; // partial: as recvmsg
-    pub(super) const IO_URING_SETUP: u64 = 425; // partial: no SQPOLL/IOPOLL rings
-    pub(super) const IO_URING_ENTER: u64 = 426; // partial: the EXT_ARG signal mask is not applied; the worker completes armed pipe and socket operations but CONNECT runs on the submitter (it may block it); a forked child's submissions run on the parent's worker
-    pub(super) const IO_URING_REGISTER: u64 = 427; // partial: probe and eventfd only (no registered files or buffers)
+    pub(super) const IO_URING_SETUP: u64 = 425; // partial: no IOPOLL, NO_MMAP or ATTACH_WQ; an SQPOLL ring's poller always sleeps (NEED_WAKEUP stays set)
+    pub(super) const IO_URING_ENTER: u64 = 426; // partial: no personalities, extended attributes, URING_CMD or zero-copy sends, no multishot RECVMSG; opening a FIFO blocks the submitter
+    pub(super) const IO_URING_REGISTER: u64 = 427; // partial: registered buffers are address ranges (unmapped ones fail), tags are told at once; no personalities or worker limits
 }
 
 const EPERM: i64 = 1;

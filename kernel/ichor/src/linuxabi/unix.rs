@@ -640,6 +640,11 @@ impl Endpoint {
 }
 
 impl UnixSocket {
+    /// Whether its data has no bounds.
+    pub(super) fn is_stream(&self) -> bool {
+        self.ep.ty == Type::Stream
+    }
+
     /// Sends `data` with `fds` to `to` (datagrams) or the peer.
     fn send(
         &self,
@@ -1348,7 +1353,14 @@ fn rights(p: &mut LinuxProcess, ctl: u64, len: u64) -> Result<Vec<Arc<Descriptio
             (SOL_SOCKET, SCM_RIGHTS) => {
                 for c in b[at + 16..at + clen].as_chunks::<4>().0 {
                     let fd = u32::from_le_bytes(*c);
-                    fds.push(p.desc(u64::from(fd)).ok_or(EBADF)?);
+                    let d = p.desc(u64::from(fd)).ok_or(EBADF)?;
+                    // A ring holds the sockets its operations are on: one
+                    // queued in such a socket would hold itself (Linux
+                    // refuses it too).
+                    if matches!(&*d.state(), Fd::Object(o) if o.obj.uring().is_some()) {
+                        return Err(EINVAL);
+                    }
+                    fds.push(d);
                 }
                 if fds.len() > SCM_MAX_FD {
                     return Err(EINVAL);

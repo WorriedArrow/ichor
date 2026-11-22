@@ -2,6 +2,7 @@
 
 - Status: Accepted
 - Date: 2026-11-15
+- Amended: 2026-11-22 (io_uring as built, at the end)
 - Milestone: 7 ("io_uring; postgres, node, python, go, and JVM workloads
   pass their own test suites at a tracked pass rate")
 
@@ -145,3 +146,38 @@ control plane's API, by digest, and commands run in cells.
   every push's results.
 - Many Linux ABI additions land through this milestone; each is listed
   in `docs/linux-abi.md` with its status as before.
+
+## Amendment (2026-11-22): io_uring as built
+
+- **Workers:** one per ring and process, not up to four per ring. It is
+  a helper thread of the process that submitted (its memory, files and
+  credentials), started when something first has to wait. Operations do
+  not block: each is tried without blocking on the open file description
+  it named when it started (held by the ring, lent to the thread), and
+  tried again when that object changes. So closing a descriptor, or
+  giving its number to another file, does not redirect an operation, and
+  no operation occupies a worker. What a process submitted is run only by
+  its own threads, and is cancelled when it exits or execs.
+- **Waiting:** a ring registers once with every object its operations
+  wait for, as an epoll instance does, and waiters sleep until it is told
+  of a change.
+- **SQPOLL** is accepted, without the polling: the ring always says
+  `IORING_SQ_NEED_WAKEUP`, so the program calls `io_uring_enter` to wake
+  the poller, and that submits. No kernel thread reads user memory on its
+  own, which is what the decision above refused; programs that insist on
+  SQPOLL run, without its latency. IOPOLL stays refused.
+- **Charges:** the ring's pages, what is in flight (8 SQEs or unread CQEs
+  a page; `EAGAIN` from `io_uring_enter` when the cell cannot pay, or at
+  131,072), registered tables, and the kernel's side of provided-buffer
+  rings. A finished SQE is forgotten at once, however long an earlier one
+  waits.
+- **Cycles:** rings do not hold rings. An operation on a ring holds it
+  weakly, rings cannot be registered files, and cannot be passed in
+  `SCM_RIGHTS` (Linux refuses both too).
+- **Registered buffers** are address ranges, not pinned pages: an
+  operation on one the program has unmapped fails with `EFAULT`, where
+  Linux's succeeds on the pinned page.
+- **liburing's tests** run as a sixth suite (`cargo xtask workloads
+  uring`), built with glibc in `buildpack-deps` rather than with musl in
+  Alpine: the suite machinery pulls images, and its tests expect glibc.
+  Version 2.5, of Linux 6.6's time, which is the version cells see.

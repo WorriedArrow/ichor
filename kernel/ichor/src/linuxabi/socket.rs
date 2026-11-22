@@ -122,6 +122,11 @@ pub(crate) struct Socket {
 type SockOpt = ((u64, u64), Vec<u8>);
 
 impl Socket {
+    /// Whether its data has no bounds.
+    pub(super) fn is_stream(&self) -> bool {
+        !self.dgram
+    }
+
     fn new(stack: Arc<Stack>, id: u64, wait: Arc<Waiters>, dgram: bool) -> Socket {
         Socket {
             stack,
@@ -996,7 +1001,11 @@ pub(super) fn msg_hdr(p: &mut LinuxProcess, msg: u64) -> Result<MsgHdr, i64> {
     Ok(MsgHdr {
         name: u(0),
         namelen: u(8) & 0xffff_ffff,
-        iov: fs::read_iov(p, u(16), n)?,
+        // (io_uring may have chosen the buffer.)
+        iov: match p.uring.iov.clone() {
+            Some(v) => v,
+            None => fs::read_iov(p, u(16), n)?,
+        },
         control: u(32),
         controllen: u(40),
     })

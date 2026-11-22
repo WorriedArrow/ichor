@@ -10,7 +10,7 @@ on:
     inputs:
       suites:
         description: Suites to run (a JSON list)
-        default: '["python", "go", "postgres", "node", "jvm"]'
+        default: '["python", "go", "postgres", "node", "jvm", "uring"]'
   schedule:
     - cron: "17 3 * * 0"
 
@@ -31,7 +31,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        suite: ${{ fromJSON(inputs.suites || '["python", "go", "postgres", "node", "jvm"]') }}
+        suite: ${{ fromJSON(inputs.suites || '["python", "go", "postgres", "node", "jvm", "uring"]') }}
     env:
       # (Never pasted into a command: it may come from the dispatch form.)
       SUITE: ${{ matrix.suite }}
