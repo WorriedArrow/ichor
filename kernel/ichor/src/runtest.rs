@@ -552,7 +552,9 @@ pub(crate) fn run_linux(
             fail("could not load the ELF");
         }
     };
-    p.group.set_exec(argv.first().copied().unwrap_or(""), argv);
+    let path = argv.first().copied().unwrap_or("");
+    let name = path.rsplit('/').next().unwrap_or("");
+    p.group.set_exec(path, name, argv);
     let cell = p.cell.clone();
     // A root that opted out of page sharing charges its private cache pages
     // to the cell too; those are the root's, not the process's.

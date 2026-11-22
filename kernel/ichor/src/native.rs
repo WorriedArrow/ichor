@@ -642,6 +642,7 @@ fn spawn(c: &Container, spec: &[u8]) -> Result<Arc<Process>, Error> {
         status: SpinLock::new(None),
     });
     let pid = p.entry.pid;
+    let sched = crate::sched::SchedInfo::of_cell(p.cell.id());
     let record = process.clone();
     let argv: Vec<Vec<u8>> = argv.into_iter().map(String::into_bytes).collect();
     let envp: Vec<Vec<u8>> = envp.into_iter().map(String::into_bytes).collect();
@@ -668,6 +669,7 @@ fn spawn(c: &Container, spec: &[u8]) -> Result<Arc<Process>, Error> {
         *record.status.lock() = Some(status);
         record.output.watchers().notify();
     })
+    .data(sched)
     .spawn();
     if task.is_none() {
         crate::proc::forget(pid);

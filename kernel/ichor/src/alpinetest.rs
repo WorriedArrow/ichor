@@ -40,7 +40,12 @@ const RUNS: &[(&[&str], i32)] = &[
         &[
             "sh",
             "-c",
-            "[ \"$(readlink /proc/self/exe)\" = /usr/bin/readlink ] && head -1 /proc/meminfo | grep -q MemTotal && ls /proc/self | grep -q maps && echo alpine: /proc works",
+            "set -e; [ \"$(readlink /proc/self/exe)\" = /bin/busybox ]; \
+             [ \"$(cat /proc/self/comm)\" = cat ]; \
+             sleep 5 & s=$!; grep -q sleep /proc/$s/cmdline; ps | grep -q '[s]leep 5'; kill $s; \
+             [ \"$(echo x | cat /dev/stdin)\" = x ]; [ \"$(echo y >/dev/stdout)\" = y ]; \
+             (cd /proc && grep -q ^Tgid self/status); ls /dev/fd/ | grep -q 2; \
+             head -1 /proc/meminfo | grep -q MemTotal && ls /proc/self | grep -q maps && echo alpine: /proc works",
         ],
         0,
     ),

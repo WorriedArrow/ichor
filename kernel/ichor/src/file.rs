@@ -71,6 +71,11 @@ impl VfsFile {
             ino,
         })
     }
+
+    /// A path of the file in its root.
+    pub(crate) fn path(&self) -> Option<alloc::string::String> {
+        self.vfs.lock().path(self.ino).ok()
+    }
 }
 
 impl Drop for VfsFile {

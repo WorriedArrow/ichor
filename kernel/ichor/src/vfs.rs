@@ -52,6 +52,8 @@ pub(crate) struct Vfs {
     pub(crate) ptys: crate::pty::Table,
     /// `AF_UNIX` sockets bound to paths in this root, by socket node.
     pub(crate) unix: crate::linuxabi::unix::Bound,
+    /// Who watches this root's files.
+    pub(crate) inotify: crate::linuxabi::inotify::Instances,
 }
 
 impl Drop for Vfs {
@@ -88,6 +90,7 @@ impl Vfs {
             view: None,
             ptys: frame::sync::SpinLock::new(alloc::collections::BTreeMap::new()),
             unix: frame::sync::SpinLock::new(alloc::collections::BTreeMap::new()),
+            inotify: crate::linuxabi::inotify::Instances::new(),
         })
     }
 

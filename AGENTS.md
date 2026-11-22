@@ -130,7 +130,23 @@ not write it; merge its branch when it lands.
   `linuxabi/netlink.rs`); CPU-time and POSIX timers (`itimer.rs`); pidfds
   and `clone3`. Debian's perl checks most of it on every boot
   (`SIGNAL_SCRIPT`, `MOVE_SCRIPT`). Explore with
-  `--cmd "go version" --follow FILE` (append shell lines to FILE).
+  `--cmd "go version" --follow FILE` (append shell lines to FILE). Under
+  TCG only: `crypto/sha1` (QEMU reads 32 bytes for a 16-byte AVX2 operand).
+- M7 PostgreSQL (third suite): `cargo xtask workloads postgres` builds
+  16.16 in `buildpack-deps` (the official image carries no `pg_regress`)
+  and runs `make check`; first run 223 of 224 (the other was QEMU's FMA on
+  Windows, which `Accel::cpu_model` now leaves out). Needed: System V
+  shared memory (`linuxabi/shm.rs`), `signalfd` (`linuxabi/timerfd.rs`,
+  with `timerfd`), and a scheduler that calls idle CPUs to steal (a woken
+  task waits on its waker's CPU; `sched::call_idle` at the tick). Tasks are
+  scheduled by cell now (`SchedInfo::of_cell`).
+- M7 also: `inotify` (the overlay records changes while watched), nested
+  epoll, O_TMPFILE, `/proc/<pid>` of every process of the cell,
+  `/dev/fd`, `/dev/std*` and `/proc/self/fd/N` opened anew
+  (`fs::reopen`), paths that lead into `/proc` any way
+  (`Overlay::set_elsewhere`), `execve` of `/proc/self/exe`, and small calls
+  in `linuxabi/misc.rs`. Suites `node` (Node.js's `test.py`) and `jvm`
+  (jtreg, OpenJDK 21's tier 1) are defined, not run yet.
 - M7 storage (ADR-0006's 2026-11-21 amendment): a cell's root writes are
   frames charged to its account (`page.rs`: one charged-page type for
   process memory and file pages; `overlay::Pages` is where the overlay

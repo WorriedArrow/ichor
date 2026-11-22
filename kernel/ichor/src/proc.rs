@@ -9,7 +9,7 @@
 //! pids are global for now.
 
 use alloc::collections::{BTreeMap, VecDeque};
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use frame::println;
@@ -18,7 +18,8 @@ use frame::task::{Task, TaskOptions, WaitQueue};
 use frame::user::{UserContext, UserEvent, UserMode};
 
 use crate::linuxabi::{self, Outcome};
-use crate::process::LinuxProcess;
+use crate::process::{Group, LinuxProcess};
+use crate::sched::SchedInfo;
 use crate::signal::{self, Info};
 
 const ECHILD: i64 = 10;
@@ -140,6 +141,10 @@ pub(crate) struct Shared {
     pub(crate) nocldwait: AtomicBool,
     /// Polled through pidfds: changes when the process exits.
     pub(crate) exit: crate::poll::Watchers,
+    /// Polled through signal descriptors: changes as signals are posted to
+    /// the process or its threads, which `posted` counts.
+    pub(crate) arrivals: crate::poll::Watchers,
+    pub(crate) posted: AtomicU64,
     /// The process's CPU time (ns) at which one of its CPU-time timers may
     /// be due (`itimer`).
     pub(crate) cpu_due: AtomicU64,
@@ -154,6 +159,8 @@ impl Default for Shared {
             nocldstop: AtomicBool::new(false),
             nocldwait: AtomicBool::new(false),
             exit: crate::poll::Watchers::new(),
+            arrivals: crate::poll::Watchers::new(),
+            posted: AtomicU64::new(0),
             cpu_due: AtomicU64::new(u64::MAX),
         }
     }
@@ -209,6 +216,8 @@ pub(crate) struct ProcEntry {
     task: SpinLock<Option<Arc<Task>>>,
     /// Woken when a signal is posted (`pause`, `rt_sigsuspend`).
     signals: WaitQueue,
+    /// The process, for a first entry (`/proc/<pid>`).
+    process: SpinLock<Weak<Group>>,
     /// CPU time this thread has spent in user code, in nanoseconds (the
     /// time inside `UserMode::execute`; kernel time is not counted yet).
     pub(crate) cpu_ns: AtomicU64,
@@ -223,6 +232,21 @@ impl ProcEntry {
     pub(crate) fn uids(&self) -> (u32, u32) {
         let v = self.uids.load(Ordering::Acquire);
         (v as u32, (v >> 32) as u32)
+    }
+
+    /// The process it is the first entry of, while that has threads.
+    pub(crate) fn process(&self) -> Option<Arc<Group>> {
+        self.process.lock().upgrade()
+    }
+
+    pub(crate) fn set_group(&self, g: &Arc<Group>) {
+        *self.process.lock() = Arc::downgrade(g);
+    }
+
+    /// Whether its thread is running or about to, or else waiting.
+    pub(crate) fn runnable(&self) -> bool {
+        let task = self.task.lock().clone();
+        task.is_some_and(|t| t.state() == frame::task::TaskState::Runnable)
     }
 
     pub(crate) fn set_uids(&self, ruid: u32, suid: u32) {
@@ -254,6 +278,16 @@ pub(crate) fn census(cell: u64) -> (usize, usize, u64) {
         }
     }
     (threads, procs, NEXT_PID.load(Ordering::Relaxed) - 1)
+}
+
+/// The pids of `cell`'s processes, zombies included, ascending.
+pub(crate) fn pids(cell: u64) -> alloc::vec::Vec<u64> {
+    TABLE
+        .lock()
+        .values()
+        .filter(|e| e.cell == cell && e.pid == e.tgid)
+        .map(|e| e.pid)
+        .collect()
 }
 
 /// A process's first entry (which carries its group, session and status),
@@ -433,6 +467,7 @@ pub(crate) fn register(
         awaited: AtomicU64::new(0),
         task: SpinLock::new(None),
         signals: WaitQueue::new(),
+        process: SpinLock::new(Weak::new()),
         cpu_ns: AtomicU64::new(0),
     });
     TABLE.lock().insert(pid, e.clone());
@@ -581,6 +616,14 @@ fn tell_parent(t: &BTreeMap<u64, Arc<ProcEntry>>, leader: &ProcEntry, code: i32,
     parent.children.wake_all();
 }
 
+/// Tells those who poll signal descriptors, and who read one, that a signal
+/// was posted (nobody may have it unblocked, so nobody is woken for it).
+fn arrived(e: &ProcEntry) {
+    e.shared.posted.fetch_add(1, Ordering::AcqRel);
+    e.shared.arrivals.notify();
+    e.signals.wake_all();
+}
+
 /// Posts `sig` to the process of thread `e` (under the table's lock), and
 /// wakes a thread that will take it. False if too many are queued.
 fn post_process(
@@ -596,6 +639,7 @@ fn post_process(
     if !e.shared.pending.add(sig, info) {
         return false;
     }
+    arrived(e);
     let b = signal::bit(sig);
     let takes = |c: &ProcEntry| {
         let open = !c.blocked.load(Ordering::SeqCst) | c.awaited.load(Ordering::SeqCst);
@@ -629,6 +673,7 @@ pub(crate) fn post_info(e: &Arc<ProcEntry>, sig: u32, info: Info) -> bool {
     if !e.pending.add(sig, info) {
         return false;
     }
+    arrived(e);
     if sig == signal::SIGKILL {
         // Whoever it is sent to, it ends the process.
         let threads = threads_of(&TABLE.lock(), e);
@@ -802,6 +847,19 @@ pub(crate) fn await_signal(
     };
     e.awaited.store(0, Ordering::SeqCst);
     r.transpose()
+}
+
+/// Takes a pending signal of `set`, waiting for one until `interrupted`
+/// (a signal descriptor's read).
+pub(crate) fn wait_signal(
+    e: &ProcEntry,
+    set: u64,
+    interrupted: &dyn Fn() -> bool,
+) -> Result<(u32, Info), i64> {
+    e.signals.wait_until(|| match take_signal(e, set) {
+        Some(s) => Some(Ok(s)),
+        None => interrupted().then_some(Err(signal::ERESTARTSYS)),
+    })
 }
 
 /// Puts `e`'s entry in the place of its process's first thread's, for a
@@ -1142,6 +1200,7 @@ pub(crate) fn start_helper(
     work: impl FnOnce(&mut LinuxProcess) + Send + 'static,
 ) -> bool {
     let pid = p.entry.pid;
+    let sched = SchedInfo::of_cell(p.cell.id());
     let task = TaskOptions::new(move || {
         let mut p = p;
         *p.entry.task.lock() = Some(frame::task::current());
@@ -1152,6 +1211,7 @@ pub(crate) fn start_helper(
         TABLE.lock().remove(&pid);
         gone.wake_all();
     })
+    .data(sched)
     .spawn();
     if task.is_none() {
         TABLE.lock().remove(&pid);
@@ -1178,9 +1238,11 @@ pub(crate) fn forget(pid: u64) {
 pub(crate) fn start(child: LinuxProcess, ctx: UserContext) -> Result<u64, i64> {
     let pid = child.entry.pid;
     let entry = child.entry.clone();
+    let sched = SchedInfo::of_cell(child.cell.id());
     let task = TaskOptions::new(move || {
         run(child, ctx);
     })
+    .data(sched)
     .spawn();
     if task.is_none() {
         // The closure (and with it the child) was dropped unrun; nobody

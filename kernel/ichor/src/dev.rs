@@ -66,6 +66,23 @@ pub(crate) fn populate(fs: &mut Tree) {
     for &(name, num) in NODES {
         let _ = fs.mknod(dev, name, 0o666, num);
     }
+    for (name, target) in [
+        ("fd", "/proc/self/fd"),
+        ("stdin", "/proc/self/fd/0"),
+        ("stdout", "/proc/self/fd/1"),
+        ("stderr", "/proc/self/fd/2"),
+    ] {
+        let _ = fs.symlink(dev, name, target);
+    }
+    // What `procfs` serves.
+    for name in ["proc", "sys"] {
+        if let Ok(d) = fs
+            .lookup(ROOT, name)
+            .or_else(|_| fs.mkdir(ROOT, name, 0o555))
+        {
+            fs.set_elsewhere(d);
+        }
+    }
     // POSIX shared memory and semaphores (`shm_open`, `sem_open`) live in
     // /dev/shm: a world-writable sticky directory of the root's upper
     // layer, so its files are the cell's memory, as tmpfs would be.

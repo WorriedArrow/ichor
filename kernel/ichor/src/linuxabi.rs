@@ -9,10 +9,14 @@
 
 pub(crate) mod exec;
 mod fs;
+pub(crate) mod inotify;
+mod misc;
 pub(crate) mod netlink;
 pub(crate) mod pidfd;
+pub(crate) mod shm;
 pub(crate) mod socket;
 mod splice;
+pub(crate) mod timerfd;
 pub(crate) mod unix;
 pub(crate) mod uring;
 
@@ -176,7 +180,7 @@ mod nr {
     pub(super) const CLOCK_NANOSLEEP: u64 = 230; // partial: CPU-time clocks are ENOTSUP; an absolute realtime sleep does not follow clock steps
     pub(super) const UTIMES: u64 = 235;
     pub(super) const EXIT_GROUP: u64 = 231;
-    pub(super) const EPOLL_WAIT: u64 = 232; // partial: an epoll instance inside another is never ready
+    pub(super) const EPOLL_WAIT: u64 = 232;
     pub(super) const EPOLL_CTL: u64 = 233;
     pub(super) const TGKILL: u64 = 234;
     pub(super) const OPENAT: u64 = 257;
@@ -198,7 +202,8 @@ mod nr {
     pub(super) const FACCESSAT2: u64 = 439;
     pub(super) const UTIMENSAT: u64 = 280;
     pub(super) const ACCEPT4: u64 = 288;
-    pub(super) const EPOLL_PWAIT: u64 = 281; // partial: an epoll instance inside another is never ready
+    pub(super) const EPOLL_PWAIT: u64 = 281;
+    pub(super) const EPOLL_PWAIT2: u64 = 441;
     pub(super) const EVENTFD: u64 = 284;
     pub(super) const EVENTFD2: u64 = 290;
     pub(super) const EPOLL_CREATE1: u64 = 291;
@@ -229,6 +234,42 @@ mod nr {
     pub(super) const PRLIMIT64: u64 = 302; // partial: own process only; NOFILE and STACK enforced, others stored
     pub(super) const GETRANDOM: u64 = 318; // ChaCha20 seeded from RDSEED/RDRAND and virtio-rng
     pub(super) const RENAMEAT2: u64 = 316; // partial: RENAME_NOREPLACE only
+    pub(super) const MINCORE: u64 = 27;
+    pub(super) const CAPGET: u64 = 125; // partial: nothing is inheritable; other processes' are the caller's
+    pub(super) const CAPSET: u64 = 126; // partial: nothing is inheritable
+    pub(super) const PERSONALITY: u64 = 135; // partial: Linux's, with or without ADDR_NO_RANDOMIZE
+    pub(super) const SCHED_SETPARAM: u64 = 142; // partial: priority 0 only
+    pub(super) const SCHED_GETPARAM: u64 = 143;
+    pub(super) const SCHED_SETSCHEDULER: u64 = 144; // partial: SCHED_OTHER only
+    pub(super) const SCHED_GETSCHEDULER: u64 = 145;
+    pub(super) const MLOCK: u64 = 149; // partial: makes the pages resident; nothing is ever paged out
+    pub(super) const MUNLOCK: u64 = 150; // partial: checks the range; nothing is ever paged out
+    pub(super) const MLOCKALL: u64 = 151; // partial: nothing is ever paged out; does not make pages resident
+    pub(super) const MUNLOCKALL: u64 = 152; // partial: nothing is ever paged out
+    pub(super) const SYNC: u64 = 162; // partial: the upper layer is memory
+    pub(super) const SETHOSTNAME: u64 = 170; // partial: always EPERM (no CAP_SYS_ADMIN in cells)
+    pub(super) const SETDOMAINNAME: u64 = 171; // partial: always EPERM (no CAP_SYS_ADMIN in cells)
+    pub(super) const READAHEAD: u64 = 187; // partial: advice, checked and ignored
+    pub(super) const UNSHARE: u64 = 272; // partial: namespaces are EPERM (no CAP_SYS_ADMIN in cells)
+    pub(super) const SYNCFS: u64 = 306; // partial: the upper layer is memory
+    pub(super) const SETNS: u64 = 308; // partial: always EPERM (no CAP_SYS_ADMIN in cells)
+    pub(super) const GETCPU: u64 = 309;
+    pub(super) const MLOCK2: u64 = 325; // partial: as mlock
+    pub(super) const RSEQ: u64 = 334; // partial: always ENOSYS (libcs go without)
+    pub(super) const FCHMODAT2: u64 = 452;
+    pub(super) const TIMERFD_CREATE: u64 = 283;
+    pub(super) const TIMERFD_SETTIME: u64 = 286;
+    pub(super) const TIMERFD_GETTIME: u64 = 287;
+    pub(super) const SIGNALFD: u64 = 282; // partial: takes the signals of the process that made it
+    pub(super) const SIGNALFD4: u64 = 289; // partial: takes the signals of the process that made it
+    pub(super) const INOTIFY_INIT: u64 = 253;
+    pub(super) const INOTIFY_ADD_WATCH: u64 = 254; // partial: a file with several names reports to one of its directories
+    pub(super) const INOTIFY_RM_WATCH: u64 = 255;
+    pub(super) const INOTIFY_INIT1: u64 = 294;
+    pub(super) const SHMGET: u64 = 29; // partial: no huge pages
+    pub(super) const SHMAT: u64 = 30; // partial: no SHM_REMAP
+    pub(super) const SHMCTL: u64 = 31; // partial: STAT, SET, RMID and INFO
+    pub(super) const SHMDT: u64 = 67;
     pub(super) const TIMER_CREATE: u64 = 222; // partial: CPU-time clocks count user time only; no alarm clocks or other processes' clocks
     pub(super) const TIMER_SETTIME: u64 = 223;
     pub(super) const TIMER_GETTIME: u64 = 224;
@@ -402,6 +443,7 @@ pub(crate) fn dispatch(p: &mut LinuxProcess, ctx: &mut frame::user::UserContext)
         nr::EPOLL_CTL => crate::poll::epoll_ctl(p, a[0], a[1], a[2], a[3]),
         nr::EPOLL_WAIT => crate::poll::epoll_wait(p, a[0], a[1], a[2], i(a[3])),
         nr::EPOLL_PWAIT => crate::poll::epoll_pwait(p, &a),
+        nr::EPOLL_PWAIT2 => crate::poll::epoll_pwait2(p, &a),
         nr::EVENTFD => crate::poll::eventfd(p, a[0], 0),
         nr::EVENTFD2 => crate::poll::eventfd(p, a[0], a[1]),
         nr::PIPE => fs::pipe2(p, a[0], 0),
@@ -425,6 +467,41 @@ pub(crate) fn dispatch(p: &mut LinuxProcess, ctx: &mut frame::user::UserContext)
         nr::BRK => Ok(p.mm().brk(a[0])),
         nr::MSYNC => p.mm().msync(a[0], a[1], a[2]),
         nr::MADVISE => p.mm().madvise(a[0], a[1], a[2]),
+        nr::GETCPU => misc::getcpu(p, a[0], a[1]),
+        nr::PERSONALITY => misc::personality(p, a[0]),
+        nr::SYNC => Ok(0),
+        nr::SYNCFS | nr::READAHEAD => misc::on_file(p, a[0]),
+        nr::MINCORE => misc::mincore(p, a[0], a[1], a[2]),
+        nr::MLOCK => misc::mlock(p, a[0], a[1], 0),
+        nr::MLOCK2 => misc::mlock(p, a[0], a[1], a[2] & 0xffff_ffff),
+        nr::MUNLOCK => misc::munlock(p, a[0], a[1]),
+        nr::MLOCKALL => misc::mlockall(a[0] & 0xffff_ffff),
+        nr::MUNLOCKALL => Ok(0),
+        nr::SCHED_GETSCHEDULER => misc::getscheduler(p, a[0]),
+        nr::SCHED_SETSCHEDULER => misc::setscheduler(p, a[0], a[1] & 0xffff_ffff, a[2]),
+        nr::SCHED_GETPARAM => misc::getparam(p, a[0], a[1]),
+        nr::SCHED_SETPARAM => misc::setparam(p, a[0], a[1]),
+        nr::CAPGET => misc::capget(p, a[0], a[1]),
+        nr::CAPSET => misc::capset(p, a[0], a[1]),
+        nr::UNSHARE => misc::unshare(a[0] & 0xffff_ffff),
+        // CAP_SYS_ADMIN, outside the cell bounding set.
+        nr::SETNS | nr::SETHOSTNAME | nr::SETDOMAINNAME => Err(EPERM),
+        nr::FCHMODAT2 => fs::fchmodat2(p, i(a[0]), a[1], a[2], a[3] & 0xffff_ffff),
+        // glibc asks every thread and goes without.
+        nr::RSEQ => Err(ENOSYS),
+        nr::TIMERFD_CREATE => timerfd::create(p, a[0], a[1] & 0xffff_ffff),
+        nr::TIMERFD_SETTIME => timerfd::settime(p, a[0], a[1] & 0xffff_ffff, a[2], a[3]),
+        nr::TIMERFD_GETTIME => timerfd::gettime(p, a[0], a[1]),
+        nr::SIGNALFD => timerfd::signalfd(p, i(a[0]), a[1], a[2], 0),
+        nr::SIGNALFD4 => timerfd::signalfd(p, i(a[0]), a[1], a[2], a[3] & 0xffff_ffff),
+        nr::INOTIFY_INIT => inotify::init(p, 0),
+        nr::INOTIFY_INIT1 => inotify::init(p, a[0] & 0xffff_ffff),
+        nr::INOTIFY_ADD_WATCH => inotify::add(p, a[0], a[1], a[2]),
+        nr::INOTIFY_RM_WATCH => inotify::remove(p, a[0], a[1]),
+        nr::SHMGET => shm::get(p, a[0], a[1], a[2] & 0xffff_ffff),
+        nr::SHMAT => shm::attach(p, a[0], a[1], a[2] & 0xffff_ffff),
+        nr::SHMDT => shm::detach(p, a[0]),
+        nr::SHMCTL => shm::control(p, a[0], a[1], a[2]),
         nr::MREMAP => p.mm().mremap(a[0], a[1], a[2], a[3], a[4]),
         // Identity, time, limits, signals, threads.
         nr::UNAME => uname(p, a[0]),
@@ -632,6 +709,12 @@ pub(crate) fn dispatch(p: &mut LinuxProcess, ctx: &mut frame::user::UserContext)
             Err(ENOSYS)
         }
     };
+    // A path into what is not the root's, where nothing else serves it.
+    let result = match result {
+        Err(crate::vfs::errno::ELSEWHERE) => Err(2), // ENOENT
+        r => r,
+    };
+    inotify::flush(&p.vfs);
     let traced = TRACE_PID.load(core::sync::atomic::Ordering::Relaxed) == p.entry.pid
         || (TRACE_ERRORS.load(core::sync::atomic::Ordering::Relaxed)
             && result.is_err_and(|e| e < signal::ERESTARTSYS));

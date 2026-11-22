@@ -48,6 +48,9 @@ pub mod errno {
     pub const ENOTEMPTY: i64 = 39;
     pub const ELOOP: i64 = 40;
     pub const EMLINK: i64 = 31;
+    /// Not an error of Linux's: the path leads into a directory something
+    /// else serves (`Overlay::set_elsewhere`).
+    pub const ELSEWHERE: i64 = 600;
 }
 use errno::*;
 
@@ -342,6 +345,8 @@ struct Inode<'a, P> {
     opens: u32,
     uid: u32,
     gid: u32,
+    /// The directory that has (one of) its names, if it ever had one.
+    home: Option<Ino>,
     atime: Time,
     mtime: Time,
     ctime: Time,
@@ -357,6 +362,7 @@ impl<'a, P> Inode<'a, P> {
             opens: 0,
             uid: 0,
             gid: 0,
+            home: None,
             atime: now,
             mtime: now,
             ctime: now,
@@ -410,6 +416,12 @@ pub struct Overlay<'a, A: Pages = Heap> {
     free: Vec<Ino>,
     used_bytes: usize,
     max_bytes: usize,
+    /// Changes not taken yet; `None` while nobody watches.
+    changes: Option<Vec<Change>>,
+    /// Directories something else serves (`/proc`), and where in one the
+    /// last resolution that came there was going.
+    elsewhere: Vec<Ino>,
+    crossing: String,
 }
 
 fn upper_dir<'a, P>(parent: Ino, lower: Option<Node<'a>>) -> Data<'a, P> {
@@ -435,8 +447,41 @@ fn from_lower<'a, P>(node: Node<'a>, parent: Ino) -> Inode<'a, P> {
     let mut i = Inode::fresh(data, node.mode & 0o7777, 1, t);
     i.uid = node.uid;
     i.gid = node.gid;
+    i.home = Some(parent);
     i
 }
+
+/// What changed in a watched tree ([`Overlay::watch`]), for `inotify`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Change {
+    /// A name was added to a directory.
+    Created {
+        dir: Ino,
+        name: String,
+        is_dir: bool,
+    },
+    /// A name was removed from a directory.
+    Removed {
+        dir: Ino,
+        name: String,
+        is_dir: bool,
+    },
+    /// An inode lost its last name.
+    Gone(Ino),
+    Moved {
+        from: (Ino, String),
+        to: (Ino, String),
+        ino: Ino,
+        is_dir: bool,
+    },
+    /// A file's contents or length.
+    Modified(Ino),
+    /// Mode, owner, times or link count.
+    Attributes(Ino),
+}
+
+/// Most changes held for whoever watches; later ones are dropped.
+const CHANGES_MAX: usize = 4096;
 
 fn check_name(name: &str) -> Result<(), i64> {
     if name.is_empty() || name.contains('/') {
@@ -505,7 +550,69 @@ impl<'a, A: Pages> Overlay<'a, A> {
             clock: || Time::default(),
             used_bytes: 0,
             max_bytes,
+            changes: None,
+            elsewhere: Vec::new(),
+            crossing: String::new(),
         }
+    }
+
+    /// Makes `dir` a directory whose contents something else serves (a
+    /// mount point): resolving a path into it is [`errno::ELSEWHERE`], and
+    /// [`Self::take_crossing`] says where it was going. The directory
+    /// itself still resolves.
+    pub fn set_elsewhere(&mut self, dir: Ino) {
+        self.elsewhere.push(dir);
+    }
+
+    /// Whether `dir` is served by something else.
+    pub fn is_elsewhere(&self, dir: Ino) -> bool {
+        self.elsewhere.contains(&dir)
+    }
+
+    /// The absolute path the resolution that was last `ELSEWHERE` led to.
+    pub fn take_crossing(&mut self) -> String {
+        core::mem::take(&mut self.crossing)
+    }
+
+    /// Starts or stops recording changes ([`Self::take_changes`]).
+    pub fn watch(&mut self, on: bool) {
+        if on != self.changes.is_some() {
+            self.changes = on.then(Vec::new);
+        }
+    }
+
+    /// The changes since this was last called.
+    pub fn take_changes(&mut self) -> Vec<Change> {
+        self.changes
+            .as_mut()
+            .map(core::mem::take)
+            .unwrap_or_default()
+    }
+
+    fn changed(&mut self, what: impl FnOnce() -> Change) {
+        if let Some(c) = &mut self.changes
+            && c.len() < CHANGES_MAX
+        {
+            c.push(what());
+        }
+    }
+
+    /// The directory and name `ino` has there (one of them, for a file with
+    /// several); `None` if it is the root or has none.
+    pub fn name_of(&self, ino: Ino) -> Option<(Ino, String)> {
+        if ino == ROOT {
+            return None;
+        }
+        let dir = match &self.get(ino).ok()?.data {
+            Data::Dir(d) => d.parent,
+            _ => self.get(ino).ok()?.home?,
+        };
+        let entries = &self.dir(dir).ok()?.entries;
+        let named = |e: &Entry| matches!(e, Entry::Ino(i) if *i == ino);
+        entries
+            .iter()
+            .find(|(_, e)| named(e))
+            .map(|(n, _)| (dir, n.clone()))
     }
 
     /// Sets the credentials later operations are checked against (`None`:
@@ -622,6 +729,7 @@ impl<'a, A: Pages> Overlay<'a, A> {
             i.mode &= !(S_ISUID | S_ISGID); // as Linux does on chown
         }
         i.ctime = now;
+        self.changed(|| Change::Attributes(ino));
         Ok(())
     }
 
@@ -642,6 +750,7 @@ impl<'a, A: Pages> Overlay<'a, A> {
             i.mtime = m;
         }
         i.ctime = now;
+        self.changed(|| Change::Attributes(ino));
         Ok(())
     }
 
@@ -891,6 +1000,7 @@ impl<'a, A: Pages> Overlay<'a, A> {
             // No need to copy bytes that are about to be dropped.
             self.get_mut(ino)?.data = Data::File(FileData::empty());
             self.touch(ino);
+            self.changed(|| Change::Modified(ino));
             return Ok(());
         }
         self.copy_up(ino)?;
@@ -903,6 +1013,7 @@ impl<'a, A: Pages> Overlay<'a, A> {
         let after = f.bytes();
         self.used_bytes = self.used_bytes - before + after;
         self.touch(ino);
+        self.changed(|| Change::Modified(ino));
         Ok(())
     }
 
@@ -938,6 +1049,7 @@ impl<'a, A: Pages> Overlay<'a, A> {
             return Err(ENOSPC);
         }
         self.touch(ino);
+        self.changed(|| Change::Modified(ino));
         Ok(n)
     }
 
@@ -996,6 +1108,7 @@ impl<'a, A: Pages> Overlay<'a, A> {
         let i = self.get_mut(ino)?;
         i.mode = mode;
         i.ctime = now;
+        self.changed(|| Change::Attributes(ino));
         Ok(())
     }
 
@@ -1019,11 +1132,18 @@ impl<'a, A: Pages> Overlay<'a, A> {
                 inode.mode |= S_ISGID;
             }
         }
+        inode.home = Some(dir);
+        let is_dir = inode.kind() == Kind::Directory;
         let ino = self.alloc(inode);
         self.dir_mut(dir)?
             .entries
             .insert(name.to_string(), Entry::Ino(ino));
         self.touch(dir);
+        self.changed(|| Change::Created {
+            dir,
+            name: name.to_string(),
+            is_dir,
+        });
         Ok(ino)
     }
 
@@ -1084,6 +1204,12 @@ impl<'a, A: Pages> Overlay<'a, A> {
         let i = self.get_mut(ino)?;
         i.nlink += 1;
         i.ctime = now;
+        self.changed(|| Change::Attributes(ino));
+        self.changed(|| Change::Created {
+            dir: ndir,
+            name: nname.to_string(),
+            is_dir: false,
+        });
         Ok(())
     }
 
@@ -1188,7 +1314,32 @@ impl<'a, A: Pages> Overlay<'a, A> {
         }
         self.may_delete(dir, ino)?;
         self.detach(dir, name)?;
+        self.removed(dir, name, ino, false);
         self.drop_link(ino)
+    }
+
+    /// Records that `ino` is about to lose its name `name` in `dir`.
+    fn removed(&mut self, dir: Ino, name: &str, ino: Ino, is_dir: bool) {
+        self.changed(|| Change::Removed {
+            dir,
+            name: name.to_string(),
+            is_dir,
+        });
+        self.unnamed(ino);
+    }
+
+    /// Records that `ino` is about to lose a name.
+    fn unnamed(&mut self, ino: Ino) {
+        let last = self
+            .get(ino)
+            .is_ok_and(|i| i.nlink <= 1 || i.kind() == Kind::Directory);
+        self.changed(|| {
+            if last {
+                Change::Gone(ino)
+            } else {
+                Change::Attributes(ino)
+            }
+        });
     }
 
     /// Whether a directory has no entries.
@@ -1214,6 +1365,7 @@ impl<'a, A: Pages> Overlay<'a, A> {
         }
         self.may_delete(dir, ino)?;
         self.detach(dir, name)?;
+        self.removed(dir, name, ino, true);
         self.drop_link(ino)
     }
 
@@ -1264,6 +1416,8 @@ impl<'a, A: Pages> Overlay<'a, A> {
                 _ => {}
             }
             self.detach(ndir, nname)?;
+            // (As `inotify` tells it, the name is replaced, not removed.)
+            self.unnamed(dst);
             self.drop_link(dst)?;
         }
         self.detach(odir, oname)?;
@@ -1275,7 +1429,15 @@ impl<'a, A: Pages> Overlay<'a, A> {
         }
         self.touch(ndir);
         let now = (self.clock)();
-        self.get_mut(src)?.ctime = now;
+        let i = self.get_mut(src)?;
+        i.ctime = now;
+        i.home = Some(ndir);
+        self.changed(|| Change::Moved {
+            from: (odir, oname.to_string()),
+            to: (ndir, nname.to_string()),
+            ino: src,
+            is_dir: src_dir,
+        });
         Ok(())
     }
 
@@ -1308,8 +1470,8 @@ impl<'a, A: Pages> Overlay<'a, A> {
             .collect()
     }
 
-    /// The absolute path of directory `ino` (for `getcwd`); `ENOENT` if
-    /// it has been removed.
+    /// An absolute path of `ino` (for `getcwd` and `/proc`); `ENOENT` if it
+    /// has been removed.
     pub fn path(&self, ino: Ino) -> Result<String, i64> {
         let mut parts: Vec<String> = Vec::new();
         let mut cur = ino;
@@ -1317,14 +1479,7 @@ impl<'a, A: Pages> Overlay<'a, A> {
             if cur == ROOT {
                 break;
             }
-            let parent = self.dir(cur)?.parent;
-            let name = self
-                .dir(parent)?
-                .entries
-                .iter()
-                .find(|(_, e)| matches!(e, Entry::Ino(i) if *i == cur))
-                .map(|(n, _)| n.clone())
-                .ok_or(ENOENT)?;
+            let (parent, name) = self.name_of(cur).ok_or(ENOENT)?;
             parts.push(name);
             cur = parent;
         }
@@ -1359,6 +1514,15 @@ impl<'a, A: Pages> Overlay<'a, A> {
                 return Err(ENOTDIR);
             }
             self.permission(cur, MAY_EXEC)?;
+            if self.is_elsewhere(cur) && comp != "." && comp != ".." {
+                let mut to = self.path(cur)?;
+                for c in core::iter::once(&comp).chain(&pending) {
+                    to.push('/');
+                    to.push_str(c);
+                }
+                self.crossing = to;
+                return Err(ELSEWHERE);
+            }
             let child = self.lookup(cur, &comp)?;
             let is_last = pending.is_empty();
             if self.get(child)?.kind() == Kind::Symlink && (follow_last || !is_last) {
@@ -1443,6 +1607,112 @@ mod tests {
 
     fn names(fs: &mut Overlay<'_>, dir: Ino) -> Vec<String> {
         fs.readdir(dir).unwrap().into_iter().map(|e| e.0).collect()
+    }
+
+    #[test]
+    fn files_know_their_paths() {
+        let bytes: &'static [u8] = std::vec::Vec::leak(lower_image());
+        let image = Image::mount(bytes).unwrap();
+        let src: &'static image::SliceSource = Box::leak(Box::new(image::SliceSource(bytes)));
+        let mut fs = Overlay::new(&image, src, 1 << 20).unwrap();
+        let motd = fs.resolve(ROOT, "/etc/motd", true).unwrap();
+        assert_eq!(fs.path(motd).unwrap(), "/etc/motd");
+        let usr = fs.resolve(ROOT, "/usr", true).unwrap();
+        let etc = fs.resolve(ROOT, "/etc", true).unwrap();
+        fs.rename(etc, "motd", usr, "moved").unwrap();
+        assert_eq!(fs.path(motd).unwrap(), "/usr/moved");
+        fs.open(motd).unwrap();
+        fs.unlink(usr, "moved").unwrap();
+        assert_eq!(fs.path(motd), Err(ENOENT));
+        assert_eq!(fs.name_of(ROOT), None);
+    }
+
+    #[test]
+    fn paths_cross_into_what_is_served_elsewhere() {
+        let mut fs = Overlay::empty(1 << 20);
+        let proc = fs.mkdir(ROOT, "proc", 0o555).unwrap();
+        let dev = fs.mkdir(ROOT, "dev", 0o755).unwrap();
+        fs.symlink(dev, "fd", "/proc/self/fd").unwrap();
+        fs.symlink(dev, "mounts", "../proc/self/mounts").unwrap();
+        fs.set_elsewhere(proc);
+        let mut to = |from: Ino, path: &str, follow: bool| {
+            let r = fs.resolve(from, path, follow);
+            (r, fs.take_crossing())
+        };
+        let crossed = |p: &str| (Err(ELSEWHERE), p.to_string());
+        assert_eq!(to(ROOT, "/dev/fd/3", true), crossed("/proc/self/fd/3"));
+        assert_eq!(to(dev, "mounts", true), crossed("/proc/self/mounts"));
+        assert_eq!(to(proc, "1/stat", true), crossed("/proc/1/stat"));
+        assert!(to(dev, "mounts", false).0.is_ok(), "the link itself");
+        assert_eq!(to(ROOT, "proc", true).0, Ok(proc));
+        assert_eq!(to(proc, "../dev", true).0, Ok(dev));
+    }
+
+    #[test]
+    fn a_watched_tree_records_changes() {
+        let mut fs = Overlay::empty(1 << 20);
+        let quiet = fs.create(ROOT, "quiet", 0o644).unwrap();
+        assert!(fs.take_changes().is_empty());
+        fs.watch(true);
+        let f = fs.create(ROOT, "f", 0o644).unwrap();
+        let d = fs.mkdir(ROOT, "d", 0o755).unwrap();
+        fs.write(f, 0, b"x").unwrap();
+        fs.chmod(f, 0o600).unwrap();
+        fs.link(f, d, "g").unwrap();
+        fs.unlink(d, "g").unwrap();
+        let s = |n: &str| n.to_string();
+        assert_eq!(
+            fs.take_changes(),
+            [
+                Change::Created {
+                    dir: ROOT,
+                    name: s("f"),
+                    is_dir: false
+                },
+                Change::Created {
+                    dir: ROOT,
+                    name: s("d"),
+                    is_dir: true
+                },
+                Change::Modified(f),
+                Change::Attributes(f),
+                Change::Attributes(f),
+                Change::Created {
+                    dir: d,
+                    name: s("g"),
+                    is_dir: false
+                },
+                Change::Removed {
+                    dir: d,
+                    name: s("g"),
+                    is_dir: false
+                },
+                Change::Attributes(f),
+            ]
+        );
+        fs.rename(ROOT, "f", ROOT, "quiet").unwrap();
+        fs.rmdir(ROOT, "d").unwrap();
+        assert_eq!(
+            fs.take_changes(),
+            [
+                Change::Gone(quiet),
+                Change::Moved {
+                    from: (ROOT, s("f")),
+                    to: (ROOT, s("quiet")),
+                    ino: f,
+                    is_dir: false
+                },
+                Change::Removed {
+                    dir: ROOT,
+                    name: s("d"),
+                    is_dir: true
+                },
+                Change::Gone(d),
+            ]
+        );
+        fs.watch(false);
+        fs.write(f, 0, b"y").unwrap();
+        assert!(fs.take_changes().is_empty());
     }
 
     #[test]

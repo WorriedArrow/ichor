@@ -121,7 +121,11 @@ impl Drop for Description {
         let st = self.state.lock();
         match &*st {
             Fd::Console | Fd::Dev(_) | Fd::Object(_) => {}
-            Fd::File(of) => self.vfs.lock().close(of.ino),
+            Fd::File(of) => {
+                let write = of.flags & 0o3 != 0; // not O_RDONLY
+                crate::linuxabi::inotify::note_close(&self.vfs, of.ino, write);
+                self.vfs.lock().close(of.ino)
+            }
             Fd::Pipe(e) => e.pipe.drop_end(e.write),
         }
     }
@@ -193,6 +197,8 @@ pub(crate) struct Prctl {
     /// `sched_setaffinity`'s CPU mask (bit n: CPU n; `None`: every CPU),
     /// kept across fork and exec. The scheduler does not apply it yet.
     pub(crate) affinity: Option<u64>,
+    /// `personality`.
+    pub(crate) personality: u32,
 }
 
 impl Default for Prctl {
@@ -203,6 +209,7 @@ impl Default for Prctl {
             no_new_privs: false,
             nice: 0,
             affinity: None,
+            personality: 0,
         }
     }
 }
@@ -256,13 +263,15 @@ fn default_limits() -> Limits {
 
 impl Group {
     /// Records the program the process runs (load or `execve`).
-    pub(crate) fn set_exec<S: AsRef<[u8]>>(&self, path: &str, argv: &[S]) {
+    /// `name` is what the process is called (`comm`).
+    pub(crate) fn set_exec<S: AsRef<[u8]>>(&self, path: &str, name: &str, argv: &[S]) {
         let mut cmd = Vec::new();
         for a in argv {
             cmd.extend_from_slice(a.as_ref());
             cmd.push(0);
         }
         *self.exe.lock() = (alloc::string::String::from(path), cmd);
+        self.prctl.lock().name = Some(name.chars().take(15).collect());
     }
 
     /// The program's path (`/proc/<pid>/exe`).
@@ -273,6 +282,48 @@ impl Group {
     /// The program's argv, NUL-separated (`/proc/<pid>/cmdline`).
     pub(crate) fn cmdline(&self) -> Vec<u8> {
         self.exe.lock().1.clone()
+    }
+
+    /// The address space (locked).
+    pub(crate) fn mm(&self) -> MutexGuard<'_, Mm> {
+        self.mm.lock()
+    }
+
+    /// The root.
+    pub(crate) fn vfs(&self) -> &Arc<Vfs> {
+        &self.vfs
+    }
+
+    /// The working directory.
+    pub(crate) fn cwd(&self) -> Ino {
+        self.files.lock().cwd
+    }
+
+    pub(crate) fn umask(&self) -> u32 {
+        self.files.lock().umask
+    }
+
+    /// The descriptor `fd`'s description, if open.
+    pub(crate) fn desc(&self, fd: u64) -> Option<Arc<Description>> {
+        let files = self.files.lock();
+        let slot = files.fds.get(usize::try_from(fd).ok()?)?.as_ref()?;
+        Some(slot.desc.clone())
+    }
+
+    /// The open descriptor numbers, ascending.
+    pub(crate) fn open_fds(&self) -> Vec<u64> {
+        let files = self.files.lock();
+        (0u64..)
+            .zip(files.fds.iter())
+            .filter_map(|(n, s)| s.as_ref().map(|_| n))
+            .collect()
+    }
+
+    /// A snapshot of what descriptor `fd` names, if open.
+    pub(crate) fn fd(&self, fd: u64) -> Option<Fd> {
+        let d = self.desc(fd)?;
+        let f = d.state().clone();
+        Some(f)
     }
 
     /// A copy of the process's credentials.
@@ -475,6 +526,7 @@ impl LinuxProcess {
             prctl: SpinLock::new(Prctl::default()),
             gone_cpu_ns: core::sync::atomic::AtomicU64::new(0),
         });
+        entry.set_group(&group);
         Some(Self {
             entry,
             group,
@@ -527,6 +579,7 @@ impl LinuxProcess {
             prctl: SpinLock::new(self.group.prctl.lock().clone()),
             gone_cpu_ns: core::sync::atomic::AtomicU64::new(0),
         });
+        entry.set_group(&group);
         let c = group.creds();
         entry.set_uids(c.ruid, c.suid);
         Some(Self {
@@ -645,7 +698,7 @@ impl LinuxProcess {
 
     /// The working directory.
     pub(crate) fn cwd(&self) -> Ino {
-        self.group.files.lock().cwd
+        self.group.cwd()
     }
 
     pub(crate) fn umask(&self) -> u32 {
@@ -669,25 +722,12 @@ impl LinuxProcess {
 
     /// The descriptor `fd`'s description, if open.
     pub(crate) fn desc(&self, fd: u64) -> Option<Arc<Description>> {
-        let files = self.group.files.lock();
-        let slot = files.fds.get(usize::try_from(fd).ok()?)?.as_ref()?;
-        Some(slot.desc.clone())
-    }
-
-    /// The open descriptor numbers, ascending.
-    pub(crate) fn open_fds(&self) -> Vec<u64> {
-        let files = self.group.files.lock();
-        (0u64..)
-            .zip(files.fds.iter())
-            .filter_map(|(n, s)| s.as_ref().map(|_| n))
-            .collect()
+        self.group.desc(fd)
     }
 
     /// A snapshot of what descriptor `fd` names, if open.
     pub(crate) fn fd(&self, fd: u64) -> Option<Fd> {
-        let d = self.desc(fd)?;
-        let f = d.state().clone();
-        Some(f)
+        self.group.fd(fd)
     }
 
     /// Runs `f` on an open file's state (its offset, say), shared by every

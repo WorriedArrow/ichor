@@ -7,9 +7,8 @@
 //! files, devices and the console are always ready. A waiter registers with
 //! the [`Watchers`] of each object it polls and sleeps on its own queue, so
 //! a state change wakes only the tasks polling that object; a deadline ends
-//! it for timeouts, a signal with `EINTR`. The condition is checked while
-//! the task is marked blocked, so it only takes spinlocks: the descriptors
-//! are looked up once, before waiting.
+//! it for timeouts, a signal with `EINTR`. The descriptors are looked up
+//! once, before waiting.
 //!
 //! `EPOLLET` entries report an object once per change: pipes and eventfds
 //! count their state changes ([`Object::changes`]), and an edge-triggered
@@ -22,8 +21,10 @@
 //! and sleeps until the count moves past what it was before the look: so it
 //! holds nothing while asleep (a descriptor another thread closes really
 //! closes, and its peer sees end-of-file), and descriptors another thread
-//! adds meanwhile are watched from then on. Partial: a nested epoll
-//! instance never polls ready.
+//! adds meanwhile are watched from then on. One epoll instance may watch
+//! another (not in circles: ELOOP), and is ready when something it watches
+//! is; looking then takes sleeping locks, so every wait looks outside its
+//! sleep's condition.
 
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
@@ -46,6 +47,7 @@ const EINVAL: i64 = 22;
 const EBADF: i64 = 9;
 const ENOENT: i64 = 2;
 const EMFILE: i64 = 24;
+const ELOOP: i64 = 40;
 const EPERM: i64 = 1;
 
 pub(crate) const POLLIN: u16 = 0x001;
@@ -101,6 +103,10 @@ pub(crate) trait Object: Send + Sync + Debug {
     fn dir(&self) -> Option<(&[DirEntry], &SpinLock<u64>)> {
         None
     }
+    /// The path of this `/proc` directory.
+    fn proc_dir(&self) -> Option<&str> {
+        None
+    }
     /// This object as a socket.
     fn socket(&self) -> Option<&crate::linuxabi::socket::Socket> {
         None
@@ -111,6 +117,18 @@ pub(crate) trait Object: Send + Sync + Debug {
     }
     /// This object as an `AF_NETLINK` socket.
     fn netlink(&self) -> Option<&crate::linuxabi::netlink::Netlink> {
+        None
+    }
+    /// This object as a timer descriptor.
+    fn timerfd(&self) -> Option<&crate::linuxabi::timerfd::TimerFd> {
+        None
+    }
+    /// This object as a signal descriptor.
+    fn signalfd(&self) -> Option<&crate::linuxabi::timerfd::SignalFd> {
+        None
+    }
+    /// This object as an inotify instance.
+    fn inotify(&self) -> Option<&crate::linuxabi::inotify::Inotify> {
         None
     }
     /// This object as a process descriptor.
@@ -135,6 +153,9 @@ struct Poller {
     queue: WaitQueue,
     /// Changes it has been told of.
     told: AtomicU64,
+    /// Who watches the epoll instance itself (nested epoll; a task's
+    /// sleep is watched by nobody).
+    onward: Watchers,
 }
 
 impl Poller {
@@ -142,6 +163,7 @@ impl Poller {
         Arc::new(Poller {
             queue: WaitQueue::new(),
             told: AtomicU64::new(0),
+            onward: Watchers::new(),
         })
     }
 
@@ -152,6 +174,7 @@ impl Poller {
     fn tell(&self) {
         self.told.fetch_add(1, Ordering::SeqCst);
         self.queue.wake_all();
+        self.onward.notify();
     }
 }
 
@@ -228,7 +251,7 @@ fn changes(fd: &Fd) -> u64 {
 
 /// Sleeps until `check` returns `Some` or the deadline passes (`None`),
 /// woken only by changes to the objects behind `watched` (the native
-/// personality's `OBJECT_WAIT`). `check` runs with interrupts off.
+/// personality's `OBJECT_WAIT`).
 pub(crate) fn wait_watchers<T>(
     watched: &[&Watchers],
     deadline: Option<Duration>,
@@ -238,9 +261,22 @@ pub(crate) fn wait_watchers<T>(
     for w in watched {
         w.watch(&poller);
     }
-    let r = match deadline {
-        Some(d) => poller.queue.wait_until_deadline(d, &mut check),
-        None => Some(poller.queue.wait_until(&mut check)),
+    let r = loop {
+        // As in `wait_ready`.
+        let told = poller.told();
+        let v = check();
+        if v.is_some() {
+            break v;
+        }
+        let woken = || (poller.told() != told).then_some(());
+        match deadline {
+            Some(d) => {
+                if poller.queue.wait_until_deadline(d, woken).is_none() {
+                    break None;
+                }
+            }
+            None => poller.queue.wait_until(woken),
+        }
     };
     for w in watched {
         w.unwatch(&poller);
@@ -260,33 +296,43 @@ pub(crate) fn wait_ready<'f, T>(
 ) -> Result<Option<T>, i64> {
     let deadline = deadline.map(|d| p.resume_until.take().unwrap_or(d));
     let entry = p.entry.clone();
-    let mut cond = || {
-        if let Some(v) = check() {
-            return Some(Ok(v));
-        }
-        proc::interrupted(&entry).then_some(Err(ERESTARTNOHAND))
-    };
     // Registered before the first check, so a change after it wakes us.
     let poller = Poller::new();
     let watched: Vec<&Watchers> = fds.filter_map(watchers).collect();
     for w in &watched {
         w.watch(&poller);
     }
-    let r = match deadline {
-        Some(d) => poller.queue.wait_until_deadline(d, &mut cond),
-        None => Some(poller.queue.wait_until(&mut cond)),
+    let r = loop {
+        // Counted before the look, so a change after it ends the sleep. (The
+        // look may take sleeping locks: a nested epoll's does.)
+        let told = poller.told();
+        if let Some(v) = check() {
+            break Ok(Some(v));
+        }
+        let woken = || {
+            if poller.told() != told {
+                Some(Ok(()))
+            } else {
+                proc::interrupted(&entry).then_some(Err(ERESTARTNOHAND))
+            }
+        };
+        let r = match deadline {
+            Some(d) => poller.queue.wait_until_deadline(d, woken),
+            None => Some(poller.queue.wait_until(woken)),
+        };
+        match r {
+            Some(Ok(())) => {}
+            Some(Err(e)) => {
+                p.resume_until = deadline;
+                break Err(e);
+            }
+            None => break Ok(None),
+        }
     };
     for w in &watched {
         w.unwatch(&poller);
     }
-    match r {
-        Some(Ok(v)) => Ok(Some(v)),
-        Some(Err(e)) => {
-            p.resume_until = deadline;
-            Err(e)
-        }
-        None => Ok(None),
-    }
+    r
 }
 
 pub(crate) fn read_timespec(p: &mut LinuxProcess, addr: u64) -> Result<Duration, i64> {
@@ -731,6 +777,29 @@ impl Epoll {
         drop(set);
         hits
     }
+
+    /// The descriptions watched.
+    fn watched(&self) -> Vec<(u32, Arc<Description>)> {
+        self.interest
+            .lock()
+            .values()
+            .filter_map(|i| Some((i.events, i.desc.upgrade()?)))
+            .collect()
+    }
+
+    /// Whether watching `target` from here would go round in circles, or
+    /// nest deeper than Linux allows.
+    fn loops(&self, target: &Epoll, depth: usize) -> bool {
+        const DEPTH_MAX: usize = 5;
+        if depth == DEPTH_MAX || Arc::ptr_eq(&self.hub, &target.hub) {
+            return true;
+        }
+        target.watched().into_iter().any(|(_, d)| {
+            let f = d.state().clone();
+            matches!(&f, Fd::Object(o)
+                if o.obj.as_epoll().is_some_and(|e| self.loops(e, depth + 1)))
+        })
+    }
 }
 
 impl Object for Epoll {
@@ -741,9 +810,18 @@ impl Object for Epoll {
         Err(EINVAL)
     }
     fn poll(&self) -> u16 {
-        // Nested epoll readiness needs the interest list (a sleeping lock);
-        // report nothing rather than block (partial).
-        0
+        let ready = self.watched().into_iter().any(|(events, d)| {
+            let f = d.state().clone();
+            let want = events | u32::from(POLLERR | POLLHUP);
+            events & !EPOLLET != 0 && u32::from(readiness(&f)) & want != 0
+        });
+        if ready { POLLIN } else { 0 }
+    }
+    fn changes(&self) -> u64 {
+        self.hub.told()
+    }
+    fn watchers(&self) -> Option<&Watchers> {
+        Some(&self.hub.onward)
     }
     fn as_epoll(&self) -> Option<&Epoll> {
         Some(self)
@@ -806,6 +884,12 @@ pub(crate) fn epoll_ctl(
     let Some(epoll) = ep.as_epoll() else {
         return Err(EINVAL);
     };
+    if op == ADD
+        && let Fd::Object(o) = &target
+        && o.obj.as_epoll().is_some_and(|t| epoll.loops(t, 0))
+    {
+        return Err(ELOOP);
+    }
     let mut set = epoll.interest.lock();
     // An entry at this number for a description that has been closed (or
     // another one, the number having been reused) is gone.
@@ -846,6 +930,18 @@ pub(crate) fn epoll_pwait(p: &mut LinuxProcess, a: &[u64; 6]) -> Result<u64, i64
     r
 }
 
+/// `epoll_pwait2(epfd, events, maxevents, timeout, sigmask, size)`.
+pub(crate) fn epoll_pwait2(p: &mut LinuxProcess, a: &[u64; 6]) -> Result<u64, i64> {
+    let timeout = match a[3] {
+        0 => None,
+        t => Some(read_timespec(p, t)?),
+    };
+    crate::signal::begin_wait_mask(p, a[4], a[5])?;
+    let r = epoll_wait_for(p, a[0], a[1], a[2], timeout);
+    crate::signal::end_wait_mask(p, &r);
+    r
+}
+
 /// `epoll_wait(epfd, events, maxevents, timeout_ms)`.
 pub(crate) fn epoll_wait(
     p: &mut LinuxProcess,
@@ -853,6 +949,17 @@ pub(crate) fn epoll_wait(
     out: u64,
     max: u64,
     timeout: i64,
+) -> Result<u64, i64> {
+    let timeout = (timeout >= 0).then(|| Duration::from_millis(timeout as u64));
+    epoll_wait_for(p, epfd, out, max, timeout)
+}
+
+fn epoll_wait_for(
+    p: &mut LinuxProcess,
+    epfd: u64,
+    out: u64,
+    max: u64,
+    timeout: Option<Duration>,
 ) -> Result<u64, i64> {
     // Linux's EP_MAX_EVENTS: servers size the array to their client limit
     // (redis asks for 10,128). Hits are bounded by the interest list.
@@ -864,13 +971,16 @@ pub(crate) fn epoll_wait(
     let Some(epoll) = ep.as_epoll() else {
         return Err(EINVAL);
     };
-    let deadline = deadline_ms(timeout).map(|d| p.resume_until.take().unwrap_or(d));
+    let deadline = timeout.map(|t| {
+        let until = p.resume_until.take();
+        until.unwrap_or_else(|| frame::time::now().saturating_add(t))
+    });
     let entry = p.entry.clone();
     let hits = loop {
         // Counted before the look, so a change after it ends the sleep.
         let told = epoll.hub.told();
         let hits = epoll.take_ready(max);
-        if !hits.is_empty() || timeout == 0 {
+        if !hits.is_empty() || timeout.is_some_and(|t| t.is_zero()) {
             break hits;
         }
         let woken = || {

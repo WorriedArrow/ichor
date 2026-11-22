@@ -325,6 +325,41 @@ syscall(247, 3, $fd, $si, 4, 0) == 0 or fail("waitid(P_PIDFD): $!");
 my ($signo, $c2, $spid, $st) = unpack("i x4 i x4 i x4 i", $si);
 $signo == SIGCHLD && $c2 == 2 && $spid == $pid && $st == SIGTERM or fail("waitid: $signo $c2 $spid $st");
 syscall(434, $pid, 0) == -1 && $!{ESRCH} or fail("a reaped process still opens");
+# Timers and signals as descriptors.
+my $tfd = syscall(283, 1, 04000);
+$tfd >= 0 or fail("timerfd_create: $!");
+$spec = pack("q4", 0, 10_000_000, 0, 10_000_000);
+syscall(286, $tfd, 0, $spec, 0) == 0 or fail("timerfd_settime: $!");
+$rin = ""; vec($rin, $tfd, 1) = 1;
+select($rout = $rin, undef, undef, 5) == 1 or fail("the timer never expired");
+select(undef, undef, undef, 0.03);
+open(my $th, "<&=", $tfd) or fail("fdopen: $!");
+my $count = "";
+sysread($th, $count, 8) == 8 && unpack("Q", $count) >= 2 or fail("timer read: $!");
+sigprocmask(SIG_BLOCK, POSIX::SigSet->new(SIGUSR2)) or fail("sigprocmask: $!");
+my $mask = pack("Q", 1 << (SIGUSR2 - 1));
+my $sfd = syscall(289, -1, $mask, 8, 04000);
+$sfd >= 0 or fail("signalfd: $!");
+$rin = ""; vec($rin, $sfd, 1) = 1;
+select($rout = $rin, undef, undef, 0) == 0 or fail("an empty signalfd is readable");
+$pid = child(sub { kill USR2 => $me });
+select($rout = $rin, undef, undef, 5) == 1 or fail("the signal never arrived");
+open(my $sh, "<&=", $sfd) or fail("fdopen: $!");
+sysread($sh, my $rec, 1024) == 128 or fail("signalfd read: $!");
+($signo, my $spid2) = unpack("I x8 I", $rec);
+$signo == SIGUSR2 && $spid2 == $pid or fail("signalfd gave $signo from $spid2");
+waitpid($pid, 0);
+# An epoll instance watching another.
+my ($outer, $inner) = (syscall(291, 0), syscall(291, 0));
+pipe(my $pr, my $pw) or fail("pipe: $!");
+my $eev = pack("I Q", 1, 7);
+syscall(233, $inner, 1, fileno $pr, $eev) == 0 && syscall(233, $outer, 1, $inner, $eev) == 0 or fail("epoll_ctl: $!");
+syscall(233, $inner, 1, $outer, $eev) == -1 && $!{ELOOP} or fail("epoll instances in a circle: $!");
+my $evs = "\0" x 48;
+syscall(232, $outer, $evs, 4, 0) == 0 or fail("an idle nested epoll is ready");
+$pid = child(sub { select(undef, undef, undef, 0.05); syswrite($pw, "x") });
+syscall(232, $outer, $evs, 4, 5000) == 1 or fail("a nested epoll never became ready");
+waitpid($pid, 0);
 # Children of a process that ignores SIGCHLD are not waited for.
 $SIG{CHLD} = "IGNORE";
 $pid = child(sub { });
@@ -432,7 +467,55 @@ ioctl($l, 0x8913, $req) or fail("SIOCGIFFLAGS: $!");
 (unpack("x16 S", $req) & 0x49) == 0x49 or fail("loopback flags");
 open(my $tty, "<", "/dev/tty") and fail("/dev/tty opened without a terminal");
 $!{ENXIO} or fail("/dev/tty: $!");
-print "debian: moves: splice, tee, copy_file_range, MSG_PEEK, timeouts and netlink work\n";
+# inotify on a directory.
+my $d = "/tmp/ichor-watched";
+mkdir $d or fail("mkdir: $!");
+my $ifd = syscall(294, 04000);
+$ifd >= 0 or fail("inotify_init1: $!");
+my $wd = syscall(254, $ifd, $d, 0xfff);
+$wd > 0 or fail("inotify_add_watch: $!");
+open(my $nf, ">", "$d/f") or fail("open: $!");
+syswrite($nf, "x"); syswrite($nf, "y"); close $nf;
+rename "$d/f", "$d/g"; chmod 0600, "$d/g"; unlink "$d/g"; rmdir $d or fail("rmdir: $!");
+open(my $inh, "<&=", $ifd) or fail("fdopen: $!");
+my ($buf, $seen, $cookies) = ("", "", "");
+sysread($inh, $buf, 8192) or fail("inotify read: $!");
+while (length $buf) {
+    my ($w, $mask, $cookie, $len) = unpack("iIII", $buf);
+    my $name = unpack("Z*", substr($buf, 16, $len));
+    $w == $wd or fail("event for watch $w");
+    $cookies .= "$cookie " if $mask & 0xc0;
+    $seen .= sprintf("%x%s ", $mask, $name);
+    substr($buf, 0, 16 + $len) = "";
+}
+$seen eq "100f 20f 2f 8f 40f 80g 4g 200g 40000400 8000 " or fail("inotify saw $seen");
+$cookies =~ /^([1-9]\d*) \1 $/ or fail("move cookies $cookies");
+!defined(sysread($inh, $buf, 8192)) && $!{EAGAIN} or fail("inotify has more to say");
+readlink("/proc/self/fd/" . fileno $f) eq $p or fail("/proc/self/fd names " . readlink("/proc/self/fd/" . fileno $f));
+system("/usr/bin/perl", "-e", 'system("/proc/self/exe", "-e", "exit 3"); exit($? >> 8)');
+$? >> 8 == 3 or fail("/proc/self/exe ran with status $?");
+# System V shared memory: shared over fork, attachments counted, removed
+# with the last one.
+my $id = shmget(4711, 5000, 01600) // fail("shmget: $!");
+shmget(4711, 5000, 03600) and fail("an exclusive shmget of a key in use worked");
+$!{EEXIST} or fail("exclusive shmget: $!");
+shmget(4711, 5000, 0) == $id or fail("the key finds another segment");
+my $at = syscall(30, $id, 0, 0);
+$at > 0 or fail("shmat: $!");
+sub put { my ($a, $s) = @_; pipe(my $pr, my $pw); syswrite($pw, $s); syscall(0, fileno $pr, $a, length $s) == length $s or fail("write to shared memory: $!") }
+sub peek { unpack("P$_[1]", pack("Q", $_[0])) }
+sub attached { shmctl($id, 2, my $ds) or return -1; unpack("x88 Q", $ds) }
+put($at + 4096, "hello");
+my $pid = fork() // fail("fork: $!");
+if (!$pid) { peek($at + 4096, 5) eq "hello" or exit 2; attached() == 2 or exit 3; put($at, "world"); kill KILL => $$ }
+waitpid($pid, 0); $? == 9 or fail("the child ended with $?");
+peek($at, 5) eq "world" or fail("the child's write is not shared");
+attached() == 1 or fail("a killed child still counts: " . attached());
+shmctl($id, 0, 0) or fail("IPC_RMID: $!");
+attached() == 1 or fail("a removed segment went with an attachment left");
+syscall(67, $at) == 0 or fail("shmdt: $!");
+attached() == -1 && $!{EINVAL} or fail("a removed segment outlived its attachments");
+print "debian: moves: splice, tee, copy_file_range, MSG_PEEK, timeouts, netlink, inotify and shared memory work\n";
 "#;
 
 /// `AF_UNIX`: a socketpair with credentials and end of file; a stream

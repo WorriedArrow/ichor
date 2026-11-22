@@ -11,6 +11,7 @@
 //! `ITIMER_VIRTUAL` does.
 
 use alloc::collections::BTreeMap;
+use alloc::sync::Weak;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use core::time::Duration;
@@ -374,13 +375,46 @@ fn send(cell: u64, tgid: u64, id: i32, n: Notify, overrun: u32) -> bool {
     }
 }
 
+/// Something to be told when a time comes ([`wake_at`]).
+pub(crate) trait Expires: Send + Sync {
+    fn expired(&self);
+}
+
+/// Who is to be told, by when and number.
+static WAKES: SpinLock<BTreeMap<(Duration, u64), Weak<dyn Expires>>> =
+    SpinLock::new(BTreeMap::new());
+
+/// Tells `who` (number `id`) at `t`, time since boot, if it is still there.
+/// It may ask for several times, and be told once too often.
+pub(crate) fn wake_at(t: Duration, id: u64, who: Weak<dyn Expires>) {
+    WAKES.lock().insert((t, id), who);
+    kick();
+}
+
+/// Tells whoever is due at `t`; when the next one is.
+fn run_wakes(t: Duration) -> Option<Duration> {
+    loop {
+        let who = {
+            let mut w = WAKES.lock();
+            let (&(d, id), _) = w.first_key_value()?;
+            if d > t {
+                return Some(d);
+            }
+            w.remove(&(d, id))
+        };
+        if let Some(w) = who.and_then(|w| w.upgrade()) {
+            w.expired();
+        }
+    }
+}
+
 fn kick() {
     GEN.fetch_add(1, Ordering::AcqRel);
     CHANGED.wake_all();
 }
 
 /// Starts the timer task on first use.
-fn start() -> bool {
+pub(crate) fn start() -> bool {
     if STARTED.swap(true, Ordering::AcqRel) {
         return true;
     }
@@ -415,6 +449,10 @@ fn run() {
                 TIMERS.lock().remove(&(cell, tgid, id));
             }
         }
+        let next = match (next, run_wakes(t)) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
         let changed = || (GEN.load(Ordering::Acquire) != g).then_some(());
         match next {
             Some(d) => {

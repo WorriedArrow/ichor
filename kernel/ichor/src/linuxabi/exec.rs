@@ -219,7 +219,10 @@ pub(crate) fn exec(
         v.release(); // the vfork parent goes on
     }
     p.sig.clear_alt_stack();
-    p.group.set_exec(&exe_path, &argv);
+    // `/proc/self/exe` is the file's own path; the name is the one given.
+    let real = image.path().unwrap_or_else(|| exe_path.clone());
+    let name = path.rsplit('/').next().unwrap_or("");
+    p.group.set_exec(&real, name, &argv);
     crate::signal::sync(p);
     *ctx = UserContext::new(loaded.entry, loaded.stack_pointer);
     Ok(())
@@ -229,8 +232,11 @@ pub(crate) fn exec(
 fn read_executable(p: &LinuxProcess, path: &str) -> Result<VfsFile, i64> {
     let cwd = p.cwd();
     let ino = {
-        let mut fs = p.fs();
-        let ino = fs.resolve(cwd, path, true)?;
+        let ino = match super::fs::executable(p, cwd, path)? {
+            super::fs::Exec::Path(target) => p.fs().resolve(cwd, &target, true)?,
+            super::fs::Exec::File(ino) => ino,
+        };
+        let fs = p.fs();
         if fs.stat(ino)?.kind != Kind::File {
             return Err(EACCES);
         }

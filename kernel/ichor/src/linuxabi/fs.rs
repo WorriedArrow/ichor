@@ -26,6 +26,8 @@ const O_TRUNC: u64 = 0o1000;
 pub(super) const O_APPEND: u64 = 0o2000;
 const O_DIRECTORY: u64 = 0o200_000;
 const O_NOFOLLOW: u64 = 0o400_000;
+/// With O_DIRECTORY, which it includes.
+const O_TMPFILE: u64 = 0o20_200_000;
 pub(super) const O_NONBLOCK: u64 = 0o4000;
 pub(super) const O_CLOEXEC: u64 = 0o2_000_000;
 
@@ -64,7 +66,7 @@ pub(super) fn user_path(p: &mut LinuxProcess, addr: u64) -> Result<String, i64> 
 }
 
 /// The directory a relative path in an `*at` call starts from.
-fn base(p: &LinuxProcess, dirfd: i64, path: &str) -> Result<Ino, i64> {
+pub(super) fn base(p: &LinuxProcess, dirfd: i64, path: &str) -> Result<Ino, i64> {
     if dirfd == AT_FDCWD || path.starts_with('/') {
         return Ok(p.cwd());
     }
@@ -77,6 +79,18 @@ fn base(p: &LinuxProcess, dirfd: i64, path: &str) -> Result<Ino, i64> {
 /// Reads the path argument and resolves its starting directory.
 fn path_at(p: &mut LinuxProcess, dirfd: i64, addr: u64) -> Result<(Ino, String), i64> {
     let path = user_path(p, addr)?;
+    from_dir(p, dirfd, path)
+}
+
+/// Where `path` starts from; made absolute if that is a `/proc` directory.
+fn from_dir(p: &LinuxProcess, dirfd: i64, path: String) -> Result<(Ino, String), i64> {
+    if dirfd != AT_FDCWD
+        && !path.starts_with('/')
+        && let Some(Fd::Object(o)) = p.fd(dirfd as u64)
+        && let Some(d) = o.obj.proc_dir()
+    {
+        return Ok((p.cwd(), alloc::format!("{d}/{path}")));
+    }
     Ok((base(p, dirfd, &path)?, path))
 }
 
@@ -116,28 +130,70 @@ fn open_path(
     if acc == O_ACCMODE {
         return Err(EINVAL);
     }
+    if hops > 8 {
+        return Err(ELOOP);
+    }
     if let Some(node) = procfs::lookup(p, path, flags & O_NOFOLLOW == 0) {
-        return open_proc(p, start, node?, flags, mode, hops);
+        if let Some(fd) = procfs::own_fd(p, path)
+            && flags & O_NOFOLLOW == 0
+        {
+            return reopen(p, fd, flags);
+        }
+        return open_proc(p, start, path, node?, flags, mode, hops);
     }
     let umask = p.umask();
     let ino = {
         let mut fs = p.fs();
         let mut created = false;
-        let ino = if flags & O_CREAT != 0 {
+        let follow = flags & O_NOFOLLOW == 0;
+        let mut find = || {
+            if flags & O_CREAT == 0 {
+                return fs.resolve(start, path, follow);
+            }
             let (dir, name) = fs.resolve_parent(start, path)?;
             match fs.lookup(dir, &name) {
-                Ok(_) if flags & O_EXCL != 0 => return Err(EEXIST),
-                Ok(_) => fs.resolve(start, path, flags & O_NOFOLLOW == 0)?,
+                Ok(_) if flags & O_EXCL != 0 => Err(EEXIST),
+                Ok(_) => fs.resolve(start, path, follow),
                 Err(ENOENT) => {
                     created = true;
-                    fs.create(dir, &name, mode as u32 & !umask)?
+                    fs.create(dir, &name, mode as u32 & !umask)
                 }
-                Err(e) => return Err(e),
+                Err(e) => Err(e),
             }
-        } else {
-            fs.resolve(start, path, flags & O_NOFOLLOW == 0)?
         };
+        let found = find();
+        // It leads into `/proc`, or is it (by a relative path).
+        let proc = match found {
+            Err(ELSEWHERE) => Some(fs.take_crossing()),
+            Ok(i) if fs.is_elsewhere(i) => Some(fs.path(i)?),
+            _ => None,
+        };
+        if let Some(path) = proc {
+            drop(fs);
+            return open_path(p, start, &path, flags, mode, hops + 1);
+        }
+        let ino = found?;
         let st = fs.stat(ino)?;
+        if flags & O_TMPFILE == O_TMPFILE {
+            // A file with no name, in the file system of this directory.
+            if st.kind != Kind::Directory {
+                return Err(ENOTDIR);
+            }
+            if acc == 0 {
+                return Err(EINVAL);
+            }
+            fs.permission(ino, overlay::MAY_WRITE | overlay::MAY_EXEC)?;
+            let ino = fs.create_unnamed(mode as u32 & !umask);
+            drop(fs);
+            let f = OpenFile {
+                ino,
+                offset: 0,
+                flags: flags & (O_ACCMODE | O_APPEND | O_NONBLOCK),
+            };
+            return p
+                .install_flags(Fd::File(f), flags & O_CLOEXEC != 0)
+                .ok_or(EMFILE);
+        }
         // The file's permission bits, unless this call just created it.
         if !created && st.kind != Kind::Symlink {
             let mut want = match acc {
@@ -172,7 +228,7 @@ fn open_path(
             }
             _ => {}
         }
-        if flags & O_TRUNC != 0 && acc != 0 && st.kind == Kind::File {
+        if flags & O_TRUNC != 0 && acc != 0 && !created && st.kind == Kind::File {
             fs.truncate(ino, 0)?;
         }
         fs.open(ino)?;
@@ -183,8 +239,65 @@ fn open_path(
         offset: 0,
         flags: flags & (O_ACCMODE | O_APPEND | O_NONBLOCK),
     };
+    super::inotify::note(&p.vfs, ino, super::inotify::IN_OPEN);
     p.install_flags(Fd::File(f), flags & O_CLOEXEC != 0)
         .ok_or(EMFILE)
+}
+
+/// Opens what descriptor `fd` names anew (`/proc/self/fd/N`, `/dev/stdout`):
+/// a description of its own on the same file, pipe or terminal. Sockets and
+/// other objects cannot be opened (ENXIO).
+fn reopen(p: &mut LinuxProcess, fd: u64, flags: u64) -> Result<u64, i64> {
+    let nonblock = flags & O_NONBLOCK != 0;
+    let acc = flags & O_ACCMODE;
+    let new = match p.fd(fd).ok_or(ENOENT)? {
+        Fd::File(of) => {
+            let mut fs = p.fs();
+            let want = match acc {
+                0 => overlay::MAY_READ,
+                O_WRONLY => overlay::MAY_WRITE,
+                _ => overlay::MAY_READ | overlay::MAY_WRITE,
+            };
+            fs.permission(of.ino, want)?;
+            let kind = fs.stat(of.ino)?.kind;
+            if kind == Kind::Directory && acc != 0 {
+                return Err(EISDIR);
+            }
+            if kind != Kind::Directory && flags & O_DIRECTORY != 0 {
+                return Err(ENOTDIR);
+            }
+            if flags & O_TRUNC != 0 && acc != 0 {
+                fs.truncate(of.ino, 0)?;
+            }
+            fs.open(of.ino)?;
+            Fd::File(OpenFile {
+                ino: of.ino,
+                offset: 0,
+                flags: flags & (O_ACCMODE | O_APPEND | O_NONBLOCK),
+            })
+        }
+        Fd::Pipe(e) => {
+            // Both ends at once cannot be held in one: the end it is of.
+            let write = match acc {
+                0 => false,
+                O_WRONLY => true,
+                _ => e.write,
+            };
+            e.pipe.add_end(write);
+            Fd::Pipe(PipeEnd {
+                pipe: e.pipe,
+                write,
+                nonblock,
+            })
+        }
+        Fd::Object(o) if o.obj.tty().is_some() => Fd::Object(crate::process::ObjectEnd {
+            obj: o.obj,
+            nonblock,
+        }),
+        Fd::Object(_) => return Err(ENXIO),
+        f @ (Fd::Console | Fd::Dev(_)) => f,
+    };
+    p.install_flags(new, flags & O_CLOEXEC != 0).ok_or(EMFILE)
 }
 
 /// Opens a named pipe: one end of the FIFO's pipe, shared by every open of
@@ -260,6 +373,7 @@ fn proc_target(target: &str) -> alloc::string::String {
 fn open_proc(
     p: &mut LinuxProcess,
     start: Ino,
+    path: &str,
     node: procfs::Node,
     flags: u64,
     mode: u64,
@@ -273,7 +387,7 @@ fn open_proc(
             return open_path(p, start, &proc_target(&t), flags, mode, hops + 1);
         }
         procfs::Node::Dir(_) if flags & O_ACCMODE != 0 => return Err(EISDIR),
-        procfs::Node::Dir(e) => alloc::sync::Arc::new(procfs::ProcDir::new(e)),
+        procfs::Node::Dir(e) => alloc::sync::Arc::new(procfs::ProcDir::new(path, e)),
         procfs::Node::File(_) if flags & O_DIRECTORY != 0 => return Err(ENOTDIR),
         procfs::Node::File(_) if flags & O_ACCMODE != 0 => return Err(EACCES),
         procfs::Node::File(d) => alloc::sync::Arc::new(procfs::ProcFile::new(d)),
@@ -288,8 +402,57 @@ fn open_proc(
     .ok_or(EMFILE)
 }
 
+/// What a path names: an inode of the root, or something `procfs` serves.
+enum Place {
+    Tree(Ino),
+    Proc(String),
+}
+
+/// Finds what `path` names, starting from `start`.
+fn place(p: &LinuxProcess, start: Ino, path: &str, follow: bool) -> Result<Place, i64> {
+    if procfs::serves(path) {
+        return Ok(Place::Proc(String::from(path)));
+    }
+    let mut fs = p.fs();
+    match fs.resolve(start, path, follow) {
+        Err(ELSEWHERE) => Ok(Place::Proc(fs.take_crossing())),
+        Ok(i) if fs.is_elsewhere(i) => Ok(Place::Proc(fs.path(i)?)),
+        r => r.map(Place::Tree),
+    }
+}
+
+/// What `execve` of a path runs: a file, or (from `/proc/self/exe`) the
+/// file at another path.
+pub(super) enum Exec {
+    File(Ino),
+    Path(String),
+}
+
+/// Finds the file `execve` runs for `path`: also `/proc/self/exe`, or an
+/// open file's `/proc/self/fd/N`.
+pub(super) fn executable(p: &LinuxProcess, start: Ino, path: &str) -> Result<Exec, i64> {
+    match place(p, start, path, true)? {
+        Place::Tree(ino) => Ok(Exec::File(ino)),
+        Place::Proc(path) => {
+            if let Some(fd) = procfs::own_fd(p, &path) {
+                return match p.fd(fd).ok_or(ENOENT)? {
+                    Fd::File(of) => Ok(Exec::File(of.ino)),
+                    _ => Err(EACCES),
+                };
+            }
+            match procfs::lookup(p, &path, false).ok_or(ENOENT)?? {
+                procfs::Node::Link(t) => Ok(Exec::Path(proc_target(&t))),
+                _ => Err(EACCES),
+            }
+        }
+    }
+}
+
 /// `stat` of a `/proc` node (following links if `follow`).
 fn stat_proc(p: &mut LinuxProcess, path: &str, follow: bool, hops: u32) -> Result<[u8; 144], i64> {
+    if follow && let Some(fd) = procfs::own_fd(p, path) {
+        return fstat_raw(p, fd);
+    }
     let node = procfs::lookup(p, path, follow).ok_or(ENOENT)??;
     Ok(match node {
         procfs::Node::Link(t) if follow => {
@@ -341,10 +504,12 @@ fn read_file(
             break;
         }
     }
+    if done > 0 {
+        super::inotify::note(&p.vfs, f.ino, super::inotify::IN_ACCESS);
+    }
     Ok(done as u64)
 }
 
-/// Writes user memory to file `f` at `offset`; returns bytes written.
 /// Writes user memory to file `f` at `offset` (or at its end, for
 /// `O_APPEND`); returns the bytes written and the offset after them. An
 /// append of up to `APPEND_ATOMIC` bytes is one atomic step, so concurrent
@@ -933,27 +1098,7 @@ pub(super) fn fstatat(
     out: u64,
     flags: u64,
 ) -> Result<u64, i64> {
-    let path = user_path(p, addr)?;
-    if path.is_empty() && flags & AT_EMPTY_PATH != 0 {
-        if dirfd == AT_FDCWD {
-            let cwd = p.cwd();
-            let st = to_stat(&p.fs().stat(cwd)?);
-            return put_stat(p, out, &st);
-        }
-        return fstat(p, dirfd as u64, out);
-    }
-    if (path.starts_with("/proc") || path.starts_with("/sys"))
-        && procfs::lookup(p, &path, false).is_some()
-    {
-        let st = stat_proc(p, &path, flags & AT_SYMLINK_NOFOLLOW == 0, 0)?;
-        return put_stat(p, out, &st);
-    }
-    let start = base(p, dirfd, &path)?;
-    let st = {
-        let mut fs = p.fs();
-        let ino = fs.resolve(start, &path, flags & AT_SYMLINK_NOFOLLOW == 0)?;
-        to_stat(&fs.stat(ino)?)
-    };
+    let st = stat_raw(p, dirfd, addr, flags)?;
     put_stat(p, out, &st)
 }
 
@@ -1019,15 +1164,12 @@ fn stat_raw(p: &mut LinuxProcess, dirfd: i64, addr: u64, flags: u64) -> Result<[
         }
         return fstat_raw(p, dirfd as u64);
     }
-    if (path.starts_with("/proc") || path.starts_with("/sys"))
-        && procfs::lookup(p, &path, false).is_some()
-    {
-        return stat_proc(p, &path, flags & AT_SYMLINK_NOFOLLOW == 0, 0);
+    let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
+    let (start, path) = from_dir(p, dirfd, path)?;
+    match place(p, start, &path, follow)? {
+        Place::Proc(path) => stat_proc(p, &path, follow, 0),
+        Place::Tree(ino) => Ok(to_stat(&p.fs().stat(ino)?)),
     }
-    let start = base(p, dirfd, &path)?;
-    let mut fs = p.fs();
-    let ino = fs.resolve(start, &path, flags & AT_SYMLINK_NOFOLLOW == 0)?;
-    Ok(to_stat(&fs.stat(ino)?))
 }
 
 pub(super) fn stat(p: &mut LinuxProcess, addr: u64, out: u64, follow: bool) -> Result<u64, i64> {
@@ -1058,11 +1200,12 @@ pub(super) fn access(
             None => return Err(EBADF),
         }
     } else {
-        Err(base(p, dirfd, &path)?)
+        let (start, path) = from_dir(p, dirfd, path.clone())?;
+        if let Place::Proc(path) = place(p, start, &path, follow)? {
+            return stat_proc(p, &path, follow, 0).map(|_| 0);
+        }
+        Err(start)
     };
-    if let Some(node) = procfs::lookup(p, &path, follow) {
-        return node.map(|_| 0);
-    }
     let c = p.group.creds();
     let cred = if flags & AT_EACCESS != 0 {
         c.fs()
@@ -1317,21 +1460,12 @@ pub(super) fn readlink(
         return Err(EINVAL);
     }
     let (start, path) = path_at(p, dirfd, addr)?;
-    if let Some(node) = procfs::lookup(p, &path, false) {
-        let procfs::Node::Link(t) = node? else {
-            return Err(EINVAL);
-        };
-        let t = overlay::name::decode(&t);
-        let n = t.len().min(size as usize);
-        if p.copy_to_user(buf, &t[..n]) != n {
-            return Err(EFAULT);
-        }
-        return Ok(n as u64);
-    }
-    let target = {
-        let mut fs = p.fs();
-        let ino = fs.resolve(start, &path, false)?;
-        overlay::name::decode(&fs.readlink(ino)?)
+    let target = match place(p, start, &path, false)? {
+        Place::Proc(path) => match procfs::lookup(p, &path, false).ok_or(ENOENT)?? {
+            procfs::Node::Link(t) => overlay::name::decode(&t),
+            _ => return Err(EINVAL),
+        },
+        Place::Tree(ino) => overlay::name::decode(&p.fs().readlink(ino)?),
     };
     // No NUL terminator, truncated to the buffer (like Linux).
     let n = target.len().min(size as usize);
@@ -1345,6 +1479,27 @@ pub(super) fn chmod(p: &mut LinuxProcess, dirfd: i64, addr: u64, mode: u64) -> R
     let (start, path) = path_at(p, dirfd, addr)?;
     let mut fs = p.fs();
     let ino = fs.resolve(start, &path, true)?;
+    fs.chmod(ino, mode as u32)?;
+    Ok(0)
+}
+
+/// `fchmodat2(dirfd, path, mode, flags)`: symbolic links have no mode.
+pub(super) fn fchmodat2(
+    p: &mut LinuxProcess,
+    dirfd: i64,
+    addr: u64,
+    mode: u64,
+    flags: u64,
+) -> Result<u64, i64> {
+    const EOPNOTSUPP: i64 = 95;
+    if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+        return Err(EINVAL);
+    }
+    let ino = inode_at(p, dirfd, addr, flags)?;
+    let mut fs = p.fs();
+    if fs.stat(ino)?.kind == Kind::Symlink {
+        return Err(EOPNOTSUPP);
+    }
     fs.chmod(ino, mode as u32)?;
     Ok(0)
 }
@@ -1544,15 +1699,12 @@ fn statfs_bytes(p: &LinuxProcess, proc: bool) -> [u8; 120] {
 /// `statfs(path, buf)`.
 pub(super) fn statfs(p: &mut LinuxProcess, addr: u64, buf: u64) -> Result<u64, i64> {
     let (start, path) = path_at(p, AT_FDCWD, addr)?;
-    let proc = match procfs::lookup(p, &path, true) {
-        Some(n) => {
-            n?;
+    let proc = match place(p, start, &path, true)? {
+        Place::Proc(path) => {
+            stat_proc(p, &path, true, 0)?;
             true
         }
-        None => {
-            p.fs().resolve(start, &path, true)?;
-            false
-        }
+        Place::Tree(_) => false,
     };
     let b = statfs_bytes(p, proc);
     if p.copy_to_user(buf, &b) != b.len() {

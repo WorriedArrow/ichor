@@ -47,6 +47,7 @@ use alloc::vec::Vec;
 use cell::Account;
 
 use crate::file::File;
+use crate::linuxabi::shm::Attached;
 use crate::page::{Page, charged};
 use frame::mm::{PAGE_SIZE, UFrame, UserProt, VmSpace};
 use vma::{Prot, RegionMap};
@@ -165,6 +166,8 @@ pub(crate) struct Mm {
     files: Vec<FileRange>,
     /// Shared anonymous mappings: `[start, end)`.
     shared: Vec<(u64, u64)>,
+    /// System V segments attached: `[start, end)` each.
+    attached: Vec<(u64, u64, Attached)>,
     brk_start: u64,
     brk: u64,
 }
@@ -180,6 +183,7 @@ impl Mm {
             cow: BTreeSet::new(),
             files: Vec::new(),
             shared: Vec::new(),
+            attached: Vec::new(),
             brk_start: 0,
             brk: 0,
         })
@@ -218,6 +222,7 @@ impl Mm {
         child.regions = self.regions.clone();
         child.files = self.files.clone();
         child.shared = self.shared.clone();
+        child.attached = self.attached.clone();
         child.brk_start = self.brk_start;
         child.brk = self.brk;
         // The child shares every page (no new charge): what either side
@@ -528,6 +533,11 @@ impl Mm {
         self.files = kept;
     }
 
+    /// Whether all of `[start, end)` is mapped (with whatever permissions).
+    pub(crate) fn all_mapped(&self, start: u64, end: u64) -> bool {
+        self.regions.covered(start, end)
+    }
+
     /// Whether anything is mapped at `addr` (with whatever permissions).
     pub(crate) fn mapped(&self, addr: u64) -> bool {
         self.regions.find(addr).is_some()
@@ -711,23 +721,63 @@ impl Mm {
         prot: u64,
         map_flags: u64,
     ) -> Result<u64, i64> {
+        let account = self.account.clone();
+        let pages: Option<Vec<Page>> = frames
+            .iter()
+            .map(|f| charged(&account, f.clone()))
+            .collect();
+        self.map_pages(addr, &pages.ok_or(ENOMEM)?, prot, map_flags)
+    }
+
+    /// [`Self::map_frames`] with pages that are charged already.
+    fn map_pages(
+        &mut self,
+        addr: u64,
+        pages: &[Page],
+        prot: u64,
+        map_flags: u64,
+    ) -> Result<u64, i64> {
         use flags::*;
-        let len = frames.len() as u64 * PAGE_SIZE;
+        let len = pages.len() as u64 * PAGE_SIZE;
         let place = map_flags & (MAP_FIXED | MAP_FIXED_NOREPLACE);
         let start = self.mmap(addr, len, prot, MAP_SHARED | MAP_ANONYMOUS | place, None)?;
         let user = Prot::from_linux(prot).ok_or(EINVAL)?;
-        for (i, f) in frames.iter().enumerate() {
+        for (i, page) in pages.iter().enumerate() {
             let va = start + i as u64 * PAGE_SIZE;
-            let mapped = charged(&self.account, f.clone()).is_some_and(|page| {
-                self.pages.insert(va, page);
-                !user.accessible() || self.space.map(va, f, user_prot(user)).is_ok()
-            });
-            if !mapped {
+            self.pages.insert(va, page.clone());
+            if user.accessible() && self.space.map(va, page, user_prot(user)).is_err() {
                 let _ = self.munmap(start, len);
                 return Err(ENOMEM);
             }
         }
         Ok(start)
+    }
+
+    /// `shmat`: maps a System V segment's `pages`, and holds `hold` until
+    /// they are detached.
+    pub(crate) fn attach(
+        &mut self,
+        addr: u64,
+        pages: &[Page],
+        prot: u64,
+        place: u64,
+        hold: Attached,
+    ) -> Result<u64, i64> {
+        let at = self.map_pages(addr, pages, prot, place)?;
+        let end = at + pages.len() as u64 * PAGE_SIZE;
+        self.attached.push((at, end, hold));
+        Ok(at)
+    }
+
+    /// `shmdt`: unmaps the segment attached at `addr`.
+    pub(crate) fn detach(&mut self, addr: u64) -> Result<u64, i64> {
+        let (start, end) = self
+            .attached
+            .iter()
+            .find(|a| a.0 == addr)
+            .map(|a| (a.0, a.1))
+            .ok_or(EINVAL)?;
+        self.munmap(start, end - start)
     }
 
     /// `munmap`.
@@ -742,6 +792,7 @@ impl Mm {
         }
         self.trim_files(addr, end);
         self.trim_shared(addr, end);
+        self.attached.retain(|a| a.0 < addr || a.1 > end);
         Ok(0)
     }
 

@@ -275,6 +275,21 @@ impl Actions {
         }
     }
 
+    /// Signals set to SIG_IGN, and signals with a handler.
+    pub(crate) fn set_ignored(&self) -> u64 {
+        self.those(|h| h == SIG_IGN)
+    }
+
+    pub(crate) fn caught(&self) -> u64 {
+        self.those(|h| h != SIG_IGN && h != SIG_DFL)
+    }
+
+    fn those(&self, which: impl Fn(u64) -> bool) -> u64 {
+        (1..=NSIG)
+            .filter(|&s| which(self.get(s).handler))
+            .fold(0, |set, s| set | bit(s))
+    }
+
     /// Signals whose arrival would be discarded right away.
     pub(crate) fn ignored(&self) -> u64 {
         let mut set = 0;
@@ -547,6 +562,21 @@ pub(crate) fn tgsigqueueinfo(
     may_signal(p, tgid, sig)?;
     proc::send_thread(p.entry.cell, Some(tgid), tid, sig, i)?;
     Ok(0)
+}
+
+/// What reading a signal descriptor gives for `sig`: `signalfd_siginfo`.
+pub(crate) fn signalfd_record(sig: u32, info: &Info) -> [u8; 128] {
+    let mut b = [0u8; 128];
+    b[0..4].copy_from_slice(&sig.to_le_bytes());
+    b[8..12].copy_from_slice(&info.code.to_le_bytes());
+    b[12..20].copy_from_slice(&info.a.to_le_bytes()); // pid, uid
+    if sig == SIGCHLD {
+        b[40..44].copy_from_slice(&(info.b as u32).to_le_bytes()); // status
+    } else {
+        b[44..48].copy_from_slice(&(info.b as u32).to_le_bytes()); // int
+        b[48..56].copy_from_slice(&info.b.to_le_bytes()); // ptr
+    }
+    b
 }
 
 /// A signal number argument, 0 included.
