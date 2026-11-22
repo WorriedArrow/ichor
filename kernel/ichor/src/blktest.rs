@@ -68,6 +68,25 @@ pub(crate) fn run() {
             Arc::new(Vfs::mount_disk(&m).unwrap_or_else(|_| fail("disk is not an Ichor image")));
         exercise("nvme", &m, vfs);
     }
+    // Every disk behind a virtio-scsi controller (GCP's general-purpose
+    // machine types attach their persistent disks so).
+    for d in virtio_scsi::probe_all() {
+        let d = d.unwrap_or_else(|e| {
+            println!("ichor: blk: virtio-scsi init failed: {e:?}");
+            fail("virtio-scsi init")
+        });
+        println!(
+            "ichor: blk: virtio-scsi target {}, block size {} bytes",
+            d.target(),
+            d.block_size()
+        );
+        let Some(m) = mount("virtio-scsi", d) else {
+            continue;
+        };
+        let vfs =
+            Arc::new(Vfs::mount_disk(&m).unwrap_or_else(|_| fail("disk is not an Ichor image")));
+        exercise("virtio-scsi", &m, vfs);
+    }
     if !FIRST_DONE.load(core::sync::atomic::Ordering::Relaxed) {
         fail("no Ichor root disk found");
     }

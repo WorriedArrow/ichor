@@ -520,6 +520,42 @@ fn cloud_disk_tolerates_blank_volumes_and_small_transfers() {
     ]);
 }
 
+/// GCP's general-purpose machine types (E2, N2, ...): the boot disk is a
+/// target of a virtio-scsi controller, not NVMe. Here a blank disk is
+/// target 0 and the Ichor disk target 2, on one controller; OVMF boots
+/// from it, the kernel scans the targets, skips the blank one and mounts
+/// the root partition, with no NVMe controller at all.
+#[test]
+fn cloud_disk_boots_from_virtio_scsi() {
+    let blank = std::env::temp_dir().join(format!("ichor-scsi-blank-{}.img", std::process::id()));
+    std::fs::write(&blank, vec![0u8; 8 << 20]).unwrap();
+    let out = boot_disk_with("cloud-disk-scsi", "", 2, |cfg| {
+        cfg.disk_scsi_target = Some(2);
+        cfg.disk_devices_before = vec![
+            "-device".into(),
+            "virtio-scsi-pci,id=scsi0,disable-legacy=on".into(),
+            "-drive".into(),
+            format!(
+                "if=none,id=blank,format=raw,readonly=on,file={}",
+                blank.display()
+            ),
+            "-device".into(),
+            "scsi-hd,drive=blank,bus=scsi0.0,scsi-id=0".into(),
+        ];
+    });
+    let _ = std::fs::remove_file(&blank);
+    out.assert_exit(Exit::Success);
+    out.assert_in_order(&[
+        "ichor: blk: no nvme controller",
+        "ichor: blk: virtio-scsi target 0, block size 512 bytes",
+        "ichor: blk: virtio-scsi: 8192 KiB, no Ichor image; skipped",
+        "ichor: blk: virtio-scsi target 2, block size 512 bytes",
+        "ichor: blk: virtio-scsi: GPT disk, Ichor root partition at sector ",
+        "ichor: busybox: all applets passed",
+        "ichor: boot complete; halting",
+    ]);
+}
+
 /// A cloud-shaped machine: no PIT and no HPET (the TSC must calibrate from
 /// the ACPI PM timer), two sockets of three cores (sparse APIC ids, as
 /// multi-socket hosts give), 2 GiB, booting the GPT disk from NVMe.

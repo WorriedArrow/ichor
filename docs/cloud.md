@@ -57,19 +57,33 @@ Check each command against the current AWS documentation; flags change.
    or the EC2 serial console (interactive; must be enabled for the
    account).
 
-## GCP (C3 or other NVMe-only machine types)
+## GCP
+
+Two kinds of machine type work. The general-purpose ones (E2, N1, N2,
+N2D) attach persistent disks as targets of a virtio-scsi controller and,
+unless gVNIC is asked for, give the VM a virtio-net NIC: both have Ichor
+drivers, so these are the ones that can network once the uplink takes
+its address from DHCP (not yet: it is QEMU's fixed 10.0.2.15 today).
+The newer ones (C3, C4, ...) boot from NVMe and require gVNIC, which
+Ichor does not drive yet: boot-only. Check the machine types' disk
+interfaces and NIC types against current GCP documentation.
 
 1. Upload: `gcloud storage cp target/ichor-gcp.tar.gz gs://BUCKET/`
 2. Create the image:
    `gcloud compute images create ichor --source-uri gs://BUCKET/ichor-gcp.tar.gz --guest-os-features UEFI_COMPATIBLE`
-3. Launch on a machine type whose disks are NVMe (C3, for example):
-   `gcloud compute instances create ichor-1 --image ichor --machine-type c3-standard-4`
+3. Launch, for example on a general-purpose type with a virtio-net NIC:
+   `gcloud compute instances create ichor-1 --image ichor --machine-type e2-standard-4 --network-interface nic-type=VIRTIO_NET`,
+   or boot-only on NVMe: `--machine-type c3-standard-4`.
 4. Read the console: `gcloud compute instances get-serial-port-output ichor-1`
+
+`cloud_disk_boots_from_virtio_scsi` boots the disk under OVMF from a
+virtio-scsi controller (a blank disk on target 0, Ichor's on target 2)
+with no NVMe at all.
 
 ## Not supported yet
 
-- Azure (Hyper-V VMBus storage), and GCP machine types that boot from
-  virtio-scsi.
-- Networking of any kind (ENA, gVNIC, virtio-net).
+- Azure (Hyper-V VMBus storage and network).
+- Cloud NICs other than virtio-net (AWS ENA, GCP gVNIC), and taking the
+  uplink's address from DHCP or the cloud's metadata.
 - Secure Boot: launch with it off (the default for custom AWS AMIs; on
   GCP, without Shielded VM Secure Boot).

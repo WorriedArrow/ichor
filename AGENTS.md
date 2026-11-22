@@ -584,8 +584,12 @@ calibrates from CPUID, the hypervisor leaf, the ACPI PM timer or the PIT
 controller, allows 30 s per command and logs failures. `--size-gib N` pads
 the disk and `--gcp` writes GCP's import archive; `cargo xtask run --disk
 FILE` boots any such image. Runbook for a first real-cloud boot:
-`docs/cloud.md`. Not yet: a network driver (AWS ENA / GCP gVNIC /
-virtio-net), Hyper-V VMBus for Azure, Secure Boot.
+`docs/cloud.md`. `kernel/drivers/virtio-scsi` reads the disks of GCP's
+general-purpose machine types (`cloud_disk_boots_from_virtio_scsi`);
+with their virtio-net NIC those can network once the uplink takes its
+address from DHCP. Not yet: DHCP or metadata for the uplink (it is
+QEMU's fixed 10.0.2.15), AWS ENA and GCP gVNIC, Hyper-V VMBus for
+Azure, Secure Boot.
 
 ## Commands
 
@@ -687,6 +691,7 @@ kernel/drivers/virtio-net  safe virtio-net driver (polled, MAC feature only)
 kernel/net       network protocols, sans-I/O: Ethernet, ARP, IPv4, ICMP, UDP, TCP (host-tested; ADR-0010)
 kernel/uring     io_uring's ABI, ring layout and submission ordering, sans-I/O (host-tested; ADR-0013)
 kernel/drivers/nvme        safe NVMe driver (polled, DMA-trusted)
+kernel/drivers/virtio-scsi safe virtio-scsi driver: every target's disk, read-only, polled (GCP's E2/N1/N2 disks)
 xtask/src/artifact.rs      pinned downloads (busybox, Alpine): SHA-256, cache, never committed
 xtask/src/inflate.rs       gzip/DEFLATE decoder; rootfs.rs: tar -> Ichor image
 xtask/src/disk.rs, fat.rs  bootable GPT disk image (FAT32 ESP + Ichor root partition)

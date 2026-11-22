@@ -215,6 +215,10 @@ pub struct RunConfig {
     /// Disk mode: extra properties for the boot NVMe controller (for
     /// example `mdts=1`, a small maximum transfer).
     pub disk_nvme_props: String,
+    /// Disk mode: put the boot disk on a virtio-scsi controller (as GCP's
+    /// general-purpose machine types attach theirs) instead of NVMe, at
+    /// this SCSI target.
+    pub disk_scsi_target: Option<u8>,
     /// Disk mode: QEMU arguments placed before the boot disk, so devices
     /// they add come first in PCI order (a blank volume ahead of the boot
     /// disk, as instance storage can be).
@@ -284,6 +288,7 @@ impl RunConfig {
             window: false,
             disk_image: None,
             disk_nvme_props: String::new(),
+            disk_scsi_target: None,
             disk_devices_before: Vec::new(),
             machine_props: String::new(),
             smp_topology: String::new(),
@@ -619,15 +624,20 @@ fn disk_command(cfg: &RunConfig, qemu: &Path, fw: &Firmware, img: &Path) -> Resu
             drive_path(img)
         ))
         .arg("-device")
-        .arg(format!(
-            "nvme,serial=ichor-boot,drive=disk,bootindex=0{}{}",
-            if cfg.disk_nvme_props.is_empty() {
-                ""
-            } else {
-                ","
-            },
-            cfg.disk_nvme_props
-        ))
+        .arg(match cfg.disk_scsi_target {
+            // On the virtio-scsi controller the test's earlier devices
+            // may have added (`scsi0`), or one of its own.
+            Some(t) => format!("scsi-hd,drive=disk,bus=scsi0.0,scsi-id={t},bootindex=0"),
+            None => format!(
+                "nvme,serial=ichor-boot,drive=disk,bootindex=0{}{}",
+                if cfg.disk_nvme_props.is_empty() {
+                    ""
+                } else {
+                    ","
+                },
+                cfg.disk_nvme_props
+            ),
+        })
         .args(["-device", "virtio-rng-pci,disable-legacy=on"])
         .args(cfg.net_args())
         .args(&cfg.extra_args);

@@ -26,6 +26,7 @@ dependencies = [
  "ichor-virtio-blk",
  "ichor-virtio-net",
  "ichor-virtio-rng",
+ "ichor-virtio-scsi",
  "ichor-vma",
 ]
 
@@ -260,6 +261,15 @@ dependencies = [
 name = "ichor-virtio-rng"
 version = "0.0.0"
 dependencies = [
+ "ichor-frame",
+ "ichor-virtio-pci",
+]
+
+[[package]]
+name = "ichor-virtio-scsi"
+version = "0.0.0"
+dependencies = [
+ "ichor-block",
  "ichor-frame",
  "ichor-virtio-pci",
 ]
