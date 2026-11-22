@@ -104,8 +104,8 @@ Status: [ ] to do, [x] done and committed.
 
 - 2026-11-15: section 3 is **blocked**. A safety classifier stopped the
   session while it was writing the section 3 script, so it was not written.
-  Sections 1-2 and 4-9 go ahead without it, and section 3 waits for the
-  owner to decide how to proceed.
+  Sections 1-2 and 4-9 went ahead without it. The owner is picking it up
+  (2026-11-22); `cell-access-tests-section-3.md` is the handoff.
 - pids are global numbers filtered by cell (`proc.rs` header), not a
   per-cell pid space with init as 1 as ADR-0002 §3 says: an ADR conflict
   for the report.

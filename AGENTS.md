@@ -58,8 +58,9 @@ boot [done: VERW, IBPB, and page-table isolation (ADR-0004's second
   its published ports, lets closed connections finish for up to 60 s, then
   frees the address and its NAT mappings together; anything new keyed by
   cell id needs the same). Open: section 3 (file systems) is **not
-  written** (a safety classifier stopped it; the owner decides). A syscall that stops being ENOSYS or changes errno there needs its check
-  updated.
+  written** (a safety classifier stopped it; the owner is writing it, from
+  `docs/reports/cell-access-tests-section-3.md`). A syscall that stops being
+  ENOSYS or changes errno there needs its check updated.
 
 - M7 page-table isolation (`kernel/frame/src/arch/x86_64/entry.rs`): the
   entry area (`mm::ENTRY_BASE`, one PML4 slot) aliases the entry code, the
