@@ -93,9 +93,71 @@ pub fn image_sized(
     Ok(img)
 }
 
+/// What makes a raw disk of `len` bytes a fixed VHD (Azure's format): the
+/// 512 bytes that follow it.
+pub fn vhd_footer(len: u64) -> [u8; 512] {
+    let mut f = [0u8; 512];
+    let mut put = |at: usize, bytes: &[u8]| f[at..at + bytes.len()].copy_from_slice(bytes);
+    put(0, b"conectix");
+    put(8, &2u32.to_be_bytes()); // features: reserved, always set
+    put(12, &0x0001_0000u32.to_be_bytes()); // format version
+    put(16, &u64::MAX.to_be_bytes()); // a fixed disk has no header
+    put(28, b"ichr");
+    put(32, &0x0001_0000u32.to_be_bytes());
+    put(36, b"Wi2k");
+    put(40, &len.to_be_bytes());
+    put(48, &len.to_be_bytes());
+    let (cylinders, heads, sectors) = vhd_geometry(len / 512);
+    put(56, &cylinders.to_be_bytes());
+    put(58, &[heads, sectors]);
+    put(60, &2u32.to_be_bytes()); // fixed
+    put(68, b"ichor disk image");
+    // The checksum is the complement of the sum of the rest.
+    let sum = f.iter().fold(0u32, |s, &b| s.wrapping_add(u32::from(b)));
+    f[64..68].copy_from_slice(&(!sum).to_be_bytes());
+    f
+}
+
+/// The geometry the VHD specification derives from a size in sectors.
+fn vhd_geometry(sectors: u64) -> (u16, u8, u8) {
+    let total = sectors.min(65_535 * 16 * 255) as u32;
+    let (mut per_track, mut heads);
+    let mut tracks;
+    if total >= 65_535 * 16 * 63 {
+        (per_track, heads) = (255, 16);
+        tracks = total / per_track;
+    } else {
+        per_track = 17;
+        tracks = total / per_track;
+        heads = tracks.div_ceil(1024).max(4);
+        for more in [31, 63] {
+            if tracks >= heads * 1024 || heads > 16 {
+                (per_track, heads) = (more, 16);
+                tracks = total / per_track;
+            }
+        }
+    }
+    ((tracks / heads) as u16, heads as u8, per_track as u8)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_vhd_footer_is_what_the_format_says() {
+        let f = vhd_footer(1 << 30);
+        assert_eq!(&f[..8], b"conectix");
+        assert_eq!(f[48..56], (1u64 << 30).to_be_bytes());
+        // 2080 cylinders of 16 heads of 63 sectors, as Windows makes for 1 GiB.
+        assert_eq!(f[56..60], [0x08, 0x20, 16, 63]);
+        assert_eq!(f[60..64], [0, 0, 0, 2]);
+        let sum = |skip: std::ops::Range<usize>| {
+            let rest = f.iter().enumerate().filter(|(i, _)| !skip.contains(i));
+            rest.fold(0u32, |s, (_, &b)| s + u32::from(b))
+        };
+        assert_eq!(f[64..68], (!sum(64..68)).to_be_bytes());
+    }
 
     #[test]
     fn the_disk_has_an_esp_and_a_root_partition() {

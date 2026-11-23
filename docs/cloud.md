@@ -171,9 +171,47 @@ virtio-scsi controller (a blank disk on target 0, Ichor's on target 2)
 with no NVMe at all, and `cloud_disk_boots_on_legacy_virtio_devices` on
 legacy devices alone, as GCP's are.
 
+## Azure (generation 2 machines)
+
+The disk and the network are VMBus channels, which Ichor drives (ADR-0016);
+boot-volume NVMe and MANA (the newest types') it does not need. **Not yet
+run on Azure.** What has been run is OpenVMM, below. Check the commands
+against current documentation.
+
+1. `cargo xtask disk-image --release --azure --cmdline "control=50051
+   control_publish=50051" --api-token-file ... --api-tls-file ...` writes
+   `target/ichor-azure.vhd`, a fixed VHD of 1 GiB.
+2. Upload it as a page blob into a private container, and make a managed
+   disk or an image of it: `az image create --os-type Linux
+   --hyper-v-generation V2 --source BLOB_URL ...`.
+3. Launch a generation 2 machine with the standard security type (Secure
+   Boot off), boot diagnostics on (the serial log), and its network security
+   group open to the API from where you are alone.
+4. Azure waits for an agent to say that the machine is provisioned; Ichor
+   has none, so it is reported as failed some time later, and runs on. (A
+   *specialized* image or an attached OS disk is not waited for.)
+
+### The same devices, locally: OpenVMM
+
+[OpenVMM](https://github.com/microsoft/openvmm) is Microsoft's own virtual
+machine monitor (MIT): its VMBus, disk and network are what a Hyper-V host's
+are to a guest, and it runs on Windows' hypervisor platform without
+administrator rights (and on KVM). With its firmware (`MSVM.fd`, from
+`microsoft/mu_msvm`'s releases):
+
+```bash
+openvmm --uefi firmware=MSVM.fd --processors 2 --memory 2GB \
+  --vmbus-scsi id=scsi0 --disk file:target/ichor-disk.img,on=scsi0,ro \
+  --net consomme:hostfwd=tcp:127.0.0.1:50061-:50051 --com1 file=com1.log
+```
+
+(It ends when its standard input does.) On 2026-11-22 (OpenVMM bf353460,
+firmware 26.0.50) Ichor boots there, finds its root on the VMBus disk, gets
+its address from DHCP over the VMBus network, and pulls and runs containers
+through the API.
+
 ## Not supported yet
 
-- Azure (Hyper-V VMBus storage and network).
 - Cloud NICs other than virtio-net (AWS ENA, GCP gVNIC).
 - Secure Boot: launch with it off (the default for custom AWS AMIs; on
   GCP, without Shielded VM Secure Boot).

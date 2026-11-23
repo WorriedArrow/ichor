@@ -30,7 +30,8 @@ Commands:
   disk-image   Write target/ichor-disk.img: a bootable GPT disk (FAT32 ESP with
                ichor.efi, Ichor root partition), for cloud import or bare metal;
                the kernel command line is --cmdline (default: empty);
-               --size-gib N pads it; --gcp also writes target/ichor-gcp.tar.gz;
+               --size-gib N pads it; --gcp also writes target/ichor-gcp.tar.gz,
+               --azure target/ichor-azure.vhd;
                --api-token-file F puts the control plane's API token on it,
                --api-tls-file F its TLS certificate and Ed25519 key (PEM)
   api HOST:PORT --name NAME --ca F --token-file F IMAGE [-- COMMAND ...]
@@ -49,7 +50,8 @@ Options:
   --window               `run`: show a QEMU window with the serial console (run dir `window`)
   --name NAME            `run`: run directory under target/qemu/ (default `run`)
   --disk FILE            `run`: boot this disk image (from `disk-image`) from NVMe, cloud-style
-  --size-gib N, --gcp    `disk-image`: pad to N GiB; also write the GCP import archive
+  --size-gib N, --gcp, --azure    `disk-image`: pad to N GiB; also write the GCP
+                         import archive, the Azure VHD
   -- <args>              Extra arguments passed to QEMU (`run`)
 
 Environment:
@@ -74,6 +76,8 @@ struct Opts {
     size_gib: Option<u64>,
     /// `disk-image`: also write the GCP import archive.
     gcp: bool,
+    /// `disk-image`: also write a fixed VHD, as Azure imports.
+    azure: bool,
     /// `disk-image`: the control plane's API token, from this file.
     api_token_file: Option<std::path::PathBuf>,
     /// `disk-image`: the API's TLS certificates and key, from this file.
@@ -96,6 +100,7 @@ fn parse(args: &[String]) -> Result<Opts> {
         name: None,
         size_gib: None,
         gcp: false,
+        azure: false,
         api_token_file: None,
         api_tls_file: None,
         disk: None,
@@ -135,6 +140,7 @@ fn parse(args: &[String]) -> Result<Opts> {
                 )
             }
             "--gcp" => o.gcp = true,
+            "--azure" => o.azure = true,
             "--api-token-file" => o.api_token_file = Some(value("--api-token-file")?.into()),
             "--api-tls-file" => o.api_tls_file = Some(value("--api-tls-file")?.into()),
             "--disk" => o.disk = Some(value("--disk")?.into()),
@@ -258,7 +264,7 @@ fn cmd_disk_image(o: &Opts, args: &[String]) -> Result<()> {
     };
     let kernel = build::kernel(o.profile)?;
     // GCP requires a whole number of GiB; cloud volumes are sized in GiB.
-    let gib = o.size_gib.unwrap_or(if o.gcp { 1 } else { 0 });
+    let gib = o.size_gib.unwrap_or(u64::from(o.gcp || o.azure));
     let read = |p: &Option<std::path::PathBuf>| match p {
         Some(p) => std::fs::read(p)
             .map(Some)
@@ -304,6 +310,17 @@ fn cmd_disk_image(o: &Opts, args: &[String]) -> Result<()> {
             path.display(),
             tgz.len() >> 10
         );
+    }
+    if o.azure {
+        if !img.len().is_multiple_of(1 << 20) {
+            return Err("Azure wants a whole number of MiB; give --size-gib".into());
+        }
+        let footer = xtask::disk::vhd_footer(img.len() as u64);
+        let path = target.join("ichor-azure.vhd");
+        let mut vhd = img;
+        vhd.extend_from_slice(&footer);
+        std::fs::write(&path, &vhd).map_err(|e| format!("writing {}: {e}", path.display()))?;
+        println!("{}: upload as a page blob (docs/cloud.md)", path.display());
     }
     Ok(())
 }

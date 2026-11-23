@@ -54,20 +54,19 @@ pub struct Hyperv {
     vp: u32,
 }
 
-/// The registers Hyper-V gives this guest, and what it may do.
-fn offered() -> Option<[u32; 2]> {
+/// The registers Hyper-V gives this guest.
+fn offered() -> Option<u32> {
     let hypervisor = crate::arch::cpu::features().hypervisor;
     if !hypervisor || cpuid(0x4000_0001, 0)[0] != u32::from_le_bytes(*b"Hv#1") {
         return None;
     }
-    let [registers, may, ..] = cpuid(0x4000_0003, 0);
-    Some([registers, may])
+    Some(cpuid(0x4000_0003, 0)[0])
 }
 
 /// The TSC's frequency, which Hyper-V knows.
 pub(crate) fn tsc_hz() -> Option<u64> {
     const FREQUENCIES: u32 = 1 << 11;
-    if offered()?[0] & FREQUENCIES == 0 {
+    if offered()? & FREQUENCIES == 0 {
         return None;
     }
     // SAFETY: a register CPUID says this guest has; reading it has no side
@@ -78,9 +77,9 @@ pub(crate) fn tsc_hz() -> Option<u64> {
 /// Tells Hyper-V of this guest and has messages come to this CPU. `None` on
 /// other machines, and after the first time.
 pub fn connect() -> Option<Hyperv> {
-    // SynIC and hypercall registers, posting and signalling.
-    let [registers, may] = offered()?;
-    if registers & 0x24 != 0x24 || may & 0x30 != 0x30 || CONNECTED.swap(true, Ordering::AcqRel) {
+    // SynIC and hypercall registers. (That it may post messages and signal
+    // events is not always said of a guest that may.)
+    if offered()? & 0x24 != 0x24 || CONNECTED.swap(true, Ordering::AcqRel) {
         return None;
     }
     let page = || DmaBuf::alloc(4096);

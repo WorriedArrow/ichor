@@ -184,9 +184,9 @@ not write it; merge its branch when it lands.
   page the cell cannot pay for ends the process. Converting takes the image
   about twice; layers may have several gzip members. Images are never freed
   (`IMAGE_CREATE` leaks them).
-- WHPX (Windows) does not work with QEMU 9.0: it has no x2APIC, which frame
-  requires (and it cannot run firmware from pflash; `-bios` with the two
-  images concatenated gets as far as that).
+- WHPX (Windows) does not work with QEMU 9.0: it cannot run firmware from
+  pflash, and with `-bios` (the two images concatenated) the firmware itself
+  fails. OpenVMM runs on the same hypervisor platform and works.
 - M7 storage (ADR-0006's 2026-11-21 amendment): a cell's root writes are
   frames charged to its account (`page.rs`: one charged-page type for
   process memory and file pages; `overlay::Pages` is where the overlay
@@ -683,11 +683,12 @@ AMD's measures. Boot logs which apply.
 
 Frame budget: ADR-0005 sets the milestone 3 ceiling at 8,500 lines / 380
 sites; ADR-0007 raises it to 9,500 / 420 for milestone 4 (TLB shootdown,
-atomic user ops for futexes, PCID). `audit.toml` is at step 8 (6,350 / 265,
-ADR-0005's amendment); frame is at 6,329 / 260 (A5 added
+atomic user ops for futexes, PCID). `audit.toml` is at step 10 (6,600 / 285,
+ADR-0016); frame is at 6,532 / 270 (A5 added
 RDSEED/RDRAND and UEFI GetTime; B added XSAVE; C the frames tree and
 request tracking; M6 reading `\ichor\roots.pem`; ADR-0011 the checked user
-copy; ADR-0004 VERW/IBPB, page-table isolation and eIBRS; `IoPorts`).
+copy; ADR-0004 VERW/IBPB, page-table isolation, eIBRS and IBRS; `IoPorts`;
+xAPIC; Hyper-V).
 `services/rt` has its own budget (`services/rt/audit.toml`: 500 / 40; at
 417 / 30).
 
@@ -718,9 +719,14 @@ cut); unrenewed past its end, it keeps the address and asks on.
 **Google Cloud is done** (2026-11-22, an E2 machine: boots, pulls and runs
 containers through the API over the internet; `docs/cloud.md`). Its virtio
 devices are legacy (I/O ports: `frame::io::IoPorts`, ADR-0005's amendment;
-virtio-pci speaks both transports). Not yet: AWS ENA and GCP gVNIC, Hyper-V
-VMBus for Azure, Secure Boot; nothing has run on AWS, Azure or a real
-machine.
+virtio-pci speaks both transports). **Hyper-V** (Azure's hypervisor):
+ADR-0015 (xAPIC) and ADR-0016: `frame::hyperv` (hypercalls, SynIC),
+`kernel/vmbus` (the protocol, sans-I/O, fuzzed), `kernel/drivers/hyperv`
+(disks and network). Works on OpenVMM, Microsoft's VMM, which runs on this
+kind of PC without administrator rights and with hardware virtualization
+(`docs/cloud.md` has the command): the fastest local way to run Ichor. Not
+yet: AWS ENA and GCP gVNIC, Secure Boot, the ACPI power button; nothing has
+run on AWS, Azure itself or a real machine.
 
 ## Commands
 
@@ -830,6 +836,8 @@ kernel/net       network protocols, sans-I/O: Ethernet, ARP, IPv4, ICMP, UDP, TC
 kernel/uring     io_uring's ABI, ring layout and submission ordering, sans-I/O (host-tested; ADR-0013)
 kernel/drivers/nvme        safe NVMe driver (polled, DMA-trusted)
 kernel/drivers/virtio-scsi safe virtio-scsi driver: every target's disk, read-only, polled (GCP's E2/N1/N2 disks)
+kernel/vmbus     VMBus (Hyper-V), sans-I/O: the connection, rings, storage and network protocols (host-tested, fuzzed; ADR-0016)
+kernel/drivers/hyperv      safe Hyper-V disk and network drivers over VMBus (polled, DMA-trusted)
 xtask/src/artifact.rs      pinned downloads (busybox, Alpine): SHA-256, cache, never committed
 xtask/src/inflate.rs       gzip/DEFLATE decoder; rootfs.rs: tar -> Ichor image
 xtask/src/disk.rs, fat.rs  bootable GPT disk image (FAT32 ESP + Ichor root partition)
