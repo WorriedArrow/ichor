@@ -170,6 +170,9 @@ pub enum Placement {
     Device = 3,
 }
 
+/// No interrupt vector.
+pub const NO_VECTOR: u32 = u32::MAX;
+
 /// An admin command, without its id and phase.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Command(pub [u8; ENTRY]);
@@ -224,14 +227,15 @@ impl Command {
     }
 
     /// Creates a completion queue of `depth` entries of `entry_bytes` at
-    /// bus address `ring`. (Interrupts are asked for, as every driver does;
-    /// none is enabled on the PCI function, so none comes.)
+    /// bus address `ring`. It has no interrupt vector, as in DPDK's polled
+    /// driver (vector 0, the admin queue's, is refused).
     pub fn create_cq(entry_bytes: u8, depth: u16, ring: u64) -> Command {
         const INTERRUPT_MODE: u8 = 1 << 5;
         let mut c = Command::new(opcode::CREATE_CQ);
         c.0[4] = INTERRUPT_MODE;
         c.0[5] = entry_bytes / 4;
         put16(&mut c.0, 6, depth);
+        put32(&mut c.0, 8, NO_VECTOR);
         put_addr(&mut c.0, 12, ring);
         c
     }
@@ -529,18 +533,24 @@ impl CreatedCq {
 pub const HOST_INFO: usize = 196;
 
 /// What the driver says of itself (`set_host_attributes` points at it):
-/// the kind of system (there is no kind for others; a polled driver is
-/// most like DPDK's), names, the specification version it follows, its PCI
-/// address and the number of CPUs. It claims no optional features.
+/// the kind of system, names, a driver version, the specification version
+/// it follows, its PCI address and the number of CPUs. It claims no
+/// optional features.
+///
+/// The device reads more into the kind and the version than it should:
+/// AWS's firmware refuses to create completion queues (status 6) for
+/// kinds and versions it does not like, as iPXE's developers found, and as
+/// this driver found with kind 3 and version 0.1.0. Linux's kind, and
+/// version 2.0.0, are taken.
 pub fn host_info(cpus: u16, bdf: u16) -> [u8; HOST_INFO] {
-    const POLLED_DRIVER: u32 = 3;
+    const LINUX: u32 = 1;
+    const DRIVER_VERSION: u32 = 2;
     const SPEC_VERSION: u16 = 2 << 8;
     let mut b = [0; HOST_INFO];
-    put32(&mut b, 0, POLLED_DRIVER);
+    put32(&mut b, 0, LINUX);
     b[4..9].copy_from_slice(b"Ichor");
     b[136..141].copy_from_slice(b"ichor");
-    // 0.1.0.
-    put32(&mut b, 172, 1 << 8);
+    put32(&mut b, 172, DRIVER_VERSION);
     put16(&mut b, 184, SPEC_VERSION);
     put16(&mut b, 186, bdf);
     put16(&mut b, 188, cpus);
@@ -870,7 +880,7 @@ mod tests {
 
         let c = Command::create_cq(16, 256, 0x2000);
         assert_eq!(&c.0[4..8], &[1 << 5, 4, 0, 1]);
-        assert_eq!(&c.0[8..16], &[0, 0, 0, 0, 0, 0x20, 0, 0]);
+        assert_eq!(&c.0[8..16], &[0xff, 0xff, 0xff, 0xff, 0, 0x20, 0, 0]);
 
         let c = Command::set_host_attributes(0x1_0000_3000);
         assert_eq!(
@@ -1042,7 +1052,7 @@ mod tests {
     #[test]
     fn host_info_says_what_it_is() {
         let h = host_info(4, 0x0028);
-        assert_eq!(get32(&h, 0), 3);
+        assert_eq!((get32(&h, 0), get32(&h, 172)), (1, 2));
         assert_eq!(&h[4..10], b"Ichor\0");
         assert_eq!(
             (get16(&h, 184), get16(&h, 186), get16(&h, 188)),

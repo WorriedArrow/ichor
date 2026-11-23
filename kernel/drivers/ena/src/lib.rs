@@ -392,7 +392,9 @@ impl Ena {
         let cpus = frame::cpu::online_count().min(usize::from(u16::MAX)) as u16;
         info.write(0, &ena::host_info(cpus, bdf));
         let at = self.reach(&info, 0)?;
-        let _ = self.admin(&Command::set_host_attributes(at));
+        if let Err(e) = self.admin(&Command::set_host_attributes(at)) {
+            frame::println!("ichor: ena: host attributes refused: {e:?}");
+        }
         // The device keeps its address; the page lives as long as it.
         core::mem::forget(info);
 
@@ -438,8 +440,7 @@ impl Ena {
 
         // Transmit: completions, then the queue.
         let cq_at = self.reach(&self.tx_cq_ring, 0)?;
-        let cq = self.admin(&Command::create_cq(TX_COMPLETION as u8, tx_depth, cq_at))?;
-        let cq = CreatedCq::parse(&cq);
+        let cq = self.create_cq(TX_COMPLETION as u8, tx_depth, cq_at)?;
         let ring = match placement {
             Placement::Host => {
                 let r = DmaBuf::alloc(usize::from(tx_depth) * DESC).ok_or(InitError::NoMemory)?;
@@ -459,8 +460,7 @@ impl Ena {
 
         // Receive.
         let cq_at = self.reach(&self.rx_cq_ring, 0)?;
-        let cq = self.admin(&Command::create_cq(RX_COMPLETION as u8, rx_depth, cq_at))?;
-        let cq = CreatedCq::parse(&cq);
+        let cq = self.create_cq(RX_COMPLETION as u8, rx_depth, cq_at)?;
         let ring = self.reach(&self.rx_ring, 0)?;
         let sq = Command::create_sq(
             Direction::Rx,
@@ -480,6 +480,12 @@ impl Ena {
         self.regs
             .write(self.rx_doorbell, u32::from(self.rx_sq.count()));
         Ok(())
+    }
+
+    /// Creates a completion queue of `entry`-byte completions.
+    fn create_cq(&mut self, entry: u8, depth: u16, ring: u64) -> Result<CreatedCq, InitError> {
+        let c = self.admin(&Command::create_cq(entry, depth, ring))?;
+        Ok(CreatedCq::parse(&c))
     }
 
     /// The device's MAC address.

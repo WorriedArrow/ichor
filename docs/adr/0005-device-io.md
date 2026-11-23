@@ -121,3 +121,27 @@ takes what ADR-0001 §4.6 called `IoPort`.
 
 Frame's audit step 8 is 6,350 lines / 265 sites, within ADR-0007's ceiling
 (6,298 / 259 at this change: the port instructions became one macro).
+
+## Amendment (2026-11-22): BARs the firmware did not place
+
+AWS's firmware leaves the BARs of the ENA, its network device, at 0: it
+programs the windows of the PCI bridge above the device but puts nothing
+in them. Linux places such BARs itself, and so must Ichor, or the machine
+has no network.
+
+- Frame places them once, at enumeration, before any driver runs: a
+  memory BAR whose size probe answers but whose address is 0 gets the
+  first address, aligned to its size, inside the window of the bridge to
+  its bus (the prefetchable window for a 64-bit prefetchable BAR if the
+  bridge has one, else the memory window) that no other BAR occupies.
+  Memory decode is off while the BAR is written.
+- Frame never programs a bridge, never moves a BAR the firmware placed,
+  and places nothing on a bus without a bridge (the host bridge's
+  windows are in ACPI, which frame does not interpret). A BAR that finds
+  no room stays absent, as before.
+- `IoMem::map` still refuses RAM and the system-device range, so a wrong
+  window could cost a device, not memory.
+
+Configuration writes stay frame's: drivers still cannot write
+configuration space. Frame grows by about 60 lines (6,597 of audit step
+10's 6,600).

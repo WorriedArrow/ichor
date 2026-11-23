@@ -3,8 +3,8 @@
 Status: the disk image boots in QEMU the way a cloud VM boots (UEFI
 firmware, one GPT disk on NVMe, serial console), including with a blank
 volume ahead of the boot disk, an 8 KiB NVMe transfer limit, and no
-PIT. It **has run on Google Cloud and on Azure** (2026-11-22, below), not
-yet on AWS. This page is the runbook.
+PIT. It **has run on Google Cloud, Azure and AWS** (2026-11-22, below).
+This page is the runbook.
 
 ## Runs so far
 
@@ -31,6 +31,28 @@ open: stopping or deleting the machine takes GCP about two minutes, since
 Ichor does not hear the ACPI power button, and a recreated machine may have
 another external address (look before connecting).
 
+**AWS, 2026-11-22**, an `m7i-flex.large` (2 vCPUs, 8 GiB; Sapphire
+Rapids with enhanced IBRS, the first such CPU Ichor has met: eIBRS with
+BHI_DIS_S, VERW and IBPB on, page-table isolation not needed) in
+us-east-2, from the image of `disk-image --release --size-gib 1 --cmdline
+metadata=aws` with a token and a certificate on the disk, and the user
+data `control=50051 control_publish=50051`, read over IMDSv2. The root is
+the EBS volume on NVMe; the uplink is the ENA (`kernel/drivers/ena`),
+transmitting through a low-latency queue in device memory, with the VPC's
+DHCP lease (its 9001 MTU taken as 1500). Over the API, from outside:
+Alpine 3.20 pulled in 0.7 s and run (its `wget` reached the internet
+through the cell switch's NAT), and redis-benchmark made 65,000 SETs and
+60,000 GETs a second (unpipelined) in a cell.
+
+What it found: the firmware leaves the ENA's BARs at 0, inside a bridge
+whose windows are set, so frame now places such BARs itself (ADR-0005's
+second amendment); and the ENA refuses to create completion queues
+(status 6, "unknown error") unless the driver's host information says
+Linux and a driver version it accepts (`ena::host_info`). Iterating took
+about four minutes a round: an image built here, uploaded to CloudShell
+(3 MB gzip'd), written to a snapshot with the EBS direct APIs, registered
+and booted (below).
+
 ## What a first boot shows
 
 The kernel runs its self-tests and the busybox suite from the disk's root
@@ -45,8 +67,9 @@ Every line goes to the serial console, so read it there:
 
 The network drivers are virtio-net (modern and legacy) and Intel gigabit
 Ethernet (82574L, and the 82576/I350/I210 family, for bare metal); cloud
-NICs (AWS ENA, GCP gVNIC) come with milestone 8. Machines with those alone
-can be reached only through their serial console.
+NICs: Hyper-V's (VMBus) and AWS's ENA have drivers; GCP's gVNIC does not,
+so a machine with only that can be reached only through its serial
+console.
 
 ## Build the images
 
@@ -125,18 +148,35 @@ answered for real; Azure's answers only in host tests.
 
 ## AWS (Nitro instances: NVMe boot volume, COM1 serial console)
 
-Check each command against the current AWS documentation; flags change.
+What worked (2026-11-22, from AWS CloudShell; no S3 bucket and no import
+role needed):
 
-1. Upload: `aws s3 cp target/ichor-disk.img s3://BUCKET/ichor-disk.img`
-2. Import a snapshot (needs the `vmimport` service role):
-   `aws ec2 import-snapshot --disk-container "Format=RAW,UserBucket={S3Bucket=BUCKET,S3Key=ichor-disk.img}"`,
-   then poll `aws ec2 describe-import-snapshot-tasks` for the snapshot id.
-3. Register a UEFI image:
-   `aws ec2 register-image --name ichor --architecture x86_64 --boot-mode uefi --ena-support --root-device-name /dev/xvda --block-device-mappings "DeviceName=/dev/xvda,Ebs={SnapshotId=snap-...}"`
-4. Launch a small Nitro instance (for example `m6i.large`) from the AMI.
-5. Read the console: `aws ec2 get-console-output --instance-id i-... --latest`,
-   or the EC2 serial console (interactive; must be enabled for the
-   account).
+1. `cargo xtask disk-image --release --size-gib 1 --cmdline metadata=aws
+   --api-token-file ... --api-tls-file ...`, then `gzip -c
+   target/ichor-disk.img > ichor.img.gz` (about 3 MB) and upload that to
+   CloudShell.
+2. Write it to a snapshot with the EBS direct APIs and register a UEFI AMI
+   on it. A short boto3 script does both: `start_snapshot` (1 GiB),
+   `put_snapshot_block` for each 512 KiB block that is not all zeros
+   (about 15), with its SHA-256, `complete_snapshot`, wait for
+   `snapshot_completed`, then `register_image(Architecture="x86_64",
+   BootMode="uefi", EnaSupport=True, ImdsSupport="v2.0",
+   RootDeviceName="/dev/xvda", BlockDeviceMappings=[{"DeviceName":
+   "/dev/xvda", "Ebs": {"SnapshotId": ..., "VolumeType": "gp3"}}])`. About
+   a minute and a half.
+3. A security group with only TCP 50051 from the client's address, and
+   `aws ec2 run-instances --image-id ami-... --instance-type
+   m7i-flex.large --security-group-ids sg-... --user-data file://ud.txt
+   --metadata-options HttpTokens=required,HttpEndpoint=enabled`, where
+   `ud.txt` holds `control=50051 control_publish=50051`.
+4. About 90 s later, `aws ec2 get-console-output --instance-id i-...
+   --latest --output text` has the boot log; then `cargo xtask api
+   PUBLIC_IP:50051 --name ... --ca ... --token-file ... IMAGE -- CMD`.
+5. Afterwards: terminate the instance, deregister the AMIs, delete their
+   snapshots and the security group.
+
+`aws ec2 import-snapshot` from S3 (with the `vmimport` role) also takes a
+raw image, more slowly.
 
 ## GCP
 
@@ -229,6 +269,7 @@ through the API.
 
 ## Not supported yet
 
-- Cloud NICs other than virtio-net (AWS ENA, GCP gVNIC).
+- GCP's gVNIC (GCP's general-purpose machines use virtio-net, which works),
+  and Azure's MANA.
 - Secure Boot: launch with it off (the default for custom AWS AMIs; on
   GCP, without Shielded VM Secure Boot).

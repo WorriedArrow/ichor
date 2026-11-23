@@ -151,9 +151,82 @@ pub fn devices() -> Vec<PciDevice> {
     DEVICES.lock().clone()
 }
 
+/// A memory BAR the firmware left without an address: (bus, device,
+/// function, BAR, size, 64-bit, prefetchable).
+type Unplaced = (u8, u8, u8, usize, u64, bool, bool);
+
+/// The windows of the bridge to `bus`: memory, then prefetchable memory, as
+/// (first, last) addresses (first > last if it has none).
+fn windows(found: &[PciDevice], bus: u8) -> Option<[(u64, u64); 2]> {
+    let b = found.iter().find(|d| {
+        let cfg = |o| read32(d.bus, d.device, d.function, o);
+        (cfg(0x0c) >> 16) & 0x7f == 1 && (cfg(0x18) >> 8) as u8 == bus
+    })?;
+    let cfg = |o| u64::from(read32(b.bus, b.device, b.function, o));
+    let (mem, pf) = (cfg(0x20), cfg(0x24));
+    let wide = |o| if pf & 0xf == 1 { cfg(o) << 32 } else { 0 };
+    Some([
+        ((mem & 0xfff0) << 16, (mem >> 16 & 0xfff0) << 16 | 0xfffff),
+        (
+            wide(0x28) | (pf & 0xfff0) << 16,
+            wide(0x2c) | (pf >> 16 & 0xfff0) << 16 | 0xfffff,
+        ),
+    ])
+}
+
+/// Gives each unplaced BAR an address in its bridge's window, clear of
+/// every other BAR, as an OS does when the firmware did not (AWS leaves
+/// its network devices' BARs at 0). Decode is off while a BAR is written.
+fn place(found: &mut [PciDevice], unplaced: &[Unplaced]) {
+    let mut used: Vec<(u64, u64)> = found
+        .iter()
+        .flat_map(|d| d.bars)
+        .filter_map(|b| match b {
+            Bar::Memory { base, size, .. } => Some((base, base + size)),
+            _ => None,
+        })
+        .collect();
+    for &(bus, dev, func, i, size, is64, prefetchable) in unplaced {
+        let Some(w) = windows(found, bus) else {
+            continue;
+        };
+        let (lo, hi) = w[usize::from(prefetchable && is64 && w[1].0 <= w[1].1)];
+        let mut at = lo.next_multiple_of(size);
+        while let Some(&(_, end)) = used.iter().find(|&&(s, e)| s < at + size && at < e) {
+            at = end.next_multiple_of(size);
+        }
+        if lo == 0 || at + size - 1 > hi || (!is64 && at + size > 1 << 32) {
+            continue;
+        }
+        used.push((at, at + size));
+        let (get, set) = (
+            |o| read32(bus, dev, func, o),
+            |o, v| write32(bus, dev, func, o, v),
+        );
+        let (cmd, off) = (get(COMMAND) & 0xffff, BAR0 + 4 * i as u8);
+        set(COMMAND, cmd & !CMD_MEMORY);
+        set(off, at as u32 | get(off) & 0xf);
+        if is64 {
+            set(off + 4, (at >> 32) as u32);
+        }
+        set(COMMAND, cmd);
+        let base = at;
+        for d in found.iter_mut().filter(|d| d.bus == bus && d.device == dev) {
+            if d.function == func {
+                d.bars[i] = Bar::Memory {
+                    base,
+                    size,
+                    prefetchable,
+                };
+            }
+        }
+    }
+}
+
 /// Sizes the BARs of a type-0 function. Memory and I/O decode are off while
-/// the all-ones pattern is in a BAR, and every BAR is restored.
-fn probe_bars(bus: u8, dev: u8, func: u8) -> [Bar; 6] {
+/// the all-ones pattern is in a BAR, and every BAR is restored. Memory BARs
+/// without an address go on `unplaced`.
+fn probe_bars(bus: u8, dev: u8, func: u8, unplaced: &mut Vec<Unplaced>) -> [Bar; 6] {
     let mut bars = [Bar::None; 6];
     let cmd = read32(bus, dev, func, COMMAND) & 0xffff;
     write32(bus, dev, func, COMMAND, cmd & !(CMD_IO | CMD_MEMORY));
@@ -196,6 +269,8 @@ fn probe_bars(bus: u8, dev: u8, func: u8) -> [Bar; 6] {
                 size,
                 prefetchable,
             };
+        } else if mask & !0xf != 0 && size.is_power_of_two() {
+            unplaced.push((bus, dev, func, i, size, is64, prefetchable));
         }
         i += if is64 { 2 } else { 1 };
     }
@@ -206,6 +281,7 @@ fn probe_bars(bus: u8, dev: u8, func: u8) -> [Bar; 6] {
 /// Enumerates every bus, device and function. Runs once at boot.
 pub(crate) fn init() -> usize {
     let mut found = Vec::new();
+    let mut unplaced = Vec::new();
     for bus in 0..=255u8 {
         for dev in 0..32u8 {
             if read32(bus, dev, 0, 0) & 0xffff == 0xffff {
@@ -220,7 +296,7 @@ pub(crate) fn init() -> usize {
                 let class = read32(bus, dev, func, 0x08);
                 let header_type = (read32(bus, dev, func, 0x0c) >> 16) & 0x7f;
                 let bars = if header_type == 0 {
-                    probe_bars(bus, dev, func)
+                    probe_bars(bus, dev, func, &mut unplaced)
                 } else {
                     [Bar::None; 6]
                 };
@@ -238,6 +314,7 @@ pub(crate) fn init() -> usize {
             }
         }
     }
+    place(&mut found, &unplaced);
     let n = found.len();
     *DEVICES.lock() = found;
     n

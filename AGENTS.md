@@ -92,6 +92,10 @@ not write it; merge its branch when it lands.
   `runtest::uring_program` and `uring_worker_program` check it on every
   boot; `cargo xtask workloads uring` runs liburing 2.5's tests. Not yet:
   personalities, URING_CMD, zero-copy sends, NO_MMAP, xattr operations.
+  Seen once under the full gate's load (2026-11-22): `uring_program`'s
+  check 23 (a fixed write past its registered buffer, entered without
+  GETEVENTS) found no completion yet; it should have completed inline
+  with EFAULT. Three reruns passed; not chased yet.
 - M7 CPython (first suite): `cargo xtask workloads python` pulls
   `python:3.12-slim-bookworm` plus the 3.12.16 source tree's `Lib/test`
   as a pinned layer and runs `python -m test -j0` in a cell. Fixed on
@@ -677,18 +681,19 @@ ADR-0004 records the side-channel posture. Built: VERW, IBPB on cross-cell
 switch, page-table isolation for Meltdown-affected CPUs, IBRS on every
 entry from ring 3 for CPUs without enhanced IBRS (`ichor_spec_ctrl` in
 `entry.rs`), and enhanced IBRS
-with BHI_DIS_S where enumerated (not yet run on hardware that has it: no
-test machine reports it). Owed: BHB clearing, RSB filling, masked indices,
+with BHI_DIS_S where enumerated (first run on AWS's m7i-flex, Sapphire
+Rapids, 2026-11-22). Owed: BHB clearing, RSB filling, masked indices,
 AMD's measures. Boot logs which apply.
 
 Frame budget: ADR-0005 sets the milestone 3 ceiling at 8,500 lines / 380
 sites; ADR-0007 raises it to 9,500 / 420 for milestone 4 (TLB shootdown,
 atomic user ops for futexes, PCID). `audit.toml` is at step 10 (6,600 / 285,
-ADR-0016); frame is at 6,532 / 270 (A5 added
+ADR-0016); frame is at 6,597 / 270, 3 lines of room (A5 added
 RDSEED/RDRAND and UEFI GetTime; B added XSAVE; C the frames tree and
 request tracking; M6 reading `\ichor\roots.pem`; ADR-0011 the checked user
 copy; ADR-0004 VERW/IBPB, page-table isolation, eIBRS and IBRS; `IoPorts`;
-xAPIC; Hyper-V).
+xAPIC; Hyper-V; placing BARs the firmware left at 0, ADR-0005's second
+amendment). The next frame growth needs an ADR and a new audit step.
 `services/rt` has its own budget (`services/rt/audit.toml`: 500 / 40; at
 417 / 30).
 
@@ -726,10 +731,23 @@ ADR-0015 (xAPIC) and ADR-0016: `frame::hyperv` (hypercalls, SynIC),
 kind of PC without administrator rights and with hardware virtualization
 (`docs/cloud.md` has the command): the fastest local way to run Ichor.
 **Azure is done** (2026-11-22, a Standard_D4s_v5: boots, pulls and runs
-containers through the API). Not yet: AWS ENA, GCP gVNIC, Azure's newest
-sizes (PCI over VMBus: NVMe and MANA), Secure Boot, the ACPI power button;
-Azure's CPU enumerates no MD_CLEAR or SPEC_CTRL (VERW and IBRS off: look
-into); nothing has run on AWS or a real machine.
+containers through the API).
+**AWS is done** (2026-11-22, an m7i-flex.large: boots from EBS on NVMe,
+networks over the ENA, takes its options from IMDSv2, pulls and runs
+containers through the API; `docs/cloud.md` has the run and the runbook).
+`kernel/ena` (host-tested) is the ENA protocol, `kernel/drivers/ena` the
+polled driver: transmit through a low-latency queue in device memory when
+offered (newer instance types require it), else host memory. Two things
+AWS taught: its firmware leaves the ENA's BARs at 0 (frame places them in
+the bridge's window, ADR-0005's second amendment), and the ENA creates no
+completion queue unless the host information says Linux and driver
+version 2 (`ena::host_info`; status 6 otherwise). Links say their MTU
+(`Link::mtu`, 1500); AWS's DHCP says 9001 and is not believed. Only the
+m7i-flex has been tried (t3 and older types: not yet).
+Not yet: GCP gVNIC, Azure's newest sizes (PCI over VMBus: NVMe and MANA),
+Secure Boot, the ACPI power button; Azure's CPU enumerates no MD_CLEAR or
+SPEC_CTRL (VERW and IBRS off: look into). Left for milestone 8: one
+bare-metal machine (the owner has none available yet).
 
 ## Commands
 
@@ -766,7 +784,7 @@ the accelerator).
 
 Plain `cargo build` / `cargo test` at the root only touch host crates
 (`default-members`). Crates that depend on frame (`ichor`, `ichor-frame`,
-`ichor-virtio-pci`, `ichor-virtio-blk`, `ichor-virtio-rng`, `ichor-virtio-net`, `ichor-intel-gbe`, `ichor-nvme`) are kernel-only: xtask's `KERNEL_ONLY` list keeps them
+`ichor-virtio-pci`, `ichor-virtio-blk`, `ichor-virtio-rng`, `ichor-virtio-net`, `ichor-intel-gbe`, `ichor-nvme`, `ichor-virtio-scsi`, `ichor-hyperv`, `ichor-ena-driver`) are kernel-only: xtask's `KERNEL_ONLY` list keeps them
 out of host clippy and tests and lints them for the UEFI target. The kernel and frame build for `x86_64-unknown-uefi`
 through xtask, into `target/kernel` so they never contend for cargo's build
 lock with the host build.
@@ -841,6 +859,8 @@ kernel/drivers/nvme        safe NVMe driver (polled, DMA-trusted)
 kernel/drivers/virtio-scsi safe virtio-scsi driver: every target's disk, read-only, polled (GCP's E2/N1/N2 disks)
 kernel/vmbus     VMBus (Hyper-V), sans-I/O: the connection, rings, storage and network protocols (host-tested, fuzzed; ADR-0016)
 kernel/drivers/hyperv      safe Hyper-V disk and network drivers over VMBus (polled, DMA-trusted)
+kernel/ena       AWS's Elastic Network Adapter, sans-I/O: admin commands, descriptors, LLQ layout (host-tested)
+kernel/drivers/ena         safe ENA driver (polled, DMA-trusted; LLQ when offered)
 xtask/src/artifact.rs      pinned downloads (busybox, Alpine): SHA-256, cache, never committed
 xtask/src/inflate.rs       gzip/DEFLATE decoder; rootfs.rs: tar -> Ichor image
 xtask/src/disk.rs, fat.rs  bootable GPT disk image (FAT32 ESP + Ichor root partition)
