@@ -19,7 +19,7 @@ own (the control). `cell_access` on the command line runs it;
 | harness | 4 | pass |
 | 1 `process_ids_and_signals_are_scoped_to_their_cell` | 146 | pass |
 | 2 `proc_and_sys_show_only_their_cell` | 115 | pass |
-| 3 file systems | 0 | **not written** (see below) |
+| 3 `file_systems_are_scoped_to_their_root` | 502 | pass |
 | 4 `shared_cache_pages_never_carry_writes_between_cells` | 35 | pass |
 | 5 `networks_are_scoped_to_their_cell` | 30 | pass |
 | 6 `other_kernel_state_is_per_cell` | 28 | pass |
@@ -29,13 +29,7 @@ own (the control). `cell_access` on the command line runs it;
 | `a_destroyed_cell_leaves_no_shared_memory` | 3 | pass (bug 1, fixed) |
 | `a_destroyed_cell_leaves_no_network` | 6 | pass (bug 2, fixed) |
 
-**Section 3 has no coverage.** A usage limit stopped the session
-while its script was being written. So
-nothing here checks `..` at the root, symlinks, links and renames across
-roots, or that A cannot open B's ptys. Partial evidence elsewhere: B's file
-is ENOENT to `stat`, `chown`, `chmod` and io_uring `OPENAT` from A, B's
-socket path is ENOENT, and B's own file and ptys are unchanged after every
-section. It is still to be written.
+Section 3 was written last, in a session of its own. It found no bug.
 
 ## Bug 1 (fixed): a destroyed cell's System V segments were never freed
 
@@ -128,6 +122,29 @@ mapping. `/proc/<pid>/root` and `mem` do not exist for anyone, so for those
 two ENOENT proves nothing yet; nor does it for `/proc/self/cwd/x`, since
 links are not followed partway through a path.
 
+Section 3, 494 checks in A and 8 by the harness. Both roots are
+`st_dev` 1, `st_ino` 1, so the root is told by its path, by its inode, by
+A's own directory being in it and by B's not being there.
+
+| In A | Result | Code |
+|---|---|---|
+| `chdir`, `openat`, `newfstatat`, `fchdir` by `..`, and chains of 3, 64 and 1300, from `/` and three depths; from a moved and a removed directory | A's root | `Overlay::lookup` (the root's parent is itself) |
+| Symlinks to B's file, directory and link: absolute, relative, above the root, chained, and partway through a path (`stat`, `open`, `O_CREAT`, `access`, `chmod`, `truncate`, `chdir`, `linkat` with AT_SYMLINK_FOLLOW, `connect`) | ENOENT | `Overlay::resolve`, `resolve_create` |
+| B's file, directory, symlink and socket (`stat`, `lstat`, `access`, `open`, `openat`, `readlink`, `chdir`) | ENOENT | `Overlay::resolve` |
+| `link`, `linkat`, `rename`, `renameat`, `renameat2`, `unlink`, `unlinkat`, `rmdir` of B's names; `link`, `rename`, `symlink`, `mkdir`, `mkdirat`, `mknod`, `open` with O_CREAT into B's directory | ENOENT | `Overlay::resolve`, `resolve_parent` |
+| `link`, `rename`, `symlink`, `mkdir` to `/../../../name` | made in A's root | `Overlay::resolve_parent` |
+| `rename` of a directory into itself | EINVAL | `Overlay::rename` (`is_ancestor`) |
+| B's pty numbers, before A has a pty and beside A's own 0 | ENOENT | no node in A's `/dev/pts` (`pty::open_master`) |
+| A second name of A's node 0, after that pty closed, while B has a pty 0 | EIO | `pty::open_slave` (the root's own table) |
+| `mknod` of a device node with B's pty's number | EPERM | no CAP_MKNOD in cells |
+
+A file A makes, reads and removes under B's very path is A's own. Then the
+harness has B look: nothing A made is in B's root, by path or by listing;
+B's directory holds what B made, no more and no less (B has a file for each
+call that could take one away); the image's files that A wrote, removed and
+moved are unchanged in B; nobody opened B's ptys and their size is their
+own. The same paths are in A's root at that moment (the control).
+
 Section 4: page 1 of `/usr/bin/dash` is the same physical page in both
 roots (checked). A's CPU store through `MAP_PRIVATE`, its `read()` into a
 private mapping (ADR-0011) and its copy-up write leave B's mapping, B's
@@ -173,14 +190,33 @@ an empty `git diff`; none was committed.
 | Cell filters in `proc::uids_of`, `send_info`, `send_thread`, `send_group` | Every `kill`, `tkill`, `rt_sigqueueinfo` and group check, `tgkill`, `rt_tgsigqueueinfo`, both `sched_*affinity`, and the pid sweep (found B's four); B was killed and the boot failed |
 | Cell filters in `proc::find`, `process`, `pids` | `getpgid`, `getsid`, `pidfd_open`, `sched_getscheduler`, `sched_getparam`, `capget`; in section 2 the listing and every `/proc/<B pid>` check but `root` and `mem` |
 | Cell id and process identity in `futex::key` | Both waiters were woken by A: 6 checks, in A, B and the harness |
+| Section 3: the root of its own (both cells on one `Vfs::mount_disk` root, in `run`) | 176 checks of section 3, 6 of them the harness's: 161 of its 165 refused calls; B's secret changed; also checks of the harness and sections 4 to 7 |
+| Section 3: `..` at the root stays there (`Overlay::lookup` gave `/usr`) | 76: by path, inode and listing, for `chdir`, `openat` and `fchdir`, and the links, renames, symlinks and directories made above the root |
+| Section 3: the node check in `pty::open_slave` | None, as expected: the root's own table refuses first |
+| Section 3: the node check, and one pty table for every root | 2: A's old node 0 opened B's pty 0, and B heard it |
+| Section 3: the same, and each pty's node in every root | 14: every check of B's pty numbers and of what A's devpts lists, and the two above |
+| Section 3: `is_ancestor` in `Overlay::rename` | 3: the rename into itself worked, and what it cut off was missing |
 
 The first run of the first experiment killed B before the later checks ran,
 so SIGKILL now comes last. Not sensitive to a cell filter, because another
 rule also refuses: `wait4`/`waitid` (not a child), `setpgid` (not a child),
 `get`/`setpriority` (caller only), `get_robust_list` (caller only).
-`prlimit64` has two filters, and either alone refuses it. Section 3's
-experiment was not possible. Sections 5 to 8 were not asked for and not
-done.
+`prlimit64` has two filters, and either alone refuses it. Sections 5 to 8
+were not asked for and not done.
+
+A root is a separate object, so section 3 has no cell filter to delete;
+the edits above stand in for one. An unowned root (`Vfs::mount_disk`) is
+charged to nobody, so `run_linux`'s memory check held on the shared one.
+The four refused calls that passed on it are not about which root: the
+rename into itself, the device node's EPERM, the old node's EIO (A's first
+number there was 2) and the `stat` after A had removed B's file. The first
+shared-root run hung in A's own pty read and hid later checks behind
+earlier ones that had worked, so the read is bounded now and each call has
+files of B's to itself. With `..` at the root going to `/usr`, a chain with
+an even number of steps past the root ends at the root and passes, which is
+why there are several lengths and depths; nothing was made to escape into
+B's root, which the overlay has no way to name. The device node's EPERM was
+not tested by any edit.
 
 ## ADR conflicts
 
@@ -213,7 +249,9 @@ done.
 
 ## Not tested
 
-- Section 3 (above).
+- `..` out of `/proc`: paths under it are not resolved by the overlay, and
+  `/proc/../x` is ENOENT for A's own files too, so it would prove nothing.
+- Files reached by handle (`open_by_handle_at`), which Ichor does not have.
 - The switch's anti-spoofing: no raw sockets, so no syscall can send
   another source address. `kernel/net` tests it.
 - A denied cell-to-cell TCP policy: ADR-0010 has none.

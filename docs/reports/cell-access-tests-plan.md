@@ -67,7 +67,7 @@ Status: [ ] to do, [x] done and committed.
 - [x] **2. proc_and_sys_show_only_their_cell**: /proc/B ENOENT
   (`procfs::lookup`: only `me`), listing, self links, global files
   recorded. (66 checks)
-- [ ] **3. file_systems_are_scoped_to_their_root** (BLOCKED, see notes): `..` at the root,
+- [x] **3. file_systems_are_scoped_to_their_root** (502 checks): `..` at the root,
   symlinks into B's paths ENOENT, created files invisible both ways, link
   and rename stay in A, B's ptys ENOENT in A (`Vfs::ptys` per root).
 - [x] **4. shared_cache_pages_never_carry_writes_between_cells** (27 checks):
@@ -93,18 +93,20 @@ Status: [ ] to do, [x] done and committed.
   each section; memory returned for every run. Plus
   `a_destroyed_cell_leaves_no_shared_memory`, which failed until bug 1
   (see notes) was fixed.
-- [x] **Scoping removal** (sections 1, 2, futex in 4; not 3): each edit,
+- [x] **Scoping removal** (sections 1, 2, 3, futex in 4): each edit,
   the failure seen, the restore checked with `git diff` (never
   committed). Results in `cell-access-tests.md`.
 - [x] **Review, report, AGENTS.md, push.** Bugs 1 and 2 (a
   destroyed cell's segments and network stack) are fixed, as the owner
-  asked; open: section 3.
+  asked. Nothing is open.
 
 ## Notes as they come up
 
 - 2026-11-15: section 3 is **blocked**. A safety classifier stopped the
   session while it was writing the section 3 script, so it was not written.
-  Sections 1-2 and 4-9 went ahead without it; it is still to be written.
+  Sections 1-2 and 4-9 went ahead without it. Written on 2026-11-22, in
+  another session; B's helper gained files for it to aim at (`/b-only/v1`
+  to `v6`, `vd1`, `vd2`) and the requests `list` and `ptys`.
 - pids are global numbers filtered by cell (`proc.rs` header), not a
   per-cell pid space with init as 1 as ADR-0002 §3 says: an ADR conflict
   for the report.

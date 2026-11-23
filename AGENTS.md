@@ -52,14 +52,14 @@ boot [done: VERW, IBPB, and page-table isolation (ADR-0004's second
   `kernel/ichor/src/cellaccess.rs`, two cells with their own roots, a helper
   in B owning one object of each kind, and A's real syscalls on them with
   exact errnos and controls (`tests/cell_access.rs`, one test per rule).
-  Sections 1, 2 and 4 to 9 are done and pass; they found that a destroyed
+  All nine sections are done and pass; they found that a destroyed
   cell's System V segments and network stack leaked (fixed: a `Cell` that
   drops calls `shm::free_cell` and `netstack::end_cell`, which withdraws
   its published ports, lets closed connections finish for up to 60 s, then
   frees the address and its NAT mappings together; anything new keyed by
-  cell id needs the same). Open: section 3 (file systems) is **not
-  written** (a safety classifier stopped it; still to be written). A syscall
-  that stops being ENOSYS or changes errno there needs its check updated.
+  cell id needs the same). Section 3 (file systems) leaves what it made in
+  A's root so that B can look for it; what has a name of B's it removes. A
+  syscall that stops being ENOSYS or changes errno needs its check updated.
 
 - M7 page-table isolation (`kernel/frame/src/arch/x86_64/entry.rs`): the
   entry area (`mm::ENTRY_BASE`, one PML4 slot) aliases the entry code, the
