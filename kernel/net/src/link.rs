@@ -29,6 +29,12 @@ pub trait Link: Send {
     fn name(&self) -> &str {
         "link"
     }
+
+    /// The largest IP packet it carries (a network may say less, as DHCP
+    /// does; one that says more, as AWS's says 9001, is not believed).
+    fn mtu(&self) -> u16 {
+        1500
+    }
 }
 
 impl<L: Link + ?Sized> Link for Box<L> {
@@ -43,6 +49,9 @@ impl<L: Link + ?Sized> Link for Box<L> {
     }
     fn name(&self) -> &str {
         (**self).name()
+    }
+    fn mtu(&self) -> u16 {
+        (**self).mtu()
     }
 }
 

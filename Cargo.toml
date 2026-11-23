@@ -23,6 +23,7 @@ members = [
     "kernel/net",
     "kernel/uring",
     "kernel/vmbus",
+    "kernel/ena",
     "kernel/drivers/virtio-pci",
     "kernel/drivers/virtio-blk",
     "kernel/drivers/virtio-rng",
@@ -31,6 +32,7 @@ members = [
     "kernel/drivers/nvme",
     "kernel/drivers/virtio-scsi",
     "kernel/drivers/hyperv",
+    "kernel/drivers/ena",
     "kernel/ichor",
     "services/crypto",
     "services/x509",
@@ -72,6 +74,7 @@ default-members = [
     "kernel/net",
     "kernel/uring",
     "kernel/vmbus",
+    "kernel/ena",
     "services/crypto",
     "services/x509",
     "services/tls",
@@ -122,6 +125,8 @@ virtio-blk = { package = "ichor-virtio-blk", path = "kernel/drivers/virtio-blk" 
 nvme = { package = "ichor-nvme", path = "kernel/drivers/nvme" }
 virtio-scsi = { package = "ichor-virtio-scsi", path = "kernel/drivers/virtio-scsi" }
 hyperv = { package = "ichor-hyperv", path = "kernel/drivers/hyperv" }
+ena = { package = "ichor-ena", path = "kernel/ena" }
+ena-driver = { package = "ichor-ena-driver", path = "kernel/drivers/ena" }
 crypto = { package = "ichor-crypto", path = "services/crypto" }
 x509 = { package = "ichor-x509", path = "services/x509" }
 layer = { package = "ichor-layer", path = "services/layer" }

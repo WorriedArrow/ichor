@@ -99,6 +99,16 @@ fn find() -> Option<Box<dyn Link>> {
             Err(e) => println!("ichor: net: virtio-net init failed: {e:?}"),
         }
     }
+    for dev in ena_driver::probe_all() {
+        match dev {
+            Ok(d) => {
+                let queue = if d.low_latency() { "device" } else { "host" };
+                println!("ichor: net: ena up, transmit descriptors in {queue} memory");
+                return Some(Box::new(d));
+            }
+            Err(e) => println!("ichor: net: ENA init failed: {e:?}"),
+        }
+    }
     for dev in crate::hv::bus().into_iter().flat_map(|b| b.networks()) {
         match dev {
             Ok(d) => return Some(Box::new(d)),
@@ -167,7 +177,8 @@ pub(crate) fn run() {
                     .map_or("ever".into(), |t| alloc::format!("{} s", t.as_secs())),
             );
             crate::switch::set_uplink_dns(l.dns.clone());
-            (l.addr, l.prefix, l.router, l.mtu.unwrap_or(1500))
+            let mtu = l.mtu.unwrap_or(1500).min(dev.mtu());
+            (l.addr, l.prefix, l.router, mtu)
         }
         None => {
             println!("ichor: net: no DHCP answer; using {GUEST}/24 via {GATEWAY}");

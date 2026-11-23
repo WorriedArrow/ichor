@@ -337,6 +337,7 @@ const KERNEL_ONLY: &[&str] = &[
     "ichor-nvme",
     "ichor-virtio-scsi",
     "ichor-hyperv",
+    "ichor-ena-driver",
 ];
 
 /// Crates that only build for the services target (the native runtime
