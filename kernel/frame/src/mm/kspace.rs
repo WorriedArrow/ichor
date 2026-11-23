@@ -279,6 +279,19 @@ pub(crate) fn map_entry(va: u64, pa: u64, len: u64, props: Props) -> Option<()> 
     if paging::slot_of(va) != paging::slot_of(super::ENTRY_BASE) {
         return None;
     }
+    map_fixed(va, pa, len, props)
+}
+
+/// Maps a page of code frame wrote at `va`, in the 2 MiB window above the
+/// kernel image kept for return thunks (`arch::rethunk`), once per page.
+pub(crate) fn map_thunk(va: u64, pa: u64) -> Option<()> {
+    if !(super::THUNK_BASE..super::THUNK_BASE + (2 << 20)).contains(&va) {
+        return None;
+    }
+    map_fixed(va, pa, PAGE_SIZE, Props::CODE)
+}
+
+fn map_fixed(va: u64, pa: u64, len: u64, props: Props) -> Option<()> {
     let _serial = KSPACE_LOCK.lock();
     let root = PhysAddr::new(KERNEL_ROOT.load(Ordering::Relaxed));
     let mut alloc = || {
@@ -291,10 +304,11 @@ pub(crate) fn map_entry(va: u64, pa: u64, len: u64, props: Props) -> Option<()> 
     // SAFETY: `root` is the live kernel PML4 and `alloc` yields zeroed,
     // owned pages, all reachable through the linear map.
     let mut m = unsafe { Mapper::new(root, false, &mut alloc) };
-    // SAFETY: the range lies in the entry area, otherwise unused, and each
-    // part is mapped once (above). The pages are frame's own (image text,
-    // its per-CPU tables, stacks and blocks), already reachable through
-    // their usual mapping; an alias of them creates no new Rust reference.
+    // SAFETY: the range lies in the entry area or the thunk window, both
+    // otherwise unused, and each part is mapped once (by its callers). The
+    // pages are frame's own (image text, its per-CPU tables, stacks and
+    // blocks, the thunks' code pages), already reachable through their usual
+    // mapping; an alias of them creates no new Rust reference.
     unsafe { m.map(va, pa, len, props) }.ok()
 }
 

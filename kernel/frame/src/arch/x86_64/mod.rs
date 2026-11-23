@@ -9,6 +9,7 @@ pub mod paging;
 pub(crate) mod pci;
 pub(crate) mod qemu;
 pub(crate) mod regs;
+pub(crate) mod rethunk;
 pub(crate) mod smp;
 pub(crate) mod switch;
 pub(crate) mod trap;

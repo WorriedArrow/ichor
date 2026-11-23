@@ -135,6 +135,12 @@ pub(crate) struct CpuBlock {
     /// 184: nonzero for IBPB on every entry from ring 3 (AMD Retbleed and
     /// SRSO, without safe-RET return thunks).
     pub(crate) ibpb_entry: AtomicU64,
+    /// 192: the safe-RET untraining routine, called on every entry from
+    /// ring 3 (AMD SRSO, `arch::rethunk`); 0 when none.
+    pub(crate) untrain: AtomicU64,
+    /// 200: the return thunk the entry code's own return jumps to; 0 for a
+    /// plain `ret`.
+    pub(crate) rethunk: AtomicU64,
 }
 
 impl CpuBlock {
@@ -164,6 +170,8 @@ impl CpuBlock {
             spec_ctrl: AtomicU64::new(0),
             bhb_clear: AtomicU64::new(0),
             ibpb_entry: AtomicU64::new(0),
+            untrain: AtomicU64::new(0),
+            rethunk: AtomicU64::new(0),
         }
     }
 }

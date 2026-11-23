@@ -737,15 +737,16 @@ pipes and fork cheaper).
 
 Frame budget: ADR-0005 sets the milestone 3 ceiling at 8,500 lines / 380
 sites; ADR-0007 raises it to 9,500 / 420 for milestone 4 (TLB shootdown,
-atomic user ops for futexes, PCID). `audit.toml` is at step 13 (7,000 / 300,
-ADR-0004's 2026-11-23 amendment); frame is at 6,997 / 283 (A5 added
+atomic user ops for futexes, PCID). `audit.toml` is at step 14 (7,250 / 310,
+ADR-0004's safe-RET amendment); frame is at 7,202 / 292 (A5 added
 RDSEED/RDRAND and UEFI GetTime; B added XSAVE; C the frames tree and
 request tracking; M6 reading `\ichor\roots.pem`, later
 `\ichor\suffixes.dat` too; ADR-0011 the checked user
 copy; ADR-0004 VERW/IBPB, page-table isolation, eIBRS and IBRS; `IoPorts`;
 xAPIC; Hyper-V; placing BARs the firmware left at 0, ADR-0005's second
 amendment; the ACPI power button and S5, ADR-0017; kvmclock, ADR-0018; the
-wall clock's NTP steering; the rest of ADR-0004 §2). Growth past the step
+wall clock's NTP steering; the rest of ADR-0004 §2; AMD's IBRS bit and the
+safe-RET return thunks, `arch::rethunk`). Growth past the step
 needs an ADR and a new audit step.
 `services/rt` has its own budget (`services/rt/audit.toml`: 500 / 40; at
 417 / 30).
@@ -895,6 +896,8 @@ comment.
 | `force_pti` | page-table isolation on any CPU, Meltdown-affected or not (ADR-0004; tests) |
 | `force_bhb` | the branch-history clearing sequence on every entry from ring 3, on any CPU (ADR-0004; tests) |
 | `force_ibpb_entry` | IBPB on every entry from ring 3 where the CPU has IBPB (ADR-0004; tests) |
+| `force_safe_ret` | the Zen 3/4 safe-RET return thunks on any CPU (ADR-0004's safe-RET amendment; tests) |
+| `srso=ibpb` | on CPUs SRSO or Retbleed affects, IBPB on every entry instead of safe-RET return thunks |
 | `trace_errors` | log every failing Linux syscall (pid, number, first arguments, errno) |
 | `trace_pid=N` | log every Linux syscall of pid N with its result |
 | `bench` | run the Phase E benchmarks (`bench.rs`) after the root disk's self-tests and print them |
@@ -1020,8 +1023,16 @@ them out of host builds and lints them for that target).
 
 ### Unstable features
 
-None. If one becomes necessary, pin a dated nightly and list it here with the
-reason. Known candidates: CET/IBT codegen and retpolines (side-channel ADR).
+The kernel build only (`xtask::build::kernel`), with `RUSTC_BOOTSTRAP=1` on
+the pinned stable compiler (the owner's choice, 2026-11-23, over a dated
+nightly; ADR-0004's safe-RET amendment): `-Zfunction-return=thunk-extern`
+(return thunks for AMD's SRSO), `-Zbuild-std=core,alloc,compiler_builtins`
+with `compiler-builtins-mem` (so the standard library's returns use them
+too; its assembly stack probe frame patches at boot). The kernel build
+also runs without a compiler wrapper (sccache hangs on its command line on
+Windows), and the first build after a clean compiles the standard library.
+Everything else builds on plain stable. Remaining candidate: CET/IBT
+codegen.
 
 ## Environment notes
 

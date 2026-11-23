@@ -74,6 +74,8 @@ const _: () = {
     assert!(offset_of!(CpuBlock, spec_ctrl) == 168);
     assert!(offset_of!(CpuBlock, bhb_clear) == 176);
     assert!(offset_of!(CpuBlock, ibpb_entry) == 184);
+    assert!(offset_of!(CpuBlock, untrain) == 192);
+    assert!(offset_of!(CpuBlock, rethunk) == 200);
     assert!(core::mem::size_of::<CpuBlock>() == PAGE_SIZE as usize);
 };
 
@@ -366,6 +368,8 @@ global_asm!(
     ".endm",
     ".set GS_BHB, 176",
     ".set GS_IBPBE, 184",
+    ".set GS_UNTRAIN, 192",
+    ".set GS_RETHUNK, 200",
     // The rest of what an entry from ring 3 owes (ADR-0004's 2026-11-23
     // amendment), after `ichor_spec_ctrl -1`, on a stack of the kernel's
     // and before any indirect branch: IBPB (AMD's Retbleed and SRSO), then
@@ -383,6 +387,14 @@ global_asm!(
     "je 92f",
     "call ichor_clear_bhb",
     "92:",
+    // AMD's SRSO with safe-RET return thunks: untrain before the kernel's
+    // first return (`rethunk`; an absolute address, as this runs at the
+    // entry area's alias; IBRS is on by now where the CPU needs it). The
+    // Zen 1/2 routine uses rax.
+    "cmp qword ptr gs:[GS_UNTRAIN], 0",
+    "je 97f",
+    "call qword ptr gs:[GS_UNTRAIN]",
+    "97:",
     ".endm",
     // UserContext offsets (`usermode::UserContext`).
     ".set UC_RAX, 0",
@@ -580,6 +592,12 @@ global_asm!(
     "pop r12",
     "pop rbp",
     "pop rbx",
+    // The kernel's first return after ring 3: through the return thunk
+    // where there is one (absolute, as this runs at the alias).
+    "cmp qword ptr gs:[GS_RETHUNK], 0",
+    "je 98f",
+    "jmp qword ptr gs:[GS_RETHUNK]",
+    "98:",
     "ret",
     // fn ichor_syscall_entry()  [via LSTAR: rcx=rip, r11=rflags, GS=block]
     ".global ichor_syscall_entry",

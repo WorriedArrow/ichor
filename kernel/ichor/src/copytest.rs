@@ -190,10 +190,20 @@ fn mm_unlocked(p: LinuxProcess) {
     const RESIDENT: u32 = 1;
     const FAULTED: u32 = 2;
     const SHORT: u32 = u32::MAX;
+    // The pages not yet faulted in lie past what faulting the first ones
+    // maps ahead of them (`umem::FAULT_AROUND`).
+    const GAP: u64 = (crate::umem::FAULT_AROUND + 1) * PAGE_SIZE;
     let va = p
         .mm()
-        .mmap(0, 2 * LEN as u64, PROT_RW, MAP_PRIVATE | MAP_ANON, None)
+        .mmap(
+            0,
+            2 * LEN as u64 + GAP,
+            PROT_RW,
+            MAP_PRIVATE | MAP_ANON,
+            None,
+        )
         .unwrap_or_else(|_| fail("usercopy: mmap"));
+    let targets = [va, va + LEN as u64 + GAP];
     p.mm().populate(va, LEN, true);
     let step = Arc::new((AtomicU32::new(0), WaitQueue::new()));
     let mut copier = p.helper().unwrap_or_else(|| fail("usercopy: helper"));
@@ -202,8 +212,8 @@ fn mm_unlocked(p: LinuxProcess) {
     let spawned = TaskOptions::new(move || {
         let (at, woken) = &*shared;
         let data = alloc::vec![0x5au8; LEN];
-        for (k, next) in [RESIDENT, FAULTED].into_iter().enumerate() {
-            let n = copier.copy_to_user(va + (k * LEN) as u64, &data);
+        for (at_va, next) in targets.into_iter().zip([RESIDENT, FAULTED]) {
+            let n = copier.copy_to_user(at_va, &data);
             at.store(if n == LEN { next } else { SHORT }, Ordering::Release);
             woken.wake_all();
         }
@@ -233,10 +243,12 @@ fn mm_unlocked(p: LinuxProcess) {
     if reached(FAULTED, 10_000) != FAULTED {
         fail("usercopy: a copy waiting for the Mm lock did not finish");
     }
-    let mut back = alloc::vec![0u8; 2 * LEN];
     let mut p = p;
-    if p.copy_from_user(va, &mut back) != back.len() || back.iter().any(|&b| b != 0x5a) {
-        fail("usercopy: the copies did not land");
+    for at_va in targets {
+        let mut back = alloc::vec![0u8; LEN];
+        if p.copy_from_user(at_va, &mut back) != LEN || back.iter().any(|&b| b != 0x5a) {
+            fail("usercopy: the copies did not land");
+        }
     }
     crate::proc::discard(p);
 }

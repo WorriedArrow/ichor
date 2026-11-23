@@ -73,6 +73,27 @@ pub fn kernel(profile: Profile) -> Result<PathBuf> {
         .arg("--target-dir")
         .arg(kernel_target_dir())
         .env("ICHOR_SERVICES_DIR", &services);
+    // Return thunks (ADR-0004's amendment of 2026-11-23): every `ret` the
+    // compiler emits becomes `jmp __x86_return_thunk`, which frame points at
+    // AMD's safe-RET sequence where SRSO applies. `core`, `alloc` and
+    // `compiler_builtins` are rebuilt with it, or their returns would stay
+    // plain (but for `compiler_builtins`' stack probe, which is assembly:
+    // frame patches its return at boot). Both flags are unstable; the
+    // pinned stable compiler takes them
+    // with RUSTC_BOOTSTRAP, for this build only (AGENTS.md, "Unstable
+    // features").
+    cmd.args([
+        "-Zbuild-std=core,alloc,compiler_builtins",
+        "-Zbuild-std-features=compiler-builtins-mem",
+    ])
+    .env("RUSTC_BOOTSTRAP", "1")
+    // No compiler wrapper: sccache on Windows hangs on the kernel crate's
+    // command line, which the rebuilt standard library lengthens.
+    .env("RUSTC_WRAPPER", "")
+    .env(
+        "CARGO_TARGET_X86_64_UNKNOWN_UEFI_RUSTFLAGS",
+        "-Zfunction-return=thunk-extern",
+    );
     if profile == Profile::Release {
         cmd.arg("--release");
     }

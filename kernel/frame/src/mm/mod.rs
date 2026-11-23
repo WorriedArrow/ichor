@@ -59,6 +59,10 @@ pub(crate) const STACKS_BASE: u64 = 0xffff_e000_0000_0000;
 pub(crate) const ENTRY_BASE: u64 = 0xffff_f000_0000_0000;
 /// Where the kernel image is mapped.
 pub(crate) const KERNEL_BASE: u64 = 0xffff_ffff_8000_0000;
+/// A 2 MiB-aligned window 1 GiB above the image, within a jump of all its
+/// code: AMD's safe-RET sequences, at the addresses they need
+/// (`arch::rethunk`).
+pub(crate) const THUNK_BASE: u64 = KERNEL_BASE + (1 << 30);
 
 /// Offset from a physical address to the virtual address it is accessible
 /// at: 0 while running on firmware's identity map, `LINEAR_BASE` afterwards.

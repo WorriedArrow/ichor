@@ -158,6 +158,9 @@ pub struct Vulnerabilities {
     /// `IA32_PRED_CMD` (IBPB) exists: Intel's CPUID.7:EDX[26], or AMD's
     /// CPUID 8000_0008h EBX[12].
     pub pred_cmd: bool,
+    /// The safe-RET sequence that mitigates Retbleed or SRSO here (Zen 1/2
+    /// and Hygon 18h, or Zen 3/4); `None` where it does not apply.
+    pub(crate) safe_ret: Option<super::rethunk::SafeRet>,
 }
 
 /// Detects this CPU's vulnerabilities from CPUID and, where enumerated,
@@ -202,6 +205,11 @@ pub fn vulnerabilities() -> Vulnerabilities {
         } else {
             0
         };
+        let retbleed = (amd && (0x15..=0x17).contains(&family)) || (hygon && family == 0x18);
+        let srso = ((amd && matches!(family, 0x17 | 0x19)) || (hygon && family == 0x18))
+            && !bit(ext21, 29)
+            && !bit(ext21, 30);
+        use super::rethunk::SafeRet;
         return Vulnerabilities {
             intel,
             eibrs: bit(caps, 1),
@@ -209,10 +217,13 @@ pub fn vulnerabilities() -> Vulnerabilities {
             bhi_ctrl,
             md_clear,
             auto_ibrs: (amd || hygon) && bit(ext21, 8),
-            retbleed: (amd && (0x15..=0x17).contains(&family)) || (hygon && family == 0x18),
-            srso: ((amd && matches!(family, 0x17 | 0x19)) || (hygon && family == 0x18))
-                && !bit(ext21, 29)
-                && !bit(ext21, 30),
+            retbleed,
+            srso,
+            safe_ret: match family {
+                0x17 | 0x18 if retbleed || srso => Some(SafeRet::Zen12),
+                0x19 if srso => Some(SafeRet::Alias),
+                _ => None,
+            },
             // Zen 1 and 2's IBPB flushes return predictions without saying.
             ibpb_brtype: bit(ext21, 28) || family == 0x17,
             pred_cmd: ibpb || bit(ext8, 12),

@@ -33,5 +33,7 @@
 # Step 12 (ADR-0018: kvmclock is the clock on KVM): 6,850 / 295.
 # Step 13 (ADR-0004's 2026-11-23 amendment: branch history cleared on
 # entry, IBPB on entry, AutoIBRS, RSB filling, masked indices): 7,000 / 300.
-max_code_lines = 7000
-max_unsafe_sites = 300
+# Step 14 (ADR-0004's safe-RET amendment of 2026-11-23: return thunks, and
+# AMD's IBRS bit before them): 7,250 / 310.
+max_code_lines = 7250
+max_unsafe_sites = 310

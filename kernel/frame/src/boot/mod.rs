@@ -272,6 +272,8 @@ pub(crate) extern "sysv64" fn kernel_space_entry() -> ! {
         pti: cmdline.flag("force_pti"),
         bhb: cmdline.flag("force_bhb"),
         ibpb_entry: cmdline.flag("force_ibpb_entry"),
+        safe_ret: cmdline.flag("force_safe_ret"),
+        ibpb_not_safe_ret: cmdline.get("srso") == Some("ibpb"),
     };
     let m = match arch::usermode::enable_mitigations(&v, forced) {
         Ok(m) => m,
@@ -280,7 +282,7 @@ pub(crate) extern "sysv64" fn kernel_space_entry() -> ! {
     let on = |b: bool| if b { "on" } else { "off (not needed)" };
     let pcid = if m.pcid { "PCID" } else { "no PCID" };
     println!(
-        "ichor: frame: mitigations (ADR-0004): VERW on return to ring 3 {}, IBPB between cells {}, page-table isolation {}, Spectre v2 in the kernel {}, branch history {}, IBPB on entry {}, RSB filled on context switch, Spectre v1 masked indices",
+        "ichor: frame: mitigations (ADR-0004): VERW on return to ring 3 {}, IBPB between cells {}, page-table isolation {}, Spectre v2 in the kernel {}, branch history {}, IBPB on entry {}, return thunks {}, RSB filled on context switch, Spectre v1 masked indices",
         // Forced, VERW runs whatever the CPU; it clears the buffers only
         // with MD_CLEAR microcode.
         match (m.verw, m.verw_missing, force_verw) {
@@ -319,7 +321,25 @@ pub(crate) extern "sysv64" fn kernel_space_entry() -> ! {
             (true, _, _) if v.retbleed || v.srso => "on (Retbleed, SRSO)",
             (true, _, _) => "on (forced)",
             (false, _, _) if forced.ibpb_entry => "off (forced, but no IBPB)",
+            (false, _, _) if m.safe_ret.is_some() => "not needed (safe RET)",
             (false, _, _) => "not needed",
+        },
+        match (m.safe_ret, m.safe_ret_failed) {
+            (_, Some(why)) => alloc::format!("NOT INSTALLED ({why})"),
+            (Some(k), _) => alloc::format!(
+                "safe RET ({}{})",
+                match k {
+                    arch::rethunk::SafeRet::Zen12 => "Zen 1/2",
+                    arch::rethunk::SafeRet::Alias if v.srso => "Zen 3/4",
+                    arch::rethunk::SafeRet::Alias => "Zen 3/4, forced",
+                },
+                if m.srso_incomplete {
+                    "; SRSO between cells NOT MITIGATED: no IBPB_BRTYPE microcode"
+                } else {
+                    ""
+                }
+            ),
+            (None, _) => "not needed".into(),
         },
     );
     enter_kernel(BootInfo {

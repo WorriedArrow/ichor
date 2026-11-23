@@ -1,6 +1,7 @@
-# Ichor builds on a pinned *stable* toolchain. No unstable features are used.
-# If a feature ever requires nightly, pin a dated nightly here and record the
-# feature and the reason in AGENTS.md ("Unstable features").
+# Ichor builds on a pinned *stable* toolchain. The kernel build alone takes
+# two unstable flags through RUSTC_BOOTSTRAP (return thunks, and the
+# standard library rebuilt with them from rust-src); AGENTS.md, "Unstable
+# features", says which and why.
 [toolchain]
 channel = "1.100.0"
 components = ["rustfmt", "clippy", "rust-src"]

@@ -305,6 +305,60 @@ of §2's table has its mitigation on the CPUs it applies to.
   wall clock's steering, ADR-0018's amendment, had taken it to 6,824);
   audit step 13 is 7,000 / 300.
 
+## Amendment (2026-11-23): safe-RET return thunks
+
+IBPB on every entry from ring 3, the SRSO and Retbleed mitigation above,
+cost about 600 ns a system call on EPYC Milan (GCP n2d). AMD's
+alternative, and Linux's default there, is the safe-RET return thunk:
+every kernel return goes through a `call` to a routine that drops its own
+return address and returns, so a return is only ever predicted to land on
+a `ud2` the kernel placed, and each entry from ring 3 runs an untraining
+routine before the kernel's first return.
+
+- **Build.** The kernel is compiled with `-Zfunction-return=thunk-extern`
+  (every compiled `ret` becomes `jmp __x86_return_thunk`), `core`,
+  `alloc` and `compiler_builtins` with it (`-Zbuild-std`). One assembly
+  routine there keeps a plain `ret`: `compiler_builtins`' stack probe
+  (LLVM has no inline probes for this COFF target: it emits a call to a
+  symbol named `inline-asm`). Frame finds the probe through a call of it,
+  checks its instructions, and patches its `ret`, which four bytes of
+  `int3` padding follow, into a jump to the thunk. These flags are
+  unstable: the owner chose `RUSTC_BOOTSTRAP=1` on the
+  pinned stable compiler, for the kernel build only, over a dated nightly
+  (2026-11-23), as Linux builds its Rust. Host crates, tests and services
+  stay on plain stable. The kernel build runs without a compiler wrapper
+  (sccache hangs on its command line on Windows).
+- **Frame** (`arch::rethunk`): `__x86_return_thunk` is a `ret` until the
+  boot CPU patches it, before any other CPU or user code runs, into a jump
+  to the CPU's sequence. Zen 1/2 and Hygon 18h: the routine hidden in a
+  `movabs` immediate, starting a cache line, in `.text`. Zen 3/4: the
+  untraining routine and the safe-RET routine must sit at addresses that
+  differ in exactly bits 2, 8, 14 and 20, the first 2 MiB-aligned, which
+  the linker's placement cannot promise; frame writes both into pages of
+  their own and maps them at `THUNK_BASE` (1 GiB above the image) and
+  `THUNK_BASE + 0x104000`. The entry code calls the untraining routine
+  after IBRS is set and before the first return, and its own return
+  (`ichor_user_resume`, at the entry area's alias) jumps to the thunk
+  through the per-CPU block; `switch_stacks` returns through it too. The
+  plain `ret`s left are the thunk's and the stack probe's until patched,
+  the entry code's fallback for CPUs without thunks, and Intel's
+  branch-history sequence.
+- **Checked:** `install` reads one of frame's compiled functions and
+  installs nothing (IBPB on entry stays, and the boot log says NOT
+  INSTALLED) unless it returns through the thunk, or if the stack probe is
+  not where and what it expects; `llvm-objdump` of the image counts the
+  plain `ret`s (five on 2026-11-23, against about 3,900 jumps to the
+  thunk in a debug build).
+- IBPB on entry is now for Retbleed on families 15h and 16h only, which
+  have no sequence here, or when forced. SRSO between cells still needs
+  IBPB_BRTYPE microcode, logged as before.
+- `force_safe_ret` installs the Zen 3/4 thunks on any CPU, so CI's Intel
+  machines run the code paths; there they mitigate nothing.
+- Not verified as a mitigation: no SRSO exploit was run. The sequences are
+  AMD's, in Linux's layout, written here from that description.
+- Frame grows past audit step 13 (to 7,202 / 292); step 14 (7,250 / 310)
+  covers the thunks and the AMD IBRS change before them.
+
 ## Consequences
 
 - Nodes on modern cloud CPUs (Ice Lake and later, EPYC Milan and later)

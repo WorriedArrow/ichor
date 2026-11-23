@@ -46,7 +46,8 @@ pub(crate) unsafe extern "sysv64" fn switch_stacks(save: *mut u64, next: u64) {
         "pop r12",
         "pop rbx",
         "pop rbp",
-        "ret",
+        // Through the return thunk, as compiled returns go (`rethunk`).
+        "jmp __x86_return_thunk",
     )
 }
 

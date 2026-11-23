@@ -65,6 +65,10 @@ pub(crate) const MMAP_HI: u64 = 0x7fff_0000_0000;
 /// a list of every page of a big region would be an allocation larger than
 /// the largest contiguous block (MAX_ORDER), and the kernel panics on that.
 const PAGE_BATCH: usize = 4096;
+
+/// Pages an anonymous fault that follows the last one maps ahead of itself
+/// (`Mm::fault_around`): 64 KiB at a time with the faulting page.
+pub(crate) const FAULT_AROUND: u64 = 15;
 /// Largest program break, relative to its start.
 const BRK_MAX: u64 = 1 << 30;
 
@@ -208,6 +212,8 @@ pub(crate) struct Mm {
     attached: Vec<(u64, u64, Attached)>,
     brk_start: u64,
     brk: u64,
+    /// The page after the last anonymous fault's (`fault_around`).
+    next_anon: u64,
 }
 
 impl Mm {
@@ -222,6 +228,7 @@ impl Mm {
             attached: Vec::new(),
             brk_start: 0,
             brk: 0,
+            next_anon: 0,
         })
     }
 
@@ -620,7 +627,41 @@ impl Mm {
             return self.break_cow(va, region.prot); // a cached file page
         }
         let prot = self.mapped_prot(va, region.prot);
-        self.space.map(va, &f, prot).is_ok()
+        let ok = self.space.map(va, &f, prot).is_ok();
+        if ok && matches!(region.backing, Backing::Private | Backing::Named(_)) {
+            self.fault_around(va, &region);
+        }
+        ok
+    }
+
+    /// After an anonymous fault at `va`: if it follows the last one's pages
+    /// (a sequential touch), maps up to `FAULT_AROUND` more pages of the
+    /// same region ahead of it now, zeroed and charged, as Linux's
+    /// multi-size THP does for anonymous memory with 64 KiB folios. Each
+    /// stops at a page already there, the region's end, or the account's.
+    fn fault_around(&mut self, va: u64, region: &Region<Backing>) {
+        let sequential = va == self.next_anon;
+        self.next_anon = va + PAGE_SIZE;
+        if !sequential {
+            return;
+        }
+        let prot = user_prot(region.prot);
+        let end = region.end.min(va + (FAULT_AROUND + 1) * PAGE_SIZE);
+        let mut at = va + PAGE_SIZE;
+        while at < end {
+            if self.pages.contains_key(&at) || self.space.translate(at).is_some() {
+                break;
+            }
+            let Some(page) = UFrame::alloc_zeroed().and_then(|f| charged(&self.account, f)) else {
+                break;
+            };
+            if self.space.map(at, &page, prot).is_err() {
+                break;
+            }
+            self.pages.insert(at, page);
+            at += PAGE_SIZE;
+        }
+        self.next_anon = at;
     }
 
     /// Copies `data` to user memory at `va` as user stores would (see

@@ -83,6 +83,10 @@ pub(crate) struct Mitigations {
     pub ibpb_entry: bool,
     pub ibpb_entry_missing: bool,
     pub srso_incomplete: bool,
+    /// Safe-RET return thunks in place of IBPB on entry, or why they could
+    /// not be installed.
+    pub safe_ret: Option<super::rethunk::SafeRet>,
+    pub safe_ret_failed: Option<&'static str>,
 }
 
 /// Mitigations a test may force on any CPU.
@@ -96,6 +100,10 @@ pub(crate) struct Forced {
     pub bhb: bool,
     /// IBPB on every entry from ring 3 (where IBPB exists).
     pub ibpb_entry: bool,
+    /// The Zen 3/4 safe-RET return thunks.
+    pub safe_ret: bool,
+    /// IBPB on entry instead of safe RET where the CPU needs one (`srso=ibpb`).
+    pub ibpb_not_safe_ret: bool,
 }
 
 /// Switches on the mitigations `v` calls for (once, on the boot CPU,
@@ -135,9 +143,19 @@ pub(crate) fn enable_mitigations(
     // Branch history without BHI_DIS_S: cleared in software on entry.
     let bhb_clear = (v.bhi && !bhi_dis_s) || forced.bhb;
     BHB_CLEAR.store(bhb_clear, Relaxed);
-    // AMD's return-prediction issues: with no safe-RET thunks from stable
-    // Rust, IBPB on every entry.
-    let ibpb_needed = v.retbleed || v.srso;
+    // AMD's return-prediction issues: safe-RET return thunks (`rethunk`)
+    // where there is a sequence for the CPU, else IBPB on every entry.
+    let wanted = match (forced.safe_ret, forced.ibpb_not_safe_ret) {
+        (true, _) => Some(super::rethunk::SafeRet::Alias),
+        (false, true) => None,
+        (false, false) => v.safe_ret,
+    };
+    let (safe_ret, safe_ret_failed) = match wanted.map(super::rethunk::install) {
+        Some(Ok(())) => (wanted, None),
+        Some(Err(e)) => (None, Some(e)),
+        None => (None, None),
+    };
+    let ibpb_needed = (v.retbleed || v.srso) && safe_ret.is_none();
     let ibpb_entry = (ibpb_needed || forced.ibpb_entry) && v.pred_cmd;
     IBPB_ENTRY.store(ibpb_entry, Relaxed);
     enable_cpu_mitigations();
@@ -154,6 +172,8 @@ pub(crate) fn enable_mitigations(
         ibpb_entry,
         ibpb_entry_missing: ibpb_needed && !v.pred_cmd,
         srso_incomplete: v.srso && !v.ibpb_brtype,
+        safe_ret,
+        safe_ret_failed,
     })
 }
 
@@ -169,6 +189,12 @@ pub(crate) fn enable_cpu_mitigations() {
     block
         .ibpb_entry
         .store(u64::from(IBPB_ENTRY.load(Relaxed)), Relaxed);
+    block
+        .untrain
+        .store(super::rethunk::UNTRAIN.load(Relaxed), Relaxed);
+    block
+        .rethunk
+        .store(super::rethunk::RETHUNK.load(Relaxed), Relaxed);
     if AUTO_IBRS.load(Relaxed) {
         // SAFETY: EFER exists on every x86_64 CPU, and AIBRSE only where
         // CPUID 8000_0021h:EAX[8] enumerates it (on the boot CPU; all CPUs
