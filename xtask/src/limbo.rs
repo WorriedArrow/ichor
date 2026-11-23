@@ -23,7 +23,66 @@ const DOC: &str = "docs/x509-limbo.md";
 
 /// The least share (in tenths of a percent) of cases that must agree:
 /// `(must accept, must refuse)`.
-const FLOORS: (u64, u64) = (984, 994);
+const FLOORS: (u64, u64) = (1000, 1000);
+
+/// Cases that contradict another case: no one validator can agree with
+/// both. Each names the case we agree with instead, and why. `services/x509`
+/// follows the Web PKI's profile (CABF Baseline Requirements) where it and
+/// RFC 5280 differ, as browsers and rustls do: it verifies public TLS
+/// servers against Mozilla's roots. A conflict is checked on every run: the
+/// case must still disagree with us, and its opposite agree.
+const CONFLICTS: &[(&str, &str, &str)] = &[
+    (
+        "rfc5280::eku::ee-without-eku",
+        "webpki::eku::ee-without-eku",
+        "the Web PKI requires a leaf's extKeyUsage (CABF 7.1.2.7.6)",
+    ),
+    (
+        "rfc5280::ca-as-leaf",
+        "webpki::ca-as-leaf",
+        "the Web PKI forbids a CA certificate as a TLS server's leaf (CABF 7.1.2.7.8)",
+    ),
+    (
+        "pathlen::validation-ignores-pathlen-in-leaf",
+        "webpki::ca-as-leaf",
+        "its leaf is a CA certificate, which the Web PKI forbids as a leaf",
+    ),
+    (
+        "rfc5280::nc::permitted-dns-match-noncritical",
+        "webpki::nc::permitted-dns-match-noncritical",
+        "the Web PKI allows non-critical name constraints (CABF 7.1.2.5.2); limbo marks it rfc5280-incompatible-with-webpki",
+    ),
+    (
+        "rfc5280::aki::cross-signed-root-missing-aki",
+        "cve::cve-2024-0567",
+        "a trust anchor is a name and a key (RFC 5280 6.1.1); its own AKI is not checked, and the CVE case trusts a cross-signed root without one",
+    ),
+    (
+        "webpki::cn::not-in-san",
+        "bettertls::nameconstraints::tc1708",
+        "the commonName is ignored, as in Chrome, Go and rustls: only SANs name the host, and bettertls's leaves carry unrelated CNs",
+    ),
+    (
+        "webpki::cn::case-mismatch",
+        "bettertls::nameconstraints::tc1708",
+        "the commonName is ignored (see webpki::cn::not-in-san)",
+    ),
+    (
+        "webpki::cn::punycode-not-in-san",
+        "bettertls::nameconstraints::tc1708",
+        "the commonName is ignored (see webpki::cn::not-in-san)",
+    ),
+    (
+        "webpki::cn::utf8-vs-punycode-mismatch",
+        "bettertls::nameconstraints::tc1708",
+        "the commonName is ignored (see webpki::cn::not-in-san)",
+    ),
+    (
+        "webpki::san::public-suffix-private-namespace-wildcard-san",
+        "online::s3.amazonaws.com",
+        "Amazon's real S3 certificate is *.s3.amazonaws.com, a suffix in the list's private section; only its ICANN section is used, as in Chrome",
+    ),
+];
 
 #[derive(Default)]
 struct Score {
@@ -36,6 +95,8 @@ struct Score {
     refused: BTreeMap<String, Vec<String>>,
     /// Wrongly accepted: case ids (the dangerous direction).
     accepted: Vec<String>,
+    /// Every scored case's id and whether we agreed with it.
+    agreed: BTreeMap<String, bool>,
 }
 
 /// `YYYY-MM-DDTHH:MM:SS(Z|+00:00)` as Unix seconds.
@@ -64,7 +125,7 @@ fn pems(v: Option<&Value>) -> Vec<Vec<u8>> {
     out
 }
 
-fn score(case: &Value, now: u64, s: &mut Score) {
+fn score(case: &Value, now: u64, suffixes: &str, s: &mut Score) {
     let id = case
         .get("id")
         .and_then(Value::as_str)
@@ -124,6 +185,9 @@ fn score(case: &Value, now: u64, s: &mut Score) {
     {
         roots.push_str(p.as_str().unwrap_or(""));
     }
+    // As on the boot volume: the roots, then the Public Suffix List.
+    roots.push('\n');
+    roots.push_str(suffixes);
     let roots = x509::RootStore::from_pem(&roots);
     let peer = case
         .get("peer_certificate")
@@ -137,6 +201,10 @@ fn score(case: &Value, now: u64, s: &mut Score) {
     } else {
         x509::verify_chain(&refs, &roots, &host, at)
     };
+    s.agreed.insert(id.clone(), expect_ok == got.is_ok());
+    if CONFLICTS.iter().any(|(c, ..)| *c == id) {
+        return;
+    }
     match (expect_ok, got) {
         (true, Ok(())) => {
             s.accept_ok += 1;
@@ -178,9 +246,10 @@ pub fn run() -> Result<()> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+    let suffixes = artifact::public_suffix_block()?;
     let mut s = Score::default();
     for c in cases {
-        score(c, now, &mut s);
+        score(c, now, &suffixes, &mut s);
     }
     let mut doc = String::new();
     let _ = writeln!(doc, "# x509-limbo results\n");
@@ -219,6 +288,25 @@ pub fn run() -> Result<()> {
     }
     let _ = writeln!(
         doc,
+        "| contradicts another case (below) | {} |",
+        CONFLICTS.len()
+    );
+    let _ = writeln!(
+        doc,
+        "\n## Cases that contradict another\n\nNo one validator can agree with both cases of a pair; \
+         `services/x509` follows the Web PKI's profile where it and RFC 5280 differ. Each is checked \
+         on every run: we disagree with the first and agree with the second.\n\n\
+         | Case | We agree instead with | Why |\n|---|---|---|"
+    );
+    let mut stale = Vec::new();
+    for (case, other, why) in CONFLICTS {
+        let _ = writeln!(doc, "| `{case}` | `{other}` | {why} |");
+        if s.agreed.get(*case) != Some(&false) || s.agreed.get(*other) != Some(&true) {
+            stale.push(*case);
+        }
+    }
+    let _ = writeln!(
+        doc,
         "\n## Accepted, should have been refused ({})\n",
         s.accepted.len()
     );
@@ -248,6 +336,11 @@ pub fn run() -> Result<()> {
         s.refuse_total,
         pct(s.refuse_ok, s.refuse_total)
     );
+    if !stale.is_empty() {
+        return Err(format!(
+            "x509-limbo: these listed conflicts no longer hold (we agree with the case, or not with its opposite): {stale:?}"
+        ));
+    }
     if a < FLOORS.0 || r < FLOORS.1 {
         return Err(format!(
             "x509-limbo fell below its floors ({} / {} per mille)",

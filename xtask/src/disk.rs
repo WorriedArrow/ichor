@@ -57,7 +57,7 @@ pub fn image_sized(
     let mut esp = Volume::default();
     esp.add("EFI/BOOT/BOOTX64.EFI", &efi)?;
     esp.add("ICHOR/CMDLINE", cmdline.as_bytes())?;
-    esp.add("ICHOR/ROOTS.PEM", &crate::artifact::MOZILLA_ROOTS.bytes()?)?;
+    esp.add("ICHOR/ROOTS.PEM", &crate::artifact::trust_bundle()?)?;
     if let Some(t) = api_token {
         esp.add("ICHOR/APITOKEN", t)?;
     }

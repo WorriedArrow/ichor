@@ -22,11 +22,30 @@ const PRIME256V1: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07];
 const SECP384R1: &[u8] = &[0x2b, 0x81, 0x04, 0x00, 0x22];
 /// Both the key type and the signature algorithm (RFC 8410).
 const ED25519: &[u8] = &[0x2b, 0x65, 0x70];
+/// id-ml-dsa-44, -65 and -87: both key type and signature algorithm
+/// (RFC 9881).
+const ML_DSA_44: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x11];
+const ML_DSA_65: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x12];
+const ML_DSA_87: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x13];
+
+/// The ML-DSA parameter set an algorithm OID names.
+fn ml_dsa(oid: &[u8]) -> Option<crypto::mldsa::Params> {
+    Some(match oid {
+        ML_DSA_44 => crypto::mldsa::ML_DSA_44,
+        ML_DSA_65 => crypto::mldsa::ML_DSA_65,
+        ML_DSA_87 => crypto::mldsa::ML_DSA_87,
+        _ => return None,
+    })
+}
 const BASIC_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x13];
 const KEY_USAGE: &[u8] = &[0x55, 0x1d, 0x0f];
 const SUBJECT_ALT_NAME: &[u8] = &[0x55, 0x1d, 0x11];
 const EXT_KEY_USAGE: &[u8] = &[0x55, 0x1d, 0x25];
 const NAME_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x1e];
+const AUTHORITY_KEY_ID: &[u8] = &[0x55, 0x1d, 0x23];
+const SUBJECT_KEY_ID: &[u8] = &[0x55, 0x1d, 0x0e];
+const POLICY_CONSTRAINTS: &[u8] = &[0x55, 0x1d, 0x24];
+const AUTHORITY_INFO_ACCESS: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x01, 0x01];
 const SERVER_AUTH: &[u8] = &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x03, 0x01];
 const ANY_EKU: &[u8] = &[0x55, 0x1d, 0x25, 0x00];
 
@@ -71,6 +90,9 @@ fn valid_dns_san(name: &str) -> bool {
 
 /// `keyCertSign` in the KeyUsage bit string (bit 5).
 pub const KEY_CERT_SIGN: u16 = 1 << 5;
+/// The KeyUsage bits of signing alone: digitalSignature, nonRepudiation,
+/// keyCertSign, cRLSign (bits 0, 1, 5, 6).
+const SIGNING_USAGES: u16 = 1 | 1 << 1 | KEY_CERT_SIGN | 1 << 6;
 
 /// How a certificate is signed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -78,6 +100,7 @@ pub enum SigAlg {
     RsaPkcs1(HashAlg),
     Ecdsa(HashAlg),
     Ed25519,
+    MlDsa(crypto::mldsa::Params),
 }
 
 /// A subject public key.
@@ -86,6 +109,7 @@ pub enum PublicKey<'a> {
     Rsa { n: &'a [u8], e: &'a [u8] },
     Ec { curve: Curve, point: &'a [u8] },
     Ed25519(&'a [u8; 32]),
+    MlDsa(crypto::mldsa::Params, &'a [u8]),
 }
 
 impl PublicKey<'_> {
@@ -98,6 +122,9 @@ impl PublicKey<'_> {
                 crypto::ecdsa::verify_der(curve, point, &h.digest(msg), sig)
             }
             (PublicKey::Ed25519(k), SigAlg::Ed25519) => crypto::ed25519::verify(k, msg, sig),
+            (PublicKey::MlDsa(p, k), SigAlg::MlDsa(s)) if p == s => {
+                crypto::mldsa::verify(&p, k, msg, sig)
+            }
             _ => false,
         }
     }
@@ -137,6 +164,19 @@ pub struct Certificate<'a> {
     pub name_constraints: Option<(Subtrees<'a>, Subtrees<'a>)>,
     /// Subject alternative DNS names.
     pub dns_names: Vec<&'a str>,
+    /// Whether the SubjectAltName extension is marked critical.
+    pub san_critical: bool,
+    /// Whether BasicConstraints is marked critical.
+    pub bc_critical: bool,
+    /// Whether ExtendedKeyUsage is marked critical.
+    pub eku_critical: bool,
+    /// AuthorityKeyIdentifier, if present: its keyIdentifier, and whether
+    /// it also names the issuer's issuer or serial number.
+    pub aki: Option<(Option<&'a [u8]>, bool)>,
+    /// SubjectKeyIdentifier, if present.
+    pub ski: Option<&'a [u8]>,
+    /// The subject is an empty name.
+    pub subject_empty: bool,
 }
 
 fn sig_alg(body: &[u8]) -> Result<SigAlg, Error> {
@@ -149,8 +189,11 @@ fn sig_alg(body: &[u8]) -> Result<SigAlg, Error> {
         ECDSA_SHA256 => SigAlg::Ecdsa(HashAlg::Sha256),
         ECDSA_SHA384 => SigAlg::Ecdsa(HashAlg::Sha384),
         ECDSA_SHA512 => SigAlg::Ecdsa(HashAlg::Sha512),
-        // No parameters, not even NULL (RFC 8410 §3).
+        // No parameters, not even NULL (RFC 8410 §3, RFC 9881 §2).
         ED25519 if r.is_empty() => SigAlg::Ed25519,
+        o if r.is_empty() && ml_dsa(o).is_some() => {
+            SigAlg::MlDsa(ml_dsa(o).ok_or(Error::Unsupported)?)
+        }
         _ => return Err(Error::Unsupported),
     })
 }
@@ -228,6 +271,13 @@ fn public_key(spki: &[u8]) -> Result<PublicKey<'_>, Error> {
         ED25519 if a.is_empty() => Ok(PublicKey::Ed25519(
             key.try_into().map_err(|_| Error::Malformed)?,
         )),
+        o if a.is_empty() && ml_dsa(o).is_some() => {
+            let p = ml_dsa(o).ok_or(Error::Unsupported)?;
+            if key.len() != p.public_key_len() {
+                return Err(Error::Malformed);
+            }
+            Ok(PublicKey::MlDsa(p, key))
+        }
         _ => Err(Error::Unsupported),
     }
 }
@@ -315,6 +365,12 @@ pub fn parse(raw: &[u8]) -> Result<Certificate<'_>, Error> {
         other_names: false,
         name_constraints: None,
         dns_names: Vec::new(),
+        san_critical: false,
+        bc_critical: false,
+        eku_critical: false,
+        aki: None,
+        ski: None,
+        subject_empty: subject.body.is_empty(),
     };
     if let Some(exts) = t.optional(0xa3) {
         let mut list = Reader::new(
@@ -342,6 +398,15 @@ pub fn parse(raw: &[u8]) -> Result<Certificate<'_>, Error> {
     Ok(out)
 }
 
+/// A GeneralName, whole (any tag of its CHOICE).
+fn general_name(r: &mut Reader<'_>) -> Result<(), Error> {
+    let gn = r.read().ok_or(Error::Malformed)?;
+    if gn.tag & 0xc0 != 0x80 || gn.tag & 0x1f > 8 {
+        return Err(Error::Malformed);
+    }
+    Ok(())
+}
+
 fn extension<'a>(
     c: &mut Certificate<'a>,
     oid: &[u8],
@@ -349,7 +414,59 @@ fn extension<'a>(
     v: &'a [u8],
 ) -> Result<(), Error> {
     match oid {
+        AUTHORITY_KEY_ID => {
+            // Non-critical (RFC 5280 4.2.1.1).
+            if critical {
+                return Err(Error::Malformed);
+            }
+            let mut outer = Reader::new(v);
+            let mut r = Reader::new(outer.expect(der::SEQUENCE).ok_or(Error::Malformed)?);
+            let key_id = r.optional(0x80);
+            let issuer = r.optional(0xa1).is_some();
+            let serial = r.optional(0x82).is_some();
+            if !r.is_empty() || !outer.is_empty() {
+                return Err(Error::Malformed);
+            }
+            c.aki = Some((key_id, issuer || serial));
+        }
+        SUBJECT_KEY_ID => {
+            if critical {
+                return Err(Error::Malformed);
+            }
+            let mut outer = Reader::new(v);
+            let id = outer.expect(der::OCTET_STRING).ok_or(Error::Malformed)?;
+            if !outer.is_empty() {
+                return Err(Error::Malformed);
+            }
+            c.ski = Some(id);
+        }
+        // Policies are not processed, so a critical PolicyConstraints is an
+        // unknown critical extension; and conforming CAs mark it critical
+        // (RFC 5280 4.2.1.11).
+        POLICY_CONSTRAINTS if critical => return Err(Error::UnknownCritical),
+        POLICY_CONSTRAINTS => return Err(Error::Malformed),
+        AUTHORITY_INFO_ACCESS => {
+            // Non-critical, and one or more AccessDescriptions (RFC 5280
+            // 4.2.2.1).
+            if critical {
+                return Err(Error::Malformed);
+            }
+            let mut outer = Reader::new(v);
+            let mut r = Reader::new(outer.expect(der::SEQUENCE).ok_or(Error::Malformed)?);
+            if r.is_empty() || !outer.is_empty() {
+                return Err(Error::Malformed);
+            }
+            while !r.is_empty() {
+                let mut ad = Reader::new(r.expect(der::SEQUENCE).ok_or(Error::Malformed)?);
+                ad.expect(der::OID).ok_or(Error::Malformed)?;
+                general_name(&mut ad)?;
+                if !ad.is_empty() {
+                    return Err(Error::Malformed);
+                }
+            }
+        }
         BASIC_CONSTRAINTS => {
+            c.bc_critical = critical;
             let mut r = Reader::new(
                 Reader::new(v)
                     .expect(der::SEQUENCE)
@@ -377,9 +494,15 @@ fn extension<'a>(
                     }
                 }
             }
+            // An ML-DSA key only signs: digitalSignature, nonRepudiation,
+            // keyCertSign and cRLSign at most (RFC 9881 §5).
+            if matches!(c.key, PublicKey::MlDsa(..)) && ku & !SIGNING_USAGES != 0 {
+                return Err(Error::Malformed);
+            }
             c.key_usage = Some(ku);
         }
         SUBJECT_ALT_NAME => {
+            c.san_critical = critical;
             let mut r = Reader::new(
                 Reader::new(v)
                     .expect(der::SEQUENCE)
@@ -402,6 +525,7 @@ fn extension<'a>(
             }
         }
         EXT_KEY_USAGE => {
+            c.eku_critical = critical;
             let mut r = Reader::new(
                 Reader::new(v)
                     .expect(der::SEQUENCE)
@@ -416,10 +540,8 @@ fn extension<'a>(
             c.eku = Some((server, any));
         }
         NAME_CONSTRAINTS => {
-            // RFC 5280 4.2.1.10: always critical.
-            if !critical {
-                return Err(Error::Malformed);
-            }
+            // RFC 5280 4.2.1.10 says always critical; the Web PKI allows it
+            // non-critical (CABF BR 7.1.2.5.2), and so do we.
             let mut r = Reader::new(
                 Reader::new(v)
                     .expect(der::SEQUENCE)
@@ -435,9 +557,12 @@ fn extension<'a>(
                     if !st.is_empty() {
                         return Err(Error::Unsupported);
                     }
+                    // A DNS base is a name, or empty (every name); a leading
+                    // period is URI constraints' syntax, not DNS's (RFC 5280
+                    // 4.2.1.10).
                     if base.tag == GN_DNS {
                         let b = core::str::from_utf8(base.body).map_err(|_| Error::Malformed)?;
-                        if !b.is_empty() && !valid_dns_name(b.strip_prefix('.').unwrap_or(b)) {
+                        if !b.is_empty() && !valid_dns_name(b) {
                             return Err(Error::Malformed);
                         }
                     }
@@ -470,23 +595,16 @@ fn extension<'a>(
 }
 
 /// Whether DNS name `name` lies in the subtree `base` (RFC 5280
-/// 4.2.1.10): `base` itself or a subdomain; with a leading dot, only
-/// subdomains; empty, every name.
+/// 4.2.1.10): `base` itself or a subdomain; empty, every name. Both are
+/// ASCII (checked when parsed).
 fn dns_within(name: &str, base: &str) -> bool {
     let name = name.trim_end_matches('.');
     if base.is_empty() {
         return true;
     }
-    let (sub_only, base) = match base.strip_prefix('.') {
-        Some(b) => (true, b),
-        None => (false, base),
-    };
-    let n = name.len();
-    let b = base.len();
-    if !sub_only && name.eq_ignore_ascii_case(base) {
-        return true;
-    }
-    n > b && name.as_bytes()[n - b - 1] == b'.' && name[n - b..].eq_ignore_ascii_case(base)
+    let (n, b) = (name.len(), base.len());
+    name.eq_ignore_ascii_case(base)
+        || n > b && name.as_bytes()[n - b - 1] == b'.' && name[n - b..].eq_ignore_ascii_case(base)
 }
 
 /// Whether some name a SAN pattern covers lies in `base`. For permitted
@@ -495,19 +613,17 @@ fn pattern_within(pat: &str, base: &str, all: bool) -> bool {
     let Some(rest) = pat.strip_prefix("*.") else {
         return dns_within(pat, base);
     };
-    // Every `x.rest` ends in `.B` exactly when `rest` is `B` or below it,
-    // whether `base` is `B` or `.B`.
-    let below = dns_within(rest, base.trim_start_matches('.'));
+    // Every `x.rest` is within `B` exactly when `rest` is.
+    let below = dns_within(rest, base);
     if all {
         below
     } else {
         // Some `x.rest` is also `B` itself when `B` is one label below
-        // `rest` (and the base is not subdomains-only).
+        // `rest`.
         below
-            || !base.starts_with('.')
-                && base.split_once('.').is_some_and(|(label, tail)| {
-                    !label.is_empty() && tail.eq_ignore_ascii_case(rest)
-                })
+            || base
+                .split_once('.')
+                .is_some_and(|(label, tail)| !label.is_empty() && tail.eq_ignore_ascii_case(rest))
     }
 }
 
@@ -582,13 +698,48 @@ impl Certificate<'_> {
         Ok(())
     }
 
-    /// Whether this certificate may be a TLS server's leaf: not a CA, no
-    /// certificate signing, and an extended key usage naming serverAuth.
+    /// Whether this certificate may be a TLS server's leaf (CABF BR
+    /// 7.1.2.7): not a CA, no certificate signing, and a non-critical
+    /// extended key usage naming serverAuth and not anyExtendedKeyUsage.
     pub fn may_serve(&self) -> bool {
         !self.ca
             && self.key_usage.is_none_or(|ku| ku & KEY_CERT_SIGN == 0)
             && self.name_constraints.is_none()
-            && self.eku.is_some_and(|(server, _)| server)
+            && self.eku == Some((true, false))
+            && !self.eku_critical
+    }
+
+    /// Whether a leaf's SubjectAltName is critical exactly when its
+    /// subject is empty (RFC 5280 4.2.1.6, CABF BR 7.1.2.7.12). The
+    /// commonName is not looked at: only DNS SANs name the host, as in
+    /// Chrome, Go and rustls.
+    pub fn names_consistent(&self) -> bool {
+        self.subject_empty == self.san_critical
+    }
+
+    /// Whether the certificate names its issuer's key (RFC 5280 4.2.1.1:
+    /// an AuthorityKeyIdentifier with a keyIdentifier), unless it is
+    /// self-issued.
+    pub fn names_issuer_key(&self) -> bool {
+        self.issuer == self.subject || self.aki.is_some_and(|(key, _)| key.is_some())
+    }
+
+    /// Whether this certificate is formed as a CA's must be (RFC 5280
+    /// 4.1.2.6, 4.2.1.2, 4.2.1.9): a subject, a SubjectKeyIdentifier and a
+    /// critical BasicConstraints.
+    pub fn ca_well_formed(&self) -> bool {
+        !self.subject_empty && self.ski.is_some() && self.bc_critical
+    }
+
+    /// Whether this trust anchor is formed as a root CA must be (CABF BR
+    /// 7.1.2.1): no extended key usage, and an AuthorityKeyIdentifier, if
+    /// any, of only a keyIdentifier, which a self-issued root's own
+    /// SubjectKeyIdentifier must equal.
+    pub fn root_well_formed(&self) -> bool {
+        self.eku.is_none()
+            && self.aki.is_none_or(|(key, more)| {
+                !more && key.is_some() && (self.issuer != self.subject || key == self.ski)
+            })
     }
 
     /// Whether this CA's extended key usage, if it has one, allows issuing
@@ -627,8 +778,6 @@ mod tests {
         assert!(dns_within("example.com", "example.com"));
         assert!(dns_within("a.b.Example.com", "example.com"));
         assert!(!dns_within("badexample.com", "example.com"));
-        assert!(!dns_within("example.com", ".example.com"));
-        assert!(dns_within("a.example.com", ".example.com"));
         assert!(dns_within("anything.test", ""));
     }
 
@@ -636,11 +785,10 @@ mod tests {
     fn wildcards_against_subtrees() {
         // Permitted: every name the wildcard covers must be inside.
         assert!(pattern_within("*.example.com", "example.com", true));
-        assert!(pattern_within("*.example.com", ".example.com", true));
         assert!(!pattern_within("*.example.com", "a.example.com", true));
         // Excluded: any covered name inside is enough.
         assert!(pattern_within("*.example.com", "a.example.com", false));
-        assert!(!pattern_within("*.example.com", ".a.example.com", false));
+        assert!(!pattern_within("*.example.com", "b.a.example.com", false));
         assert!(!pattern_within("*.example.com", "other.com", false));
     }
 

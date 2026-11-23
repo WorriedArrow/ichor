@@ -23,10 +23,13 @@ deliberately does not do.
   runs C2SP's x509-limbo suite (pinned to commit `519f4bcf`) through
   `verify_chain` and writes [`x509-limbo.md`](x509-limbo.md): the pass rate
   for cases that must be accepted and for cases that must be refused, the
-  cases that do not apply and why, and every disagreement. CI fails if
-  either rate falls below the floor in `xtask/src/limbo.rs`. At this
-  writing: **98.4%** of the applicable accept cases and **99.4%** of the
-  refuse cases.
+  cases that do not apply and why, and every disagreement. CI fails below
+  **100%** either way (`FLOORS` in `xtask/src/limbo.rs`); every applicable
+  case agrees (504 accept, 4,799 refuse). Ten cases contradict another
+  case, so that no validator can agree with both: they are listed in
+  `CONFLICTS` with the case we side with and why (the Web PKI's rule over
+  RFC 5280's, and a real certificate over a stricter rule), and each run
+  checks that we still disagree with one and agree with the other.
 - **Fuzzing.** `fuzz/` mutation-fuzzes every parser that takes untrusted
   input: the TLS client fed a server's side of a session (records,
   handshake messages, certificates, key exchange), the TLS server fed a
@@ -52,22 +55,39 @@ when some path from the leaf, through the certificates the server sent
 root, with:
 
 - every certificate on the path valid at `now`, and every signature
-  verified (RSA PKCS#1 v1.5 and ECDSA P-256/P-384 with SHA-2, and
-  Ed25519);
+  verified (RSA PKCS#1 v1.5 and ECDSA P-256/P-384 with SHA-2, Ed25519,
+  and ML-DSA-44/65/87 per RFC 9881, whose keys may only sign);
 - path building that backtracks over every candidate issuer, trust
   anchors first, bounded at 8 certificates and 64 signature checks;
 - each issuer a CA (basicConstraints `cA`, keyCertSign if keyUsage is
   present) within its path length, self-issued intermediates not counted;
-- extended key usage: the leaf must name `serverAuth`; an issuer with an
-  EKU must allow `serverAuth` (or `anyExtendedKeyUsage`);
+- extended key usage: the leaf's must be non-critical and name
+  `serverAuth` and not `anyExtendedKeyUsage`; an issuer with an EKU must
+  allow `serverAuth` (or `anyExtendedKeyUsage`); a trust anchor may have
+  none (CABF 7.1.2.1);
 - name constraints on DNS and IP names, permitted and excluded, applied to
-  the leaf's and the intermediates' SANs, wildcard-aware; a
-  name-constraints extension must be critical and may not be on the leaf;
-  directoryName constraints, and constraints of other types when the
-  certificate has names of those types, are refused rather than ignored;
+  the leaf's and the non-self-issued intermediates' SANs, wildcard-aware;
+  critical or not (the Web PKI allows either), never on the leaf; a DNS
+  constraint is a name (no leading period, no wildcard); directoryName
+  constraints, and constraints of other types when the certificate has
+  names of those types, are refused rather than ignored;
 - the leaf: not a CA, no keyCertSign, a DNS SAN matching `host` (the
-  subject common name is never used); DNS SANs must be valid host names
-  (no underscores, empty labels or misplaced wildcards);
+  subject common name is never used, as in Chrome, Go and rustls); DNS
+  SANs must be valid host names (no underscores, empty labels or
+  misplaced wildcards); no wildcard over a whole public suffix (`*.com`,
+  `*.co.uk`: the Public Suffix List's ICANN section, carried in the
+  boot volume's CA bundle); its SAN critical exactly when its subject is
+  empty;
+- the profile CAs must issue to (RFC 5280, CABF): every certificate but a
+  self-issued one or a trust anchor names its issuer's key (an
+  authorityKeyIdentifier with a keyIdentifier); every CA on the path has a
+  subject, a subjectKeyIdentifier and a critical basicConstraints; a
+  trust anchor's own AKI, if any, is a keyIdentifier alone, equal to its
+  SKI if self-issued; AKI, SKI and AIA must not be critical and AIA must
+  be well formed; policy constraints must be critical (and then, as
+  policies are not processed, are an unknown critical extension). Of
+  Mozilla's roots (2026-11-05), only TWCA Global Root CA, which has no
+  SKI, cannot anchor a path;
 - unknown critical extensions refused; duplicate extensions, non-positive
   or over-long serial numbers (in certificates a server sends) and RSA
   keys under 2048 bits or not a whole number of bytes refused.
@@ -82,11 +102,11 @@ amendment.
 | No revocation (CRLs, OCSP, OCSP stapling) | Registry certificates are short-lived (Let's Encrypt: 90 days, with revocation effectively deprecated for the Web PKI); a pull also verifies every blob against a digest the client chose. Revisit with signature verification (cosign/notation). |
 | No Certificate Transparency checks | Same reasoning; CT enforcement belongs to browsers' policies. |
 | Server validation of DNS names only: no IP-address peer names, no email, no client certificates | The control plane connects to registries by name. x509-limbo's IP and client cases are counted as not applicable. |
-| The RFC 5280 profile is not fully enforced: missing AKI/SKI, non-critical basicConstraints on roots, empty subjects with non-critical SANs, non-critical policy constraints, malformed AIA are accepted | These are issuance-profile rules; none lets a certificate pass that the path checks above would refuse on security grounds. x509-limbo lists each case. |
-| No Public Suffix List: a wildcard like `*.co.uk` in a SAN is honored | Matters for CAs that would mis-issue; trusted roots do not issue such certificates. |
-| Web PKI policy where x509-limbo's RFC and Web PKI cases conflict | A leaf must have `serverAuth` EKU and must not be a CA; RFC 5280 allows both. We follow the Web PKI (rustls-webpki, Chromium). |
+| Web PKI policy where x509-limbo's RFC and Web PKI cases conflict | A leaf must have `serverAuth` EKU and must not be a CA, and name constraints may be non-critical; RFC 5280 says otherwise. We follow the Web PKI (rustls-webpki, Chromium). `CONFLICTS` in `xtask/src/limbo.rs` lists every such case. |
+| The commonName is not checked against the SANs (CABF 7.1.4.3) | It names nothing we match against; bettertls's suite expects unrelated CNs accepted, x509-limbo's `webpki::cn` cases expect them refused. |
+| The Public Suffix List's private section is not used: `*.s3.amazonaws.com` is honored | Amazon's own S3 certificate is that wildcard, and registries serve layers from S3; Chrome does the same. |
 | No certificate policies processing | Not used by the Web PKI for path validation. |
-| ML-DSA (RFC 9881) and RSA-PSS certificate signatures are not accepted | Not used by any registry we pull from; TLS 1.3 handshake signatures do use RSA-PSS (supported there). |
+| RSA-PSS certificate signatures are not accepted | Not used by any registry we pull from; TLS 1.3 handshake signatures do use RSA-PSS (supported there). |
 | The TLS server takes only Ed25519 certificates, TLS 1.3, ChaCha20-Poly1305 and X25519, and no HelloRetryRequest | One constant-time path through a long-lived key (ADR-0012's 2026-11-21 amendment). |
 | TLS: AES-128-GCM, not AES-256-GCM; SHA-256 suites only; X25519 and P-256 only | ChaCha20-Poly1305 is offered first; AES-128-GCM (bitsliced, constant-time) is for registries without it (Amazon ECR, Microsoft's, Quay). No registry tried needs the others. |
 | TLS: no session resumption, 0-RTT, renegotiation, client certificates or record-size limits negotiation | Simplicity; none is needed for pulls. |

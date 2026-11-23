@@ -4,14 +4,15 @@
 //!
 //! Verification walks from the leaf: each certificate must be within its
 //! validity, and each issuer a CA (BasicConstraints, KeyUsage keyCertSign
-//! if present, path length) whose key verifies the signature. A root
-//! whose subject matches is tried first at every step, so cross-signed
-//! intermediates end at whichever root is trusted. The leaf must name the
-//! host in a DNS SAN and allow server authentication.
+//! if present, path length, name constraints) whose key verifies the
+//! signature. A root whose subject matches is tried first at every step,
+//! so cross-signed intermediates end at whichever root is trusted. The
+//! leaf must name the host in a DNS SAN and allow server authentication,
+//! and every certificate must follow the profile CAs issue to (RFC 5280
+//! and the Web PKI's; `docs/tls-and-x509.md` lists the rules).
 //!
-//! Partial: RSA-PSS certificate signatures, name constraints and
-//! revocation are not handled (a certificate with an unknown critical
-//! extension is refused).
+//! Not handled: RSA-PSS certificate signatures and revocation (a
+//! certificate with an unknown critical extension is refused).
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -22,8 +23,10 @@ use alloc::vec::Vec;
 
 pub mod cert;
 pub mod der;
+pub mod suffix;
 
 pub use cert::{Certificate, PublicKey, SigAlg, ed25519_seed, parse};
+pub use suffix::PublicSuffixes;
 
 /// Why a certificate or chain was refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,26 +50,47 @@ pub enum Error {
     NameConstraint,
     /// Path building gave up (too many candidate issuers).
     TooComplex,
+    /// A certificate breaks a rule of RFC 5280's or the Web PKI's profile
+    /// (CABF Baseline Requirements) that conforming CAs follow.
+    Nonconforming,
 }
 
 /// Most certificates in a path, leaf and root included.
 const MAX_DEPTH: usize = 8;
 
-/// Trusted roots, as DER.
+/// Trusted roots, as DER, and the public suffixes no wildcard may cover.
 #[derive(Clone, Debug, Default)]
 pub struct RootStore {
     roots: Vec<Vec<u8>>,
+    suffixes: PublicSuffixes,
 }
+
+/// The label of the bundle's block of Public Suffix List rules (text, not
+/// base64).
+pub const SUFFIX_BLOCK: &str = "PUBLIC SUFFIX LIST";
 
 impl RootStore {
     /// Every certificate in a PEM bundle that parses (others are skipped:
-    /// a bundle carries algorithms we may not handle).
+    /// a bundle carries algorithms we may not handle), and the rules of
+    /// its `PUBLIC SUFFIX LIST` block, if it has one.
     pub fn from_pem(pem: &str) -> RootStore {
         let roots = pem_certificates(pem)
             .into_iter()
             .filter(|der| parse(der).is_ok())
             .collect();
-        RootStore { roots }
+        let begin = alloc::format!("-----BEGIN {SUFFIX_BLOCK}-----");
+        let end = alloc::format!("-----END {SUFFIX_BLOCK}-----");
+        let suffixes = pem
+            .split_once(begin.as_str())
+            .and_then(|(_, rest)| rest.split_once(end.as_str()))
+            .map(|(rules, _)| PublicSuffixes::parse(rules))
+            .unwrap_or_default();
+        RootStore { roots, suffixes }
+    }
+
+    /// How many public suffix rules the store has.
+    pub fn public_suffixes(&self) -> usize {
+        self.suffixes.len()
     }
 
     pub fn len(&self) -> usize {
@@ -183,18 +207,33 @@ impl Search<'_, '_> {
     /// within its path length (self-issued certificates below do not count,
     /// RFC 5280 6.1.4), its name constraints allowing the leaf's and those
     /// intermediates' names.
-    fn may_extend(&self, issuer: &Certificate<'_>, path: &[usize]) -> Result<(), Error> {
+    /// A trust anchor (`root`) must also be formed as CABF 7.1.2.1 has a
+    /// root CA.
+    fn may_extend(
+        &self,
+        issuer: &Certificate<'_>,
+        path: &[usize],
+        root: bool,
+    ) -> Result<(), Error> {
         valid_at(issuer, self.now)?;
-        let counted = path
-            .iter()
-            .filter(|&&i| self.pool[i].issuer != self.pool[i].subject)
-            .count();
+        let self_issued = |i: usize| self.pool[i].issuer == self.pool[i].subject;
+        let counted = path.iter().filter(|&&i| !self_issued(i)).count();
         may_issue(issuer, counted)?;
+        // A trust anchor's own issuer is not on the path, so it need not
+        // name that issuer's key.
+        if !issuer.ca_well_formed()
+            || (!root && !issuer.names_issuer_key())
+            || (root && !issuer.root_well_formed())
+        {
+            return Err(Error::Nonconforming);
+        }
         if !issuer.may_issue_server() {
             return Err(Error::NotServerAuth);
         }
+        // Name constraints apply to the leaf, and to intermediates that
+        // are not self-issued (RFC 5280 4.2.1.10).
         issuer.permits(self.leaf)?;
-        for &i in path {
+        for &i in path.iter().filter(|&&i| !self_issued(i)) {
             issuer.permits(&self.pool[i])?;
         }
         Ok(())
@@ -228,7 +267,7 @@ impl Search<'_, '_> {
                 }
                 continue;
             }
-            match self.may_extend(r, path) {
+            match self.may_extend(r, path, true) {
                 Ok(()) => return Ok(()),
                 Err(e) => best = e,
             }
@@ -249,7 +288,7 @@ impl Search<'_, '_> {
                 best = Error::Malformed;
                 continue;
             }
-            if let Err(e) = self.may_extend(issuer, path) {
+            if let Err(e) = self.may_extend(issuer, path, false) {
                 best = e;
                 continue;
             }
@@ -286,6 +325,17 @@ pub fn verify_chain(chain: &[&[u8]], roots: &RootStore, host: &str, now: u64) ->
     }
     if !leaf.serial_ok {
         return Err(Error::Malformed);
+    }
+    // Its names consistent, its issuer's key named, and no wildcard over
+    // a whole public suffix.
+    if !leaf.names_consistent()
+        || !leaf.names_issuer_key()
+        || leaf.dns_names.iter().any(|n| {
+            n.strip_prefix("*.")
+                .is_some_and(|rest| roots.suffixes.is_public_suffix(rest))
+        })
+    {
+        return Err(Error::Nonconforming);
     }
     valid_at(leaf, now)?;
     let roots: Vec<Certificate<'_>> = roots.roots.iter().filter_map(|d| parse(d).ok()).collect();

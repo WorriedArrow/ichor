@@ -91,7 +91,15 @@ boot [done: VERW, IBPB, and page-table isolation (ADR-0004's second
   floors; `docs/tls-and-x509.md` says what is enforced and the deliberate
   gaps. Verification now builds paths with backtracking and enforces name
   constraints, leaf serverAuth EKU and not-a-CA, DNS SAN syntax, serial
-  and RSA key rules (98.4% accept / 99.4% refuse agreement).
+  and RSA key rules. Since 2026-11-23 it agrees with every applicable
+  case (504 accept, 4,799 refuse; floors 100%): the RFC 5280 / CABF
+  issuance profile (AKI, SKI, critical BC, root AKI, AIA, SAN
+  criticality), ML-DSA (FIPS 204, `crypto::mldsa`, with SHAKE in
+  `crypto::sha3`), and the Public Suffix List's ICANN rules against
+  wildcards (`x509::suffix`; pinned `artifact::PUBLIC_SUFFIX_LIST`, carried
+  in `\ichor\roots.pem` as a `PUBLIC SUFFIX LIST` block by
+  `artifact::trust_bundle`). Ten cases contradict another case and are
+  listed, with reasons, in `limbo.rs`'s `CONFLICTS` (checked each run).
 - M7 io_uring (ADR-0013 and its 2026-11-22 amendment): `kernel/uring`
   (host-tested) has the ABI, this kernel's ring layout and the ordering
   rules (`Order`: links, hard links, link timeouts, drains; what is

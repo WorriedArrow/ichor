@@ -128,6 +128,64 @@ pub const MOZILLA_ROOTS: Artifact = Artifact {
     token_url: None,
 };
 
+/// The Public Suffix List (publicsuffix.org), pinned to a commit: carried
+/// in the CA bundle (`trust_bundle`) so that no wildcard certificate for a
+/// whole public suffix verifies. MPL-2.0 data, never committed.
+pub const PUBLIC_SUFFIX_LIST: Artifact = Artifact {
+    dir: "roots",
+    file: "public_suffix_list-7a21dc34.dat",
+    url: "https://raw.githubusercontent.com/publicsuffix/list/7a21dc3491d43db036124fdd6a3a77d1cc44ad8a/public_suffix_list.dat",
+    sha256: "a73b72cf4c58dea1a5b59f8a193b95ac65f74a1a1c7e1f296d734bc5497fbb9c",
+    env: "ICHOR_PUBLIC_SUFFIX_LIST",
+    token_url: None,
+};
+
+/// Most the boot volume's `\ichor\roots.pem` may hold (frame's
+/// `ROOTS_MAX`).
+const ROOTS_MAX: usize = 512 * 1024;
+
+/// The Public Suffix List's ICANN rules (comments and blank lines left
+/// out) as the CA bundle's `PUBLIC SUFFIX LIST` block. Its private section
+/// (names companies let others register under, `s3.amazonaws.com` among
+/// them) is left out, as Chrome leaves it out for wildcards: Amazon's own
+/// S3 certificate is `*.s3.amazonaws.com`, and registries serve layers
+/// from S3.
+pub fn public_suffix_block() -> Result<String> {
+    let list = PUBLIC_SUFFIX_LIST.bytes()?;
+    let list = String::from_utf8(list).map_err(|_| "the public suffix list is not UTF-8")?;
+    let (Some(start), Some(end)) = (
+        list.find("===BEGIN ICANN DOMAINS==="),
+        list.find("===END ICANN DOMAINS==="),
+    ) else {
+        return Err("the public suffix list has no ICANN section".into());
+    };
+    let label = x509::SUFFIX_BLOCK;
+    let mut out = format!("-----BEGIN {label}-----\n");
+    for line in list[start..end].lines().map(str::trim) {
+        if !line.is_empty() && !line.starts_with("//") {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out.push_str(&format!("-----END {label}-----\n"));
+    Ok(out)
+}
+
+/// The control plane's trust bundle, `\ichor\roots.pem`: Mozilla's roots
+/// and the Public Suffix List.
+pub fn trust_bundle() -> Result<Vec<u8>> {
+    let mut b = MOZILLA_ROOTS.bytes()?;
+    b.push(b'\n');
+    b.extend_from_slice(public_suffix_block()?.as_bytes());
+    if b.len() > ROOTS_MAX {
+        return Err(format!(
+            "the trust bundle is {} bytes, more than the boot volume's {ROOTS_MAX} (frame's ROOTS_MAX)",
+            b.len()
+        ));
+    }
+    Ok(b)
+}
+
 /// The x509-limbo certificate path-validation suite (C2SP), pinned to a
 /// commit: `cargo xtask x509-limbo` scores `services/x509` against it.
 pub const X509_LIMBO: Artifact = Artifact {

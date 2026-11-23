@@ -374,7 +374,7 @@ fn cmd_test(o: &Opts) -> Result<()> {
     // the integration tests.
     let kernel = build::kernel(o.profile)?;
     xtask::artifact::BUSYBOX.bytes()?;
-    xtask::artifact::MOZILLA_ROOTS.bytes()?;
+    xtask::artifact::trust_bundle()?;
     xtask::artifact::ALPINE_MINIROOTFS.bytes()?;
     for a in xtask::artifact::ALPINE_PACKAGES {
         a.bytes()?;

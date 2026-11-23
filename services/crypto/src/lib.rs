@@ -9,7 +9,9 @@
 //! - [`x25519`]: X25519 key agreement (RFC 7748);
 //! - [`p256`]: key agreement on P-256 (SEC 1);
 //! - [`ed25519`]: Ed25519 signatures (RFC 8032);
-//! - [`ecdsa`], [`rsa`]: verification only (public values).
+//! - [`ecdsa`], [`rsa`], [`mldsa`] (FIPS 204): verification only
+//!   (public values);
+//! - [`sha3`]: SHAKE128, SHAKE256 and SHA3-256 (FIPS 202).
 //!
 //! Secrets (keys, the key agreements' scalars) only flow through code whose timing
 //! does not depend on them: no secret-indexed tables, no secret branches.
@@ -28,9 +30,11 @@ pub mod ed25519;
 mod field;
 pub mod gcm;
 pub mod hmac;
+pub mod mldsa;
 pub mod p256;
 pub mod rsa;
 pub mod sha2;
+pub mod sha3;
 pub mod x25519;
 
 /// A hash for signatures and their encodings.
