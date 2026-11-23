@@ -328,14 +328,19 @@ fn m1_boots_on_one_cpu() {
 
 #[test]
 fn m2_scheduler_on_eight_cpus() {
-    // Page-table isolation, forced (ADR-0004): everything below runs with
-    // ring 3 on shadow roots, entries switching CR3, and TLB shootdowns
-    // across 8 CPUs (with PCID where the CPU has it, as under KVM).
-    let out = boot("m2-smp8", "force_pti", 8);
+    // Page-table isolation, the branch-history clearing sequence and IBPB
+    // on every entry, forced (ADR-0004): everything below runs with ring 3
+    // on shadow roots, entries switching CR3 and running the entry
+    // barriers (IBPB where the CPU has it, as under KVM), and TLB
+    // shootdowns across 8 CPUs (with PCID where the CPU has it).
+    let out = boot("m2-smp8", "force_pti force_bhb force_ibpb_entry", 8);
     out.assert_exit(Exit::Success);
     out.assert_in_order(&[
         "ichor: frame: mitigations (ADR-0004): VERW on return to ring 3 ",
         "page-table isolation on (", // "forced, " unless the host is affected
+        "branch history cleared on entry",
+        "IBPB on entry ",
+        "RSB filled on context switch, Spectre v1 masked indices",
         "ichor: pti: user roots map only the entry area and user pages",
         "ichor: boot complete",
     ]);

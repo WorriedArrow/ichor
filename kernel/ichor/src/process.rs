@@ -316,6 +316,14 @@ pub(crate) const RLIM_NLIMITS: usize = 16;
 /// `splice` and `copy_file_range`) are enforced; the others are stored and reported (nothing yet consumes them).
 pub(crate) type Limits = [(u64, u64); RLIM_NLIMITS];
 
+/// Descriptor `fd`'s place in a table of `len` slots, clamped so that the
+/// CPU does not run past the bound with a larger one (Spectre v1, ADR-0004
+/// §2).
+fn fd_index(fd: u64, len: usize) -> Option<usize> {
+    let i = usize::try_from(fd).ok().filter(|&i| i < len)?;
+    Some(frame::nospec::index(i, len))
+}
+
 fn default_limits() -> Limits {
     let mut l = [(RLIM_INFINITY, RLIM_INFINITY); RLIM_NLIMITS];
     l[RLIMIT_STACK] = (8 << 20, RLIM_INFINITY);
@@ -389,7 +397,7 @@ impl Group {
     /// The descriptor `fd`'s description, if open.
     pub(crate) fn desc(&self, fd: u64) -> Option<Arc<Description>> {
         let files = self.files.lock();
-        let slot = files.fds.get(usize::try_from(fd).ok()?)?.as_ref()?;
+        let slot = files.fds[fd_index(fd, files.fds.len())?].as_ref()?;
         Some(slot.desc.clone())
     }
 
@@ -910,7 +918,8 @@ impl LinuxProcess {
     /// direct descriptor).
     pub(crate) fn take_desc(&mut self, fd: u64) -> Option<Arc<Description>> {
         let mut files = self.group.files.lock();
-        let slot = files.fds.get_mut(usize::try_from(fd).ok()?)?.take()?;
+        let i = fd_index(fd, files.fds.len())?;
+        let slot = files.fds[i].take()?;
         Some(slot.desc)
     }
 
@@ -928,13 +937,14 @@ impl LinuxProcess {
     /// Whether `fd` closes on exec (`F_GETFD`).
     pub(crate) fn cloexec(&self, fd: u64) -> Option<bool> {
         let files = self.group.files.lock();
-        Some(files.fds.get(usize::try_from(fd).ok()?)?.as_ref()?.cloexec)
+        Some(files.fds[fd_index(fd, files.fds.len())?].as_ref()?.cloexec)
     }
 
     /// Sets `FD_CLOEXEC` (`F_SETFD`); false if `fd` is not open.
     pub(crate) fn set_cloexec(&self, fd: u64, on: bool) -> bool {
         let mut files = self.group.files.lock();
-        match usize::try_from(fd).ok().and_then(|i| files.fds.get_mut(i)) {
+        let len = files.fds.len();
+        match fd_index(fd, len).map(|i| &mut files.fds[i]) {
             Some(Some(slot)) => {
                 slot.cloexec = on;
                 true

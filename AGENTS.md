@@ -712,18 +712,26 @@ switch, page-table isolation for Meltdown-affected CPUs, IBRS on every
 entry from ring 3 for CPUs without enhanced IBRS (`ichor_spec_ctrl` in
 `entry.rs`), and enhanced IBRS
 with BHI_DIS_S where enumerated (first run on AWS's m7i-flex, Sapphire
-Rapids, 2026-11-22). Owed: BHB clearing, RSB filling, masked indices,
-AMD's measures. Boot logs which apply.
+Rapids, 2026-11-22). Since 2026-11-23 (ADR-0004's last amendment) also:
+the branch history cleared on every entry from ring 3 where BHI applies
+without BHI_DIS_S (`ichor_clear_bhb`), IBPB on every entry for AMD's
+Retbleed and SRSO (`ichor_entry_barriers`), AutoIBRS on AMD, the RSB
+filled on every context switch (`switch_stacks`), and Spectre v1 masked
+indices (`frame::nospec::index`; syscall numbers, descriptors, signals,
+capability slots, io_uring's registered tables). Nothing in §2 is owed
+now. Not verified on affected hardware (the forced flags test the code
+paths). Boot logs which apply.
 
 Frame budget: ADR-0005 sets the milestone 3 ceiling at 8,500 lines / 380
 sites; ADR-0007 raises it to 9,500 / 420 for milestone 4 (TLB shootdown,
-atomic user ops for futexes, PCID). `audit.toml` is at step 12 (6,850 / 295,
-ADR-0018); frame is at 6,781 / 280 (A5 added
+atomic user ops for futexes, PCID). `audit.toml` is at step 13 (7,000 / 300,
+ADR-0004's 2026-11-23 amendment); frame is at 6,978 / 283 (A5 added
 RDSEED/RDRAND and UEFI GetTime; B added XSAVE; C the frames tree and
 request tracking; M6 reading `\ichor\roots.pem`; ADR-0011 the checked user
 copy; ADR-0004 VERW/IBPB, page-table isolation, eIBRS and IBRS; `IoPorts`;
 xAPIC; Hyper-V; placing BARs the firmware left at 0, ADR-0005's second
-amendment; the ACPI power button and S5, ADR-0017; kvmclock, ADR-0018). Growth past the step
+amendment; the ACPI power button and S5, ADR-0017; kvmclock, ADR-0018; the
+wall clock's NTP steering; the rest of ADR-0004 §2). Growth past the step
 needs an ADR and a new audit step.
 `services/rt` has its own budget (`services/rt/audit.toml`: 500 / 40; at
 417 / 30).
@@ -870,6 +878,8 @@ comment.
 | `test_stack_overflow` | recurse until the kernel stack hits its guard page |
 | `force_verw` | VERW before every return to ring 3 on any CPU (ADR-0004; tests) |
 | `force_pti` | page-table isolation on any CPU, Meltdown-affected or not (ADR-0004; tests) |
+| `force_bhb` | the branch-history clearing sequence on every entry from ring 3, on any CPU (ADR-0004; tests) |
+| `force_ibpb_entry` | IBPB on every entry from ring 3 where the CPU has IBPB (ADR-0004; tests) |
 | `trace_errors` | log every failing Linux syscall (pid, number, first arguments, errno) |
 | `trace_pid=N` | log every Linux syscall of pid N with its result |
 | `bench` | run the Phase E benchmarks (`bench.rs`) after the root disk's self-tests and print them |

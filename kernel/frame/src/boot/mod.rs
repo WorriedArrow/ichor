@@ -238,7 +238,7 @@ pub(crate) extern "sysv64" fn kernel_space_entry() -> ! {
     println!("ichor: frame: pci: {} functions", crate::bus::pci::init());
     let acpi_power = match power::init_acpi() {
         Some(true) => "power button and S5 from the FADT and DSDT",
-        Some(false) => "power button, but no S5 in the DSDT (cannot turn off)",
+        Some(false) => "power button, but no S5 in the DSDT or an SSDT (cannot turn off)",
         None => "no fixed-hardware power button",
     };
     println!("ichor: frame: acpi: {acpi_power}");
@@ -256,15 +256,21 @@ pub(crate) extern "sysv64" fn kernel_space_entry() -> ! {
         v.md_clear,
     );
     let cmdline = cmdline::Cmdline::new(state.cmdline());
-    let (force_verw, force_pti) = (cmdline.flag("force_verw"), cmdline.flag("force_pti"));
-    let m = match arch::usermode::enable_mitigations(&v, force_verw, force_pti) {
+    let force_verw = cmdline.flag("force_verw");
+    let forced = arch::usermode::Forced {
+        verw: force_verw,
+        pti: cmdline.flag("force_pti"),
+        bhb: cmdline.flag("force_bhb"),
+        ibpb_entry: cmdline.flag("force_ibpb_entry"),
+    };
+    let m = match arch::usermode::enable_mitigations(&v, forced) {
         Ok(m) => m,
         Err(e) => fatal(e),
     };
     let on = |b: bool| if b { "on" } else { "off (not needed)" };
     let pcid = if m.pcid { "PCID" } else { "no PCID" };
     println!(
-        "ichor: frame: mitigations (ADR-0004): VERW on return to ring 3 {}, IBPB between cells {}, page-table isolation {}, Spectre v2 in the kernel {}",
+        "ichor: frame: mitigations (ADR-0004): VERW on return to ring 3 {}, IBPB between cells {}, page-table isolation {}, Spectre v2 in the kernel {}, branch history {}, IBPB on entry {}, RSB filled on context switch, Spectre v1 masked indices",
         // Forced, VERW runs whatever the CPU; it clears the buffers only
         // with MD_CLEAR microcode.
         match (m.verw, m.verw_missing, force_verw) {
@@ -285,12 +291,25 @@ pub(crate) extern "sysv64" fn kernel_space_entry() -> ! {
         } else {
             alloc::format!("on (forced, {pcid})")
         },
-        match (m.eibrs, m.bhi_dis_s) {
-            (true, true) => "eIBRS + BHI_DIS_S",
-            (true, false) if v.bhi => "eIBRS (BHI NOT MITIGATED: no BHI_DIS_S)",
-            (true, false) => "eIBRS",
-            (false, _) if m.ibpb => "IBRS on entry",
-            (false, _) => "NOT MITIGATED (no IBRS)",
+        match (m.eibrs, m.auto_ibrs) {
+            (true, _) => "eIBRS",
+            (false, true) => "AutoIBRS",
+            (false, false) if v.ibpb => "IBRS on entry",
+            (false, false) => "NOT MITIGATED (no IBRS)",
+        },
+        match (m.bhi_dis_s, m.bhb_clear) {
+            (true, _) => "BHI_DIS_S",
+            (false, true) if v.bhi => "cleared on entry",
+            (false, true) => "cleared on entry (forced)",
+            (false, false) => "not affected",
+        },
+        match (m.ibpb_entry, m.ibpb_entry_missing, m.srso_incomplete) {
+            (_, true, _) => "NOT MITIGATED (no IBPB)",
+            (true, _, true) => "on (SRSO NOT MITIGATED: no IBPB_BRTYPE microcode)",
+            (true, _, _) if v.retbleed || v.srso => "on (Retbleed, SRSO)",
+            (true, _, _) => "on (forced)",
+            (false, _, _) if forced.ibpb_entry => "off (forced, but no IBPB)",
+            (false, _, _) => "not needed",
         },
     );
     enter_kernel(BootInfo {

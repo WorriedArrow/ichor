@@ -144,6 +144,19 @@ pub struct Vulnerabilities {
     pub bhi_ctrl: bool,
     /// VERW clears CPU buffers (MD_CLEAR microcode).
     pub md_clear: bool,
+    /// AMD's automatic IBRS (CPUID 8000_0021h EAX[8]).
+    pub auto_ibrs: bool,
+    /// AMD's Retbleed (families 15h to 17h, Hygon 18h).
+    pub retbleed: bool,
+    /// AMD's speculative return stack overflow (families 17h and 19h,
+    /// without SRSO_NO or SRSO_USER_KERNEL_NO).
+    pub srso: bool,
+    /// IBPB also flushes return predictions (IBPB_BRTYPE microcode, which
+    /// SRSO's mitigation needs on family 19h).
+    pub ibpb_brtype: bool,
+    /// `IA32_PRED_CMD` (IBPB) exists: Intel's CPUID.7:EDX[26], or AMD's
+    /// CPUID 8000_0008h EBX[12].
+    pub pred_cmd: bool,
 }
 
 /// Detects this CPU's vulnerabilities from CPUID and, where enumerated,
@@ -166,13 +179,37 @@ pub fn vulnerabilities() -> Vulnerabilities {
     let bhi_ctrl = max_leaf >= 7 && cpuid(7, 0)[0] >= 2 && cpuid(7, 2)[3] & (1 << 4) != 0;
     if !intel {
         // AMD and others are not affected by Meltdown, MDS or TAA; their
-        // own issues (Retbleed, SRSO) are handled per ADR-0004 §2.
+        // own issues are Retbleed and SRSO (ADR-0004 §2).
+        let amd = [b, d, c] == [0x6874_7541, 0x6974_6e65, 0x444d_4163]; // "AuthenticAMD"
+        let hygon = [b, d, c] == [0x6f67_7948, 0x6e65_476e, 0x656e_6975]; // "HygonGenuine"
+        let eax1 = cpuid(1, 0)[0];
+        let base = (eax1 >> 8) & 0xf;
+        let family = if base == 0xf {
+            base + ((eax1 >> 20) & 0xff)
+        } else {
+            base
+        };
+        let ext21 = if cpuid(0x8000_0000, 0)[0] >= 0x8000_0021 {
+            u64::from(cpuid(0x8000_0021, 0)[0])
+        } else {
+            0
+        };
         return Vulnerabilities {
             intel,
             eibrs: bit(caps, 1),
             ibpb,
             bhi_ctrl,
             md_clear,
+            auto_ibrs: (amd || hygon) && bit(ext21, 8),
+            retbleed: (amd && (0x15..=0x17).contains(&family)) || (hygon && family == 0x18),
+            srso: ((amd && matches!(family, 0x17 | 0x19)) || (hygon && family == 0x18))
+                && !bit(ext21, 29)
+                && !bit(ext21, 30),
+            // Zen 1 and 2's IBPB flushes return predictions without saying.
+            ibpb_brtype: bit(ext21, 28) || family == 0x17,
+            pred_cmd: ibpb
+                || cpuid(0x8000_0000, 0)[0] >= 0x8000_0008
+                    && u64::from(cpuid(0x8000_0008, 0)[1]) & (1 << 12) != 0,
             ..Vulnerabilities::default()
         };
     }
@@ -187,5 +224,7 @@ pub fn vulnerabilities() -> Vulnerabilities {
         ibpb,
         bhi_ctrl,
         md_clear,
+        pred_cmd: ibpb,
+        ..Vulnerabilities::default()
     }
 }

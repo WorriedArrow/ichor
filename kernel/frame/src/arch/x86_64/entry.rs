@@ -72,6 +72,8 @@ const _: () = {
     assert!(offset_of!(CpuBlock, verw) == 152);
     assert!(offset_of!(CpuBlock, verw_sel) == 160);
     assert!(offset_of!(CpuBlock, spec_ctrl) == 168);
+    assert!(offset_of!(CpuBlock, bhb_clear) == 176);
+    assert!(offset_of!(CpuBlock, ibpb_entry) == 184);
     assert!(core::mem::size_of::<CpuBlock>() == PAGE_SIZE as usize);
 };
 
@@ -362,6 +364,26 @@ global_asm!(
     "wrmsr",
     "90:",
     ".endm",
+    ".set GS_BHB, 176",
+    ".set GS_IBPBE, 184",
+    // The rest of what an entry from ring 3 owes (ADR-0004's 2026-11-23
+    // amendment), after `ichor_spec_ctrl -1`, on a stack of the kernel's
+    // and before any indirect branch: IBPB (AMD's Retbleed and SRSO), then
+    // the branch history cleared (BHI without BHI_DIS_S). Uses rax, rcx
+    // and rdx.
+    ".macro ichor_entry_barriers",
+    "cmp dword ptr gs:[GS_IBPBE], 0",
+    "je 91f",
+    "mov ecx, 0x49",
+    "mov eax, 1",
+    "xor edx, edx",
+    "wrmsr",
+    "91:",
+    "cmp dword ptr gs:[GS_BHB], 0",
+    "je 92f",
+    "call ichor_clear_bhb",
+    "92:",
+    ".endm",
     // UserContext offsets (`usermode::UserContext`).
     ".set UC_RAX, 0",
     ".set UC_RBX, 8",
@@ -447,6 +469,7 @@ global_asm!(
     "mov rax, gs:[GS_KCR3]",
     "mov cr3, rax",
     "ichor_spec_ctrl -1",
+    "ichor_entry_barriers",
     "2:",
     // 22 quadwords from the 16-byte aligned interrupt frame: aligned.
     "mov rdi, rsp",
@@ -485,6 +508,7 @@ global_asm!(
     "mov cr3, rax",
     "5:",
     "ichor_spec_ctrl -1",
+    "ichor_entry_barriers",
     "mov rdi, rsp",
     "mov rsp, gs:[GS_RESUME]",
     "and rsp, -16",
@@ -588,7 +612,35 @@ global_asm!(
     "mov [rdi + UC_RDI], rax",
     "mov qword ptr gs:[GS_EVENT], 1", // Syscall
     "ichor_spec_ctrl -1",
+    // rsp is still the user's: the barriers call and return, so they run
+    // on the kernel stack the run returns to.
+    "mov rsp, gs:[GS_RESUME]",
+    "ichor_entry_barriers",
     "jmp ichor_user_resume",
+    // Clears the branch history: a software sequence for CPUs with BHI and
+    // without BHI_DIS_S (Intel's BHI guidance): five times a call and a
+    // return around five taken jumps, so that the history ends up made of
+    // branches the kernel chose, then LFENCE so that nothing runs ahead of
+    // it. Uses rax and rcx.
+    ".balign 64",
+    "ichor_clear_bhb:",
+    "mov ecx, 5",
+    "93:",
+    "call 94f",
+    "dec ecx",
+    "jnz 93b",
+    "lfence",
+    "ret",
+    ".balign 64",
+    "94:",
+    "mov eax, 5",
+    "95:",
+    "jmp 96f",
+    "int3",
+    "96:",
+    "dec eax",
+    "jnz 95b",
+    "ret",
     ".balign 4096",
     ".global ichor_entry_end",
     "ichor_entry_end:",

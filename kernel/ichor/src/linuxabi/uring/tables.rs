@@ -57,9 +57,16 @@ pub(super) struct Files {
     hint: u32,
 }
 
+/// Item `n` of `v`: an index an SQE chose, clamped so that the CPU does
+/// not run past the bounds check with a larger one (Spectre v1, ADR-0004
+/// §2).
+fn nth<T>(v: &[T], n: usize) -> Option<&T> {
+    (n < v.len()).then(|| &v[frame::nospec::index(n, v.len())])
+}
+
 impl Files {
     pub(super) fn get(&self, n: u32) -> Option<Arc<Description>> {
-        self.slots.as_ref()?.get(n as usize)?.file.clone()
+        nth(self.slots.as_ref()?, n as usize)?.file.clone()
     }
 
     /// Puts `d` in slot `index - 1`, or a free one
@@ -102,7 +109,7 @@ impl Buffers {
     pub(super) fn holds(&self, n: u16, addr: u64, len: u64) -> bool {
         self.0
             .as_ref()
-            .and_then(|b| b.get(usize::from(n)))
+            .and_then(|b| nth(b, usize::from(n)))
             .is_some_and(|&(at, size, _)| {
                 at != 0
                     && addr >= at

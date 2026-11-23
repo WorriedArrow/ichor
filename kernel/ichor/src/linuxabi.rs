@@ -322,6 +322,15 @@ pub(crate) enum Outcome {
 /// Dispatches one Linux syscall, writing the result into `ctx.rax`.
 pub(crate) fn dispatch(p: &mut LinuxProcess, ctx: &mut frame::user::UserContext) -> Outcome {
     let (nr, a) = ctx.syscall_args();
+    // The match below is a jump table indexed by a number the program
+    // chose: past its bounds check the CPU must not run ahead with one out
+    // of range (Spectre v1, ADR-0004 §2). Every number we know is below
+    // `NR_LIMIT`; the rest are ENOSYS.
+    const NR_LIMIT: usize = 512;
+    let nr = match usize::try_from(nr) {
+        Ok(n) if n < NR_LIMIT => frame::nospec::index(n, NR_LIMIT) as u64,
+        _ => nr,
+    };
     // A C `int` argument: only the low 32 bits are defined (glibc passes
     // them zero-extended, musl sign-extended), so read them as Linux does.
     let i = |v: u64| i64::from(v as u32 as i32);

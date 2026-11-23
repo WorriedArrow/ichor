@@ -24,6 +24,13 @@ pub(crate) fn dispatch(
     ctx: &mut UserContext,
 ) -> bool {
     let (nr, args) = ctx.syscall_args();
+    // Spectre v1: the match is a jump table on a number ring 3 chose (as in
+    // `linuxabi::dispatch`); every call number is below `NR_LIMIT`.
+    const NR_LIMIT: usize = 64;
+    let nr = match usize::try_from(nr) {
+        Ok(n) if n < NR_LIMIT => frame::nospec::index(n, NR_LIMIT) as u64,
+        _ => nr,
+    };
     let result = match nr {
         sys::VERSION => Ok(ichor_abi::VERSION),
         sys::MEM_SIZE => mem_size(cell, Handle::from_raw(args[0])),

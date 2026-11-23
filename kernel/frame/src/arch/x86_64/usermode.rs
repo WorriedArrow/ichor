@@ -49,6 +49,12 @@ const SPEC_CTRL_BHI_DIS_S: u64 = 1 << 10;
 /// the entry code writes it on every entry from ring 3.
 static SPEC_CTRL: AtomicU64 = AtomicU64::new(0);
 static IBRS_ON_ENTRY: AtomicBool = AtomicBool::new(false);
+/// AMD's automatic IBRS (EFER.AIBRSE), set on every CPU.
+static AUTO_IBRS: AtomicBool = AtomicBool::new(false);
+const EFER_AIBRSE: u64 = 1 << 21;
+/// The branch history cleared, and IBPB, on every entry from ring 3.
+static BHB_CLEAR: AtomicBool = AtomicBool::new(false);
+static IBPB_ENTRY: AtomicBool = AtomicBool::new(false);
 
 /// What the boot CPU's vulnerabilities call for, switched on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -67,24 +73,44 @@ pub(crate) struct Mitigations {
     /// Enhanced IBRS on (Spectre v2 in the kernel), and BHI_DIS_S with it.
     pub eibrs: bool,
     pub bhi_dis_s: bool,
+    /// AMD's automatic IBRS on, in place of IBRS on entry.
+    pub auto_ibrs: bool,
+    /// The branch history cleared on every entry from ring 3.
+    pub bhb_clear: bool,
+    /// IBPB on every entry from ring 3 (Retbleed, SRSO), and whether it is
+    /// needed but impossible (no IBPB) or incomplete (SRSO without
+    /// IBPB_BRTYPE microcode).
+    pub ibpb_entry: bool,
+    pub ibpb_entry_missing: bool,
+    pub srso_incomplete: bool,
+}
+
+/// Mitigations a test may force on any CPU.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Forced {
+    /// VERW on every return to ring 3 (it clears buffers only with MD_CLEAR
+    /// microcode).
+    pub verw: bool,
+    pub pti: bool,
+    /// The branch-history clearing sequence on every entry from ring 3.
+    pub bhb: bool,
+    /// IBPB on every entry from ring 3 (where IBPB exists).
+    pub ibpb_entry: bool,
 }
 
 /// Switches on the mitigations `v` calls for (once, on the boot CPU,
-/// before any user code runs; all CPUs are assumed alike). `force_verw`
-/// and `force_pti` turn VERW and page-table isolation on regardless
-/// (tests: they run on any CPU; VERW only clears buffers with MD_CLEAR
-/// microcode).
+/// before any user code runs; all CPUs are assumed alike), and those
+/// `forced` (tests: they run on any CPU).
 pub(crate) fn enable_mitigations(
     v: &super::cpu::Vulnerabilities,
-    force_verw: bool,
-    force_pti: bool,
+    forced: Forced,
 ) -> Result<Mitigations, &'static str> {
     use core::sync::atomic::Ordering::Relaxed;
     let needs_verw = v.mds || v.taa;
-    let verw = (needs_verw && v.md_clear) || force_verw;
+    let verw = (needs_verw && v.md_clear) || forced.verw;
     VERW_ON.store(verw, Relaxed);
-    IBPB_ON.store(v.ibpb, Relaxed);
-    let pti = v.meltdown || force_pti;
+    IBPB_ON.store(v.pred_cmd, Relaxed);
+    let pti = v.meltdown || forced.pti;
     if pti {
         super::entry::enable()?;
     }
@@ -92,21 +118,40 @@ pub(crate) fn enable_mitigations(
     // branch predictions out of the kernel's indirect branches; BHI_DIS_S
     // does the same for branch history. Written only where enumerated
     // (`IA32_SPEC_CTRL` needs CPUID.7:EDX[26]; a reserved bit would fault).
+    // AMD's automatic IBRS does the same through EFER.
     let eibrs = v.eibrs && v.ibpb;
+    let auto_ibrs = v.auto_ibrs && !eibrs;
     let bhi_dis_s = eibrs && v.bhi_ctrl;
-    let spec =
-        if v.ibpb { SPEC_CTRL_IBRS } else { 0 } | if bhi_dis_s { SPEC_CTRL_BHI_DIS_S } else { 0 };
+    let spec = if v.ibpb && !auto_ibrs {
+        SPEC_CTRL_IBRS
+    } else {
+        0
+    } | if bhi_dis_s { SPEC_CTRL_BHI_DIS_S } else { 0 };
     SPEC_CTRL.store(spec, Relaxed);
-    IBRS_ON_ENTRY.store(v.ibpb && !eibrs, Relaxed);
+    IBRS_ON_ENTRY.store(v.ibpb && !eibrs && !auto_ibrs, Relaxed);
+    AUTO_IBRS.store(auto_ibrs, Relaxed);
+    // Branch history without BHI_DIS_S: cleared in software on entry.
+    let bhb_clear = (v.bhi && !bhi_dis_s) || forced.bhb;
+    BHB_CLEAR.store(bhb_clear, Relaxed);
+    // AMD's return-prediction issues: with no safe-RET thunks from stable
+    // Rust, IBPB on every entry.
+    let ibpb_needed = v.retbleed || v.srso;
+    let ibpb_entry = (ibpb_needed || forced.ibpb_entry) && v.pred_cmd;
+    IBPB_ENTRY.store(ibpb_entry, Relaxed);
     enable_cpu_mitigations();
     Ok(Mitigations {
         verw,
         verw_missing: needs_verw && !v.md_clear,
-        ibpb: v.ibpb,
+        ibpb: v.pred_cmd,
         pti,
         pcid: pti && super::entry::pcid(),
         eibrs,
         bhi_dis_s,
+        auto_ibrs,
+        bhb_clear,
+        ibpb_entry,
+        ibpb_entry_missing: ibpb_needed && !v.pred_cmd,
+        srso_incomplete: v.srso && !v.ibpb_brtype,
     })
 }
 
@@ -116,6 +161,20 @@ pub(crate) fn enable_cpu_mitigations() {
     use core::sync::atomic::Ordering::Relaxed;
     let block = cpu::this_block();
     block.verw.store(u64::from(VERW_ON.load(Relaxed)), Relaxed);
+    block
+        .bhb_clear
+        .store(u64::from(BHB_CLEAR.load(Relaxed)), Relaxed);
+    block
+        .ibpb_entry
+        .store(u64::from(IBPB_ENTRY.load(Relaxed)), Relaxed);
+    if AUTO_IBRS.load(Relaxed) {
+        // SAFETY: EFER exists on every x86_64 CPU, and AIBRSE only where
+        // CPUID 8000_0021h:EAX[8] enumerates it (on the boot CPU; all CPUs
+        // are assumed alike). It only restricts speculation.
+        let efer = unsafe { rdmsr(regs::MSR_EFER) };
+        // SAFETY: as above; no other EFER bit changes.
+        unsafe { wrmsr(regs::MSR_EFER, efer | EFER_AIBRSE) };
+    }
     super::entry::enable_cpu(block);
     let spec = SPEC_CTRL.load(Relaxed);
     if spec != 0 {

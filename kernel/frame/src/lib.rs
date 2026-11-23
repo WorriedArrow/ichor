@@ -36,6 +36,7 @@ pub mod io;
 pub mod irq;
 mod kvm;
 pub mod mm;
+pub mod nospec;
 pub mod power;
 pub mod smp;
 pub mod sync;

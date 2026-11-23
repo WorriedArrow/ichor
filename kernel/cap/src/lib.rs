@@ -25,6 +25,16 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 
+/// `i` if `i < len`, else 0, without a branch: a handle's slot index is
+/// the user's choice, and past the bounds check the CPU must not run ahead
+/// with a larger one (Spectre v1, ADR-0004 §2). Frame's `nospec::index` is
+/// the same in two instructions; this crate is portable and host-tested.
+fn index_nospec(i: usize, len: usize) -> usize {
+    // All ones when `i < len` (both far below 2^63): the sign of i - len.
+    let mask = (i.wrapping_sub(len) as isize >> (usize::BITS - 1)) as usize;
+    i & core::hint::black_box(mask)
+}
+
 /// A set of rights on a capability. The generic rights live in the low bits;
 /// object-specific rights (READ, WRITE, MAP, ...) are defined by the kernel
 /// in the high bits.
@@ -288,7 +298,11 @@ impl<T> CSpace<T> {
     }
 
     fn slot(&self, handle: Handle) -> Option<&Slot<T>> {
-        let slot = self.slots.get(handle.index() as usize)?;
+        let i = handle.index() as usize;
+        if i >= self.slots.len() {
+            return None;
+        }
+        let slot = &self.slots[index_nospec(i, self.slots.len())];
         (slot.generation == handle.generation() && slot.cap.is_some()).then_some(slot)
     }
 
@@ -308,7 +322,11 @@ impl<T> CSpace<T> {
     /// so the handle can never resolve again. Returns the removed capability.
     pub fn close(&mut self, handle: Handle) -> Option<Cap<T>> {
         let index = handle.index() as usize;
-        let slot = self.slots.get_mut(index)?;
+        if index >= self.slots.len() {
+            return None;
+        }
+        let len = self.slots.len();
+        let slot = &mut self.slots[index_nospec(index, len)];
         if slot.generation != handle.generation() || slot.cap.is_none() {
             return None;
         }
@@ -335,6 +353,15 @@ mod tests {
     use super::*;
 
     type C = CSpace<u64>;
+
+    #[test]
+    fn indexes_are_clamped() {
+        assert_eq!(index_nospec(0, 1), 0);
+        assert_eq!(index_nospec(6, 7), 6);
+        assert_eq!(index_nospec(7, 7), 0);
+        assert_eq!(index_nospec(u32::MAX as usize, 8), 0);
+        assert_eq!(index_nospec(3, 0), 0);
+    }
 
     #[test]
     fn rights_shrink_only() {

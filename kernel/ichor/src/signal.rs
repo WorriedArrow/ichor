@@ -254,6 +254,13 @@ pub(crate) struct Actions {
     actions: [Action; NSIG as usize],
 }
 
+/// Signal `sig`'s place in the actions table. Every caller has checked
+/// that `sig` is 1 to `NSIG`; the index is clamped so that the CPU does not
+/// run past that check with another (Spectre v1, ADR-0004 §2).
+fn slot(sig: u32) -> usize {
+    frame::nospec::index((sig as usize).wrapping_sub(1), NSIG as usize)
+}
+
 impl Actions {
     pub(crate) fn new() -> Actions {
         Actions {
@@ -262,7 +269,7 @@ impl Actions {
     }
 
     fn get(&self, sig: u32) -> Action {
-        self.actions[(sig - 1) as usize]
+        self.actions[slot(sig)]
     }
 
     /// `execve`: caught signals revert to the default; ignored ones stay
@@ -371,7 +378,7 @@ pub(crate) fn sigaction(
         let word = |i: usize| u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap_or([0; 8]));
         let ignored = {
             let mut acts = p.group.actions.lock();
-            acts.actions[(sig - 1) as usize] = Action {
+            acts.actions[slot(sig)] = Action {
                 handler: word(0),
                 flags: word(1),
                 restorer: word(2),
@@ -934,7 +941,7 @@ fn setup_frame(
     }
     p.sig.mask = mask & !UNBLOCKABLE;
     if act.flags & SA_RESETHAND != 0 {
-        p.group.actions.lock().actions[(sig - 1) as usize] = Action::default();
+        p.group.actions.lock().actions[slot(sig)] = Action::default();
     }
     sync(p);
     ctx.rdi = u64::from(sig);

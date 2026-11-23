@@ -246,6 +246,54 @@ protects the mode it was last written in:
   (Ichor takes none), and what IBRS does not do (BHI, the RSB across VM
   exits).
 
+## Amendment (2026-11-23): the rest of §2
+
+What §2 and the amendments above still owed, as built. With it every row
+of §2's table has its mitigation on the CPUs it applies to.
+
+- **Branch history (BHI) without `BHI_DIS_S`** (Intel parts before Alder
+  Lake that enumerate no BHI_NO, eIBRS or not): every entry from ring 3
+  runs a software sequence that overwrites the branch history with the
+  kernel's own taken branches (five calls, each around five taken jumps,
+  then LFENCE; Intel's BHI guidance), before the first indirect branch.
+  CPUs with `BHI_DIS_S` keep using it (the 2026-11-21 amendment).
+- **IBPB on entry** (AMD's Retbleed, family 15h to 17h, and SRSO, 17h and
+  19h without SRSO_NO; Hygon 18h): stable Rust cannot emit untrained or
+  safe-RET return thunks, so the mitigation is the one without compiler
+  help: an IBPB on every entry from ring 3, before any return. Zen 3 and 4
+  need microcode that makes IBPB flush return predictions too
+  (IBPB_BRTYPE); without it the boot log says SRSO is NOT MITIGATED. It is
+  expensive (a few hundred cycles each entry), as Linux's `ibpb` modes are.
+- **AutoIBRS** (AMD Zen 4 and later, CPUID 8000_0021h EAX[8]): EFER.AIBRSE
+  on every CPU, in place of IBRS on entry, as enhanced IBRS is for Intel.
+- **RSB filling on context switch**: every `switch_stacks` fills the return
+  stack buffer with 32 harmless entries (each call's speculation lands on
+  an INT3) before its `ret`, so a task never returns through predictions
+  another left, on every CPU (a few tens of cycles a switch).
+- **Masked indices (Spectre v1)**: `frame::nospec::index(i, len)` returns
+  `i` if `i < len` and 0 otherwise without a branch (CMP and SBB, which the
+  compiler cannot turn into one). It guards the indexes a user picks for a
+  table: the Linux and native system call numbers (before their jump
+  tables), descriptors, signal numbers, io_uring's registered files and
+  buffers, and capability slots (`kernel/cap` has the same mask in
+  portable Rust: it is host-tested and does not depend on frame).
+- IBPB is found on AMD by its own CPUID bit (8000_0008h EBX[12]) as well
+  as Intel's, for IBPB between cells and on entry alike.
+- The boot log's mitigations line goes on: `branch history` (`BHI_DIS_S`,
+  `cleared on entry`, or `not affected`), `IBPB on entry` (`on (Retbleed,
+  SRSO)`, `not needed`, or `NOT MITIGATED`), `RSB filled on context switch`,
+  `Spectre v1 masked indices`.
+- Not covered still: SMT (§3, dedicated cores), Downfall/GDS and SRBDS
+  (microcode; logged), and speculative store bypass, which §2 leaves to
+  programs (Linux's default too: opt-in per process; not offered yet).
+- **Not verified on affected hardware.** TCG and CI's KVM report neither
+  BHI nor an affected AMD part, so tests run the RSB fill and masked indices
+  everywhere, and the BHB sequence and IBPB on entry only when forced
+  (`force_bhb`, `force_ibpb_entry` on the command line).
+- Frame grows by about 155 lines and 3 unsafe sites (to 6,978 / 283; the
+  wall clock's steering, ADR-0018's amendment, had taken it to 6,824);
+  audit step 13 is 7,000 / 300.
+
 ## Consequences
 
 - Nodes on modern cloud CPUs (Ice Lake and later, EPYC Milan and later)

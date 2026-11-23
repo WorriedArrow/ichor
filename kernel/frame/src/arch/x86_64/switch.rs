@@ -25,6 +25,21 @@ pub(crate) unsafe extern "sysv64" fn switch_stacks(save: *mut u64, next: u64) {
         "push r15",
         "mov [rdi], rsp",
         "mov rsp, rsi",
+        // Fill the return stack buffer with 32 entries of our own before
+        // the `ret` below (ADR-0004 §2), so that no return of this task
+        // goes where the last one's returns would: each call's
+        // return-address prediction lands on an INT3. rax is caller-saved.
+        "mov eax, 16",
+        "2:",
+        "call 3f",
+        "int3",
+        "3:",
+        "call 4f",
+        "int3",
+        "4:",
+        "dec eax",
+        "jnz 2b",
+        "add rsp, 256",
         "pop r15",
         "pop r14",
         "pop r13",

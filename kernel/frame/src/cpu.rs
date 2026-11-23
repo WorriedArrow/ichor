@@ -129,6 +129,12 @@ pub(crate) struct CpuBlock {
     /// 168: what `IA32_SPEC_CTRL` holds in the kernel, if that is written on
     /// every entry from ring 3 (ring 3 has it without IBRS); else 0.
     pub(crate) spec_ctrl: AtomicU64,
+    /// 176: nonzero to clear the branch history on every entry from ring 3
+    /// (BHI without `BHI_DIS_S`).
+    pub(crate) bhb_clear: AtomicU64,
+    /// 184: nonzero for IBPB on every entry from ring 3 (AMD Retbleed and
+    /// SRSO, without safe-RET return thunks).
+    pub(crate) ibpb_entry: AtomicU64,
 }
 
 impl CpuBlock {
@@ -156,6 +162,8 @@ impl CpuBlock {
             verw: AtomicU64::new(0),
             verw_sel: AtomicU64::new(0),
             spec_ctrl: AtomicU64::new(0),
+            bhb_clear: AtomicU64::new(0),
+            ibpb_entry: AtomicU64::new(0),
         }
     }
 }
