@@ -1367,6 +1367,15 @@ impl Stack {
         }
     }
 
+    /// `TCP_INFO`: the connection's numbers, if it is one.
+    pub(crate) fn tcp_info(&self, id: u64) -> Option<net::tcp::Info> {
+        let i = self.inner.lock();
+        match &i.socks.get(&id)?.kind {
+            Kind::Conn { tcp, .. } => Some(tcp.info()),
+            _ => None,
+        }
+    }
+
     /// `SO_ERROR`: the pending error, cleared.
     pub(crate) fn take_error(&self, id: u64) -> i64 {
         let mut i = self.inner.lock();

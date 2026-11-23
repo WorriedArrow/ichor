@@ -157,6 +157,57 @@ pub fn segment(
     b
 }
 
+/// A connection's numbers, as Linux's `struct tcp_info` reports them
+/// (`getsockopt(TCP_INFO)`; iperf3 and others read it).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Info {
+    /// Linux's numbering (1 established ... 11 closing).
+    pub state: u8,
+    pub retransmits: u8,
+    pub snd_wscale: u8,
+    pub rcv_wscale: u8,
+    pub rto_us: u32,
+    pub mss: u32,
+    /// Segments sent and not acknowledged.
+    pub unacked: u32,
+    pub rtt_us: u32,
+    pub rttvar_us: u32,
+    /// Slow-start threshold and congestion window, in segments.
+    pub ssthresh: u32,
+    pub cwnd: u32,
+    pub snd_wnd: u32,
+    pub rcv_space: u32,
+}
+
+impl Info {
+    /// The size of what [`Info::bytes`] gives (Linux's struct up to
+    /// `tcpi_rcv_wnd`; a shorter buffer takes its start).
+    pub const LEN: usize = 236;
+
+    /// Linux's `struct tcp_info`; what this stack does not count is 0.
+    pub fn bytes(&self) -> [u8; Info::LEN] {
+        let mut b = [0u8; Info::LEN];
+        let mut put = |at: usize, v: u32| b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        put(8, self.rto_us);
+        put(16, self.mss);
+        put(20, self.mss);
+        put(24, self.unacked);
+        put(60, self.mss + 40);
+        put(68, self.rtt_us);
+        put(72, self.rttvar_us);
+        put(76, self.ssthresh);
+        put(80, self.cwnd);
+        put(84, self.mss);
+        put(88, 3);
+        put(96, self.rcv_space);
+        put(228, self.snd_wnd);
+        b[0] = self.state;
+        b[2] = self.retransmits;
+        b[6] = (self.snd_wscale & 0xf) | (self.rcv_wscale & 0xf) << 4;
+        b
+    }
+}
+
 /// A connection's state (RFC 9293 §3.3.2; LISTEN lives in the stack).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
@@ -333,6 +384,39 @@ impl Tcp {
 
     pub fn state(&self) -> State {
         self.state
+    }
+
+    /// What `TCP_INFO` says of the connection.
+    pub fn info(&self) -> Info {
+        let mss = u32::from(self.peer_mss.max(1));
+        let us = |d: Duration| u32::try_from(d.as_micros()).unwrap_or(u32::MAX);
+        let unacked = self.snd_nxt.wrapping_sub(self.snd_una);
+        Info {
+            state: match self.state {
+                State::Established => 1,
+                State::SynSent => 2,
+                State::SynReceived => 3,
+                State::FinWait1 => 4,
+                State::FinWait2 => 5,
+                State::TimeWait => 6,
+                State::Closed => 7,
+                State::CloseWait => 8,
+                State::LastAck => 9,
+                State::Closing => 11,
+            },
+            retransmits: self.retries.min(255) as u8,
+            snd_wscale: self.snd_shift,
+            rcv_wscale: self.rcv_shift,
+            rto_us: us(self.rto),
+            mss,
+            unacked: unacked.div_ceil(mss),
+            rtt_us: self.srtt.map_or(0, us),
+            rttvar_us: us(self.rttvar),
+            ssthresh: self.ssthresh / mss,
+            cwnd: self.cwnd.div_ceil(mss),
+            snd_wnd: self.snd_wnd,
+            rcv_space: u32::try_from(self.recv_buf.len()).unwrap_or(u32::MAX),
+        }
     }
 
     pub fn error(&self) -> Option<Error> {
@@ -1599,5 +1683,34 @@ mod tests {
                 .collect();
             let _ = Segment::parse(&g, A.0, B.0);
         }
+    }
+
+    #[test]
+    fn tcp_info_is_laid_out_as_linux_reads_it() {
+        let a = Tcp::connect(A, B, 77, Duration::from_secs(1));
+        let i = a.info();
+        assert_eq!(i.state, 2, "SYN_SENT");
+        assert!(i.rto_us > 0 && i.mss > 0);
+        let b = Info {
+            state: 1,
+            retransmits: 2,
+            snd_wscale: 7,
+            rcv_wscale: 5,
+            rto_us: 204_000,
+            mss: 1420,
+            unacked: 3,
+            rtt_us: 1500,
+            rttvar_us: 750,
+            ssthresh: 40,
+            cwnd: 10,
+            snd_wnd: 65_535,
+            rcv_space: 1000,
+        }
+        .bytes();
+        let u = |at: usize| u32::from_le_bytes(b[at..at + 4].try_into().unwrap());
+        assert_eq!((b[0], b[2], b[6]), (1, 2, 0x57));
+        assert_eq!((u(8), u(16), u(24), u(60)), (204_000, 1420, 3, 1460));
+        assert_eq!((u(68), u(72), u(76), u(80)), (1500, 750, 40, 10));
+        assert_eq!((u(96), u(228)), (1000, 65_535));
     }
 }

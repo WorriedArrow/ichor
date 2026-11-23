@@ -757,7 +757,17 @@ cloud's stop should end the machine at once on GCP and AWS (tested in
 QEMU only: `the_power_button_turns_the_machine_off`, `system_powerdown`
 through `RunConfig::power_button_after`); Azure's hardware-reduced FADT has no
 such button: its stop needs Hyper-V's shutdown integration service.
-Not yet: GCP gVNIC, Azure's newest sizes (PCI over VMBus: NVMe and MANA),
+**gVNIC** (2026-11-23): `kernel/gve` (host-tested) and `kernel/drivers/gve`,
+GQI-QPL, polled; works on GCP E2 (first boot, MTU 1460). It polls the
+status register the management interrupt announces (100 ms) and resets the
+device when asked (`ichor: gve:` lines). DQO-only devices (C3 and newer)
+are refused. `kernel/ichor/src/watch.rs` (`metadata=gcp` or `watch_cloud`):
+GCP's `maintenance-event` long-polled, the wall clock against the
+metadata server's NTP (`net::ntp`), a stall ticker, and `disk_hammer`.
+`tests/migration/` is the live-migration campaign (README there). It found
+the TSC calibrated over 10 ms of the PM timer was 14 ppm off on GCP (now
+100 ms: 0.25 ppm), and that GCP's DSDT has no `\_S5` the parser finds.
+Not yet: Azure's newest sizes (PCI over VMBus: NVMe and MANA),
 Secure Boot, Azure's shutdown service; Azure's CPU enumerates no MD_CLEAR or
 SPEC_CTRL (VERW and IBRS off: look into; frame reads the right bits, and
 on OpenVMM the guest OS ID changes nothing in CPUID leaf 7, so try it on

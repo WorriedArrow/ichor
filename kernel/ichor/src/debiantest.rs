@@ -165,6 +165,10 @@ connect($nb, pack_sockaddr_in($port, $lo)) or $!{EINPROGRESS} or fail("connect: 
 my $win = ""; vec($win, fileno($nb), 1) = 1;
 select(undef, my $wout = $win, undef, 5) == 1 or fail("connect never completed");
 unpack("i", getsockopt($nb, SOL_SOCKET, SO_ERROR)) == 0 or fail("SO_ERROR");
+# TCP_INFO (iperf3 reads it every second): established is 1, listening 10.
+my $ti = getsockopt($nb, 6, 11) // fail("TCP_INFO: $!");
+length($ti) >= 104 && unpack("C", $ti) == 1 or fail("TCP_INFO state " . unpack("C", $ti));
+unpack("C", getsockopt($l, 6, 11) // "") == 10 or fail("TCP_INFO of a listener");
 select($rout = $rin, undef, undef, 5) == 1 or fail("listener never readable");
 accept(my $b, $l) or fail("accept after select: $!");
 syswrite($nb, "ping") == 4 or fail("write: $!");

@@ -83,6 +83,7 @@ const TCP_MAXSEG: u64 = 2;
 const TCP_SYNCNT: u64 = 7;
 const TCP_LINGER2: u64 = 8;
 const TCP_WINDOW_CLAMP: u64 = 10;
+const TCP_INFO: u64 = 11;
 const TCP_NOTSENT_LOWAT: u64 = 25;
 /// nginx corks around `sendfile` (`TCP_NOPUSH`); our TCP sends what it
 /// has at once, so corking is recorded and changes nothing.
@@ -664,6 +665,7 @@ fn known_option(s: &Socket, level: u64, name: u64) -> bool {
                 | TCP_USER_TIMEOUT
                 | TCP_FASTOPEN
                 | TCP_NOTSENT_LOWAT
+                | TCP_INFO
         ),
         _ => false,
     }
@@ -709,7 +711,7 @@ pub(super) fn setsockopt(
             (
                 SOL_SOCKET,
                 SO_TYPE | SO_ERROR | SO_ACCEPTCONN | SO_PROTOCOL | SO_DOMAIN
-            )
+            ) | (IPPROTO_TCP, TCP_INFO)
         )
     {
         return Err(ENOPROTOOPT);
@@ -814,6 +816,18 @@ fn option_value(s: &Socket, level: u64, name: u64) -> Result<Vec<u8>, i64> {
         (SOL_SOCKET, SO_DOMAIN) => int(i32::from(AF_INET)),
         (SOL_SOCKET, SO_PROTOCOL) => int(if s.dgram { IPPROTO_UDP } else { IPPROTO_TCP } as i32),
         (SOL_SOCKET, SO_RCVTIMEO | SO_SNDTIMEO) => s.timeouts.get(name),
+        // A socket that is no connection is listening (10) or closed (7).
+        (IPPROTO_TCP, TCP_INFO) => {
+            let info = s.stack.tcp_info(s.id()).unwrap_or(net::tcp::Info {
+                state: if s.listening.load(Ordering::Acquire) {
+                    10
+                } else {
+                    7
+                },
+                ..Default::default()
+            });
+            info.bytes().to_vec()
+        }
         _ => {
             let opts = s.opts.lock();
             match opts.iter().find(|(k, _)| *k == (level, name)) {
