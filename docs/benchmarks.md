@@ -121,11 +121,9 @@ Reading it:
 - Pipes and fork are cheaper on Ichor everywhere, and so is fork + exec
   on AMD.
 - Anonymous page faults are Ichor's worst case here: 2.4-2.9 us on both
-  machines, where the QEMU comparison had them at 1.26x Linux. One
-  untested explanation is that Ichor hands each fault never-touched guest
-  memory, which the host itself must fault in, while Linux's per-CPU
-  lists hand back pages freed a moment before (the per-CPU page lists are
-  still held back on `pcp-page-lists`).
+  machines, where the QEMU comparison had them at 1.26x Linux. (The
+  second round below found most of the gap was Linux's transparent huge
+  pages: with them off, Linux's 4 KiB faults cost 1.6-1.8 us on AMD.)
 - The runs found that frame read only Intel's IBRS bit (CPUID.7:EDX[26]),
   so on AMD it reported `ibpb false` and "Spectre v2 in the kernel NOT
   MITIGATED". AMD enumerates IBRS in CPUID 8000_0008h EBX[14]. That is
@@ -134,6 +132,68 @@ Reading it:
 - Mitigations seen working on real hardware: the branch-history clearing
   sequence (Ice Lake), IBPB on entry and IBRS on entry (Milan), IBPB
   between cells (both).
+
+## Google Cloud, second round (2026-11-23): fault-around, safe RET, containers
+
+After `f5f9472` (anonymous faults map 64 KiB ahead; safe-RET return thunks
+in place of IBPB on entry on AMD). Same machine types, plus n2d on AMD
+Rome (EPYC 7B12, Zen 2); one Ichor boot per row, Linux the median of five
+rounds. Debian's kernel runs with transparent huge pages `[always]`; the
+Linux rows show it as is and with THP off (`never`).
+
+**Ichor** (`bench`; on AMD also `bench srso=ibpb`, the old IBPB on entry):
+
+| Benchmark | n2 (Ice Lake) | Milan, safe RET | Milan, IBPB | Rome, safe RET | Rome, IBPB |
+|---|---|---|---|---|---|
+| null syscall | 309 ns | 572 ns | 1086 ns | 575 ns | 1075 ns |
+| pipe round trip | 3.9 us | 5.3 us | 10 us | 5.3 us | 10 us |
+| page fault | 1.86 us | 1.09 us | 1.02 us | 1.09 us | 1.12 us |
+| fork + wait | 27 us | 19 us | 25 us | 18 us | 23 us |
+| fork + exec + wait | 149 us | 135 us | 159 us | 132 us | 156 us |
+| container start | 489 us | 413 us | 317 us | 414 us | 329 us |
+
+**Linux 6.1** (THP always / never):
+
+| Benchmark | n2 | Milan | Rome |
+|---|---|---|---|
+| null syscall | 107 / 106 ns | 393 / 387 ns | 154 / 154 ns |
+| pipe round trip | 9.1 / 9.3 us | 17.1 / 14.1 us | 17.2 / 16.3 us |
+| page fault | 1.36 / 1.26 us | 0.42 / 1.82 us | 0.44 / 1.61 us |
+| fork + wait | 36.8 / 36.1 us | 51.8 / 51.9 us | 49.9 / 61.5 us |
+| fork + exec + wait | 94 / 92 us | 174 / 172 us | 175 / 182 us |
+
+**Container start on Linux**, the same busybox root running `/bin/true`,
+each timed over its runs after three to warm up (crun 1.8.1, runc 1.1.5,
+Docker 20.10.24, Debian 12's packages); Ichor's is the table above:
+
+| How | n2 | Milan | Rome |
+|---|---|---|---|
+| `unshare` (mount, UTS, IPC, net, PID, cgroup namespaces) `--root` | 1.29 ms | 2.06 ms | 1.92 ms |
+| `crun run` (OCI bundle) | 4.9 ms | 6.7 ms | 6.5 ms |
+| `runc run` | 15.4 ms | 22.1 ms | 21.8 ms |
+| `docker run --rm --network none` | 251 ms | 264 ms | 256 ms |
+| `docker run --rm` | 583 ms | 591 ms | 602 ms |
+
+Reading it:
+
+- Safe RET beats IBPB on entry on both AMD generations for system calls,
+  pipes, fork and exec (about half the cost of a null system call), and
+  loses only on container start (about 90 us more: much kernel code, each
+  return mispredicted on purpose). It stays the default; `srso=ibpb`
+  selects the other. Both sequences ran on real hardware: Zen 3/4's on
+  Milan, Zen 1/2's on Rome.
+- Ichor now beats Linux's 4 KiB anonymous faults on AMD (1.0-1.1 us
+  against 1.6-1.8 us), not its huge-page ones (0.42 us), and is still
+  slower than Linux on Ice Lake (1.86 against 1.26-1.36 us; that was
+  2.4-2.9 us before fault-around). The first round's Linux page-fault
+  figures were huge-page faults: THP is on by default in Debian.
+- Starting a container from a root that is already there: Ichor takes
+  0.3-0.5 ms, Linux's bare `unshare` 1.3-2.1 ms, crun 5-7 ms, runc 15-22
+  ms, Docker 250-600 ms. Ichor's figure is one kernel operation, measured
+  in the kernel; Linux's include starting the tool's own process from a
+  shell, which is what a container runtime there pays.
+- Entries still cost Ichor more than Linux on Intel (309 against 107 ns),
+  where neither has an expensive mitigation: Ichor's syscall path itself.
 
 Caveats: in the QEMU comparisons above (before `91a5a17`), Linux runs with
 its default CPU-vulnerability mitigations, which Ichor did not all apply

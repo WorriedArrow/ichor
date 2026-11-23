@@ -732,8 +732,12 @@ on Ice Lake (n2), IBPB and IBRS on entry on EPYC Milan (n2d); that run
 found AMD's IBRS bit (CPUID 8000_0008h EBX[14]) unread, now fixed
 (`Vulnerabilities::ibrs`). CI's forced flags test the code paths. Boot
 logs which apply. GCP benchmarks against Debian 12 on the same machine
-types: `docs/benchmarks.md` (entries 2.7-2.9x Linux, page faults 3-6x,
-pipes and fork cheaper).
+types, Ice Lake, Milan and Rome: `docs/benchmarks.md` (second round, with
+fault-around and safe RET: system calls 1.5-3x Linux, pipes and fork
+cheaper, 4 KiB page faults cheaper on AMD and slower on Intel; Linux's
+own figures are huge-page faults, THP being on; container start 0.3-0.5
+ms against 1.3-2 ms for `unshare`, 5-7 ms crun, 15-22 ms runc, 250-600 ms
+Docker).
 
 Frame budget: ADR-0005 sets the milestone 3 ceiling at 8,500 lines / 380
 sites; ADR-0007 raises it to 9,500 / 420 for milestone 4 (TLB shootdown,
