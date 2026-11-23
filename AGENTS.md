@@ -791,8 +791,13 @@ quick sample, then a PI loop on the rate, tau 60 s, at most 500 ppm;
 `frame::time::steer_wall_clock`; `now()` and timers stay unsteered;
 ADR-0018's amendment); that GCP keeps `\_S5` in an SSDT, not its DSDT
 (now searched too; not yet seen working on GCP); and
-that GCE's simulated maintenance takes about 11 minutes a run (6.5 before
-the notice, 80 s of migration, 3.5 before the operation ends).
+that GCE's simulated maintenance takes about 11 minutes a run (3.5 to 6.5
+before the notice, 80 s of migration, 3.5 before the operation ends), and
+fails now and then (`BACKEND_ERROR`, nothing migrated). Results so far (two
+migrations under load; the owner stopped the campaign early): network, disk,
+API and TCP connections came through untouched, no stall of 250 ms, no
+gVNIC reset; the clock now stays within 0.62 ms of NTP through one
+(`tests/migration/README.md`).
 Not yet: Azure's newest sizes (PCI over VMBus: NVMe and MANA),
 Secure Boot, Azure's shutdown service; Azure's CPU enumerates no MD_CLEAR or
 SPEC_CTRL (VERW and IBRS off: look into; frame reads the right bits, and

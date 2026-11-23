@@ -53,3 +53,32 @@ hammer.
 4. On the peer (as root, once `/root/ready` exists, with `ca.pem` and
    `api-token` copied there): `ICHOR_IP=... PEER_IP=... bash campaign.sh
    ichor-mig Z 50 /root/out`, then `python3 analyze.py /root/out`.
+
+GCP's simulate call fails now and then (`BACKEND_ERROR` after 10 to 14
+minutes) and nothing migrates; the run's `rc` is not 0 then. To see what GCP
+did: `gcloud logging read 'protoPayload.methodName:"migrateOnHostMaintenance"'`.
+
+## Results (2026-11-23, e2-standard-4, us-central1-a)
+
+Stopped early by the owner: four simulate calls, two of which migrated
+(the other two ended in `BACKEND_ERROR`). Both migrations were under the full
+load, the first on a boot-calibrated TSC clock, the second on kvmclock with
+the NTP-disciplined wall clock.
+
+- The notice came 3.5 to 6.5 minutes after the call and cleared 79 s later;
+  the guest saw no stall of 250 ms or more and missed no 5 s clock sample.
+- gVNIC: no status change or reset request; iperf3 to the peer went on at
+  2.8 Gbit/s (its lowest second 1.6), the TCP stream from a cell never
+  paused more than 0.23 s, and nothing broke. The API pulled and ran a
+  container after each, reaching the internet.
+- Disk: no errors, slowest read 249 ms.
+- Clock: no jump. What the campaign found was rate, not steps: the TSC
+  calibration was 14 ppm off (fixed: 100 ms windows), the first migration
+  moved the guest to a host whose TSC ran 96 ppm differently (fixed:
+  kvmclock, ADR-0018), and kvmclock itself runs 71 to 99 ppm off NTP
+  depending on the host (fixed: the NTP discipline, ADR-0018's amendment).
+  After those, the offset from NTP stayed within 0.62 ms through a
+  migration (median 0.05 ms), and the learned rate moved 3 ppm with it.
+- Not covered by this few: a migration that does cut the uplink for
+  seconds, and the notice-to-blackout lead (the blackout was too short to
+  see).

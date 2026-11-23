@@ -65,7 +65,8 @@ for i in $(seq 1 "$runs"); do
   echo "$(date +%s.%N) RUN $i request" >> "$out/runs.log"
   gcloud compute instances simulate-maintenance-event "$vm" --zone "$zone" --quiet \
     >> "$out/gcloud.log" 2>&1
-  echo "$(date +%s.%N) RUN $i done rc=$?" >> "$out/runs.log"
+  rc=$?  # (not inside the echo: `$(date)` would set it first)
+  echo "$(date +%s.%N) RUN $i done rc=$rc" >> "$out/runs.log"
   # After each: does the API still pull and run, and reach the internet?
   api "$alpine" -- sh -c 'echo alive; wget -q -T 10 -O /dev/null http://dl-cdn.alpinelinux.org/alpine/ && echo internet' \
     2>&1 | ts >> "$out/health-$i.log"

@@ -62,9 +62,11 @@ for peer_t, text in lines("serial.log"):
 
 runs = {}
 for t, text in lines("runs.log"):
-    m = re.match(r"RUN (\d+) (request|done)", text)
+    m = re.match(r"RUN (\d+) (request|done)(?: rc=(\d+))?", text)
     if m:
         runs.setdefault(int(m.group(1)), {})[m.group(2)] = t
+        if m.group(3) is not None:
+            runs[int(m.group(1))]["rc"] = int(m.group(3))
 runs = {i: r for i, r in runs.items() if "request" in r and "done" in r}
 
 
@@ -94,7 +96,9 @@ for k, i in enumerate(ordered):
     nxt = runs[ordered[k + 1]]["request"] if k + 1 < len(ordered) else r["done"] + 300
     b = min(r["done"] + 180, nxt)
     ev = window(serial, a - 5, b)
-    res = {"run": i, "gcloud_s": round(r["done"] - a, 1)}
+    # (GCP's simulate call fails now and then, BACKEND_ERROR, and then
+    # nothing migrates: such a run tests nothing.)
+    res = {"run": i, "gcloud_s": round(r["done"] - a, 1), "rc": r.get("rc", "-")}
     notices = [(t, NOTICE.search(x).group(1)) for t, x, _ in ev if NOTICE.search(x)]
     migrate = [t for t, v in notices if v != "NONE"]
     res["notice"] = bool(migrate)
@@ -160,7 +164,7 @@ if "--json" in sys.argv:
     sys.exit(0)
 
 print(f"{len(results)} runs\n")
-cols = ["run", "gcloud_s", "notice", "notice_lead_s", "tick_gap_ms", "clock_jump_ms", "clock_worst_ms",
+cols = ["run", "gcloud_s", "rc", "notice", "notice_lead_s", "tick_gap_ms", "clock_jump_ms", "clock_worst_ms",
         "rate_change_ppm", "tcp_gap_s",
         "tcp_broke", "iperf_base_mbps", "iperf_min_mbps", "iperf_stalled_s", "iperf_broke",
         "disk_errors", "disk_slowest_ms", "api_ok", "internet_ok"]
@@ -182,11 +186,15 @@ def stat(c):
 
 
 print("\nsummary")
+failed = [r["run"] for r in results if r["rc"] not in (0, "-")]
+print(f"  GCP's simulate call failed in runs {failed or 'none'}; a run with no notice may not have migrated")
 print(f"  notice seen before the blackout: {sum(1 for r in results if r['notice'])}/{len(results)}; lead (s): {stat('notice_lead_s')}")
 print(f"  guest tick gap (ms): {stat('tick_gap_ms')}")
 print(f"  clock jump per run (ms): {stat('clock_jump_ms')}; worst offset around a migration (ms): {stat('clock_worst_ms')}")
 print(f"  steps after the first: {sum(len(r['clock_steps']) for r in results)}; host TSC rate change per migration (ppm): {stat('rate_change_ppm')}")
-settled = [s[1] for s in clock_samples if clock_samples and s[0] > clock_samples[0][0] + 900]
+# (Fifteen minutes after the clock was last stepped: a new boot steps it.)
+step_times = [t for t, x, _ in serial if STEPPED.search(x)] or [clock_samples[0][0] if clock_samples else 0]
+settled = [s[1] for s in clock_samples if s[0] > max((t for t in step_times if t <= s[0]), default=s[0]) + 900]
 if settled:
     print(f"  offset from NTP after the first 15 minutes (ms): worst {max(settled, key=abs):.3f}, median |offset| {statistics.median(abs(x) for x in settled):.3f}")
 print(f"  TCP stream gap (s): {stat('tcp_gap_s')}; broke in {sum(r['tcp_broke'] for r in results)} runs")
