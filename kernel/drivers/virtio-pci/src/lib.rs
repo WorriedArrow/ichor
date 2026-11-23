@@ -1,8 +1,11 @@
-//! The modern (virtio 1.x) PCI transport, shared by the virtio drivers.
+//! The virtio PCI transports, shared by the virtio drivers: the modern one
+//! (virtio 1.x, registers in memory BARs the PCI capabilities name), and
+//! the legacy one (virtio 0.9.5, registers in I/O ports), which is all that
+//! Google Cloud's virtio devices speak.
 //!
 //! Safe code only: registers are reached through frame's bounds-checked
-//! `IoMem`, and queues are frame's `VirtQueue`, so a driver never handles a
-//! bus address (ADR-0005). A driver finds its device with [`find`], brings
+//! `IoMem` and `IoPorts`, and queues are frame's `VirtQueue`, so a driver
+//! never handles a bus address (ADR-0005). A driver finds its device with [`find`], brings
 //! it up with [`Transport::new`] (reset, feature negotiation), sets up its
 //! queues with [`Transport::queue`], calls [`Transport::driver_ok`], and then
 //! notifies the device after each submission.
@@ -16,7 +19,7 @@ use alloc::vec::Vec;
 use core::time::Duration;
 
 use frame::bus::pci::{self, PciDevice};
-use frame::io::IoMem;
+use frame::io::{IoMem, IoPorts};
 use frame::virtio::VirtQueue;
 
 /// The PCI vendor id of every virtio device.
@@ -40,6 +43,19 @@ const QUEUE_NOTIFY_OFF: u64 = 30;
 const QUEUE_DESC: u64 = 32;
 const QUEUE_DRIVER: u64 = 40;
 const QUEUE_DEVICE: u64 = 48;
+
+// The legacy transport's registers, in ports (BAR 0).
+const L_DEVICE_FEATURES: u64 = 0;
+const L_DRIVER_FEATURES: u64 = 4;
+const L_QUEUE_PFN: u64 = 8;
+const L_QUEUE_SIZE: u64 = 12;
+const L_QUEUE_SELECT: u64 = 14;
+const L_QUEUE_NOTIFY: u64 = 16;
+const L_STATUS: u64 = 18;
+/// Where its device-specific configuration starts (MSI-X being off).
+const L_DEVICE: u64 = 20;
+/// The alignment of its used rings, and the unit of its queue addresses.
+const L_PAGE: u64 = 4096;
 
 const STATUS_ACKNOWLEDGE: u8 = 1;
 const STATUS_DRIVER: u8 = 2;
@@ -80,9 +96,19 @@ struct Window {
 #[derive(Clone, Copy, Debug)]
 pub struct Notifier(Window);
 
-/// A device's registers: the mapped BARs and the configuration windows.
+/// A device's registers.
 #[derive(Debug)]
-pub struct Transport {
+pub struct Transport(Regs);
+
+#[derive(Debug)]
+enum Regs {
+    Modern(Modern),
+    Legacy(IoPorts),
+}
+
+/// The modern transport: the mapped BARs and the configuration windows.
+#[derive(Debug)]
+struct Modern {
     bars: Vec<(u8, IoMem)>,
     common: Window,
     device: Window,
@@ -90,12 +116,97 @@ pub struct Transport {
     multiplier: u32,
 }
 
+/// Resets a device through its status register and says a driver is here.
+fn reset(read: impl Fn() -> u8, write: impl Fn(u8)) {
+    write(0);
+    let deadline = frame::time::now() + RESET_TIMEOUT;
+    while read() != 0 && frame::time::now() < deadline {
+        core::hint::spin_loop();
+    }
+    write(STATUS_ACKNOWLEDGE);
+    write(STATUS_ACKNOWLEDGE | STATUS_DRIVER);
+}
+
 impl Transport {
-    /// Resets `dev` and negotiates features: `VIRTIO_F_VERSION_1` plus the
-    /// low 32 feature bits in `features` that the device offers. Returns
-    /// the transport and the low feature bits accepted.
+    /// Resets `dev` and negotiates features: the low 32 feature bits in
+    /// `features` that the device offers (and `VIRTIO_F_VERSION_1`, on the
+    /// modern transport, taken if there is one). Returns the transport and
+    /// the low feature bits accepted.
     pub fn new(dev: &PciDevice, features: u32) -> Result<(Transport, u32), InitError> {
         dev.enable(true, true);
+        match Modern::new(dev, features) {
+            Err(InitError::MissingCapability) => {}
+            r => return r.map(|(m, f)| (Transport(Regs::Modern(m)), f)),
+        }
+        let ports = dev.map_ports(0).ok_or(InitError::MissingCapability)?;
+        reset(|| ports.read8(L_STATUS), |s| ports.write8(L_STATUS, s));
+        let accepted = ports.read32(L_DEVICE_FEATURES) & features;
+        ports.write32(L_DRIVER_FEATURES, accepted);
+        Ok((Transport(Regs::Legacy(ports)), accepted))
+    }
+
+    /// Whether the device speaks the legacy protocol: what its requests
+    /// look like may differ, and their parts go in separate descriptors.
+    pub fn is_legacy(&self) -> bool {
+        matches!(self.0, Regs::Legacy(_))
+    }
+
+    /// Sets up queue `index` with at most `max` entries (rounded down to a
+    /// power of two the device allows; a legacy device has the only say).
+    pub fn queue(&self, index: u16, max: u16) -> Result<(VirtQueue, Notifier), InitError> {
+        let ports = match &self.0 {
+            Regs::Modern(m) => return m.queue(index, max),
+            Regs::Legacy(ports) => ports,
+        };
+        ports.write16(L_QUEUE_SELECT, index);
+        let size = ports.read16(L_QUEUE_SIZE);
+        if size == 0 || size == u16::MAX {
+            return Err(InitError::NoQueue);
+        }
+        let queue = VirtQueue::new(size, L_PAGE as usize).ok_or(InitError::NoMemory)?;
+        let (at, _, _) = queue.addresses();
+        let pfn = u32::try_from(at.as_u64() / L_PAGE).map_err(|_| InitError::NoMemory)?;
+        ports.write32(L_QUEUE_PFN, pfn);
+        Ok((
+            queue,
+            Notifier(Window {
+                bar: 0,
+                offset: L_QUEUE_NOTIFY,
+            }),
+        ))
+    }
+
+    /// Tells the device the driver is ready (after its queues are set up).
+    pub fn driver_ok(&self) {
+        let status = STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_DRIVER_OK;
+        match &self.0 {
+            Regs::Modern(m) => m.w8(m.common, DEVICE_STATUS, status | STATUS_FEATURES_OK),
+            Regs::Legacy(ports) => ports.write8(L_STATUS, status),
+        }
+    }
+
+    /// Tells the device that queue `index` (behind `n`) has new buffers.
+    pub fn notify(&self, n: Notifier, index: u16) {
+        match &self.0 {
+            Regs::Modern(m) => m.w16(n.0, 0, index),
+            Regs::Legacy(ports) => ports.write16(n.0.offset, index),
+        }
+    }
+
+    /// Reads 32 bits of device-specific configuration.
+    pub fn device_r32(&self, off: u64) -> u32 {
+        match &self.0 {
+            Regs::Modern(m) => m.r32(m.device, off),
+            // (Byte by byte: some devices answer nothing wider.)
+            Regs::Legacy(p) => {
+                u32::from_le_bytes([0, 1, 2, 3].map(|i| p.read8(L_DEVICE + off + i)))
+            }
+        }
+    }
+}
+
+impl Modern {
+    fn new(dev: &PciDevice, features: u32) -> Result<(Modern, u32), InitError> {
         let mut bars: Vec<(u8, IoMem)> = Vec::new();
         let mut window = |bar: u8, offset: u32| -> Result<Window, InitError> {
             let idx = match bars.iter().position(|(b, _)| *b == bar) {
@@ -136,7 +247,7 @@ impl Transport {
         let (Some(common), Some(notify)) = (common, notify) else {
             return Err(InitError::MissingCapability);
         };
-        let t = Transport {
+        let t = Modern {
             bars,
             common,
             device: device.unwrap_or(Window {
@@ -147,12 +258,7 @@ impl Transport {
             multiplier,
         };
         let c = t.common;
-        t.w8(c, DEVICE_STATUS, 0);
-        let deadline = frame::time::now() + RESET_TIMEOUT;
-        while t.r8(c, DEVICE_STATUS) != 0 && frame::time::now() < deadline {
-            core::hint::spin_loop();
-        }
-        t.w8(c, DEVICE_STATUS, STATUS_ACKNOWLEDGE | STATUS_DRIVER);
+        reset(|| t.r8(c, DEVICE_STATUS), |s| t.w8(c, DEVICE_STATUS, s));
         t.w32(c, DEVICE_FEATURE_SELECT, 1);
         if t.r32(c, DEVICE_FEATURE) & F_VERSION_1_HI == 0 {
             return Err(InitError::NoVersion1);
@@ -171,9 +277,7 @@ impl Transport {
         Ok((t, accepted))
     }
 
-    /// Sets up queue `index` with at most `max` entries (rounded down to a
-    /// power of two the device allows).
-    pub fn queue(&self, index: u16, max: u16) -> Result<(VirtQueue, Notifier), InitError> {
+    fn queue(&self, index: u16, max: u16) -> Result<(VirtQueue, Notifier), InitError> {
         let c = self.common;
         self.w16(c, QUEUE_SELECT, index);
         let dev_max = self.r16(c, QUEUE_SIZE);
@@ -182,7 +286,7 @@ impl Transport {
         }
         let cap = max.min(dev_max).max(1);
         let size = 1u16 << (15 - cap.leading_zeros());
-        let queue = VirtQueue::new(size).ok_or(InitError::NoMemory)?;
+        let queue = VirtQueue::new(size, 4).ok_or(InitError::NoMemory)?;
         self.w16(c, QUEUE_SIZE, size);
         let (desc, avail, used) = queue.addresses();
         self.w64(c, QUEUE_DESC, desc.as_u64());
@@ -195,22 +299,6 @@ impl Transport {
         };
         self.w16(c, QUEUE_ENABLE, 1);
         Ok((queue, Notifier(at)))
-    }
-
-    /// Tells the device the driver is ready (after its queues are set up).
-    pub fn driver_ok(&self) {
-        let status = STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK | STATUS_DRIVER_OK;
-        self.w8(self.common, DEVICE_STATUS, status);
-    }
-
-    /// Tells the device that queue `index` (behind `n`) has new buffers.
-    pub fn notify(&self, n: Notifier, index: u16) {
-        self.w16(n.0, 0, index);
-    }
-
-    /// Reads 32 bits of device-specific configuration.
-    pub fn device_r32(&self, off: u64) -> u32 {
-        self.r32(self.device, off)
     }
 
     fn mem(&self, w: Window) -> Option<&IoMem> {

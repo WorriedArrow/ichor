@@ -237,6 +237,9 @@ pub struct RunConfig {
     /// `sockets=2,cores=3`, which gives sparse APIC ids as multi-socket
     /// cloud hosts do).
     pub smp_topology: String,
+    /// Extra `-cpu` properties (for example `-x2apic`, which Hyper-V's
+    /// guests do without).
+    pub cpu_props: String,
     /// Extra options for the user-mode network backend (for example
     /// `hostfwd=tcp:127.0.0.1:8080-:80`).
     pub net_user_opts: String,
@@ -276,6 +279,14 @@ impl RunConfig {
         }
     }
 
+    fn cpu_arg(&self, accel: Accel) -> String {
+        let model = accel.cpu_model();
+        match self.cpu_props.as_str() {
+            "" => model.into(),
+            props => format!("{model},{props}"),
+        }
+    }
+
     fn smp_arg(&self) -> String {
         if self.smp_topology.is_empty() {
             self.smp.to_string()
@@ -304,6 +315,7 @@ impl RunConfig {
             disk_devices_before: Vec::new(),
             machine_props: String::new(),
             smp_topology: String::new(),
+            cpu_props: String::new(),
             net_user_opts: String::new(),
             nic: "virtio-net-pci,disable-legacy=on".into(),
             api_token: None,
@@ -547,7 +559,7 @@ pub fn command(cfg: &RunConfig) -> Result<Command> {
         .map_err(|_| "run directory is outside the workspace".to_string())?;
 
     cmd.args(["-machine", &cfg.machine(), "-accel", accel.qemu_name()])
-        .args(["-cpu", accel.cpu_model()])
+        .args(["-cpu", &cfg.cpu_arg(accel)])
         .args(["-smp", &cfg.smp_arg()])
         .args(["-m", &format!("{}M", cfg.memory_mib)])
         .args(["-nodefaults", "-no-user-config", "-no-reboot"])
@@ -618,7 +630,7 @@ fn disk_command(cfg: &RunConfig, qemu: &Path, fw: &Firmware, img: &Path) -> Resu
     let accel = cfg.accel.resolve();
     let mut cmd = Command::new(qemu);
     cmd.args(["-machine", &cfg.machine(), "-accel", accel.qemu_name()])
-        .args(["-cpu", accel.cpu_model()])
+        .args(["-cpu", &cfg.cpu_arg(accel)])
         .args(["-smp", &cfg.smp_arg()])
         .args(["-m", &format!("{}M", cfg.memory_mib)])
         .args(["-nodefaults", "-no-user-config", "-no-reboot"])

@@ -558,6 +558,30 @@ impl ImageConfig {
         v.extend_from_slice(if args.is_empty() { &self.cmd } else { args });
         v
     }
+
+    /// The process's environment: the image's, with `set` over it (the last
+    /// of one name counts), and what an image may rely on being there: a
+    /// `PATH`, and root's `HOME`.
+    pub fn environment(&self, set: &[String]) -> Vec<String> {
+        const ALWAYS: [&str; 2] = [
+            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            "HOME=/root",
+        ];
+        let name = |e: &str| e.split_once('=').map_or(e.len(), |(n, _)| n.len());
+        let mut env: Vec<String> = Vec::new();
+        for e in ALWAYS
+            .iter()
+            .copied()
+            .chain(self.env.iter().chain(set).map(String::as_str))
+        {
+            let n = &e[..name(e)];
+            match env.iter_mut().find(|had| had[..name(had)] == *n) {
+                Some(had) => *had = e.into(),
+                None => env.push(e.into()),
+            }
+        }
+        env
+    }
 }
 
 #[cfg(test)]

@@ -15,5 +15,8 @@ postgres = 980
 # 2026-11-22: 4398 of 4404 tests (99.8%) under TCG on 4 vCPUs.
 node = 985
 
+# 2026-11-22: 2283 of 2376 tests (96.0%) on KVM with 4 vCPUs.
+jvm = 945
+
 # 2026-11-22: 150 of 156 tests (96.2%) under TCG on 4 vCPUs.
 uring = 940

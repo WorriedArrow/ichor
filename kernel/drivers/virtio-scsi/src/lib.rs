@@ -1,4 +1,4 @@
-//! virtio-scsi (virtio 1.x §5.6) over the modern PCI transport, polled:
+//! virtio-scsi (virtio 1.x §5.6), polled:
 //! the disks behind a virtio-scsi controller as read-only block devices.
 //! GCP's general-purpose machine types (E2, N1, N2, ...) attach their
 //! persistent disks this way, as targets of one controller.

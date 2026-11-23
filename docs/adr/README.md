@@ -20,6 +20,7 @@ brief where they conflict with it.
 | [0012](0012-control-plane.md) | The control plane: a native-ABI service, native ABI v2, our own TLS/HTTP/OCI crates | Accepted |
 | [0013](0013-workloads-and-io-uring.md) | Milestone 7: io_uring, and real workloads' own test suites through the control plane | Accepted |
 | [0014](0014-services-runtime-trusted-crate.md) | `services/rt`, the second crate allowed `unsafe`: scope, rules, budget | Accepted |
+| [0015](0015-xapic.md) | Machines without x2APIC: the local APIC as an xAPIC | Accepted |
 
 ## Planned
 

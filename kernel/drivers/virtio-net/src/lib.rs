@@ -1,9 +1,10 @@
-//! virtio-net over the modern PCI transport, polled (ADR-0010 §5).
+//! virtio-net, polled (ADR-0010 §5).
 //!
 //! Negotiates only `VIRTIO_NET_F_MAC`: no checksum or segmentation
 //! offloads and no mergeable receive buffers, so every frame on either
-//! queue is preceded by the fixed 12-byte `virtio_net_hdr` (all zero on
-//! transmit). Queue 0 receives: [`RX_BUFFERS`] device-writable buffers stay
+//! queue is preceded by the fixed `virtio_net_hdr` (12 bytes; a legacy
+//! device's is 10, in a descriptor of its own; all zero on transmit). Queue
+//! 0 receives: [`RX_BUFFERS`] device-writable buffers stay
 //! posted and each is reposted once its frame is taken. Queue 1 transmits:
 //! each frame gets its own buffer, which the queue holds until the device
 //! reports it used.
@@ -19,7 +20,7 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 use frame::dma::DmaBuf;
-use frame::virtio::{Segment, VirtQueue};
+use frame::virtio::{Segment, SubmitError, VirtQueue};
 use virtio_pci::{Notifier, Transport};
 
 pub use virtio_pci::InitError;
@@ -29,6 +30,8 @@ const DEVICE_NET_TRANSITIONAL: u16 = 0x1000;
 const F_MAC: u32 = 1 << 5;
 /// `virtio_net_hdr` with VIRTIO_F_VERSION_1 (num_buffers included).
 const HEADER: usize = 12;
+/// Without it, which a legacy device is (no num_buffers).
+const LEGACY_HEADER: usize = 10;
 /// The largest frame: a 1500-byte MTU plus the Ethernet header.
 pub const MAX_FRAME: usize = 1514;
 /// Receive buffers kept posted (a polled driver must hold what arrives
@@ -47,6 +50,8 @@ pub struct VirtioNet {
     tx: VirtQueue,
     tx_notify: Notifier,
     mac: [u8; 6],
+    /// The bytes before each frame.
+    header: usize,
     /// Posted receive buffers by token.
     rx_bufs: BTreeMap<u16, DmaBuf>,
     /// Buffers reposted that the device has not been told of (telling it
@@ -64,6 +69,27 @@ pub fn probe_all() -> Vec<Result<VirtioNet, InitError>> {
         .collect()
 }
 
+/// Submits `buf`: a header of `header` bytes and a frame of `len`.
+fn submit(
+    queue: &mut VirtQueue,
+    buf: &DmaBuf,
+    header: usize,
+    len: usize,
+    device_writes: bool,
+) -> Result<u16, SubmitError> {
+    let part = |offset, len| Segment {
+        buf,
+        offset,
+        len,
+        device_writes,
+    };
+    if header == LEGACY_HEADER {
+        queue.submit(&[part(0, header), part(header, len)])
+    } else {
+        queue.submit(&[part(0, header + len)])
+    }
+}
+
 impl VirtioNet {
     fn init(dev: &frame::bus::pci::PciDevice) -> Result<VirtioNet, InitError> {
         let (transport, features) = Transport::new(dev, F_MAC)?;
@@ -78,6 +104,11 @@ impl VirtioNet {
         } else {
             [0x02, 0x49, 0x43, 0x48, 0x4f, 0x52]
         };
+        let header = if transport.is_legacy() {
+            LEGACY_HEADER
+        } else {
+            HEADER
+        };
         let mut net = VirtioNet {
             transport,
             rx,
@@ -85,11 +116,13 @@ impl VirtioNet {
             tx,
             tx_notify,
             mac,
+            header,
             rx_bufs: BTreeMap::new(),
             rx_untold: 0,
             tx_dropped: 0,
         };
-        for _ in 0..net.rx.size() {
+        // (A legacy device's queue can be much larger.)
+        for _ in 0..net.rx.size().min(RX_BUFFERS) {
             if !net.post_rx(None) {
                 break;
             }
@@ -106,16 +139,10 @@ impl VirtioNet {
 
     /// Posts a receive buffer (a fresh one, or `reuse`).
     fn post_rx(&mut self, reuse: Option<DmaBuf>) -> bool {
-        let Some(buf) = reuse.or_else(|| DmaBuf::alloc(HEADER + MAX_FRAME)) else {
+        let Some(buf) = reuse.or_else(|| DmaBuf::alloc(self.header + MAX_FRAME)) else {
             return false;
         };
-        let seg = [Segment {
-            buf: &buf,
-            offset: 0,
-            len: HEADER + MAX_FRAME,
-            device_writes: true,
-        }];
-        match self.rx.submit(&seg) {
+        match submit(&mut self.rx, &buf, self.header, MAX_FRAME, true) {
             Ok(token) => {
                 self.rx_bufs.insert(token, buf);
                 true
@@ -139,10 +166,10 @@ impl VirtioNet {
             return None;
         };
         let buf = self.rx_bufs.remove(&token)?;
-        let len = (len as usize).min(HEADER + MAX_FRAME);
-        let frame = if len > HEADER {
-            let mut f = alloc::vec![0u8; len - HEADER];
-            buf.read(HEADER, &mut f);
+        let len = (len as usize).min(self.header + MAX_FRAME);
+        let frame = if len > self.header {
+            let mut f = alloc::vec![0u8; len - self.header];
+            buf.read(self.header, &mut f);
             Some(f)
         } else {
             None
@@ -163,18 +190,12 @@ impl VirtioNet {
         if frame.is_empty() || frame.len() > MAX_FRAME {
             return false;
         }
-        let Some(buf) = DmaBuf::alloc(HEADER + frame.len()) else {
+        let Some(buf) = DmaBuf::alloc(self.header + frame.len()) else {
             self.tx_dropped += 1;
             return false;
         };
-        buf.write(HEADER, frame);
-        let seg = [Segment {
-            buf: &buf,
-            offset: 0,
-            len: HEADER + frame.len(),
-            device_writes: false,
-        }];
-        if self.tx.submit(&seg).is_err() {
+        buf.write(self.header, frame);
+        if submit(&mut self.tx, &buf, self.header, frame.len(), false).is_err() {
             self.tx_dropped += 1;
             return false;
         }

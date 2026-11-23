@@ -60,14 +60,16 @@ pub struct VirtQueue {
 }
 
 impl VirtQueue {
-    /// A queue of `size` entries (a power of two, 1–256).
-    pub fn new(size: u16) -> Option<VirtQueue> {
-        if !size.is_power_of_two() || size > 256 {
+    /// A queue of `size` entries (a power of two), whose used ring is
+    /// aligned to `align` bytes (likewise, at least 4; a legacy device has
+    /// 4096, and takes the queue as one piece at the first address).
+    pub fn new(size: u16, align: usize) -> Option<VirtQueue> {
+        if !size.is_power_of_two() || !align.is_power_of_two() {
             return None;
         }
         let n = usize::from(size);
         let avail_off = n * DESC_LEN;
-        let used_off = (avail_off + 6 + 2 * n).next_multiple_of(4);
+        let used_off = (avail_off + 6 + 2 * n).checked_next_multiple_of(align.max(4))?;
         let total = used_off + 6 + 8 * n;
         let mem = DmaBuf::alloc(total)?;
         Some(VirtQueue {

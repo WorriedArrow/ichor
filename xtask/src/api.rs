@@ -71,8 +71,18 @@ impl Session {
         trust: Option<&Trust>,
         deadline: Instant,
     ) -> Result<Session> {
+        Session::connect_to(&format!("127.0.0.1:{port}"), token, trust, deadline)
+    }
+
+    /// [`Session::connect`], to a machine anywhere (`address`: `HOST:PORT`).
+    pub fn connect_to(
+        address: &str,
+        token: Option<&str>,
+        trust: Option<&Trust>,
+        deadline: Instant,
+    ) -> Result<Session> {
         while Instant::now() < deadline {
-            if let Ok(sock) = TcpStream::connect(("127.0.0.1", port)) {
+            if let Ok(sock) = TcpStream::connect(address) {
                 let client = match token {
                     Some(t) => Client::with_token("ichor", t),
                     None => Client::new("ichor"),

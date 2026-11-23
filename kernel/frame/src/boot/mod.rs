@@ -221,7 +221,12 @@ pub(crate) extern "sysv64" fn kernel_space_entry() -> ! {
     };
     init_cpu(CpuId::BOOT);
     println!(
-        "ichor: frame: cpu0 ready (x2APIC id {}, TSC {} MHz from {source}, {} timer)",
+        "ichor: frame: cpu0 ready ({} id {}, TSC {} MHz from {source}, {} timer)",
+        if arch::cpu::features().x2apic {
+            "x2APIC"
+        } else {
+            "xAPIC"
+        },
         arch::apic::apic_id(),
         hz / 1_000_000,
         if arch::cpu::features().tsc_deadline {
@@ -278,7 +283,8 @@ pub(crate) extern "sysv64" fn kernel_space_entry() -> ! {
             (true, true) => "eIBRS + BHI_DIS_S",
             (true, false) if v.bhi => "eIBRS (BHI NOT MITIGATED: no BHI_DIS_S)",
             (true, false) => "eIBRS",
-            (false, _) => "NOT MITIGATED (no enhanced IBRS)",
+            (false, _) if m.ibpb => "IBRS on entry",
+            (false, _) => "NOT MITIGATED (no IBRS)",
         },
     );
     enter_kernel(BootInfo {

@@ -200,8 +200,16 @@ fn kmain(info: BootInfo) -> ! {
     // ADR-0004: how often user code of one cell followed another's on a
     // CPU that needs a predictor barrier between them.
     println!(
-        "ichor: mitigations: {} IBPBs between cells' user code",
-        frame::user::ibpb_count()
+        "ichor: mitigations: {} IBPBs between cells' user code, IBRS in the kernel {}",
+        frame::user::ibpb_count(),
+        match frame::user::ibrs_in_kernel() {
+            Some(true) => "on",
+            Some(false) => {
+                println!("ichor: FAILED: the kernel runs without IBRS");
+                shutdown(ExitStatus::Failure)
+            }
+            None => "not enumerated",
+        }
     );
 
     // Nothing may need more contiguous memory than MAX_ORDER (4 MiB).

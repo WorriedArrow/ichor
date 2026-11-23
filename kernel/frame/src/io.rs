@@ -1,4 +1,4 @@
-//! Memory-mapped device registers (ADR-0005).
+//! Device registers, memory-mapped and behind I/O ports (ADR-0005).
 //!
 //! An [`IoMem`] is obtained only from [`PciDevice::map_bar`](crate::bus::pci::PciDevice::map_bar),
 //! which refuses ranges that overlap RAM. Accessors are bounds-checked,
@@ -58,6 +58,71 @@ impl IoMem {
         let end = offset.checked_add(size)?;
         (end <= self.len && offset.is_multiple_of(size)).then(|| (self.va + offset) as usize)
     }
+}
+
+/// The I/O ports of a device's BAR, from
+/// [`PciDevice::map_ports`](crate::bus::pci::PciDevice::map_ports) only.
+/// Accessors behave as [`IoMem`]'s do.
+#[derive(Debug)]
+pub struct IoPorts {
+    base: u16,
+    len: u16,
+}
+
+impl IoPorts {
+    /// The ports below this are the platform's (frame drives the interrupt
+    /// controllers, timers, the console and PCI configuration there).
+    const PLATFORM: u32 = 0x1000;
+
+    /// Frame-internal; see `PciDevice::map_ports`.
+    pub(crate) fn new(base: u32, len: u32) -> Option<IoPorts> {
+        let end = base.checked_add(len)?;
+        let ours = base >= Self::PLATFORM && end <= 0x1_0000 && len != 0;
+        Some(IoPorts {
+            base: u16::try_from(base).ok().filter(|_| ours)?,
+            len: u16::try_from(len).ok()?,
+        })
+    }
+
+    fn slot(&self, offset: u64, size: u64) -> Option<u16> {
+        let end = offset.checked_add(size)?;
+        let inside = end <= u64::from(self.len) && offset.is_multiple_of(size);
+        inside.then(|| self.base + offset as u16)
+    }
+}
+
+macro_rules! port_accessors {
+    ($($read:ident, $write:ident, $in:ident, $out:ident, $t:ty;)*) => {
+        impl IoPorts {
+            $(
+                /// Reads the port at `offset` (all ones if out of range or
+                /// misaligned).
+                pub fn $read(&self, offset: u64) -> $t {
+                    match self.slot(offset, core::mem::size_of::<$t>() as u64) {
+                        // SAFETY: a port of this device's BAR (checked by
+                        // `slot`), which only this `IoPorts` was given.
+                        Some(port) => unsafe { crate::arch::io::$in(port) },
+                        None => <$t>::MAX,
+                    }
+                }
+
+                /// Writes the port at `offset` (dropped if out of range or
+                /// misaligned).
+                pub fn $write(&self, offset: u64, value: $t) {
+                    if let Some(port) = self.slot(offset, core::mem::size_of::<$t>() as u64) {
+                        // SAFETY: as in the read.
+                        unsafe { crate::arch::io::$out(port, value) };
+                    }
+                }
+            )*
+        }
+    };
+}
+
+port_accessors! {
+    read8, write8, inb, outb, u8;
+    read16, write16, inw, outw, u16;
+    read32, write32, inl, outl, u32;
 }
 
 macro_rules! accessors {

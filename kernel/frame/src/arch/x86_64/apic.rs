@@ -1,8 +1,8 @@
-//! Local x2APIC, the per-CPU timer, IPIs and TSC calibration.
+//! Local APIC, the per-CPU timer, IPIs and TSC calibration.
 //!
-//! Ichor requires x2APIC (every cloud VM and server CPU of the last decade
-//! has it), so the local APIC is programmed entirely through MSRs and needs
-//! no MMIO mapping. The 8259 PICs are masked and never used. The timer runs
+//! The local APIC is programmed as an x2APIC, through MSRs, where there is
+//! one; elsewhere (Hyper-V's guests) the same registers are an xAPIC's, in
+//! memory (ADR-0015). The 8259 PICs are masked and never used. The timer runs
 //! in TSC-deadline mode when available, else in one-shot mode calibrated
 //! against the TSC; either way it only fires when armed (tickless).
 
@@ -48,38 +48,70 @@ static TIMER_HANDLER: SpinLock<Option<fn()>> = SpinLock::new(None);
 static IPI_HANDLER: SpinLock<Option<fn()>> = SpinLock::new(None);
 static UNEXPECTED_IRQS: AtomicU64 = AtomicU64::new(0);
 
+/// Where an xAPIC's registers are mapped (every CPU's are at one address);
+/// 0: it is an x2APIC.
+static XAPIC: AtomicU64 = AtomicU64::new(0);
+/// The upper half of an xAPIC's ICR (the destination's, bits 24-31), and
+/// its delivery status.
+const MSR_ICR_HIGH: u32 = 0x831;
+const ICR_PENDING: u64 = 1 << 12;
+
+/// The register of an xAPIC that an x2APIC has as `msr`.
+fn xapic(va: u64, msr: u32) -> *mut u32 {
+    core::ptr::with_exposed_provenance_mut((va + u64::from((msr - 0x800) << 4)) as usize)
+}
+
 fn write(msr: u32, v: u64) {
-    // SAFETY: `msr` is one of the x2APIC registers above, which exist once
-    // x2APIC mode is enabled (`init_local` runs first on every CPU). They
-    // only affect interrupt delivery to and from this CPU.
-    unsafe { wrmsr(msr, v) };
+    let va = XAPIC.load(Relaxed);
+    if va == 0 {
+        // SAFETY: `msr` is one of the x2APIC registers above, which exist
+        // once x2APIC mode is enabled (`init_local` runs first on every
+        // CPU). They only affect interrupt delivery to and from this CPU.
+        return unsafe { wrmsr(msr, v) };
+    }
+    // SAFETY: `va` is the local APIC's page, mapped uncached for good, and
+    // the register one of the above: as with the MSRs.
+    let put = |msr, v| unsafe { xapic(va, msr).write_volatile(v) };
+    if msr != MSR_ICR {
+        return put(msr, v as u32);
+    }
+    // Two writes, the second of which sends: no interrupt between them may
+    // send one of its own.
+    let _irqs = crate::cpu::IrqGuard::new();
+    put(MSR_ICR_HIGH, ((v >> 32) as u32) << 24);
+    put(MSR_ICR, v as u32);
+    while read(MSR_ICR) & ICR_PENDING != 0 {
+        core::hint::spin_loop();
+    }
 }
 
 fn read(msr: u32) -> u64 {
-    // SAFETY: as in `write`; reads of these registers have no side effects.
-    unsafe { rdmsr(msr) }
+    match XAPIC.load(Relaxed) {
+        // SAFETY: as in `write`; reads of these registers have no side
+        // effects.
+        0 => unsafe { rdmsr(msr) },
+        // SAFETY: as above.
+        va => u64::from(unsafe { xapic(va, msr).read_volatile() }),
+    }
 }
 
-/// Puts this CPU's local APIC in x2APIC mode with all local interrupts
-/// masked except NMI on LINT1 and the error interrupt.
+/// Puts this CPU's local APIC in x2APIC mode (if it has one) with all local
+/// interrupts masked except NMI on LINT1 and the error interrupt.
 pub(crate) fn init_local() -> Result<(), &'static str> {
-    let f = super::cpu::features();
-    if !f.x2apic {
-        return Err("CPU lacks x2APIC");
-    }
-    // SAFETY: IA32_APIC_BASE exists on every x2APIC-capable CPU. Enabling
-    // the APIC and then x2APIC mode is the architectural sequence (xAPIC ->
-    // x2APIC); it changes only how this CPU's APIC is accessed.
-    let base = unsafe { rdmsr(regs::MSR_APIC_BASE) };
+    // SAFETY: IA32_APIC_BASE exists on every x86-64 CPU. Enabling the APIC
+    // and then x2APIC mode is the architectural sequence (xAPIC -> x2APIC);
+    // it changes only how this CPU's APIC is accessed.
+    let base = unsafe { rdmsr(regs::MSR_APIC_BASE) } | APIC_BASE_ENABLE;
     // SAFETY: as above (global enable first).
-    unsafe { wrmsr(regs::MSR_APIC_BASE, base | APIC_BASE_ENABLE) };
-    // SAFETY: as above (then x2APIC mode).
-    unsafe {
-        wrmsr(
-            regs::MSR_APIC_BASE,
-            base | APIC_BASE_ENABLE | APIC_BASE_X2APIC,
-        )
-    };
+    unsafe { wrmsr(regs::MSR_APIC_BASE, base) };
+    if super::cpu::features().x2apic {
+        // SAFETY: as above (then x2APIC mode).
+        unsafe { wrmsr(regs::MSR_APIC_BASE, base | APIC_BASE_X2APIC) };
+    } else if XAPIC.load(Relaxed) == 0 {
+        let page = base & 0x000f_ffff_ffff_f000;
+        let va = crate::mm::kspace::map_mmio(page, crate::mm::PAGE_SIZE);
+        XAPIC.store(va.ok_or("cannot map the local APIC")?, Relaxed);
+    }
     write(MSR_TPR, 0);
     write(MSR_LVT_LINT0, LVT_MASKED);
     write(MSR_LVT_LINT1, LVT_NMI);
@@ -98,9 +130,12 @@ pub(crate) fn mask_legacy_pic() {
     unsafe { outb(0xa1, 0xff) };
 }
 
-/// This CPU's x2APIC ID.
+/// This CPU's APIC ID.
 pub(crate) fn apic_id() -> u32 {
-    read(MSR_ID) as u32
+    match XAPIC.load(Relaxed) {
+        0 => read(MSR_ID) as u32,
+        _ => read(MSR_ID) as u32 >> 24,
+    }
 }
 
 pub(crate) fn eoi() {
@@ -256,6 +291,8 @@ pub(crate) fn init_timer() {
     if super::cpu::features().tsc_deadline {
         DEADLINE_MODE.store(true, Relaxed);
         write(MSR_LVT_TIMER, LVT_TSC_DEADLINE | u64::from(TIMER_VECTOR));
+        // (An xAPIC's is a store, which the deadline's MSR does not wait for.)
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         return;
     }
     // One-shot mode: measure LAPIC ticks per millisecond against the TSC.

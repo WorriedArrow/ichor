@@ -71,6 +71,7 @@ const _: () = {
     assert!(offset_of!(CpuBlock, pti) == 144);
     assert!(offset_of!(CpuBlock, verw) == 152);
     assert!(offset_of!(CpuBlock, verw_sel) == 160);
+    assert!(offset_of!(CpuBlock, spec_ctrl) == 168);
     assert!(core::mem::size_of::<CpuBlock>() == PAGE_SIZE as usize);
 };
 
@@ -347,6 +348,20 @@ global_asm!(
     ".set GS_PTI, 144",
     ".set GS_VERW, 152",
     ".set GS_VERWSEL, 160",
+    ".set GS_SPEC, 168",
+    // Spectre v2 without enhanced IBRS: IA32_SPEC_CTRL is written on every
+    // entry from ring 3, before any indirect branch or return, and again
+    // without IBRS on the way back (mask -1 and -2). Uses rax, rcx and rdx.
+    ".macro ichor_spec_ctrl mask",
+    "mov eax, gs:[GS_SPEC]",
+    "and eax, \\mask",
+    "cmp dword ptr gs:[GS_SPEC], 0",
+    "je 90f",
+    "mov ecx, 0x48",
+    "xor edx, edx",
+    "wrmsr",
+    "90:",
+    ".endm",
     // UserContext offsets (`usermode::UserContext`).
     ".set UC_RAX, 0",
     ".set UC_RBX, 8",
@@ -431,12 +446,14 @@ global_asm!(
     "mov r12, rax",
     "mov rax, gs:[GS_KCR3]",
     "mov cr3, rax",
+    "ichor_spec_ctrl -1",
     "2:",
     // 22 quadwords from the 16-byte aligned interrupt frame: aligned.
     "mov rdi, rsp",
     "call qword ptr gs:[GS_DISPATCH]",
     "test r12, r12",
     "jz 3f",
+    "ichor_spec_ctrl -2",
     "mov cr3, r12",
     "3:",
     "pop rax",
@@ -467,6 +484,7 @@ global_asm!(
     "mov rax, gs:[GS_KCR3]",
     "mov cr3, rax",
     "5:",
+    "ichor_spec_ctrl -1",
     "mov rdi, rsp",
     "mov rsp, gs:[GS_RESUME]",
     "and rsp, -16",
@@ -498,6 +516,7 @@ global_asm!(
     "push qword ptr [rdi + UC_RIP]",
     "push qword ptr [rdi + UC_RAX]",
     "push qword ptr [rdi + UC_RDI]",
+    "ichor_spec_ctrl -2",
     "mov rbx, [rdi + UC_RBX]",
     "mov rcx, [rdi + UC_RCX]",
     "mov rdx, [rdi + UC_RDX]",
@@ -568,6 +587,7 @@ global_asm!(
     "mov rax, gs:[GS_SCRATCH]",
     "mov [rdi + UC_RDI], rax",
     "mov qword ptr gs:[GS_EVENT], 1", // Syscall
+    "ichor_spec_ctrl -1",
     "jmp ichor_user_resume",
     ".balign 4096",
     ".global ichor_entry_end",

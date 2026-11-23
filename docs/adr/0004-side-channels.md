@@ -214,7 +214,8 @@ What §2 says for Spectre v2 and BHI on CPUs with enhanced IBRS, as built:
   other CPU.
 - The boot log's mitigations line ends with `Spectre v2 in the kernel`
   and one of `eIBRS + BHI_DIS_S`, `eIBRS`, `eIBRS (BHI NOT MITIGATED: no
-  BHI_DIS_S)`, or `NOT MITIGATED (no enhanced IBRS)`.
+  BHI_DIS_S)`, `IBRS on entry` (the next amendment), or `NOT MITIGATED (no
+  IBRS)`.
 - **Not verified on hardware.** Neither TCG nor CI's KVM guests report
   enhanced IBRS, so tests cover only the CPUs where nothing is written.
   The first cloud boot on a CPU that has it is the first run of this code.
@@ -222,6 +223,28 @@ What §2 says for Spectre v2 and BHI on CPUs with enhanced IBRS, as built:
   `BHI_DIS_S` (Cascade Lake, Ice Lake), IBRS on entry for CPUs without
   enhanced IBRS, RSB filling, masked indices for Spectre v1, and AMD's
   AutoIBRS, Retbleed and SRSO measures.
+
+## Amendment (2026-11-22): IBRS on entry
+
+The first cloud machine (GCP E2) has a CPU without enhanced IBRS and said
+so: `Spectre v2 in the kernel NOT MITIGATED`. Stable Rust has no
+retpolines, so what is left for such CPUs is IBRS as it first was, which
+protects the mode it was last written in:
+
+- Where CPUID enumerates `IA32_SPEC_CTRL` and the CPU has no enhanced IBRS
+  (on AMD too, under a hypervisor that says so), the entry code writes it
+  with IBRS on every entry from ring 3, after the kernel's page tables are
+  loaded and before the first indirect branch or return, and without IBRS
+  before it goes back (ring 3 does not pay for it; an NMI from the moment
+  the kernel still has the user's page tables does the same around
+  itself). Two MSR writes for each system call, fault or interrupt from
+  ring 3. Firmware's bits are kept.
+- The boot log says `IBRS on entry`; the boot fails if the kernel finds
+  itself without IBRS. Verified on that machine, where it costs Redis about
+  a tenth and PostgreSQL a twentieth (`docs/cloud.md`).
+- Not covered: an NMI between IBRS going off and the user's page tables
+  (Ichor takes none), and what IBRS does not do (BHI, the RSB across VM
+  exits).
 
 ## Consequences
 

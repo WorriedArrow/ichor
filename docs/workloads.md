@@ -83,3 +83,110 @@ Failed:
 - `socket-io-cmd`
 - `timeout`
 - `wq-aff`
+
+## jvm
+
+- Image: `docker.io/library/eclipse-temurin@sha256:a09e64f4976df9c4f2029c6abe64fc26f069a342ec9a7f147dce7b1933ebda16`
+- Layer: `https://ci.adoptium.net/view/Dependencies/job/dependency_pipeline/lastSuccessfulBuild/artifact/jtreg/jtreg-8.2.1+1.tar.gz` (sha256:07d1a51162d5b60c2709fecb5438c7ba9d3d698a9ac7673256e4e6c5364a2201), `jtreg/` at `/opt/jtreg/`
+- Layer: `https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.13.1%2B2/OpenJDK21U-jdk-sources_21.0.13.1_2.tar.gz` (sha256:427e3eaec042f61c93258b5a42c86f3ddbad45a2ba95132dd4a3e3c07414bc8c), `jdk-21.0.13.1+2-src/test/jdk/` at `/usr/src/jdk/test/jdk/`
+- Layer: `https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.13.1%2B2/OpenJDK21U-jdk-sources_21.0.13.1_2.tar.gz` (sha256:427e3eaec042f61c93258b5a42c86f3ddbad45a2ba95132dd4a3e3c07414bc8c), `jdk-21.0.13.1+2-src/test/jtreg-ext/` at `/usr/src/jdk/test/jtreg-ext/`
+- Layer: `https://github.com/adoptium/temurin21-binaries/releases/download/jdk-21.0.13.1%2B2/OpenJDK21U-jdk-sources_21.0.13.1_2.tar.gz` (sha256:427e3eaec042f61c93258b5a42c86f3ddbad45a2ba95132dd4a3e3c07414bc8c), `jdk-21.0.13.1+2-src/test/lib/` at `/usr/src/jdk/test/lib/`
+- Command: `sh -c useradd -m jdk; cd /usr/src/jdk/test/jdk && { [ $# -gt 0 ] || set -- :tier1; } && exec su jdk -c 'exec sh /opt/jtreg/bin/jtreg -jdk:"$JAVA_HOME" -agentvm -automatic -ignore:quiet -conc:4 -timeoutFactor:10 -verbose:summary -exclude:ProblemList.txt -w:/tmp/work -r:/tmp/report "$@"' -- "$0" "$@" jvm`
+- Result: 2283 of 2376 tests passed (96.0%), 0 skipped; floor 0.0%
+- Run time: 34 min (kvm, 4 vCPUs, the cell given 5 GiB)
+
+Failed:
+
+- `java/foreign/LibraryLookupTest.java`
+- `java/foreign/SafeFunctionAccessTest.java`
+- `java/foreign/TestAddressDereference.java`
+- `java/foreign/TestClassLoaderFindNative.java`
+- `java/foreign/TestDowncallScope.java`
+- `java/foreign/TestDowncallStack.java`
+- `java/foreign/TestHFA.java`
+- `java/foreign/TestIntrinsics.java`
+- `java/foreign/TestLinker.java`
+- `java/foreign/TestLargeSegmentCopy.java`
+- `java/foreign/TestNULLAddress.java`
+- `java/foreign/TestNative.java`
+- `java/foreign/TestUpcallHighArity.java`
+- `java/foreign/TestUpcallException.java`
+- `java/foreign/TestUpcallAsync.java`
+- `java/foreign/TestUpcallStructScope.java`
+- `java/foreign/TestUpcallScope.java`
+- `java/foreign/TestUpcallStack.java`
+- `java/foreign/TestVarArgs.java`
+- `java/foreign/arraystructs/TestArrayStructs.java#interpreted`
+- `java/foreign/arraystructs/TestArrayStructs.java#specialized`
+- `java/foreign/capturecallstate/TestCaptureCallState.java`
+- `java/foreign/dontrelease/TestDontRelease.java`
+- `java/foreign/loaderLookup/TestLoaderLookup.java`
+- `java/foreign/loaderLookup/TestLoaderLookupJNI.java`
+- `java/foreign/nested/TestNested.java`
+- `java/foreign/passheapsegment/TestPassHeapSegment.java`
+- `java/foreign/normalize/TestNormalize.java`
+- `java/foreign/stackwalk/TestAsyncStackWalk.java#default_gc`
+- `java/foreign/stackwalk/TestAsyncStackWalk.java#shenandoah`
+- `java/foreign/enablenativeaccess/TestEnableNativeAccess.java`
+- `java/foreign/stackwalk/TestAsyncStackWalk.java#ZGenerational`
+- `java/foreign/stackwalk/TestAsyncStackWalk.java#ZSinglegen`
+- `java/foreign/stackwalk/TestReentrantUpcalls.java`
+- `java/foreign/stackwalk/TestStackWalk.java#shenandoah`
+- `java/foreign/stackwalk/TestStackWalk.java#default_gc`
+- `java/foreign/stackwalk/TestStackWalk.java#ZGenerational`
+- `java/foreign/trivial/TestTrivial.java`
+- `java/foreign/stackwalk/TestStackWalk.java#ZSinglegen`
+- `java/foreign/virtual/TestVirtualCalls.java`
+- `java/foreign/upcalldeopt/TestUpcallDeopt.java`
+- `java/foreign/trivial/TestTrivialUpcall.java`
+- `java/lang/Character/UnicodeBlock/CheckBlocks.java`
+- `java/lang/Character/CharPropTest.java`
+- `java/lang/Character/CheckProp.java`
+- `java/lang/Character/CheckScript.java`
+- `java/lang/Character/CheckUnicode.java`
+- `java/lang/Character/TestEmojiProperties.java`
+- `java/lang/Character/UnicodeCasingTest.java`
+- `java/lang/ClassLoader/loadLibraryDeadlock/TestLoadLibraryDeadlock.java`
+- `java/lang/ClassLoader/loadLibraryUnload/LoadLibraryUnloadTest.java`
+- `java/lang/ClassLoader/nativeLibrary/NativeLibraryTest.java`
+- `java/lang/ProcessBuilder/Basic.java#id0`
+- `java/lang/reflect/exeCallerAccessTest/CallerAccessTest.java`
+- `java/lang/reflect/Proxy/ProxyGeneratorCombo.java`
+- `java/lang/StackWalker/NativeMethod.java`
+- `java/lang/String/nativeEncoding/StringPlatformChars.java`
+- `java/lang/String/SpecialCasingTest.java`
+- `java/lang/String/UnicodeCasingTest.java`
+- `java/lang/Thread/jni/AttachCurrentThread/AttachTest.java#id0`
+- `java/lang/Thread/jni/AttachCurrentThread/AttachTest.java#id1`
+- `java/lang/Thread/virtual/TracePinnedThreads.java`
+- `java/nio/Buffer/LimitDirectMemory.java`
+- `java/util/Arrays/ArraysEqCmpTest.java`
+- `java/util/Arrays/largeMemory/ParallelPrefix.java`
+- `java/util/Arrays/HashCode.java`
+- `java/util/Arrays/TimSortStackSize2.java`
+- `java/util/BitSet/BSMethods.java`
+- `java/util/BitSet/stream/BitSetStreamTest.java`
+- `java/util/Base64/TestBase64.java`
+- `java/util/HexFormat/HexFormatTest.java`
+- `java/util/IdentityHashMap/Basic.java`
+- `java/util/HashMap/WhiteBoxResizeTest.java`
+- `java/util/Locale/LSRDataTest.java`
+- `java/util/regex/whitebox/GraphemeTest.java`
+- `java/util/regex/RegExTest.java`
+- `jdk/internal/loader/NativeLibraries/Main.java`
+- `jdk/internal/misc/CDS/ArchivedEnumTest.java`
+- `jdk/internal/vm/Continuation/Basic.java#id0`
+- `jdk/internal/vm/Continuation/BasicExt.java#COMP_ALL`
+- `jdk/internal/vm/Continuation/BasicExt.java#COMP_ALL-GC_AFTER_YIELD`
+- `jdk/internal/vm/Continuation/BasicExt.java#COMP_NONE`
+- `jdk/internal/vm/Continuation/BasicExt.java#COMP_NONE-GC_AFTER_YIELD`
+- `jdk/internal/vm/Continuation/BasicExt.java#COMP_WINDOW_LENGTH_1`
+- `jdk/internal/vm/Continuation/BasicExt.java#COMP_WINDOW_LENGTH_1-GC_AFTER_YIELD`
+- `jdk/internal/vm/Continuation/BasicExt.java#COMP_WINDOW_LENGTH_2`
+- `jdk/internal/vm/Continuation/BasicExt.java#COMP_WINDOW_LENGTH_2-GC_AFTER_YIELD`
+- `jdk/internal/vm/Continuation/BasicExt.java#COMP_WINDOW_LENGTH_3`
+- `jdk/internal/vm/Continuation/BasicExt.java#COMP_WINDOW_LENGTH_3-GC_AFTER_YIELD`
+- `jdk/internal/vm/Continuation/MovingCompWindow.java`
+- `jdk/internal/vm/Continuation/OSRTest.java`
+- `jni/nullCaller/NullCallerTest.java`
+- `sun/util/calendar/zi/TestZoneInfo310.java`

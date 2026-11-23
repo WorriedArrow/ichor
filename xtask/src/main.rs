@@ -33,7 +33,10 @@ Commands:
                --size-gib N pads it; --gcp also writes target/ichor-gcp.tar.gz;
                --api-token-file F puts the control plane's API token on it,
                --api-tls-file F its TLS certificate and Ed25519 key (PEM)
-  help         Show this message
+  api HOST:PORT --name NAME --ca F --token-file F IMAGE [-- COMMAND ...]
+               Have a running machine pull IMAGE and run it in a cell
+               (--memory MiB: the cell's, default 256)
+  help        Show this message
 
 Options:
   --release              Build the kernel with the release profile
@@ -369,6 +372,75 @@ fn cmd_test(o: &Opts) -> Result<()> {
     run_cmd(&mut cmd)
 }
 
+/// `cargo xtask api HOST:PORT --name NAME --ca FILE --token-file FILE
+/// [--memory MiB] IMAGE [-- COMMAND ...]`: has a running machine pull
+/// `IMAGE`, make a cell of it and run a command there (the image's own
+/// without one); prints the output and fails if the command did.
+fn cmd_api(args: &[String]) -> Result<()> {
+    use std::io::Write;
+    use std::time::Instant;
+    use xtask::api::{Session, Trust};
+    let mut it = args.iter();
+    let (mut name, mut ca, mut token) = (None, None, None);
+    let mut memory_mib = 256u64;
+    let mut words = Vec::new();
+    let mut argv = Vec::new();
+    let read = |f: &str| std::fs::read_to_string(f).map_err(|e| format!("{f}: {e}"));
+    while let Some(a) = it.next() {
+        let mut value = || it.next().ok_or_else(|| format!("{a} needs a value"));
+        match a.as_str() {
+            "--name" => name = Some(value()?.clone()),
+            "--ca" => ca = Some(read(value()?)?),
+            "--token-file" => token = Some(read(value()?)?.trim().to_string()),
+            "--memory" => memory_mib = value()?.parse().map_err(|e| format!("--memory: {e}"))?,
+            "--" => {
+                argv.extend(it.by_ref().map(String::as_str));
+                break;
+            }
+            s if s.starts_with('-') => return Err(format!("unknown option {s:?}")),
+            s => words.push(s),
+        }
+    }
+    let [address, image] = words[..] else {
+        return Err("api needs HOST:PORT and an image".into());
+    };
+    let trust = match (name, ca) {
+        (Some(host), Some(pem)) => Some(Trust {
+            roots: std::sync::Arc::new(x509::RootStore::from_pem(&pem)),
+            host,
+        }),
+        (None, None) => None,
+        _ => return Err("--name and --ca go together".into()),
+    };
+    if trust.is_none() && token.is_some() {
+        return Err("a token goes only to a machine that proves who it is: --name and --ca".into());
+    }
+    let until = Instant::now() + Duration::from_secs(300);
+    let mut s = Session::connect_to(address, token.as_deref(), trust.as_ref(), until)?;
+    let start = Instant::now();
+    let pulled = s.pull(image, Vec::new(), Duration::from_secs(1800))?;
+    eprintln!(
+        "api: {} is image {} ({} KiB), pulled in {:.1?}",
+        pulled.digest,
+        pulled.image_id,
+        pulled.size / 1024,
+        start.elapsed()
+    );
+    let cell = s.create_cell(&pulled.image_id, memory_mib << 20)?;
+    eprintln!("api: cell {} at {}", cell.cell_id, cell.address);
+    let day = Duration::from_secs(24 * 3600);
+    let status = s.run_with(&cell.cell_id, &argv, &[], day, &mut |b| {
+        let mut out = std::io::stdout();
+        let _ = out.write_all(b).and_then(|()| out.flush());
+    })?;
+    eprintln!("api: wait status {status}");
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(format!("the command ended with wait status {status}"))
+    }
+}
+
 /// `cargo xtask workloads SUITE [--tests "a b"] [--cmd "shell command"]
 /// [--follow FILE] [--accel A] [--cmdline "kernel options"] [--image REF]
 /// [--memory MiB]`: a runtime's own test suite through the control plane
@@ -573,8 +645,8 @@ fn main() -> ExitCode {
     let (command, rest) = args
         .split_first()
         .map_or(("help", &[][..]), |(c, r)| (c.as_str(), r));
-    // `fuzz` and `workloads` take their own arguments.
-    let rest_for_parse = if command == "fuzz" || command == "workloads" {
+    // These take their own arguments.
+    let rest_for_parse = if matches!(command, "fuzz" | "workloads" | "api") {
         &[][..]
     } else {
         rest
@@ -593,6 +665,7 @@ fn main() -> ExitCode {
         "fuzz" => cmd_fuzz(rest),
         "workloads" => cmd_workloads(rest),
         "disk-image" => cmd_disk_image(&o, rest),
+        "api" => cmd_api(rest),
         "help" | "--help" | "-h" => {
             print!("{HELP}");
             Ok(())

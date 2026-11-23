@@ -565,6 +565,54 @@ fn cloud_disk_boots_from_virtio_scsi() {
     ]);
 }
 
+/// What Google Cloud's virtio devices are: legacy ones (registers in I/O
+/// ports, queues of the device's size), for the disk, the network and
+/// entropy alike.
+#[test]
+fn cloud_disk_boots_on_legacy_virtio_devices() {
+    let legacy = "disable-modern=on,disable-legacy=off";
+    let out = boot_disk_with("cloud-disk-legacy", "", 2, |cfg| {
+        cfg.disk_scsi_target = Some(1);
+        cfg.nic = format!("virtio-net-pci,{legacy},rx_queue_size=1024");
+        cfg.disk_devices_before = vec![
+            "-device".into(),
+            format!("virtio-scsi-pci,id=scsi0,{legacy},virtqueue_size=1024"),
+            "-device".into(),
+            format!("virtio-rng-pci,{legacy}"),
+        ];
+    });
+    out.assert_exit(Exit::Success);
+    out.assert_in_order(&[
+        ", virtio-rng 512 bits)",
+        "ichor: net: DHCP lease 10.0.2.15/24",
+        " on virtio-net is the cell switch's",
+        "ichor: blk: virtio-scsi target 1, block size 512 bytes",
+        "ichor: blk: virtio-scsi: GPT disk, Ichor root partition at sector ",
+        "ichor: busybox: all applets passed",
+        "ichor: boot complete; halting",
+    ]);
+}
+
+/// What Hyper-V's guests do without: x2APIC and the TSC-deadline timer
+/// (ADR-0015).
+#[test]
+fn boots_without_x2apic() {
+    let out = boot_disk_with("no-x2apic", "", 4, |cfg| {
+        cfg.cpu_props = "-x2apic,-tsc-deadline".into();
+    });
+    out.assert_exit(Exit::Success);
+    out.assert_in_order(&[
+        "ichor: frame: cpu0 ready (xAPIC id 0, TSC ",
+        " MHz from ",
+        ", one-shot timer)",
+        "ichor: smp: 4 CPUs online, every CPU took ",
+        "ichor: sched: 9 spinners on 4 CPUs all ran",
+        "ichor: linux: munmap shot down a page another thread was reading",
+        "ichor: busybox: all applets passed",
+        "ichor: boot complete; halting",
+    ]);
+}
+
 /// A cloud-shaped machine: no PIT and no HPET (the TSC must calibrate from
 /// the ACPI PM timer), two sockets of three cores (sparse APIC ids, as
 /// multi-socket hosts give), 2 GiB, booting the GPT disk from NVMe.
@@ -593,6 +641,13 @@ fn cloud_disk_boots_without_legacy_timers_on_two_sockets() {
 #[test]
 fn tcp_through_virtio_net_to_a_host_echo_server() {
     echo_through("net-echo", "virtio-net-pci,disable-legacy=on", "virtio-net");
+}
+
+/// The same through a legacy virtio-net device (Google Cloud's).
+#[test]
+fn tcp_through_a_legacy_virtio_net_to_a_host_echo_server() {
+    let nic = "virtio-net-pci,disable-modern=on,disable-legacy=off";
+    echo_through("net-echo-legacy", nic, "virtio-net");
 }
 
 /// The same through the Intel network devices of bare-metal servers.
