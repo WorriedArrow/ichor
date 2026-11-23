@@ -77,8 +77,8 @@ pub(crate) fn run() {
         });
         println!(
             "ichor: blk: virtio-scsi target {}, block size {} bytes",
-            d.target(),
-            d.block_size()
+            d.unit.target,
+            1 << d.geometry.block_shift
         );
         let Some(m) = mount("virtio-scsi", d) else {
             continue;
@@ -86,6 +86,29 @@ pub(crate) fn run() {
         let vfs =
             Arc::new(Vfs::mount_disk(&m).unwrap_or_else(|_| fail("disk is not an Ichor image")));
         exercise("virtio-scsi", &m, vfs);
+    }
+    // Every disk of a Hyper-V machine's SCSI controllers (Azure's).
+    for d in crate::hv::bus().into_iter().flat_map(|b| b.disks()) {
+        let d = match d {
+            Ok(d) => d,
+            // (Another controller may have the disk.)
+            Err(e) => {
+                println!("ichor: blk: a Hyper-V SCSI controller failed: {e:?}");
+                continue;
+            }
+        };
+        println!(
+            "ichor: blk: hyper-v disk {}:{}, block size {} bytes",
+            d.unit.controller_number,
+            d.unit.lun,
+            1 << d.geometry.block_shift
+        );
+        let Some(m) = mount("hyper-v", d) else {
+            continue;
+        };
+        let vfs =
+            Arc::new(Vfs::mount_disk(&m).unwrap_or_else(|_| fail("disk is not an Ichor image")));
+        exercise("hyper-v", &m, vfs);
     }
     if !FIRST_DONE.load(core::sync::atomic::Ordering::Relaxed) {
         fail("no Ichor root disk found");

@@ -185,6 +185,9 @@ pub(crate) fn init_tsc() -> Option<(u64, &'static str)> {
             ));
         }
     }
+    if found.is_none() {
+        found = crate::hyperv::tsc_hz().map(|hz| (hz, "Hyper-V"));
+    }
     if found.is_none()
         && super::cpu::features().hypervisor
         && cpuid(0x4000_0000, 0)[0] >= 0x4000_0010
@@ -448,6 +451,11 @@ pub(crate) fn handle_irq(vector: u8, _frame: &mut TrapFrame) {
         crate::mm::tlb::VECTOR => {
             eoi();
             crate::mm::tlb::on_ipi();
+            return;
+        }
+        crate::hyperv::VECTOR => {
+            eoi();
+            crate::hyperv::on_interrupt();
             return;
         }
         IPI_VECTOR => {

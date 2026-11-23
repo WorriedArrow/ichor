@@ -16,6 +16,7 @@ dependencies = [
  "ichor-elf",
  "ichor-frame",
  "ichor-gpt",
+ "ichor-hyperv",
  "ichor-image",
  "ichor-intel-gbe",
  "ichor-net",
@@ -124,6 +125,7 @@ dependencies = [
  "ichor-net",
  "ichor-oci",
  "ichor-tls",
+ "ichor-vmbus",
  "ichor-x509",
 ]
 
@@ -141,6 +143,16 @@ dependencies = [
 [[package]]
 name = "ichor-http"
 version = "0.0.0"
+
+[[package]]
+name = "ichor-hyperv"
+version = "0.0.0"
+dependencies = [
+ "ichor-block",
+ "ichor-frame",
+ "ichor-net",
+ "ichor-vmbus",
+]
 
 [[package]]
 name = "ichor-image"
@@ -286,6 +298,10 @@ dependencies = [
 
 [[package]]
 name = "ichor-vma"
+version = "0.0.0"
+
+[[package]]
+name = "ichor-vmbus"
 version = "0.0.0"
 
 [[package]]

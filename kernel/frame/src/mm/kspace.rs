@@ -316,6 +316,21 @@ static MMIO_NEXT: SpinLock<u64> = SpinLock::new(0);
 /// the virtual address of `pa`. The caller (`IoMem::map`) has checked the
 /// range is device memory, not RAM.
 pub(crate) fn map_mmio(pa: u64, len: u64) -> Option<u64> {
+    let props = Props {
+        write: true,
+        exec: false,
+        global: true,
+        uncached: true,
+    };
+    map_window(pa, len, props)
+}
+
+/// Maps the page of code at `pa` (a hypervisor's) into the same window.
+pub(crate) fn map_code(pa: u64) -> Option<u64> {
+    map_window(pa, PAGE_SIZE, Props::CODE)
+}
+
+fn map_window(pa: u64, len: u64, props: Props) -> Option<u64> {
     let start = super::align_down(pa, PAGE_SIZE);
     let end = super::align_up(pa.checked_add(len)?, PAGE_SIZE);
     let size = end - start;
@@ -335,15 +350,10 @@ pub(crate) fn map_mmio(pa: u64, len: u64) -> Option<u64> {
     // SAFETY: `root` is the live kernel PML4 and `alloc` yields zeroed,
     // owned pages, all reachable through the linear map.
     let mut m = unsafe { Mapper::new(root, false, &mut alloc) };
-    let props = Props {
-        write: true,
-        exec: false,
-        global: true,
-        uncached: true,
-    };
     // SAFETY: the window range is handed out once (bump allocator under the
-    // lock), so it is unused. The physical range is device MMIO, not RAM, so
-    // no Rust object lives there and the mapping cannot alias one.
+    // lock), so it is unused. The physical range is device MMIO, not RAM, or
+    // a page given up to the hypervisor: no Rust object lives there and the
+    // mapping cannot alias one.
     unsafe { m.map(va, start, size, props) }.ok()?;
     *next += size;
     Some(va + (pa - start))

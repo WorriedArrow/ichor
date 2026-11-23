@@ -7,6 +7,8 @@
 
 extern crate alloc;
 
+pub mod scsi;
+
 use alloc::vec::Vec;
 
 /// Sector size every Ichor block device exposes.

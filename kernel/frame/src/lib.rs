@@ -31,6 +31,7 @@ pub mod cpu;
 pub mod debug;
 pub mod dma;
 pub mod entropy;
+pub mod hyperv;
 pub mod io;
 pub mod irq;
 pub mod mm;

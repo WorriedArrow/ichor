@@ -99,6 +99,12 @@ fn find() -> Option<Box<dyn Link>> {
             Err(e) => println!("ichor: net: virtio-net init failed: {e:?}"),
         }
     }
+    for dev in crate::hv::bus().into_iter().flat_map(|b| b.networks()) {
+        match dev {
+            Ok(d) => return Some(Box::new(d)),
+            Err(e) => println!("ichor: net: Hyper-V network failed: {e:?}"),
+        }
+    }
     // A cable in one port of several is as good as any.
     let mut first = None;
     for dev in intel_gbe::probe_all() {

@@ -5,12 +5,9 @@
 //!
 //! One request queue (queue 2; the control and event queues are set up
 //! but given no buffers, so the device drops events, which a polled,
-//! read-only driver does not need). At probe every target's LUN 0 gets an
-//! INQUIRY; each direct-access disk gets TEST UNIT READY (a fresh device
-//! reports a unit attention first) and READ CAPACITY, (16) when (10)
-//! saturates. Reads are READ(10), or READ(16) past 2^32 blocks, of at
-//! most [`MAX_REQUEST`] bytes. The disks of one controller share its
-//! queue through a mutex.
+//! read-only driver does not need). At probe every target's LUN 0 is looked
+//! at (`block::scsi`). Reads are of at most [`MAX_REQUEST`] bytes. The disks
+//! of one controller share its queue through a mutex.
 //!
 //! Safe code only: buffers are `DmaBuf`s and descriptors are written by
 //! frame's `VirtQueue` (ADR-0005).
@@ -24,7 +21,8 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::time::Duration;
 
-use block::{BlockDevice, BlockError, SECTOR_SIZE, check};
+use block::BlockError;
+use block::scsi::{self, Ended, Found};
 use frame::dma::DmaBuf;
 use frame::sync::Mutex;
 use frame::virtio::{Segment, VirtQueue};
@@ -54,29 +52,6 @@ const CFG_MAX_TARGET: u64 = 28; // u16 max_channel, then u16 max_target
 /// `virtio_scsi_resp_cmd.response`.
 const S_OK: u8 = 0;
 const S_BAD_TARGET: u8 = 3;
-
-/// SCSI status bytes.
-const GOOD: u8 = 0;
-
-/// SCSI opcodes.
-const TEST_UNIT_READY: u8 = 0x00;
-const INQUIRY: u8 = 0x12;
-const READ_CAPACITY_10: u8 = 0x25;
-const READ_10: u8 = 0x28;
-const READ_16: u8 = 0x88;
-const SERVICE_ACTION_IN_16: u8 = 0x9e;
-const READ_CAPACITY_16: u8 = 0x10;
-
-/// How a command ended.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Ended {
-    /// The command ran: its SCSI status (GOOD, CHECK CONDITION, ...).
-    Ran(u8),
-    /// No device at that target.
-    NoTarget,
-    /// The transport failed it (`response`).
-    Failed(u8),
-}
 
 /// One controller: its request queue, shared by its disks.
 #[derive(Debug)]
@@ -203,14 +178,21 @@ impl Hba {
     }
 }
 
-/// A disk behind a virtio-scsi controller (LUN 0 of one target).
+/// LUN 0 of one target of a controller.
 #[derive(Debug)]
-pub struct ScsiDisk {
+pub struct Target {
     hba: Arc<Mutex<Hba>>,
-    target: u16,
-    blocks: u64,
-    block_shift: u32,
+    pub target: u16,
 }
+
+impl scsi::Unit for Target {
+    fn command(&mut self, cdb: &[u8], data: &mut [u8]) -> Result<Ended, BlockError> {
+        self.hba.lock().command(self.target, cdb, data)
+    }
+}
+
+/// A disk behind a virtio-scsi controller.
+pub type ScsiDisk = scsi::Disk<Target>;
 
 /// Every disk behind every virtio-scsi controller, in PCI and target
 /// order. A controller that fails to initialize is one `Err`.
@@ -227,136 +209,25 @@ pub fn probe_all() -> Vec<Result<ScsiDisk, InitError>> {
 
 /// The direct-access disks of one controller.
 fn disks(hba: Hba) -> Vec<ScsiDisk> {
+    let last = hba.max_target().min(MAX_TARGETS - 1);
     let hba = Arc::new(Mutex::new(hba));
-    let last = hba.lock().max_target().min(MAX_TARGETS - 1);
     let mut found = Vec::new();
     for target in 0..=last {
-        let mut h = hba.lock();
-        let mut inq = [0u8; 36];
-        let cdb = [INQUIRY, 0, 0, 0, inq.len() as u8, 0];
-        match h.command(target, &cdb, &mut inq) {
-            Ok(Ended::Ran(GOOD)) => {}
-            _ => continue,
-        }
-        // Peripheral qualifier 0 (connected), device type 0 (disk).
-        if inq[0] != 0 {
-            continue;
-        }
-        // A fresh device answers its first command with a unit attention.
-        let ready = (0..4).any(|_| {
-            matches!(
-                h.command(target, &[TEST_UNIT_READY, 0, 0, 0, 0, 0], &mut []),
-                Ok(Ended::Ran(GOOD))
-            )
-        });
-        if !ready {
-            frame::println!("ichor: virtio-scsi: target {target} is not ready; skipped");
-            continue;
-        }
-        let Some((blocks, block_len)) = capacity(&mut h, target) else {
-            frame::println!("ichor: virtio-scsi: target {target}: no capacity; skipped");
-            continue;
-        };
-        if !block_len.is_power_of_two() || !(512..=4096).contains(&block_len) {
-            frame::println!(
-                "ichor: virtio-scsi: target {target}: {block_len}-byte blocks; skipped"
-            );
-            continue;
-        }
-        drop(h);
-        found.push(ScsiDisk {
+        let mut unit = Target {
             hba: hba.clone(),
             target,
-            blocks,
-            block_shift: block_len.trailing_zeros(),
-        });
+        };
+        match scsi::probe(&mut unit) {
+            Found::Nothing => {}
+            Found::Unusable(why) => {
+                frame::println!("ichor: virtio-scsi: target {target}: {why}; skipped");
+            }
+            Found::Disk(geometry) => found.push(scsi::Disk {
+                unit,
+                geometry,
+                max: MAX_REQUEST,
+            }),
+        }
     }
     found
-}
-
-/// The disk's block count and block length: READ CAPACITY (10), or (16)
-/// for a disk of 2^32 blocks or more.
-fn capacity(h: &mut Hba, target: u16) -> Option<(u64, u32)> {
-    let mut d = [0u8; 8];
-    let cdb = [READ_CAPACITY_10, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-    if h.command(target, &cdb, &mut d).ok()? != Ended::Ran(GOOD) {
-        return None;
-    }
-    let last = u32::from_be_bytes([d[0], d[1], d[2], d[3]]);
-    let len = u32::from_be_bytes([d[4], d[5], d[6], d[7]]);
-    if last != u32::MAX {
-        return Some((u64::from(last) + 1, len));
-    }
-    let mut d = [0u8; 32];
-    let mut cdb = [0u8; 16];
-    cdb[0] = SERVICE_ACTION_IN_16;
-    cdb[1] = READ_CAPACITY_16;
-    cdb[10..14].copy_from_slice(&(d.len() as u32).to_be_bytes());
-    if h.command(target, &cdb, &mut d).ok()? != Ended::Ran(GOOD) {
-        return None;
-    }
-    let mut b = [0u8; 8];
-    b.copy_from_slice(&d[0..8]);
-    let last = u64::from_be_bytes(b);
-    let len = u32::from_be_bytes([d[8], d[9], d[10], d[11]]);
-    Some((last.checked_add(1)?, len))
-}
-
-impl ScsiDisk {
-    /// The disk's target number on its controller.
-    pub fn target(&self) -> u16 {
-        self.target
-    }
-
-    /// The disk's block size in bytes.
-    pub fn block_size(&self) -> usize {
-        1 << self.block_shift
-    }
-
-    /// Reads whole blocks from `lba` into `buf` (at most `MAX_REQUEST`).
-    fn read_blocks(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), BlockError> {
-        let count = (buf.len() >> self.block_shift) as u32;
-        let mut cdb = [0u8; 16];
-        let cdb: &[u8] = match u32::try_from(lba) {
-            Ok(l) if count <= u32::from(u16::MAX) && l.checked_add(count).is_some() => {
-                cdb[0] = READ_10;
-                cdb[2..6].copy_from_slice(&l.to_be_bytes());
-                cdb[7..9].copy_from_slice(&(count as u16).to_be_bytes());
-                &cdb[..10]
-            }
-            _ => {
-                cdb[0] = READ_16;
-                cdb[2..10].copy_from_slice(&lba.to_be_bytes());
-                cdb[10..14].copy_from_slice(&count.to_be_bytes());
-                &cdb[..16]
-            }
-        };
-        match self.hba.lock().command(self.target, cdb, buf)? {
-            Ended::Ran(GOOD) => Ok(()),
-            Ended::Ran(_) | Ended::NoTarget | Ended::Failed(_) => Err(BlockError::Io),
-        }
-    }
-}
-
-impl BlockDevice for ScsiDisk {
-    fn sector_count(&self) -> u64 {
-        self.blocks << (self.block_shift - 9)
-    }
-
-    fn read(&mut self, sector: u64, buf: &mut [u8]) -> Result<(), BlockError> {
-        check(self, sector, buf.len())?;
-        let block = self.block_size();
-        let byte = sector * SECTOR_SIZE as u64;
-        if !byte.is_multiple_of(block as u64) || !buf.len().is_multiple_of(block) {
-            return Err(BlockError::Unaligned);
-        }
-        let mut done = 0;
-        while done < buf.len() {
-            let n = MAX_REQUEST.min(buf.len() - done);
-            let lba = (byte + done as u64) >> self.block_shift;
-            self.read_blocks(lba, &mut buf[done..done + n])?;
-            done += n;
-        }
-        Ok(())
-    }
 }

@@ -24,6 +24,7 @@ block.workspace = true
 virtio-blk.workspace = true
 nvme.workspace = true
 virtio-scsi.workspace = true
+hyperv.workspace = true
 vma.workspace = true
 overlay.workspace = true
 csprng.workspace = true

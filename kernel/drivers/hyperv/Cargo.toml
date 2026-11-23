@@ -1,0 +1,19 @@
+[package]
+name = "ichor-hyperv"
+description = "Hyper-V guest drivers over VMBus: SCSI disks and the network (polled, DMA-trusted); safe code only"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "hyperv"
+
+[dependencies]
+frame.workspace = true
+block.workspace = true
+net.workspace = true
+vmbus.workspace = true
+
+[lints]
+workspace = true

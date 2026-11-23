@@ -21,6 +21,7 @@ brief where they conflict with it.
 | [0013](0013-workloads-and-io-uring.md) | Milestone 7: io_uring, and real workloads' own test suites through the control plane | Accepted |
 | [0014](0014-services-runtime-trusted-crate.md) | `services/rt`, the second crate allowed `unsafe`: scope, rules, budget | Accepted |
 | [0015](0015-xapic.md) | Machines without x2APIC: the local APIC as an xAPIC | Accepted |
+| [0016](0016-hyper-v.md) | Hyper-V guests: VMBus, its disks and its network | Accepted |
 
 ## Planned
 

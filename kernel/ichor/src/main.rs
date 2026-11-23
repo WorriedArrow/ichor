@@ -23,6 +23,7 @@ mod debiantest;
 mod dev;
 mod file;
 mod futex;
+mod hv;
 mod itimer;
 mod kcell;
 mod linuxabi;

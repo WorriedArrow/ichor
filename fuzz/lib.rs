@@ -615,6 +615,75 @@ fn dns_run(input: &[u8]) {
     let _ = dns::parse_a(input, 7, "registry-1.docker.io");
 }
 
+/// Memory a Hyper-V host writes: a channel's rings.
+struct HostMemory(std::cell::RefCell<Vec<u8>>);
+
+impl vmbus::ring::Memory for HostMemory {
+    fn read(&self, at: usize, out: &mut [u8]) {
+        out.copy_from_slice(&self.0.borrow()[at..at + out.len()]);
+    }
+    fn write(&self, at: usize, data: &[u8]) {
+        self.0.borrow_mut()[at..at + data.len()].copy_from_slice(data);
+    }
+    fn load(&self, at: usize) -> u32 {
+        u32::from_le_bytes(self.0.borrow()[at..at + 4].try_into().unwrap())
+    }
+    fn store(&self, at: usize, v: u32) {
+        self.write(at, &v.to_le_bytes());
+    }
+    fn fence(&self) {}
+}
+
+/// The host's ring: how far it wrote, then what (a frame's packet, and a
+/// completion); it also stands for a message on every other way in.
+fn vmbus_seeds() -> Vec<Vec<u8>> {
+    let words = |w: &[u32]| -> Vec<u8> { w.iter().flat_map(|v| v.to_le_bytes()).collect() };
+    let mut ring = words(&[0x70 + 0x30, 0x0005_0007, 0x0001_0009, 1, 0]);
+    ring.extend(words(&[0xcafe, 2, 100, 0, 60, 1728]));
+    ring.extend(words(&[107, 0, 0, 0, 0, 0, 0, 0]));
+    ring.extend(words(&[0x0002_000b, 4, 9, 0, 108, 1, 0, 0, 0, 0]));
+    let mut frame = vmbus::netvsc::frame_header(60).to_vec();
+    frame.extend_from_slice(&[7; 60]);
+    let mut answer = words(&[0x8000_0004, 30, 2, 0, 6, 16]);
+    answer.extend_from_slice(&[0, 0x15, 0x5d, 1, 2, 3]);
+    let mut offer = words(&[1, 0]);
+    offer.extend_from_slice(&vmbus::NET.0);
+    offer.resize(196, 1);
+    vec![
+        ring,
+        frame,
+        answer,
+        offer,
+        words(&[15, 0, 1, 0x2001]),
+        words(&[10, 0, 14, 1, 0]),
+        vmbus::storvsc::command(0, 0, 1, &[0x28; 10], 4096).to_vec(),
+    ]
+}
+
+fn vmbus_run(input: &[u8]) {
+    use vmbus::{client, netvsc, ring, storvsc};
+    const DATA: usize = 4096;
+    const CONTROL: usize = 2 * 4096;
+    let size = ring::Rings::<HostMemory>::size(DATA);
+    let mut memory = vec![0u8; size];
+    let (index, packets) = input.split_at(input.len().min(4));
+    memory[CONTROL..CONTROL + index.len()].copy_from_slice(index);
+    let packets = &packets[..packets.len().min(DATA)];
+    memory[CONTROL + 4096..CONTROL + 4096 + packets.len()].copy_from_slice(packets);
+    let mut rings = ring::Rings::new(HostMemory(memory.into()), DATA).unwrap();
+    while let Ok(Some((p, _))) = rings.receive() {
+        let _ = netvsc::received(&p.payload);
+        let _ = rings.complete(p.transaction, &netvsc::taken());
+    }
+    let _ = client::Client::new(2, 0, [0; 2]).receive(input);
+    let _ = netvsc::received(input);
+    let _ = netvsc::init_answer(input);
+    let _ = netvsc::send_buffer_answer(input);
+    let _ = storvsc::ended(input);
+    let mut setup = storvsc::Setup::default();
+    while let storvsc::Next::Send(_) = setup.answer(input) {}
+}
+
 fn metadata_seeds() -> Vec<Vec<u8>> {
     let answer = |h: &str, b: &str| format!("HTTP/1.0 200 OK\r\n{h}\r\n{b}").into_bytes();
     vec![
@@ -810,6 +879,11 @@ pub const TARGETS: &[Target] = &[
         name: "dns",
         seeds: dns_seeds,
         run: dns_run,
+    },
+    Target {
+        name: "vmbus",
+        seeds: vmbus_seeds,
+        run: vmbus_run,
     },
     Target {
         name: "metadata",
