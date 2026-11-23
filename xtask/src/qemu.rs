@@ -6,7 +6,8 @@
 //! ```text
 //! esp/EFI/BOOT/BOOTX64.EFI   the kernel
 //! esp/ichor/cmdline          the kernel command line
-//! esp/ichor/roots.pem        the control plane's CA bundle (Mozilla's, pinned) and the Public Suffix List
+//! esp/ichor/roots.pem        the control plane's CA bundle (Mozilla's, pinned)
+//! esp/ichor/suffixes.dat     the Public Suffix List's ICANN rules (pinned), against wildcard certificates
 //! esp/ichor/apitoken         the control plane's API token (when configured)
 //! esp/ichor/apitls.pem       its TLS certificates and key (when configured)
 //! root.img                   the root image, attached as virtio-blk and NVMe disks
@@ -400,6 +401,11 @@ fn prepare_run_dir(cfg: &RunConfig, fw: &Firmware) -> Result<PathBuf> {
         .map_err(|e| format!("writing cmdline: {e}"))?;
     fs::write(cfg_dir.join("roots.pem"), crate::artifact::trust_bundle()?)
         .map_err(|e| format!("writing roots.pem: {e}"))?;
+    fs::write(
+        cfg_dir.join("suffixes.dat"),
+        crate::artifact::public_suffix_rules()?,
+    )
+    .map_err(|e| format!("writing suffixes.dat: {e}"))?;
     if let Some(t) = &cfg.api_token {
         fs::write(cfg_dir.join("apitoken"), t).map_err(|e| format!("writing apitoken: {e}"))?;
     }

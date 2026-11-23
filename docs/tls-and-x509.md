@@ -25,11 +25,22 @@ deliberately does not do.
   for cases that must be accepted and for cases that must be refused, the
   cases that do not apply and why, and every disagreement. CI fails below
   **100%** either way (`FLOORS` in `xtask/src/limbo.rs`); every applicable
-  case agrees (504 accept, 4,799 refuse). Ten cases contradict another
+  case agrees (504 accept, 4,798 refuse). Ten cases contradict another
   case, so that no validator can agree with both: they are listed in
   `CONFLICTS` with the case we side with and why (the Web PKI's rule over
   RFC 5280's, and a real certificate over a stricter rule), and each run
-  checks that we still disagree with one and agree with the other.
+  checks that we still disagree with one and agree with the other. One
+  more, `rfc5280::ski::root-missing-ski`, is contradicted by a root in
+  Mozilla's store (TWCA Global Root CA has no SKI): it is listed in
+  `DEPARTURES`, and each run checks that we still disagree with it.
+- **ML-DSA: Wycheproof.** `cargo xtask wycheproof` runs C2SP Wycheproof's
+  `mldsa_{44,65,87}_verify_test.json` (pinned to commit `65ca4947`, the
+  files BoringSSL and OpenSSL run) through `crypto::mldsa`: 631 vectors,
+  404 of them invalid (keys and signatures a byte short or long, hints out
+  of order, repeated or past omega, non-zero padding after the hints, z
+  over its bound, contexts over 255 bytes). Every one must get its verdict;
+  CI and `cargo xtask test` run it. The unit tests check signatures OpenSSL
+  3.5.2 made.
 - **Fuzzing.** `fuzz/` mutation-fuzzes every parser that takes untrusted
   input: the TLS client fed a server's side of a session (records,
   handshake messages, certificates, key exchange), the TLS server fed a
@@ -75,19 +86,21 @@ root, with:
   subject common name is never used, as in Chrome, Go and rustls); DNS
   SANs must be valid host names (no underscores, empty labels or
   misplaced wildcards); no wildcard over a whole public suffix (`*.com`,
-  `*.co.uk`: the Public Suffix List's ICANN section, carried in the
-  boot volume's CA bundle); its SAN critical exactly when its subject is
-  empty;
+  `*.co.uk`: the Public Suffix List's ICANN section, a file of its own on
+  the boot volume, `\ichor\suffixes.dat`, beside the CA bundle
+  `\ichor\roots.pem`); its SAN critical exactly when its subject is empty;
 - the profile CAs must issue to (RFC 5280, CABF): every certificate but a
   self-issued one or a trust anchor names its issuer's key (an
   authorityKeyIdentifier with a keyIdentifier); every CA on the path has a
-  subject, a subjectKeyIdentifier and a critical basicConstraints; a
+  subject and a critical basicConstraints, and every one but the trust
+  anchor a subjectKeyIdentifier (an anchor is a name and a key, RFC 5280
+  6.1.1; Mozilla's TWCA Global Root CA has no SKI); a
   trust anchor's own AKI, if any, is a keyIdentifier alone, equal to its
   SKI if self-issued; AKI, SKI and AIA must not be critical and AIA must
   be well formed; policy constraints must be critical (and then, as
-  policies are not processed, are an unknown critical extension). Of
-  Mozilla's roots (2026-11-05), only TWCA Global Root CA, which has no
-  SKI, cannot anchor a path;
+  policies are not processed, are an unknown critical extension). Every
+  one of Mozilla's roots can anchor a path: xtask refuses to build a boot
+  volume otherwise (`artifact::trust_bundle`, `RootStore::unusable`);
 - unknown critical extensions refused; duplicate extensions, non-positive
   or over-long serial numbers (in certificates a server sends) and RSA
   keys under 2048 bits or not a whole number of bytes refused.

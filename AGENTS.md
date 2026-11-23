@@ -92,14 +92,21 @@ boot [done: VERW, IBPB, and page-table isolation (ADR-0004's second
   gaps. Verification now builds paths with backtracking and enforces name
   constraints, leaf serverAuth EKU and not-a-CA, DNS SAN syntax, serial
   and RSA key rules. Since 2026-11-23 it agrees with every applicable
-  case (504 accept, 4,799 refuse; floors 100%): the RFC 5280 / CABF
+  case (504 accept, 4,798 refuse; floors 100%): the RFC 5280 / CABF
   issuance profile (AKI, SKI, critical BC, root AKI, AIA, SAN
   criticality), ML-DSA (FIPS 204, `crypto::mldsa`, with SHAKE in
-  `crypto::sha3`), and the Public Suffix List's ICANN rules against
-  wildcards (`x509::suffix`; pinned `artifact::PUBLIC_SUFFIX_LIST`, carried
-  in `\ichor\roots.pem` as a `PUBLIC SUFFIX LIST` block by
-  `artifact::trust_bundle`). Ten cases contradict another case and are
-  listed, with reasons, in `limbo.rs`'s `CONFLICTS` (checked each run).
+  `crypto::sha3`; Wycheproof's 631 verify vectors, malformed ones
+  included, pass in `cargo xtask wycheproof`, run by CI and `cargo xtask
+  test`), and the Public Suffix List's ICANN rules against
+  wildcards (`x509::suffix`; pinned `artifact::PUBLIC_SUFFIX_LIST`, its own
+  file on the boot volume, `\ichor\suffixes.dat`, written by
+  `artifact::public_suffix_rules`, read by frame and handed to the control
+  plane as a second Blob, `suffix-blob=`). Ten cases contradict another
+  case and are listed, with reasons, in `limbo.rs`'s `CONFLICTS`; one,
+  `root-missing-ski`, is contradicted by Mozilla's TWCA Global Root CA
+  (no SKI) and listed in `DEPARTURES` (both checked each run). Trust
+  anchors need no SKI; every Mozilla root must anchor, or xtask refuses to
+  build a boot volume (`RootStore::unusable`).
 - M7 io_uring (ADR-0013 and its 2026-11-22 amendment): `kernel/uring`
   (host-tested) has the ABI, this kernel's ring layout and the ordering
   rules (`Order`: links, hard links, link timeouts, drains; what is
@@ -282,7 +289,8 @@ ABI v2; our own host-tested crates for crypto, X.509, TLS 1.2 + 1.3,
 HTTP/1.1 and HTTP/2, gRPC/protobuf, OCI, layer conversion and DNS;
 Mozilla's CA bundle (`xtask::artifact::MOZILLA_ROOTS`, pinned) as
 `\ichor\roots.pem` on the ESP, read by frame at boot and handed to the
-service as a Blob capability. Open from it: `Signal`/`Inspect`/`Destroy`
+service as a Blob capability (and, since 2026-11-23, the Public Suffix
+List's rules as `\ichor\suffixes.dat`, a second Blob). Open from it: `Signal`/`Inspect`/`Destroy`
 calls and cell destruction, image deletion, API TLS and authentication
 (before milestone 8 runs anywhere reachable), signature verification,
 a working directory and user for `Run`, an offline (recorded) variant of
@@ -725,9 +733,10 @@ paths). Boot logs which apply.
 Frame budget: ADR-0005 sets the milestone 3 ceiling at 8,500 lines / 380
 sites; ADR-0007 raises it to 9,500 / 420 for milestone 4 (TLB shootdown,
 atomic user ops for futexes, PCID). `audit.toml` is at step 13 (7,000 / 300,
-ADR-0004's 2026-11-23 amendment); frame is at 6,978 / 283 (A5 added
+ADR-0004's 2026-11-23 amendment); frame is at 6,990 / 283 (A5 added
 RDSEED/RDRAND and UEFI GetTime; B added XSAVE; C the frames tree and
-request tracking; M6 reading `\ichor\roots.pem`; ADR-0011 the checked user
+request tracking; M6 reading `\ichor\roots.pem`, later
+`\ichor\suffixes.dat` too; ADR-0011 the checked user
 copy; ADR-0004 VERW/IBPB, page-table isolation, eIBRS and IBRS; `IoPorts`;
 xAPIC; Hyper-V; placing BARs the firmware left at 0, ADR-0005's second
 amendment; the ACPI power button and S5, ADR-0017; kvmclock, ADR-0018; the
@@ -839,6 +848,7 @@ cargo xtask disk-image     # target/ichor-disk.img: bootable GPT disk (ESP + Ich
 cargo xtask api HOST:50051 --name NAME --ca ca.pem --token-file F IMAGE -- CMD   # pull and run on a running machine (docs/cloud.md)
 cargo xtask fuzz [TARGET] --iterations N   # mutation-fuzz the parsers (failing inputs: target/fuzz/)
 cargo xtask x509-limbo     # certificate validation vs x509-limbo -> docs/x509-limbo.md (fails below floors)
+cargo xtask wycheproof     # Wycheproof's ML-DSA verify vectors (malformed ones too); fails on any wrong verdict
 cargo xtask workloads python   # CPython's own suite through the control plane -> docs/workloads.md (fails below workloads.toml's floor)
 cargo xtask workloads python --tests "test_os test_json"   # a subset (printed, not recorded)
 cargo xtask workloads python --cmdline trace_errors --cmd "python3 -c ..."   # explore; guest log in target/workloads-python.serial.log

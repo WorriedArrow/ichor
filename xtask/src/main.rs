@@ -24,6 +24,8 @@ Commands:
                machine and programs; prints a Markdown table (CI: --smp 4)
   x509-limbo   Score services/x509 against the pinned x509-limbo suite; writes
                docs/x509-limbo.md and fails below the recorded floors
+  wycheproof   Run Wycheproof's pinned ML-DSA verification vectors (malformed keys
+               and signatures too) through services/crypto; fails on any wrong verdict
   fuzz [TARGET] [--iterations N]
                Mutation-fuzz every parser (or one); failing inputs go to
                target/fuzz/ (replay with ICHOR_FUZZ_REPLAY=FILE)
@@ -370,11 +372,14 @@ fn cmd_test(o: &Opts) -> Result<()> {
         "--exclude",
         "ichor-tests",
     ])))?;
+    // Wycheproof's ML-DSA vectors (malformed keys and signatures too).
+    xtask::wycheproof::run()?;
     // Build the kernel and fetch the test busybox once, then hand both to
     // the integration tests.
     let kernel = build::kernel(o.profile)?;
     xtask::artifact::BUSYBOX.bytes()?;
     xtask::artifact::trust_bundle()?;
+    xtask::artifact::public_suffix_rules()?;
     xtask::artifact::ALPINE_MINIROOTFS.bytes()?;
     for a in xtask::artifact::ALPINE_PACKAGES {
         a.bytes()?;
@@ -682,6 +687,7 @@ fn main() -> ExitCode {
         "linux-abi-table" => linux_abi::write_table(),
         "bench" => cmd_bench(&o),
         "x509-limbo" => xtask::limbo::run(),
+        "wycheproof" => xtask::wycheproof::run(),
         "fuzz" => cmd_fuzz(rest),
         "workloads" => cmd_workloads(rest),
         "disk-image" => cmd_disk_image(&o, rest),

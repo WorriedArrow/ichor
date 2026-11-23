@@ -36,6 +36,8 @@ pub(crate) const MAX_REGIONS: usize = 1638;
 pub(crate) const CMDLINE_MAX: usize = 4096;
 /// Room for `\ichor\roots.pem` (Mozilla's bundle is about 200 KiB).
 pub(crate) const ROOTS_MAX: usize = 512 * 1024;
+/// Room for `\ichor\suffixes.dat` (the list's ICANN rules are about 75 KiB).
+pub(crate) const SUFFIXES_MAX: usize = 256 * 1024;
 /// Room for `\ichor\apitoken` (the control plane's API credential).
 pub(crate) const TOKEN_MAX: usize = 256;
 /// Room for `\ichor\apitls.pem` (the API's TLS certificates and key).
@@ -53,6 +55,9 @@ pub(crate) struct BootState {
     /// `\ichor\roots.pem`, the control plane's CA bundle (ADR-0012 §4).
     pub(crate) roots: [u8; ROOTS_MAX],
     pub(crate) roots_len: usize,
+    /// `\ichor\suffixes.dat`, the Public Suffix List's ICANN rules.
+    pub(crate) suffixes: [u8; SUFFIXES_MAX],
+    pub(crate) suffixes_len: usize,
     /// `\ichor\apitoken`, the control plane's API credential.
     pub(crate) token: [u8; TOKEN_MAX],
     pub(crate) token_len: usize,
@@ -97,6 +102,8 @@ static BOOT_STATE: BootStateCell = BootStateCell(UnsafeCell::new(BootState {
     cmdline_len: 0,
     roots: [0; ROOTS_MAX],
     roots_len: 0,
+    suffixes: [0; SUFFIXES_MAX],
+    suffixes_len: 0,
     token: [0; TOKEN_MAX],
     token_len: 0,
     tls: [0; TLS_MAX],
@@ -315,6 +322,7 @@ pub(crate) extern "sysv64" fn kernel_space_entry() -> ! {
     enter_kernel(BootInfo {
         cmdline: state.cmdline(),
         roots: &state.roots[..state.roots_len],
+        suffixes: &state.suffixes[..state.suffixes_len],
         api_token: Secret(&state.token[..state.token_len]),
         api_tls: Secret(&state.tls[..state.tls_len]),
         memory_map: state.regions(),
@@ -374,6 +382,7 @@ fn enter_kernel(info: BootInfo) -> ! {
 pub struct BootInfo {
     cmdline: &'static str,
     roots: &'static [u8],
+    suffixes: &'static [u8],
     api_token: Secret,
     api_tls: Secret,
     memory_map: &'static [MemoryRegion],
@@ -394,6 +403,13 @@ impl BootInfo {
     /// there is none): the control plane's CA bundle.
     pub fn roots(&self) -> &'static [u8] {
         self.roots
+    }
+
+    /// The contents of `\ichor\suffixes.dat` on the boot volume (empty if
+    /// there is none): the Public Suffix List rules the control plane
+    /// checks wildcard certificates against.
+    pub fn suffixes(&self) -> &'static [u8] {
+        self.suffixes
     }
 
     /// The contents of `\ichor\apitoken` on the boot volume (empty if

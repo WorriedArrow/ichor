@@ -3,9 +3,9 @@
 //! `s3.amazonaws.com`). A wildcard certificate for a whole public suffix
 //! is refused (CABF BR 3.2.2.6: no CA may issue one).
 //!
-//! The list is data, not code (MPL-2.0, fetched pinned by xtask and
-//! carried in the boot volume's CA bundle as a `PUBLIC SUFFIX LIST`
-//! block). Its rules are UTF-8; certificates carry A-labels, so rules are
+//! The list is data, not code (MPL-2.0, fetched pinned by xtask; its ICANN
+//! section is a file of its own on the boot volume, `\ichor\suffixes.dat`,
+//! beside the CA bundle). Its rules are UTF-8; certificates carry A-labels, so rules are
 //! kept punycode-encoded (RFC 3492).
 
 use alloc::collections::BTreeSet;

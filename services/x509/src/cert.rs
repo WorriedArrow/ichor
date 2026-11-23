@@ -725,10 +725,18 @@ impl Certificate<'_> {
     }
 
     /// Whether this certificate is formed as a CA's must be (RFC 5280
-    /// 4.1.2.6, 4.2.1.2, 4.2.1.9): a subject, a SubjectKeyIdentifier and a
-    /// critical BasicConstraints.
+    /// 4.1.2.6, 4.2.1.9): a subject and a critical BasicConstraints. An
+    /// issuing CA also needs a SubjectKeyIdentifier (4.2.1.2,
+    /// `has_key_id`); a trust anchor does not, since the SKI is there to
+    /// build paths and an anchor ends one (Mozilla's TWCA Global Root CA
+    /// has none).
     pub fn ca_well_formed(&self) -> bool {
-        !self.subject_empty && self.ski.is_some() && self.bc_critical
+        !self.subject_empty && self.bc_critical
+    }
+
+    /// Whether the certificate carries a SubjectKeyIdentifier.
+    pub fn has_key_id(&self) -> bool {
+        self.ski.is_some()
     }
 
     /// Whether this trust anchor is formed as a root CA must be (CABF BR

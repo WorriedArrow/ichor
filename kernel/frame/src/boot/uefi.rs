@@ -277,6 +277,8 @@ const fn ucs2<const N: usize>(s: &str) -> [u16; N] {
 const CMDLINE_PATH: [u16; 15] = ucs2("\\ichor\\cmdline");
 /// Where the control plane's CA bundle lives.
 const ROOTS_PATH: [u16; 17] = ucs2("\\ichor\\roots.pem");
+/// Where the Public Suffix List's rules live.
+const SUFFIXES_PATH: [u16; 20] = ucs2("\\ichor\\suffixes.dat");
 /// Where the control plane's API token lives.
 const TOKEN_PATH: [u16; 16] = ucs2("\\ichor\\apitoken");
 /// Where the control plane's TLS certificates and key live.
@@ -660,6 +662,7 @@ extern "efiapi" fn efi_main(image: Handle, system_table: *const SystemTable) -> 
         Err(_) => 0,
     };
     state.roots_len = optional(&ROOTS_PATH, r"\ichor\roots.pem", &mut state.roots);
+    state.suffixes_len = optional(&SUFFIXES_PATH, r"\ichor\suffixes.dat", &mut state.suffixes);
     state.token_len = optional(&TOKEN_PATH, r"\ichor\apitoken", &mut state.token);
     state.tls_len = optional(&TLS_PATH, r"\ichor\apitls.pem", &mut state.tls);
     if cmdline::Cmdline::new(state.cmdline()).flag("qemu_debug_exit") {

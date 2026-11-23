@@ -65,27 +65,44 @@ pub struct RootStore {
     suffixes: PublicSuffixes,
 }
 
-/// The label of the bundle's block of Public Suffix List rules (text, not
-/// base64).
-pub const SUFFIX_BLOCK: &str = "PUBLIC SUFFIX LIST";
-
 impl RootStore {
     /// Every certificate in a PEM bundle that parses (others are skipped:
-    /// a bundle carries algorithms we may not handle), and the rules of
-    /// its `PUBLIC SUFFIX LIST` block, if it has one.
+    /// a bundle carries algorithms we may not handle), with no public
+    /// suffixes.
     pub fn from_pem(pem: &str) -> RootStore {
         let roots = pem_certificates(pem)
             .into_iter()
             .filter(|der| parse(der).is_ok())
             .collect();
-        let begin = alloc::format!("-----BEGIN {SUFFIX_BLOCK}-----");
-        let end = alloc::format!("-----END {SUFFIX_BLOCK}-----");
-        let suffixes = pem
-            .split_once(begin.as_str())
-            .and_then(|(_, rest)| rest.split_once(end.as_str()))
-            .map(|(rules, _)| PublicSuffixes::parse(rules))
-            .unwrap_or_default();
-        RootStore { roots, suffixes }
+        RootStore {
+            roots,
+            suffixes: PublicSuffixes::default(),
+        }
+    }
+
+    /// The store with the Public Suffix List's rules (its own text format,
+    /// as `public_suffix_list.dat`; the boot volume's `\ichor\suffixes.dat`
+    /// has its ICANN section), against which no wildcard may stand for a
+    /// whole public suffix.
+    pub fn with_public_suffixes(mut self, rules: &str) -> RootStore {
+        self.suffixes = PublicSuffixes::parse(rules);
+        self
+    }
+
+    /// How many roots cannot anchor a path whatever the date: not formed as
+    /// a trust anchor must be, or not a CA for TLS servers.
+    pub fn unusable(&self) -> usize {
+        self.roots
+            .iter()
+            .filter(|der| {
+                parse(der).is_ok_and(|c| {
+                    may_issue(&c, 0).is_err()
+                        || !c.ca_well_formed()
+                        || !c.root_well_formed()
+                        || !c.may_issue_server()
+                })
+            })
+            .count()
     }
 
     /// How many public suffix rules the store has.
@@ -220,9 +237,9 @@ impl Search<'_, '_> {
         let counted = path.iter().filter(|&&i| !self_issued(i)).count();
         may_issue(issuer, counted)?;
         // A trust anchor's own issuer is not on the path, so it need not
-        // name that issuer's key.
+        // name that issuer's key, nor carry a key identifier of its own.
         if !issuer.ca_well_formed()
-            || (!root && !issuer.names_issuer_key())
+            || (!root && !(issuer.names_issuer_key() && issuer.has_key_id()))
             || (root && !issuer.root_well_formed())
         {
             return Err(Error::Nonconforming);

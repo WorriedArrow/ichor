@@ -62,6 +62,7 @@ pub(crate) fn options(c: &cmdline::Cmdline<'_>) -> Option<alloc::vec::Vec<alloc:
 /// exit code (`None`: it could not start or was killed).
 pub(crate) fn run(
     roots: &'static [u8],
+    suffixes: &'static [u8],
     (token, token_from): (&'static [u8], &str),
     (tls, tls_from): (&'static [u8], &str),
     options: &[alloc::string::String],
@@ -101,15 +102,20 @@ pub(crate) fn run(
     let (me_s, switch_s, roots_s) = (hex(me), hex(switch), hex(roots_blob));
     // The API's token and TLS identity, if the boot volume has them
     // (`\ichor\apitoken`, `\ichor\apitls.pem`) or the cloud does.
-    let mut secrets = alloc::vec::Vec::new();
-    for (name, bytes) in [("token-blob", token), ("tls-blob", tls)] {
+    // The Public Suffix List's rules too (`\ichor\suffixes.dat`).
+    let mut blobs = alloc::vec::Vec::new();
+    for (name, bytes) in [
+        ("token-blob", token),
+        ("tls-blob", tls),
+        ("suffix-blob", suffixes),
+    ] {
         if !bytes.is_empty() {
-            secrets.push(alloc::format!("{name}={}", hex(blob(bytes)?)));
+            blobs.push(alloc::format!("{name}={}", hex(blob(bytes)?)));
         }
     }
     let mut argv = alloc::vec!["control", me_s.as_str(), &switch_s, &roots_s];
     argv.extend(options.iter().map(alloc::string::String::as_str));
-    argv.extend(secrets.iter().map(alloc::string::String::as_str));
+    argv.extend(blobs.iter().map(alloc::string::String::as_str));
     let code = crate::native::run(&cell, CONTROL, &argv);
     // The cell's handle to itself would keep it alive forever.
     let _ = cell.close(me);

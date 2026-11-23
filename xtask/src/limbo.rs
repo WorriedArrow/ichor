@@ -84,6 +84,14 @@ const CONFLICTS: &[(&str, &str, &str)] = &[
     ),
 ];
 
+/// Cases no other case contradicts but a root in Mozilla's store does: we
+/// side with the store, which the control plane must work with. Each is
+/// checked on every run: the case must still disagree with us.
+const DEPARTURES: &[(&str, &str)] = &[(
+    "rfc5280::ski::root-missing-ski",
+    "Mozilla's TWCA Global Root CA has no subjectKeyIdentifier; a trust anchor is a name and a key (RFC 5280 6.1.1), and the SKI is there to build paths, which an anchor ends. Issuing CAs still need one (`rfc5280::ski::intermediate-missing-ski` agrees)",
+)];
+
 #[derive(Default)]
 struct Score {
     accept_ok: u64,
@@ -185,10 +193,8 @@ fn score(case: &Value, now: u64, suffixes: &str, s: &mut Score) {
     {
         roots.push_str(p.as_str().unwrap_or(""));
     }
-    // As on the boot volume: the roots, then the Public Suffix List.
-    roots.push('\n');
-    roots.push_str(suffixes);
-    let roots = x509::RootStore::from_pem(&roots);
+    // With the Public Suffix List's rules, as on the boot volume.
+    let roots = x509::RootStore::from_pem(&roots).with_public_suffixes(suffixes);
     let peer = case
         .get("peer_certificate")
         .and_then(Value::as_str)
@@ -202,7 +208,7 @@ fn score(case: &Value, now: u64, suffixes: &str, s: &mut Score) {
         x509::verify_chain(&refs, &roots, &host, at)
     };
     s.agreed.insert(id.clone(), expect_ok == got.is_ok());
-    if CONFLICTS.iter().any(|(c, ..)| *c == id) {
+    if CONFLICTS.iter().any(|(c, ..)| *c == id) || DEPARTURES.iter().any(|(c, _)| *c == id) {
         return;
     }
     match (expect_ok, got) {
@@ -246,7 +252,7 @@ pub fn run() -> Result<()> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let suffixes = artifact::public_suffix_block()?;
+    let suffixes = artifact::public_suffix_rules()?;
     let mut s = Score::default();
     for c in cases {
         score(c, now, &suffixes, &mut s);
@@ -293,6 +299,11 @@ pub fn run() -> Result<()> {
     );
     let _ = writeln!(
         doc,
+        "| contradicted by a root in Mozilla's store (below) | {} |",
+        DEPARTURES.len()
+    );
+    let _ = writeln!(
+        doc,
         "\n## Cases that contradict another\n\nNo one validator can agree with both cases of a pair; \
          `services/x509` follows the Web PKI's profile where it and RFC 5280 differ. Each is checked \
          on every run: we disagree with the first and agree with the second.\n\n\
@@ -302,6 +313,18 @@ pub fn run() -> Result<()> {
     for (case, other, why) in CONFLICTS {
         let _ = writeln!(doc, "| `{case}` | `{other}` | {why} |");
         if s.agreed.get(*case) != Some(&false) || s.agreed.get(*other) != Some(&true) {
+            stale.push(*case);
+        }
+    }
+    let _ = writeln!(
+        doc,
+        "\n## Cases a trusted root contradicts\n\nNo other case contradicts these, but a root in \
+         Mozilla's store, which the control plane must use, does. Each is checked on every run: we \
+         disagree with it.\n\n| Case | Why |\n|---|---|"
+    );
+    for (case, why) in DEPARTURES {
+        let _ = writeln!(doc, "| `{case}` | {why} |");
+        if s.agreed.get(*case) != Some(&false) {
             stale.push(*case);
         }
     }
@@ -338,7 +361,7 @@ pub fn run() -> Result<()> {
     );
     if !stale.is_empty() {
         return Err(format!(
-            "x509-limbo: these listed conflicts no longer hold (we agree with the case, or not with its opposite): {stale:?}"
+            "x509-limbo: these listed conflicts or departures no longer hold (we agree with the case, or not with its opposite): {stale:?}"
         ));
     }
     if a < FLOORS.0 || r < FLOORS.1 {

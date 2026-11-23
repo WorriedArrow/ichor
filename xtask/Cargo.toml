@@ -31,6 +31,8 @@ layer.workspace = true
 # external code).
 x509.workspace = true
 oci.workspace = true
+# Runs Wycheproof's ML-DSA vectors (a path crate, no external code).
+crypto.workspace = true
 civil.workspace = true
 # The control plane's API, from the host (tests, `cargo xtask workloads`).
 grpc.workspace = true

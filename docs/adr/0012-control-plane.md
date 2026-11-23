@@ -166,7 +166,8 @@ above:
   verified when read) and is kept for the life of the system.
 - The CA bundle reaches the service as a read-only Blob capability
   (`BLOB_READ`): frame reads `\ichor\roots.pem` with the command line
-  before boot services exit.
+  before boot services exit. (Since 2026-11-23 the Public Suffix List's
+  rules, `\ichor\suffixes.dat`, come the same way, as a Blob of their own.)
 - The acceptance test pulls `hello-world` and Alpine 3.20.3 by digest
   from Docker Hub (so it needs the internet) and runs a command in each.
 

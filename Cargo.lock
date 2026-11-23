@@ -345,6 +345,7 @@ name = "xtask"
 version = "0.0.0"
 dependencies = [
  "ichor-civil",
+ "ichor-crypto",
  "ichor-gpt",
  "ichor-grpc",
  "ichor-image",

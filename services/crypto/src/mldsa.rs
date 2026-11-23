@@ -249,8 +249,19 @@ fn use_hint(hint: bool, r: i64, gamma2: i64) -> i64 {
 }
 
 /// Verifies `sig` over `msg` with public key `pk` (ML-DSA.Verify with an
-/// empty context, FIPS 204 algorithms 3 and 8).
+/// empty context, as certificates use it: RFC 9881).
 pub fn verify(p: &Params, pk: &[u8], msg: &[u8], sig: &[u8]) -> bool {
+    verify_with_context(p, pk, msg, &[], sig)
+}
+
+/// Verifies `sig` over `msg` and the context string `ctx` (at most 255
+/// bytes) with public key `pk` (ML-DSA.Verify, FIPS 204 algorithms 3 and
+/// 8). A key or signature of the wrong length, or a longer context, is
+/// refused.
+pub fn verify_with_context(p: &Params, pk: &[u8], msg: &[u8], ctx: &[u8], sig: &[u8]) -> bool {
+    let Ok(ctx_len) = u8::try_from(ctx.len()) else {
+        return false;
+    };
     if pk.len() != p.public_key_len() || sig.len() != p.signature_len() {
         return false;
     }
@@ -277,8 +288,8 @@ pub fn verify(p: &Params, pk: &[u8], msg: &[u8], sig: &[u8]) -> bool {
         z.push(zi);
     }
     let tr = shake256(&[pk], 64);
-    // M' = 0 (pure), the context's length (0), the message.
-    let mu = shake256(&[&tr, &[0, 0], msg], 64);
+    // M' = 0 (pure), the context's length, the context, the message.
+    let mu = shake256(&[&tr, &[0, ctx_len], ctx, msg], 64);
     let mut c = sample_in_ball(c_tilde, p.tau);
     ntt(&mut c, &zetas);
     let mut w1 = Vec::with_capacity(p.k * N * p.w1_bits() / 8);

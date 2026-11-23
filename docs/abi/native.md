@@ -140,7 +140,7 @@ stderr. A program that cannot be loaded exits with status `127 << 8`.
 | Image | `IMAGE_CREATE` | DUPLICATE, INSPECT, READ |
 | Container | `CELL_CREATE` | DUPLICATE, INSPECT, WAIT, WRITE |
 | Process | `CELL_SPAWN` | DUPLICATE, INSPECT, WAIT, READ |
-| Blob | the kernel, at boot (the boot volume's `\ichor\roots.pem`) | DUPLICATE, INSPECT, READ |
+| Blob | the kernel, at boot (the boot volume's `\ichor\roots.pem`, `\ichor\suffixes.dat`, `\ichor\apitoken`, `\ichor\apitls.pem`) | DUPLICATE, INSPECT, READ |
 
 An image's pages are charged to the creating cell and kept for the life of
 the system (version 2 has no image deletion). A socket closes when its

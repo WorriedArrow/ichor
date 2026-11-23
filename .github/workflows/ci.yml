@@ -28,7 +28,7 @@ jobs:
       - run: cargo xtask lint
 
   conformance:
-    name: parsers (fuzzing) and certificate validation (x509-limbo)
+    name: parsers (fuzzing), certificate validation (x509-limbo), ML-DSA (Wycheproof)
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
@@ -43,6 +43,13 @@ jobs:
       # Fails below the floors in xtask/src/limbo.rs; the report is the
       # job summary.
       - run: cargo xtask x509-limbo && cat docs/x509-limbo.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Cache Wycheproof's ML-DSA vectors (hash-checked by xtask)
+        uses: actions/cache@v4
+        with:
+          path: target/wycheproof
+          key: wycheproof-65ca4947
+      # Every vector must get its verdict, malformed keys and signatures too.
+      - run: cargo xtask wycheproof
       - run: cargo xtask fuzz --iterations 20000
       - name: Keep inputs that broke a parser
         if: failure()

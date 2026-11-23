@@ -128,9 +128,10 @@ pub const MOZILLA_ROOTS: Artifact = Artifact {
     token_url: None,
 };
 
-/// The Public Suffix List (publicsuffix.org), pinned to a commit: carried
-/// in the CA bundle (`trust_bundle`) so that no wildcard certificate for a
-/// whole public suffix verifies. MPL-2.0 data, never committed.
+/// The Public Suffix List (publicsuffix.org), pinned to a commit: its
+/// ICANN rules are the boot volume's `\ichor\suffixes.dat`
+/// (`public_suffix_rules`), so that no wildcard certificate for a whole
+/// public suffix verifies. MPL-2.0 data, never committed.
 pub const PUBLIC_SUFFIX_LIST: Artifact = Artifact {
     dir: "roots",
     file: "public_suffix_list-7a21dc34.dat",
@@ -144,13 +145,17 @@ pub const PUBLIC_SUFFIX_LIST: Artifact = Artifact {
 /// `ROOTS_MAX`).
 const ROOTS_MAX: usize = 512 * 1024;
 
-/// The Public Suffix List's ICANN rules (comments and blank lines left
-/// out) as the CA bundle's `PUBLIC SUFFIX LIST` block. Its private section
-/// (names companies let others register under, `s3.amazonaws.com` among
-/// them) is left out, as Chrome leaves it out for wildcards: Amazon's own
-/// S3 certificate is `*.s3.amazonaws.com`, and registries serve layers
-/// from S3.
-pub fn public_suffix_block() -> Result<String> {
+/// Most the boot volume's `\ichor\suffixes.dat` may hold (frame's
+/// `SUFFIXES_MAX`).
+const SUFFIXES_MAX: usize = 256 * 1024;
+
+/// The boot volume's `\ichor\suffixes.dat`: the Public Suffix List's ICANN
+/// rules, in the list's own format (comments and blank lines left out).
+/// Its private section (names companies let others register under,
+/// `s3.amazonaws.com` among them) is left out, as Chrome leaves it out for
+/// wildcards: Amazon's own S3 certificate is `*.s3.amazonaws.com`, and
+/// registries serve layers from S3.
+pub fn public_suffix_rules() -> Result<String> {
     let list = PUBLIC_SUFFIX_LIST.bytes()?;
     let list = String::from_utf8(list).map_err(|_| "the public suffix list is not UTF-8")?;
     let (Some(start), Some(end)) = (
@@ -159,31 +164,40 @@ pub fn public_suffix_block() -> Result<String> {
     ) else {
         return Err("the public suffix list has no ICANN section".into());
     };
-    let label = x509::SUFFIX_BLOCK;
-    let mut out = format!("-----BEGIN {label}-----\n");
+    let mut out = String::new();
     for line in list[start..end].lines().map(str::trim) {
         if !line.is_empty() && !line.starts_with("//") {
             out.push_str(line);
             out.push('\n');
         }
     }
-    out.push_str(&format!("-----END {label}-----\n"));
+    if out.len() >= SUFFIXES_MAX {
+        return Err(format!(
+            "the public suffix rules are {} bytes, more than the boot volume's {SUFFIXES_MAX} (frame's SUFFIXES_MAX)",
+            out.len()
+        ));
+    }
     Ok(out)
 }
 
-/// The control plane's trust bundle, `\ichor\roots.pem`: Mozilla's roots
-/// and the Public Suffix List.
+/// The control plane's CA bundle, `\ichor\roots.pem`: Mozilla's roots,
+/// every one of which must be able to anchor a path.
 pub fn trust_bundle() -> Result<Vec<u8>> {
-    let mut b = MOZILLA_ROOTS.bytes()?;
-    b.push(b'\n');
-    b.extend_from_slice(public_suffix_block()?.as_bytes());
-    if b.len() > ROOTS_MAX {
+    let b = MOZILLA_ROOTS.bytes()?;
+    if b.len() >= ROOTS_MAX {
         return Err(format!(
-            "the trust bundle is {} bytes, more than the boot volume's {ROOTS_MAX} (frame's ROOTS_MAX)",
+            "the CA bundle is {} bytes, more than the boot volume's {ROOTS_MAX} (frame's ROOTS_MAX)",
             b.len()
         ));
     }
-    Ok(b)
+    let store = x509::RootStore::from_pem(&String::from_utf8_lossy(&b));
+    match store.unusable() {
+        0 => Ok(b),
+        n => Err(format!(
+            "{n} of Mozilla's {} roots cannot anchor a path in services/x509",
+            store.len()
+        )),
+    }
 }
 
 /// The x509-limbo certificate path-validation suite (C2SP), pinned to a
@@ -196,6 +210,37 @@ pub const X509_LIMBO: Artifact = Artifact {
     env: "ICHOR_X509_LIMBO",
     token_url: None,
 };
+
+/// Wycheproof's (C2SP) ML-DSA verification vectors, pinned to a commit:
+/// malformed keys and signatures (wrong lengths, bad hint encodings,
+/// non-zero padding after the hints, norm violations) as well as valid
+/// ones. Apache-2.0 data, never committed. `cargo xtask wycheproof`.
+pub const WYCHEPROOF_MLDSA: [Artifact; 3] = [
+    Artifact {
+        dir: "wycheproof",
+        file: "mldsa_44_verify_test-65ca4947.json",
+        url: "https://raw.githubusercontent.com/C2SP/wycheproof/65ca494727a52944c204441c860b039e6786b99b/testvectors_v1/mldsa_44_verify_test.json",
+        sha256: "f70759c95146ff3057ae9708438f6e8d25ba822e3af11d2e87bb20d9a9c39d0e",
+        env: "ICHOR_WYCHEPROOF_MLDSA_44",
+        token_url: None,
+    },
+    Artifact {
+        dir: "wycheproof",
+        file: "mldsa_65_verify_test-65ca4947.json",
+        url: "https://raw.githubusercontent.com/C2SP/wycheproof/65ca494727a52944c204441c860b039e6786b99b/testvectors_v1/mldsa_65_verify_test.json",
+        sha256: "1ca235f61928421a173a171780beb00264ae9155dc33c52a11e1766cc7979034",
+        env: "ICHOR_WYCHEPROOF_MLDSA_65",
+        token_url: None,
+    },
+    Artifact {
+        dir: "wycheproof",
+        file: "mldsa_87_verify_test-65ca4947.json",
+        url: "https://raw.githubusercontent.com/C2SP/wycheproof/65ca494727a52944c204441c860b039e6786b99b/testvectors_v1/mldsa_87_verify_test.json",
+        sha256: "54adffe10f6dad7941ffd97f77ad4e5c85cb3a54d44cf5ce1c95cb1757b9ba14",
+        env: "ICHOR_WYCHEPROOF_MLDSA_87",
+        token_url: None,
+    },
+];
 
 /// The official static busybox 1.35.0 (musl, x86-64) from busybox.net.
 pub const BUSYBOX: Artifact = Artifact {

@@ -24,6 +24,7 @@ pub mod qemu;
 pub mod rootfs;
 pub mod sha256;
 pub mod workloads;
+pub mod wycheproof;
 
 use std::path::{Path, PathBuf};
 

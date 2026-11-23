@@ -90,7 +90,8 @@ plane; its gRPC API stays local to the system cell unless
 `control_publish=PORT` publishes it on the uplink, which also needs a
 token and a certificate, below) and `dns=A.B.C.D` (its resolver; the
 cloud's, e.g. `169.254.169.253` on AWS). The disk's ESP carries the
-pinned CA bundle as `\ichor\roots.pem`.
+pinned CA bundle as `\ichor\roots.pem` and the Public Suffix List's
+ICANN rules as `\ichor\suffixes.dat`.
 
 To publish the API, make a token and an Ed25519 certificate (here under a
 CA of your own; name it what clients will check) and put both on the disk:

@@ -265,6 +265,7 @@ fn kmain(info: BootInfo) -> ! {
         };
         let code = control::run(
             info.roots(),
+            info.suffixes(),
             pick(info.api_token(), &from_cloud.api_token),
             pick(info.api_tls(), &from_cloud.api_tls),
             &options,

@@ -11,8 +11,9 @@
 //! Arguments (from the kernel): the system cell's handle, the switch's and
 //! the CA bundle's (hex), then options: `port=N` (default 50051),
 //! `listen=A.B.C.D`, `publish=N`, `dns=A.B.C.D`, `plaintext`,
-//! `token-blob=HANDLE` and `tls-blob=HANDLE` (the boot volume's
-//! `\ichor\apitoken` and `\ichor\apitls.pem`), `exit-on-close` (tests:
+//! `token-blob=HANDLE`, `tls-blob=HANDLE` and `suffix-blob=HANDLE` (the
+//! boot volume's `\ichor\apitoken`, `\ichor\apitls.pem` and
+//! `\ichor\suffixes.dat`), `exit-on-close` (tests:
 //! stop when the first API client hangs up) and `exit-after=SECONDS`.
 //!
 //! The API is local by default: it listens on the system cell's loopback
@@ -311,8 +312,15 @@ fn main(args: &[&str]) -> i32 {
 
     let pem = rt::blob_read(&roots).unwrap_or_default();
     drop(roots);
-    let store = x509::RootStore::from_pem(core::str::from_utf8(&pem).unwrap_or(""));
-    drop(pem);
+    let suffixes = blob("suffix-blob");
+    let store = x509::RootStore::from_pem(core::str::from_utf8(&pem).unwrap_or(""))
+        .with_public_suffixes(core::str::from_utf8(&suffixes).unwrap_or(""));
+    drop((pem, suffixes));
+    if store.public_suffixes() == 0 {
+        rt::log(
+            "control: no Public Suffix List on the boot volume; wildcards are not checked against it",
+        );
+    }
     if store.is_empty() {
         rt::log("control: no CA bundle on the boot volume; HTTPS pulls will fail");
     }
