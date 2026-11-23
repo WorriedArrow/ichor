@@ -724,9 +724,12 @@ ADR-0015 (xAPIC) and ADR-0016: `frame::hyperv` (hypercalls, SynIC),
 `kernel/vmbus` (the protocol, sans-I/O, fuzzed), `kernel/drivers/hyperv`
 (disks and network). Works on OpenVMM, Microsoft's VMM, which runs on this
 kind of PC without administrator rights and with hardware virtualization
-(`docs/cloud.md` has the command): the fastest local way to run Ichor. Not
-yet: AWS ENA and GCP gVNIC, Secure Boot, the ACPI power button; nothing has
-run on AWS, Azure itself or a real machine.
+(`docs/cloud.md` has the command): the fastest local way to run Ichor.
+**Azure is done** (2026-11-22, a Standard_D4s_v5: boots, pulls and runs
+containers through the API). Not yet: AWS ENA, GCP gVNIC, Azure's newest
+sizes (PCI over VMBus: NVMe and MANA), Secure Boot, the ACPI power button;
+Azure's CPU enumerates no MD_CLEAR or SPEC_CTRL (VERW and IBRS off: look
+into); nothing has run on AWS or a real machine.
 
 ## Commands
 

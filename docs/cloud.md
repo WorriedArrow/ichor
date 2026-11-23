@@ -3,8 +3,8 @@
 Status: the disk image boots in QEMU the way a cloud VM boots (UEFI
 firmware, one GPT disk on NVMe, serial console), including with a blank
 volume ahead of the boot disk, an 8 KiB NVMe transfer limit, and no
-PIT. It **has run on Google Cloud** (2026-11-22, below), and on no other
-cloud yet. This page is the runbook.
+PIT. It **has run on Google Cloud and on Azure** (2026-11-22, below), not
+yet on AWS. This page is the runbook.
 
 ## Runs so far
 
@@ -173,23 +173,40 @@ legacy devices alone, as GCP's are.
 
 ## Azure (generation 2 machines)
 
-The disk and the network are VMBus channels, which Ichor drives (ADR-0016);
-boot-volume NVMe and MANA (the newest types') it does not need. **Not yet
-run on Azure.** What has been run is OpenVMM, below. Check the commands
-against current documentation.
+The disk and the network are VMBus channels, which Ichor drives (ADR-0016).
+The newest types (v6, v7) reach their NVMe disks and MANA network through
+PCI over VMBus, which Ichor does not drive yet: use v5 or older.
+
+**Run on 2026-11-22**: a `Standard_D4s_v5` (4 vCPUs, 16 GB) in Central US,
+from a disk made of the VHD. VMBus 5.3 with 12 channels, the network's DHCP
+lease from 168.63.129.16, the root found and verified on the VMBus SCSI
+disk; over the API (from Cloud Shell) Alpine, Python (HTTPS) and
+redis-benchmark (424,000 pipelined SETs a second) ran. The CPU Azure shows
+there enumerates neither `IA32_SPEC_CTRL` nor MD_CLEAR while reporting TAA,
+so Ichor reports VERW and IBRS as unavailable: to look into.
+
+A new pay-as-you-go subscription had quota only for sizes Azure would not
+place (v4: `SkuNotAvailable` in East US 2 and Central US, every zone) and
+none for those it would (v5); a request for 4 vCPUs of the DSv5 family
+(`az quota create`) was granted at once.
+
+Check the commands against current documentation.
 
 1. `cargo xtask disk-image --release --azure --cmdline "control=50051
    control_publish=50051" --api-token-file ... --api-tls-file ...` writes
    `target/ichor-azure.vhd`, a fixed VHD of 1 GiB.
-2. Upload it as a page blob into a private container, and make a managed
-   disk or an image of it: `az image create --os-type Linux
-   --hyper-v-generation V2 --source BLOB_URL ...`.
-3. Launch a generation 2 machine with the standard security type (Secure
-   Boot off), boot diagnostics on (the serial log), and its network security
-   group open to the API from where you are alone.
-4. Azure waits for an agent to say that the machine is provisioned; Ichor
-   has none, so it is reported as failed some time later, and runs on. (A
-   *specialized* image or an attached OS disk is not waited for.)
+   (Cloud Shell can build it: clone the repository, install rustup, run
+   the command; nothing need leave Azure.)
+2. Upload it as a page blob into a private container (`az storage blob
+   upload --type page`) and make a disk of it: `az disk create --source
+   BLOB_URL --source-storage-account-id ... --os-type Linux
+   --hyper-v-generation V2`.
+3. Attach it as the OS disk of a generation 2 machine (`az vm create
+   --attach-os-disk DISK --os-type linux --size Standard_D4s_v5
+   --security-type Standard --nsg-rule NONE --boot-diagnostics-storage
+   ACCOUNT`): an attached disk is not waited on for a provisioning agent,
+   which Ichor does not have. Open the API to where you are alone, read the
+   serial log with `az vm boot-diagnostics get-boot-log`.
 
 ### The same devices, locally: OpenVMM
 
