@@ -1,7 +1,6 @@
 //! SNTP (RFC 4330), sans-I/O: one request, and the clock offset and round
-//! trip its answer gives. Ichor sets no clock from it; it measures how far
-//! its own wall clock is from a server's (a cloud's metadata server
-//! answers NTP), so a jump or a drift shows.
+//! trip its answer gives, and a [`Discipline`] that steers a wall clock
+//! from them (a cloud's metadata server answers NTP).
 
 use core::time::Duration;
 
@@ -72,9 +71,166 @@ pub fn answer(b: &[u8], sent: Duration, received: Duration) -> Option<Sample> {
     })
 }
 
+/// Under this round trip a sample is trusted to steer the clock (its error
+/// is at most half the round trip).
+pub const STEER_RTT_NS: i64 = 3_000_000;
+/// An offset larger than this is stepped at once, not slewed away.
+pub const STEP_NS: i64 = 100_000_000;
+/// The loop's time constant, in seconds.
+const TAU_S: i128 = 60;
+/// The fastest the clock is made to gain or lose: 500 ppm.
+pub const MAX_PPB: i64 = 500_000;
+
+/// What the clock should do after a sample: step by `step_ns`, then gain
+/// `ppb` parts per billion on its own rate until the next.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Steer {
+    pub step_ns: i64,
+    pub ppb: i64,
+}
+
+/// Disciplines a clock from samples: the first trusted sample (and any
+/// off by more than [`STEP_NS`]) steps it; the rest steer its rate with a
+/// proportional-integral loop, so it slews, never jumps, and the integral
+/// learns the clock's own rate error (how far its oscillator is off).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Discipline {
+    freq_ppb: i64,
+    last_ns: Option<u64>,
+}
+
+impl Discipline {
+    /// The clock's rate error as learned: what it is made to gain.
+    pub fn freq_ppb(&self) -> i64 {
+        self.freq_ppb
+    }
+
+    /// Takes a sample taken at `t_ns` (a monotonic clock); how to steer,
+    /// or `None` if the sample is not trusted.
+    pub fn sample(&mut self, t_ns: u64, s: Sample) -> Option<Steer> {
+        if !(0..STEER_RTT_NS).contains(&s.rtt_ns) {
+            return None;
+        }
+        let off = s.offset_ns;
+        let last = self.last_ns.replace(t_ns);
+        let Some(last) = last.filter(|_| off.abs() <= STEP_NS) else {
+            return Some(Steer {
+                step_ns: off,
+                ppb: self.freq_ppb,
+            });
+        };
+        let dt_ns = i128::from(t_ns.saturating_sub(last)).min(TAU_S * 1_000_000_000);
+        let gained = i128::from(off) * dt_ns / (TAU_S * TAU_S * 1_000_000_000);
+        let max = i128::from(MAX_PPB);
+        let freq = (i128::from(self.freq_ppb) + gained).clamp(-max, max);
+        self.freq_ppb = freq as i64;
+        let ppb = (freq + i128::from(off) / TAU_S).clamp(-max, max);
+        Some(Steer {
+            step_ns: 0,
+            ppb: ppb as i64,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A clock that runs `drift_ppb` fast, steered as frame steers the wall
+    /// clock, against true time; the offsets a server would see.
+    struct Clock {
+        drift_ppb: i64,
+        start_ns: i64,
+        at: u64,
+        by: i64,
+        ppb: i64,
+    }
+
+    impl Clock {
+        fn read(&self, t: u64) -> i64 {
+            let own = t as i64
+                + (i128::from(t as i64) * i128::from(self.drift_ppb) / 1_000_000_000) as i64;
+            let steer = self.by
+                + (i128::from((t - self.at) as i64) * i128::from(self.ppb) / 1_000_000_000) as i64;
+            self.start_ns + own + steer
+        }
+
+        fn steer(&mut self, t: u64, s: Steer) {
+            let by = self.read(t)
+                - self.start_ns
+                - t as i64
+                - (i128::from(t as i64) * i128::from(self.drift_ppb) / 1_000_000_000) as i64;
+            self.at = t;
+            self.by = by + s.step_ns;
+            self.ppb = s.ppb;
+        }
+    }
+
+    fn sample(offset_ns: i64, rtt_ns: i64) -> Sample {
+        Sample {
+            offset_ns,
+            rtt_ns,
+            stratum: 2,
+        }
+    }
+
+    #[test]
+    fn a_drifting_clock_is_brought_in_and_kept() {
+        // kvmclock on GCP: 71 ppm slow, the firmware's clock 0.57 s ahead.
+        let mut c = Clock {
+            drift_ppb: -71_000,
+            start_ns: 567_700_000,
+            at: 0,
+            by: 0,
+            ppb: 0,
+        };
+        let mut d = Discipline::default();
+        let mut worst_late = 0i64;
+        for i in 1..=720u64 {
+            let t = i * 5_000_000_000;
+            if i == 361 {
+                // A migration: the clock jumps 300 ms and runs 96 ppm
+                // differently.
+                c.start_ns -= 300_000_000;
+                c.drift_ppb += 96_000;
+            }
+            let off = t as i64 - c.read(t);
+            if i == 1 || i == 361 {
+                assert!(off.abs() > STEP_NS, "{i}: {off}");
+            }
+            // Every third sample came back slowly and is not trusted.
+            let rtt = if i % 3 == 0 { 9_000_000 } else { 1_000_000 };
+            match d.sample(t, sample(off, rtt)) {
+                Some(s) => {
+                    assert_eq!(s.step_ns != 0, i == 1 || i == 361, "{i}: {s:?}");
+                    c.steer(t, s)
+                }
+                None => assert_eq!(rtt, 9_000_000),
+            }
+            // Twenty minutes after either step, within a millisecond.
+            if (240..361).contains(&i) || i >= 600 {
+                worst_late = worst_late.max(off.abs());
+            }
+        }
+        assert!(worst_late < 1_000_000, "{worst_late}");
+        // And it learned the clock's rate: 25 ppm fast after the move.
+        assert!((d.freq_ppb() + 25_000).abs() < 500, "{}", d.freq_ppb());
+    }
+
+    #[test]
+    fn steering_is_bounded() {
+        let mut d = Discipline::default();
+        assert_eq!(d.sample(0, sample(5, 1_000)).unwrap().step_ns, 5);
+        let mut t = 0;
+        for _ in 0..1000 {
+            t += 5_000_000_000;
+            let s = d.sample(t, sample(STEP_NS, 1_000)).unwrap();
+            assert_eq!(s.step_ns, 0);
+            assert!(s.ppb.abs() <= MAX_PPB);
+        }
+        assert_eq!(d.freq_ppb(), MAX_PPB);
+        assert!(d.sample(t, sample(0, -1)).is_none());
+    }
 
     fn server(req: &[u8; LEN], recv: Duration, xmit: Duration) -> [u8; LEN] {
         let mut b = [0; LEN];

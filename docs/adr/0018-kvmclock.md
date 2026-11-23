@@ -74,3 +74,27 @@ step 12 is 6,850 lines / 295 sites.
 - TCG and other hypervisors are unchanged.
 - The live-migration campaign checks this: the clock's offset from NTP
   should stay flat across migrations.
+
+## Amendment (2026-11-23): the wall clock is disciplined by NTP
+
+The first boot on GCP with kvmclock showed its rate is the host's own
+calibration of its TSC: the wall clock drifted from the metadata server's
+NTP at a steady 71 ppm (568 to 630 ms over 870 s). No migration was needed
+for that; it is how far that host's measurement is off.
+
+So the alternative set aside above is taken, for the wall clock only. Frame
+gains `time::steer_wall_clock(step_ns, ppb)`: a step, and a rate the wall
+clock gains on the monotonic clock from then on, kept under a sequence
+counter and read lock-free by `wall_clock()`. The policy is outside frame,
+in `net::ntp::Discipline` (host-tested): the first sample with a round trip
+under 3 ms steps the clock (the firmware's clock was 0.57 s off), as does
+any later offset over 100 ms; the rest steer the rate with a
+proportional-integral loop (time constant 60 s, at most 500 ppm), so the
+clock slews and never jumps back. The integral is the clock's learned rate
+error, logged with every sample. The kernel's watch (`watch.rs`) runs it
+from the samples it takes every 5 s when `metadata=gcp` or `watch_cloud`
+is given.
+
+`now()`, which timers, timeouts and the scheduler use, is not steered: a
+71 ppm error in an interval does not matter, and a monotonic clock whose
+rate changes under it would make intervals harder to reason about.

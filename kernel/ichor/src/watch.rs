@@ -77,6 +77,8 @@ pub(crate) struct Watch {
     ntp_sent: Option<Duration>,
     next_ntp: Duration,
     logged_offset: Option<(i64, Duration)>,
+    /// What steers the wall clock from the samples.
+    discipline: ntp::Discipline,
     /// What to log, once the uplink is let go.
     pub(crate) log: Vec<String>,
 }
@@ -96,6 +98,7 @@ impl Watch {
                 ntp_sent: None,
                 next_ntp: Duration::ZERO,
                 logged_offset: None,
+                discipline: ntp::Discipline::default(),
                 log: Vec::new(),
             }
         })
@@ -215,8 +218,25 @@ impl Watch {
         false
     }
 
-    /// Logs a clock sample if it moved, now and then, and around a notice.
+    /// Steers the wall clock by a sample (a quick one), and logs the sample
+    /// if it moved, now and then, and around a notice. What is logged is
+    /// the offset before steering; `steering` is the clock's learned rate
+    /// error, so the unsteered clock's drift still shows.
     fn clock(&mut self, t: Duration, s: ntp::Sample) {
+        let t_ns = u64::try_from(t.as_nanos()).unwrap_or(u64::MAX);
+        let steer = self.discipline.sample(t_ns, s);
+        if let Some(st) = steer {
+            frame::time::steer_wall_clock(st.step_ns, st.ppb);
+            if st.step_ns != 0 {
+                self.log.push(format!(
+                    "ichor: watch: clock stepped {}{}.{:06} ms to the metadata server's NTP ({})",
+                    if st.step_ns < 0 { "-" } else { "+" },
+                    st.step_ns.unsigned_abs() / 1_000_000,
+                    st.step_ns.unsigned_abs() % 1_000_000,
+                    stamp()
+                ));
+            }
+        }
         let near = self
             .noticed
             .is_some_and(|n| t.saturating_sub(n) < AFTER_NOTICE);
@@ -228,13 +248,17 @@ impl Watch {
         };
         if near || due {
             self.log.push(format!(
-                "ichor: watch: clock {}{}.{:06} ms from the metadata server's NTP (rtt {}.{:03} ms, stratum {}; {})",
+                "ichor: watch: clock {}{}.{:06} ms from the metadata server's NTP (rtt {}.{:03} ms, stratum {}; steering {}{}.{:03} ppm{}; {})",
                 if s.offset_ns < 0 { "-" } else { "+" },
                 s.offset_ns.unsigned_abs() / 1_000_000,
                 s.offset_ns.unsigned_abs() % 1_000_000,
                 s.rtt_ns / 1_000_000,
                 (s.rtt_ns % 1_000_000).abs() / 1000,
                 s.stratum,
+                if self.discipline.freq_ppb() < 0 { "-" } else { "+" },
+                self.discipline.freq_ppb().unsigned_abs() / 1000,
+                self.discipline.freq_ppb().unsigned_abs() % 1000,
+                if steer.is_some() { "" } else { ", not used" },
                 stamp()
             ));
             self.logged_offset = Some((s.offset_ns, t));

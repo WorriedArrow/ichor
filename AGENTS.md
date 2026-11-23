@@ -770,7 +770,12 @@ the TSC calibrated over 10 ms of the PM timer was 14 ppm off on GCP (now
 runs about 96 ppm differently, after which a boot-calibrated clock loses 8 s
 a day (so on KVM frame's clock is kvmclock now, `frame::kvm`, ADR-0018:
 refreshed within 10 ms of a migration; checked only on GCP and CI's KVM,
-since TCG has none); that GCP's DSDT has no `\_S5` the parser finds; and
+since TCG has none); that kvmclock itself runs 71 ppm slow against NTP on
+GCP (its rate is the host's own TSC calibration), so the watch now
+disciplines the wall clock (`net::ntp::Discipline`: a step at the first
+quick sample, then a PI loop on the rate, tau 60 s, at most 500 ppm;
+`frame::time::steer_wall_clock`; `now()` and timers stay unsteered;
+ADR-0018's amendment); that GCP's DSDT has no `\_S5` the parser finds; and
 that GCE's simulated maintenance takes about 11 minutes a run (6.5 before
 the notice, 80 s of migration, 3.5 before the operation ends).
 Not yet: Azure's newest sizes (PCI over VMBus: NVMe and MANA),

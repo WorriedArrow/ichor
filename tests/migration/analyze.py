@@ -34,6 +34,8 @@ def lines(name):
 
 STAMP = re.compile(r"uptime ([\d.]+) s, wall ([\d.]+)")
 CLOCK = re.compile(r"clock ([+-][\d.]+) ms from the metadata server's NTP \(rtt ([\d.]+) ms")
+STEERING = re.compile(r"steering ([+-][\d.]+) ppm")
+STEPPED = re.compile(r"clock stepped ([+-][\d.]+) ms")
 NOTICE = re.compile(r"maintenance-event (\S+)")
 GAP = re.compile(r"no tick for (\d+) ms")
 HAMMER_SUM = re.compile(r"hammer: (\d+) reads \(([\d.]+) MiB/s\), (\d+) errors, slowest (\d+) ms")
@@ -52,7 +54,9 @@ for peer_t, text in lines("serial.log"):
     # half that wait: only quick round trips are taken.)
     if c and wall and float(c.group(2)) < 3.0:
         offset_ms = float(c.group(1))
-        clock_samples.append((wall + offset_ms / 1000, offset_ms, float(c.group(2))))
+        s = STEERING.search(text)
+        steer = float(s.group(1)) if s else None
+        clock_samples.append((wall + offset_ms / 1000, offset_ms, float(c.group(2)), steer))
     true = wall + offset_ms / 1000 if wall else peer_t
     serial.append((true, text, wall))
 
@@ -107,6 +111,17 @@ for k, i in enumerate(ordered):
         res["clock_before_ms"] = round(before[-1][1], 3)
         res["clock_after_ms"] = round(after[0][1], 3)
         res["clock_jump_ms"] = round(after[0][1] - before[-1][1], 3)
+    # With the wall clock disciplined, a jump shows as the worst offset
+    # around the migration (or a step), and a new host's TSC rate as a
+    # change in the learned steering rate.
+    near = [s for s in clock_samples if a <= s[0] <= r["done"] + 60]
+    if near:
+        res["clock_worst_ms"] = round(max((s[1] for s in near), key=abs), 3)
+    res["clock_steps"] = [x for _, x, _ in ev if STEPPED.search(x)][:3]
+    rate_before = [s[3] for s in before if s[3] is not None]
+    rate_after = [s[3] for s in clock_samples if s[0] > r["done"] + 120 and s[0] <= b and s[3] is not None]
+    if rate_before and rate_after:
+        res["rate_change_ppm"] = round(rate_after[-1] - rate_before[-1], 3)
     # The TCP stream from a cell: its longest silence, and whether it broke.
     stream = window(tcp, a, b)
     res["tcp_gap_s"] = round(max((y[0] - x[0] for x, y in zip(stream, stream[1:])), default=0), 2)
@@ -145,13 +160,14 @@ if "--json" in sys.argv:
     sys.exit(0)
 
 print(f"{len(results)} runs\n")
-cols = ["run", "gcloud_s", "notice", "notice_lead_s", "tick_gap_ms", "clock_jump_ms", "tcp_gap_s",
+cols = ["run", "gcloud_s", "notice", "notice_lead_s", "tick_gap_ms", "clock_jump_ms", "clock_worst_ms",
+        "rate_change_ppm", "tcp_gap_s",
         "tcp_broke", "iperf_base_mbps", "iperf_min_mbps", "iperf_stalled_s", "iperf_broke",
         "disk_errors", "disk_slowest_ms", "api_ok", "internet_ok"]
 print("\t".join(cols))
 for r in results:
     print("\t".join(str(r.get(c, "-")) for c in cols))
-    for key in ("gve", "disk_lines", "bad"):
+    for key in ("gve", "disk_lines", "bad", "clock_steps"):
         for x in r[key]:
             print(f"    {key}: {x}")
 
@@ -168,7 +184,11 @@ def stat(c):
 print("\nsummary")
 print(f"  notice seen before the blackout: {sum(1 for r in results if r['notice'])}/{len(results)}; lead (s): {stat('notice_lead_s')}")
 print(f"  guest tick gap (ms): {stat('tick_gap_ms')}")
-print(f"  clock jump per run (ms): {stat('clock_jump_ms')}")
+print(f"  clock jump per run (ms): {stat('clock_jump_ms')}; worst offset around a migration (ms): {stat('clock_worst_ms')}")
+print(f"  steps after the first: {sum(len(r['clock_steps']) for r in results)}; host TSC rate change per migration (ppm): {stat('rate_change_ppm')}")
+settled = [s[1] for s in clock_samples if clock_samples and s[0] > clock_samples[0][0] + 900]
+if settled:
+    print(f"  offset from NTP after the first 15 minutes (ms): worst {max(settled, key=abs):.3f}, median |offset| {statistics.median(abs(x) for x in settled):.3f}")
 print(f"  TCP stream gap (s): {stat('tcp_gap_s')}; broke in {sum(r['tcp_broke'] for r in results)} runs")
 print(f"  iperf3 stalled (s): {stat('iperf_stalled_s')}; broke in {sum(r['iperf_broke'] for r in results)} runs")
 print(f"  disk errors: {sum(r['disk_errors'] for r in results)}; slowest read (ms): {stat('disk_slowest_ms')}")

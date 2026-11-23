@@ -5,7 +5,7 @@
 //! handler (installed once, for every CPU) decides whether to re-arm. The
 //! scheduler (milestone 2) becomes that handler.
 
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use core::time::Duration;
 
 use crate::arch::apic;
@@ -25,10 +25,51 @@ pub(crate) fn set_boot_wall_clock(secs: u64, nanos: u32, tsc: u64) {
     WALL_VALID.store(true, Ordering::Release);
 }
 
+/// How the wall clock is steered (by an NTP client, [`steer_wall_clock`]):
+/// at monotonic time `STEER_AT` (ns) it is `STEER_BY` ns ahead of the
+/// firmware's reading plus the monotonic clock, and gains `STEER_PPB`
+/// parts per billion from then on. A sequence counter guards the three.
+static STEER_SEQ: AtomicU64 = AtomicU64::new(0);
+static STEER_AT: AtomicU64 = AtomicU64::new(0);
+static STEER_BY: AtomicI64 = AtomicI64::new(0);
+static STEER_PPB: AtomicI64 = AtomicI64::new(0);
+
+/// The steering at monotonic time `t` (ns), and its parts.
+fn steering(t: u64) -> (i64, u64, i64, i64) {
+    loop {
+        let s = STEER_SEQ.load(Ordering::Acquire);
+        let (at, by) = (
+            STEER_AT.load(Ordering::Relaxed),
+            STEER_BY.load(Ordering::Relaxed),
+        );
+        let ppb = STEER_PPB.load(Ordering::Relaxed);
+        if s & 1 == 0 && STEER_SEQ.load(Ordering::Acquire) == s {
+            let gained = i128::from(t.saturating_sub(at)) * i128::from(ppb) / 1_000_000_000;
+            return (by.saturating_add(gained as i64), at, by, ppb);
+        }
+        core::hint::spin_loop();
+    }
+}
+
+/// Steers the wall clock: steps it by `step_ns` now, and from now on has it
+/// gain `ppb` parts per billion on the monotonic clock (which timers keep
+/// using, unsteered). One caller at a time.
+pub fn steer_wall_clock(step_ns: i64, ppb: i64) {
+    // A reader interrupting the write on this CPU would wait for it forever.
+    let _irq = crate::cpu::IrqGuard::new();
+    let t = apic::now_ns();
+    let (by, ..) = steering(t);
+    STEER_SEQ.fetch_add(1, Ordering::AcqRel);
+    STEER_AT.store(t, Ordering::Relaxed);
+    STEER_BY.store(by.saturating_add(step_ns), Ordering::Relaxed);
+    STEER_PPB.store(ppb, Ordering::Relaxed);
+    STEER_SEQ.fetch_add(1, Ordering::Release);
+}
+
 /// The time of day as time since the Unix epoch (UTC): the firmware's
 /// clock as read at boot plus the monotonic clock since (kvmclock's on
-/// KVM, so a migration does not make it drift). `None` if the firmware had
-/// no clock to read. Nothing disciplines it yet (no NTP).
+/// KVM, so a migration does not make it drift), as steered by an NTP
+/// client if one runs. `None` if the firmware had no clock to read.
 pub fn wall_clock() -> Option<Duration> {
     if !WALL_VALID.load(Ordering::Acquire) {
         return None;
@@ -36,15 +77,14 @@ pub fn wall_clock() -> Option<Duration> {
     // From the reading to boot, by the TSC; from boot on, the clock.
     let hz = u128::from(tsc_hz().max(1));
     let before = u128::from(apic::tsc_at_boot().saturating_sub(WALL_TSC.load(Ordering::Relaxed)));
-    let before = Duration::from_nanos(u64::try_from(before * 1_000_000_000 / hz).unwrap_or(0));
-    Some(
-        Duration::new(
-            WALL_SECS.load(Ordering::Relaxed),
-            WALL_NANOS.load(Ordering::Relaxed),
-        )
-        .saturating_add(before)
-        .saturating_add(now()),
-    )
+    let before = before * 1_000_000_000 / hz;
+    let t = apic::now_ns();
+    let secs = u128::from(WALL_SECS.load(Ordering::Relaxed)) * 1_000_000_000;
+    let ns = secs + u128::from(WALL_NANOS.load(Ordering::Relaxed)) + before + u128::from(t);
+    let ns = (ns as i128)
+        .saturating_add(i128::from(steering(t).0))
+        .max(0);
+    Some(Duration::from_nanos(u64::try_from(ns).unwrap_or(u64::MAX)))
 }
 
 /// Time since boot.
