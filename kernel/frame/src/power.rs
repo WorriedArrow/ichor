@@ -27,8 +27,12 @@ static PM1: SpinLock<Option<(Pm1, Option<SleepTypes>)>> = SpinLock::new(None);
 pub(crate) fn init_acpi() -> Option<bool> {
     let fadt = crate::acpi::find_table(b"FACP")?;
     let pm1 = acpi::fadt_pm1(&fadt)?;
+    // In the DSDT, or in an SSDT (GCP's is in Google's own).
     let dsdt = acpi::fadt_dsdt(&fadt).and_then(crate::acpi::table_at);
-    let s5 = dsdt.as_deref().and_then(acpi::s5_sleep_types);
+    let s5 = dsdt
+        .as_deref()
+        .and_then(acpi::s5_sleep_types)
+        .or_else(|| crate::acpi::find_in_tables(b"SSDT", |t| acpi::s5_sleep_types(&t)));
     let sci = || {
         // SAFETY: the FADT names this as the PM1 control register, which
         // frame alone uses (ADR-0017), as it does every port below.

@@ -27,8 +27,9 @@ not interpret.
   ACPI_ENABLE to SMI_CMD.
 - `\_S5`'s two sleep types are read from the DSDT by matching that one
   object's usual encoding, `Name (_S5, Package { a, b, ... })`
-  (`acpi::s5_sleep_types`, host-tested). No AML is run. A DSDT that
-  computes them in a method gets no soft off.
+  (`acpi::s5_sleep_types`, host-tested), and from the SSDTs if the DSDT
+  has none (2026-11-23: GCP's is in Google's `GOOGSSDT`, not its DSDT).
+  No AML is run. A table that computes them in a method gets no soft off.
 - The power button is the fixed-hardware one (FADT flag 4 clear). Frame
   clears its status and sets its enable bit: hardware (QEMU's among it)
   records a press only while that bit is set. No SCI is taken: the

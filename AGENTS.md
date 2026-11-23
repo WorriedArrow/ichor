@@ -47,7 +47,7 @@ tests/control.rs serves one from the host and refuses a wrong digest]; (6) ADR-0
 boot [done: VERW, IBPB, and page-table isolation (ADR-0004's second
 2026-11-16 amendment)].
 
-- Cell access-control suite (branch `claude/ichor-cell-access-tests-feb51a`,
+- Cell access-control suite (merged 2026-11-23, WorriedArrow/ichor#4;
   `docs/reports/cell-access-tests.md`): `cell_access` runs
   `kernel/ichor/src/cellaccess.rs`, two cells with their own roots, a helper
   in B owning one object of each kind, and A's real syscalls on them with
@@ -554,7 +554,8 @@ from a local mirror). Phase E (scalability) is done except the vDSO
   local `/mirror` (hello, jq, libjq1, libonig5; pinned on
   snapshot.debian.org) passes in CI: milestone 4's acceptance test.
   prctl, statx, sched_getaffinity, /sys cpu lists, mremap, sysinfo are in.
-  Open: the cross-cell isolation test (owner is writing it).
+  The cross-cell isolation test is the cell access-control suite (merged
+  2026-11-23).
 - Pseudo-terminals (`pty.rs`): `/dev/ptmx` and a devpts per root
   (`Vfs::ptys`; a slave opens only through the node made for it in the
   same root), an N_TTY-style line discipline (canonical editing, echo,
@@ -764,8 +765,8 @@ The ACPI power button (ADR-0017): frame owns the PM1 and SMI_CMD ports
 (ACPI mode on if the firmware left it off), enables the fixed button's
 event without taking the SCI, and the kernel polls it every 250 ms
 (`frame::power::power_button`, `watch_power_button` in `main.rs`); a press
-writes `\_S5`'s sleep types (read from the DSDT by `acpi::s5_sleep_types`,
-no AML run) and turns the machine off (`frame::power::power_off`). So a
+writes `\_S5`'s sleep types (read from the DSDT, else an SSDT, by
+`acpi::s5_sleep_types`, no AML run) and turns the machine off (`frame::power::power_off`). So a
 cloud's stop should end the machine at once on GCP and AWS (tested in
 QEMU only: `the_power_button_turns_the_machine_off`, `system_powerdown`
 through `RunConfig::power_button_after`); Azure's hardware-reduced FADT has no
@@ -788,7 +789,8 @@ GCP (its rate is the host's own TSC calibration), so the watch now
 disciplines the wall clock (`net::ntp::Discipline`: a step at the first
 quick sample, then a PI loop on the rate, tau 60 s, at most 500 ppm;
 `frame::time::steer_wall_clock`; `now()` and timers stay unsteered;
-ADR-0018's amendment); that GCP's DSDT has no `\_S5` the parser finds; and
+ADR-0018's amendment); that GCP keeps `\_S5` in an SSDT, not its DSDT
+(now searched too; not yet seen working on GCP); and
 that GCE's simulated maintenance takes about 11 minutes a run (6.5 before
 the notice, 80 s of migration, 3.5 before the operation ends).
 Not yet: Azure's newest sizes (PCI over VMBus: NVMe and MANA),

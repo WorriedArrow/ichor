@@ -293,13 +293,22 @@ pub fn fadt_dsdt(fadt: &[u8]) -> Option<u64> {
 }
 
 /// The sleep types of S5 (soft off) for PM1a and PM1b, from the `\_S5`
-/// package in a DSDT's AML: `Name (_S5, Package () { a, b, ... })`. Only
-/// that one object is read, by its usual encoding, not the AML as a whole.
-pub fn s5_sleep_types(dsdt: &[u8]) -> Option<(u8, u8)> {
+/// package in a DSDT's or SSDT's AML: `Name (_S5, Package () { a, b, ...
+/// })`. Only that one object is read, by its usual encoding, not the AML
+/// as a whole; the name may also appear elsewhere (a reference to it), so
+/// every place it does is tried.
+pub fn s5_sleep_types(aml: &[u8]) -> Option<(u8, u8)> {
+    aml.windows(4)
+        .enumerate()
+        .filter(|(_, w)| *w == b"_S5_")
+        .find_map(|(at, _)| s5_at(aml, at))
+}
+
+/// The `\_S5` package whose name is at `at`, if that is its definition.
+fn s5_at(dsdt: &[u8], at: usize) -> Option<(u8, u8)> {
     const NAME_OP: u8 = 0x08;
     const ROOT: u8 = b'\\';
     const PACKAGE_OP: u8 = 0x12;
-    let at = dsdt.windows(4).position(|w| w == b"_S5_")?;
     let named = (at >= 1 && dsdt[at - 1] == NAME_OP)
         || (at >= 2 && dsdt[at - 1] == ROOT && dsdt[at - 2] == NAME_OP);
     let rest = dsdt.get(at + 4..)?;
@@ -381,6 +390,16 @@ mod tests {
         assert_eq!(s5_sleep_types(&b), Some((7, 5)));
         let one = [8, b'_', b'S', b'5', b'_', 0x12, 0x05, 0x02, 0x01, 0x00];
         assert_eq!(s5_sleep_types(&one), Some((1, 0)));
+        // GCP's, in Google's SSDT, after `_S4`.
+        let gcp = [
+            0x00, 0x08, b'_', b'S', b'4', b'_', 0x12, 0x08, 0x04, 0x0a, 0x00, 0x0a, 0x00, 0x00,
+            0x00, 0x08, b'_', b'S', b'5', b'_', 0x12, 0x06, 0x04, 0x00, 0x00, 0x00, 0x00, 0x10,
+        ];
+        assert_eq!(s5_sleep_types(&gcp), Some((0, 0)));
+        // A reference to it before its definition.
+        let mut later = std::vec![0x70, b'_', b'S', b'5', b'_', 0x60];
+        later.extend_from_slice(&b);
+        assert_eq!(s5_sleep_types(&later), Some((7, 5)));
         // A method, or a reference, is not read.
         assert_eq!(
             s5_sleep_types(&[0x14, b'_', b'S', b'5', b'_', 0x12, 3, 1, 0]),

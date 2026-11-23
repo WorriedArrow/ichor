@@ -54,6 +54,15 @@ pub(crate) fn table_at(pa: u64) -> Option<Vec<u8>> {
 
 /// Finds and copies the first table with `signature`, validated.
 pub(crate) fn find_table(signature: &[u8; 4]) -> Option<Vec<u8>> {
+    find_in_tables(signature, Some)
+}
+
+/// The first answer `f` gives for a validated copy of each table with
+/// `signature` (there may be several SSDTs), in the root table's order.
+pub(crate) fn find_in_tables<T>(
+    signature: &[u8; 4],
+    mut f: impl FnMut(Vec<u8>) -> Option<T>,
+) -> Option<T> {
     let rsdp = copy_phys(boot::acpi_rsdp()?.as_u64(), RSDP_LEN)
         .or_else(|| copy_phys(boot::acpi_rsdp()?.as_u64(), 20))?;
     let root = acpi::parse_rsdp(&rsdp).ok()?;
@@ -66,6 +75,6 @@ pub(crate) fn find_table(signature: &[u8; 4]) -> Option<Vec<u8>> {
     acpi::root_entries(&root_table, root).find_map(|pa| {
         let t = copy_table(pa)?;
         acpi::validate(&t, signature).ok()?;
-        Some(t)
+        f(t)
     })
 }
