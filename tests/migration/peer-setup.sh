@@ -5,6 +5,8 @@
 exec >> /var/log/peer-setup.log 2>&1
 set -eux
 [ -e /root/ready ] && exit 0
+# (iperf3's package asks whether to start a daemon; nobody is there to answer.)
+export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get install -y iperf3 netcat-openbsd git build-essential python3 curl
 export HOME=/root

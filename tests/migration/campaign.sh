@@ -54,10 +54,10 @@ iperf3 -s -D --logfile "$out/iperf-server.log"
 (while true; do nc -l 9001; echo "CLOSED"; done | ts > "$out/tcp-recv.log") &
 serial &
 alpine=docker.io/library/alpine:3.20
-load iperf "$alpine" "apk add -q iperf3 && iperf3 -c $PEER_IP -t 1000000 -i 1 --forceflush" &
+load iperf "$alpine" "apk add -q iperf3 && iperf3 -c $PEER_IP -t 86400 -i 1 --forceflush" &
 load tcp "$alpine" 'i=0; while true; do i=$((i+1)); echo $i; sleep 0.2; done | nc '"$PEER_IP"' 9001' &
-load fio "$alpine" "apk add -q fio && fio --name=mem --directory=/tmp --rw=randrw --bs=64k --size=128m --time_based --runtime=1000000 --status-interval=10 --eta=never" &
-load cpu "$alpine" 'while true; do head -c 32M /dev/urandom | sha256sum >/dev/null; echo round; done' &
+load fio "$alpine" "apk add -q fio && fio --name=mem --directory=/tmp --rw=randrw --bs=64k --size=128m --time_based --runtime=86400 --status-interval=10 --output-format=terse --eta=never" &
+load cpu "$alpine" 'while true; do head -c 33554432 /dev/urandom | sha256sum >/dev/null; echo round; done' &
 
 echo "$(date +%s.%N) campaign of $runs on $vm ($zone); Ichor $ICHOR_IP, peer $PEER_IP" >> "$out/runs.log"
 sleep 120  # the loads get going

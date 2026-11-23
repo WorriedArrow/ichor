@@ -48,7 +48,9 @@ for peer_t, text in lines("serial.log"):
     m = STAMP.search(text)
     wall = float(m.group(2)) if m else None
     c = CLOCK.search(text)
-    if c and wall:
+    # (An answer that waited for an idle uplink's 10 ms poll is skewed by
+    # half that wait: only quick round trips are taken.)
+    if c and wall and float(c.group(2)) < 3.0:
         offset_ms = float(c.group(1))
         clock_samples.append((wall + offset_ms / 1000, offset_ms, float(c.group(2))))
     true = wall + offset_ms / 1000 if wall else peer_t

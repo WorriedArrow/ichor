@@ -217,14 +217,16 @@ fn calibrate_with_pm_timer(t: acpi::PmTimer) -> Option<u64> {
     Some(hz[1])
 }
 
-/// Measures the TSC over 10 ms of the ACPI PM timer (3.579545 MHz). `None`
-/// if the counter does not advance (no timer at that port).
+/// Measures the TSC over 100 ms of the ACPI PM timer (3.579545 MHz): a
+/// tick (279 ns) of error is then 2.8 ppm, where over 10 ms it was 28 (on
+/// GCP the wall clock lost 14 ppm). `None` if the counter does not advance
+/// (no timer at that port).
 fn pm_window(t: acpi::PmTimer) -> Option<u64> {
     let mask: u32 = if t.bits32 { u32::MAX } else { 0x00ff_ffff };
     // SAFETY: the FADT names this port as the PM timer, a read-only
     // free-running counter: reading it has no side effects on any device.
     let read = || unsafe { inl(t.port) } & mask;
-    let target = (acpi::PM_TIMER_HZ / 100) as u32; // 10 ms
+    let target = (acpi::PM_TIMER_HZ / 10) as u32; // 100 ms
     let start = read();
     let tsc_start = rdtsc();
     let mut spins = 0u64;
@@ -242,11 +244,12 @@ fn pm_window(t: acpi::PmTimer) -> Option<u64> {
     Some(ticks * acpi::PM_TIMER_HZ / u64::from(elapsed))
 }
 
-/// Measures the TSC over 10 ms of PIT channel 2. Frame owns ports 0x42,
-/// 0x43 and 0x61. `None` if the PIT never signals (absent).
+/// Measures the TSC over 50 ms of PIT channel 2 (as long as its 16-bit
+/// count goes; longer is more exact). Frame owns ports 0x42, 0x43 and 0x61.
+/// `None` if the PIT never signals (absent).
 fn calibrate_with_pit() -> Option<u64> {
     const PIT_HZ: u64 = 1_193_182;
-    const COUNT: u64 = PIT_HZ / 100; // 10 ms
+    const COUNT: u64 = PIT_HZ / 20; // 50 ms
     // SAFETY: frame owns the PIT and the port-0x61 gate. Channel 2 drives
     // only the PC speaker, which stays disconnected (bit 1 clear).
     let gate = unsafe { inb(0x61) };
