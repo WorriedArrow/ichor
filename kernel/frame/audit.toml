@@ -27,5 +27,6 @@
 # page-table isolation, with PCID): 6,250 / 265.
 # Step 8 (ADR-0005 amendment of 2026-11-22: a device's I/O ports, for legacy
 # virtio): 6,350 / 265.
-max_code_lines = 6350
-max_unsafe_sites = 265
+# Step 9 (ADR-0015: xAPIC): 6,450 / 270.
+max_code_lines = 6450
+max_unsafe_sites = 270

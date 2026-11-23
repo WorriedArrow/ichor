@@ -593,6 +593,26 @@ fn cloud_disk_boots_on_legacy_virtio_devices() {
     ]);
 }
 
+/// What Hyper-V's guests do without: x2APIC and the TSC-deadline timer
+/// (ADR-0015).
+#[test]
+fn boots_without_x2apic() {
+    let out = boot_disk_with("no-x2apic", "", 4, |cfg| {
+        cfg.cpu_props = "-x2apic,-tsc-deadline".into();
+    });
+    out.assert_exit(Exit::Success);
+    out.assert_in_order(&[
+        "ichor: frame: cpu0 ready (xAPIC id 0, TSC ",
+        " MHz from ",
+        ", one-shot timer)",
+        "ichor: smp: 4 CPUs online, every CPU took ",
+        "ichor: sched: 9 spinners on 4 CPUs all ran",
+        "ichor: linux: munmap shot down a page another thread was reading",
+        "ichor: busybox: all applets passed",
+        "ichor: boot complete; halting",
+    ]);
+}
+
 /// A cloud-shaped machine: no PIT and no HPET (the TSC must calibrate from
 /// the ACPI PM timer), two sockets of three cores (sparse APIC ids, as
 /// multi-socket hosts give), 2 GiB, booting the GPT disk from NVMe.
