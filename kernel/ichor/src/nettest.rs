@@ -109,6 +109,15 @@ fn find() -> Option<Box<dyn Link>> {
             Err(e) => println!("ichor: net: ENA init failed: {e:?}"),
         }
     }
+    for dev in gve_driver::probe_all() {
+        match dev {
+            Ok(d) => {
+                println!("ichor: net: gve up (GQI-QPL), MTU {}", d.mtu());
+                return Some(Box::new(d));
+            }
+            Err(e) => println!("ichor: net: gVNIC init failed: {e:?}"),
+        }
+    }
     for dev in crate::hv::bus().into_iter().flat_map(|b| b.networks()) {
         match dev {
             Ok(d) => return Some(Box::new(d)),

@@ -28,7 +28,7 @@ use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use block::{BlockDevice, SECTOR_SIZE};
 use cell::Account;
 use frame::mm::UFrame;
-use frame::sync::Mutex;
+use frame::sync::{Mutex, SpinLock};
 use image::{CHUNK_SIZE, ChunkSource, Error, Extent, Hash, Image, SEGMENT};
 
 /// Most pages a namespace holds: an eighth of memory, but at least 32 MiB,
@@ -363,5 +363,25 @@ pub(crate) fn mount_disk(mut dev: impl BlockDevice + Send + 'static) -> Result<M
         id: NEXT_DISK.fetch_add(1, Ordering::Relaxed),
         dev: Mutex::new(Box::new(dev)),
     }));
+    DISKS.lock().push(disk);
     Ok(Mounted { image, disk })
+}
+
+/// Every disk mounted (for `disk_hammer`).
+static DISKS: SpinLock<Vec<&'static Disk>> = SpinLock::new(Vec::new());
+
+/// The largest disk mounted: its index and size in sectors.
+pub(crate) fn largest_disk() -> Option<(usize, u64)> {
+    let disks: Vec<&'static Disk> = DISKS.lock().clone();
+    disks
+        .iter()
+        .enumerate()
+        .map(|(i, d)| (i, d.dev.lock().sector_count()))
+        .max_by_key(|&(_, n)| n)
+}
+
+/// Reads disk `i` directly, past the cache: what the driver does.
+pub(crate) fn read_raw(i: usize, sector: u64, buf: &mut [u8]) -> Result<(), block::BlockError> {
+    let d = *DISKS.lock().get(i).ok_or(block::BlockError::OutOfRange)?;
+    d.dev.lock().read(sector, buf)
 }

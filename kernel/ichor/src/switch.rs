@@ -59,6 +59,8 @@ struct Uplink {
     /// The lease ran out unrenewed (the address is kept: see
     /// [`Uplink::lease_news`]).
     expired: bool,
+    /// The maintenance notice and clock watch, if asked for.
+    watch: Option<crate::watch::Watch>,
 }
 
 /// What became of the uplink's lease, to log outside the lock.
@@ -231,6 +233,7 @@ pub(crate) fn set_uplink(dev: Box<dyn Link>, ifc: Interface, mtu: u16, dhcp: Opt
         dhcp,
         renewed: false,
         expired: false,
+        watch: crate::watch::Watch::wanted(),
     });
 }
 
@@ -397,6 +400,7 @@ pub(crate) fn poll_uplink() -> bool {
     let mut any = false;
     let mut st = UplinkStats::default();
     let mut news = None;
+    let mut watched = Vec::new();
     {
         let mut u = UPLINK.lock();
         let Some(u) = u.as_mut() else {
@@ -405,6 +409,9 @@ pub(crate) fn poll_uplink() -> bool {
         let t = now();
         u.ifc.poll(t);
         news = u.poll_dhcp(t).or(news);
+        if let Some(w) = &mut u.watch {
+            w.poll(t, &mut u.ifc);
+        }
         if t.saturating_sub(u.last_expire) > Duration::from_secs(10) {
             u.nat.expire(t);
             u.last_expire = t;
@@ -422,6 +429,11 @@ pub(crate) fn poll_uplink() -> bool {
             let Some(mut p) = u.ifc.receive(t, &frame) else {
                 continue;
             };
+            if let Some(w) = &mut u.watch
+                && w.take(t, &p)
+            {
+                continue;
+            }
             let Some((sp, dp)) = ports(p.protocol, &p.payload) else {
                 continue;
             };
@@ -457,12 +469,19 @@ pub(crate) fn poll_uplink() -> bool {
             };
             inbound.push((id, p));
         }
+        if let Some(w) = &mut u.watch {
+            w.poll(t, &mut u.ifc);
+            watched = core::mem::take(&mut w.log);
+        }
         while let Some(frame) = u.ifc.transmit() {
             u.dev.transmit(&frame);
         }
     }
     if let Some(n) = news {
         lease_news(n);
+    }
+    for line in watched {
+        println!("{line}");
     }
     if any {
         st.delivered = inbound.len() as u64;

@@ -31,6 +31,7 @@ pub mod iface;
 pub mod link;
 pub mod metadata;
 pub mod nat;
+pub mod ntp;
 pub mod rtnl;
 pub mod switch;
 pub mod tcp;

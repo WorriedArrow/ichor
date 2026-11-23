@@ -66,6 +66,11 @@ pub fn image_sized(
     }
     let esp = esp.image(ESP_SECTORS, ESP_START)?;
     let root = qemu::root_image()?;
+    // On a padded disk the root partition takes the rest (less room for
+    // alignment and the backup table, so the disk stays `min_bytes`): a
+    // whole disk for `disk_hammer` to read.
+    let root_size =
+        min_bytes.saturating_sub(u64::from(ESP_START) * 512 + esp.len() as u64 + (2 << 20));
     let (img, starts) = disk(
         DISK_GUID,
         512,
@@ -82,7 +87,7 @@ pub fn image_sized(
                 unique_guid: ROOT_GUID,
                 name: "Ichor root",
                 data: &root,
-                size: 0,
+                size: root_size,
             },
         ],
         min_bytes,

@@ -53,6 +53,7 @@ mod switch;
 mod umem;
 mod usertest;
 mod vfs;
+mod watch;
 
 use frame::boot::{BootInfo, MemoryKind};
 use frame::cpu::CpuId;
@@ -111,6 +112,9 @@ fn kmain(info: BootInfo) -> ! {
     }
     if let Some(which) = cmdline.get("metadata") {
         cloud::set(which, cmdline.get("metadata_addr"));
+    }
+    if cmdline.get("metadata") == Some("gcp") || cmdline.flag("watch_cloud") {
+        watch::want();
     }
 
     let image = info.kernel_image();
@@ -241,6 +245,9 @@ fn kmain(info: BootInfo) -> ! {
     // goes first (later options count).
     let from_cloud = cloud::config().unwrap_or_default();
     let merged = alloc::format!("{} {}", from_cloud.options, info.cmdline());
+    if cmdline::Cmdline::new(&merged).flag("disk_hammer") {
+        watch::start_disk_hammer();
+    }
     if let Some(options) = control::options(&cmdline::Cmdline::new(&merged)) {
         let pick = |volume: &'static [u8], cloud: &str| {
             if volume.is_empty() {

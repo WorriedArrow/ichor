@@ -17,6 +17,7 @@ dependencies = [
  "ichor-ena-driver",
  "ichor-frame",
  "ichor-gpt",
+ "ichor-gve-driver",
  "ichor-hyperv",
  "ichor-image",
  "ichor-intel-gbe",
@@ -152,6 +153,19 @@ name = "ichor-grpc"
 version = "0.0.0"
 dependencies = [
  "ichor-http",
+]
+
+[[package]]
+name = "ichor-gve"
+version = "0.0.0"
+
+[[package]]
+name = "ichor-gve-driver"
+version = "0.0.0"
+dependencies = [
+ "ichor-frame",
+ "ichor-gve",
+ "ichor-net",
 ]
 
 [[package]]

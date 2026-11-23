@@ -35,6 +35,7 @@ virtio-rng.workspace = true
 virtio-net.workspace = true
 intel-gbe.workspace = true
 ena-driver.workspace = true
+gve-driver.workspace = true
 net.workspace = true
 uring.workspace = true
 

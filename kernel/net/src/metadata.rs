@@ -184,6 +184,35 @@ impl<'a> Answer<'a> {
     }
 }
 
+/// GCP's notice of host maintenance: a request for the value of
+/// `instance/maintenance-event` (`NONE`, `MIGRATE_ON_HOST_MAINTENANCE`,
+/// `TERMINATE_ON_HOST_MAINTENANCE`; about 60 s before it happens). With
+/// the `etag` of the last answer, the service answers only when the value
+/// changes, or after `wait` seconds.
+pub fn maintenance_request(host: &str, etag: Option<&str>, wait: u32) -> Vec<u8> {
+    let query = match etag.filter(|e| e.bytes().all(|b| b.is_ascii_alphanumeric())) {
+        Some(e) => format!("?wait_for_change=true&last_etag={e}&timeout_sec={wait}"),
+        None => String::new(),
+    };
+    format!(
+        "GET /computeMetadata/v1/instance/maintenance-event{query} HTTP/1.0\r\nHost: {host}\r\n\
+         Metadata-Flavor: Google\r\nConnection: close\r\n\r\n"
+    )
+    .into_bytes()
+}
+
+/// The value and ETag in an answer to [`maintenance_request`], if it is
+/// GCP's and successful.
+pub fn maintenance_answer(b: &[u8]) -> Option<(String, Option<String>)> {
+    let a = Answer::parse(b)?;
+    if a.status != 200 || a.header("metadata-flavor") != Some("Google") {
+        return None;
+    }
+    let value = core::str::from_utf8(a.body).ok()?.trim();
+    let fits = (1..=64).contains(&value.len()) && value.bytes().all(|b| b.is_ascii_graphic());
+    fits.then(|| (value.to_string(), a.header("etag").map(str::to_string)))
+}
+
 /// Whether the answer so far is all of it, if it says how long it is.
 pub fn complete(answer: &[u8]) -> bool {
     Answer::parse(answer).is_some_and(|a| a.header("content-length").is_some())
@@ -280,6 +309,33 @@ mod tests {
 
     fn text(b: &[u8]) -> &str {
         core::str::from_utf8(b).unwrap()
+    }
+
+    #[test]
+    fn maintenance_events_are_long_polled() {
+        let first = maintenance_request("169.254.169.254", None, 300);
+        assert!(
+            text(&first)
+                .starts_with("GET /computeMetadata/v1/instance/maintenance-event HTTP/1.0\r\n")
+        );
+        assert!(text(&first).contains("Metadata-Flavor: Google\r\n"));
+        let next = maintenance_request("169.254.169.254", Some("1a2b"), 300);
+        assert!(text(&next).starts_with(
+            "GET /computeMetadata/v1/instance/maintenance-event?wait_for_change=true&last_etag=1a2b&timeout_sec=300 "
+        ));
+        // An ETag that is not plain is not put in a URL.
+        let odd = maintenance_request("h", Some("a b&c"), 300);
+        assert!(text(&odd).starts_with("GET /computeMetadata/v1/instance/maintenance-event HTTP"));
+        let a = b"HTTP/1.1 200 OK\r\nMetadata-Flavor: Google\r\nETag: 9f8e\r\nContent-Length: 28\r\n\r\nMIGRATE_ON_HOST_MAINTENANCE\n";
+        assert_eq!(
+            maintenance_answer(a),
+            Some(("MIGRATE_ON_HOST_MAINTENANCE".into(), Some("9f8e".into())))
+        );
+        assert_eq!(
+            maintenance_answer(b"HTTP/1.1 503 Busy\r\nMetadata-Flavor: Google\r\n\r\n"),
+            None
+        );
+        assert_eq!(maintenance_answer(b"HTTP/1.1 200 OK\r\n\r\nNONE"), None);
     }
 
     #[test]

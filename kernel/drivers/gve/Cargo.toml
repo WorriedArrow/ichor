@@ -1,0 +1,18 @@
+[package]
+name = "ichor-gve-driver"
+description = "Google gVNIC driver (GQI-QPL), polled; safe code only"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "gve_driver"
+
+[dependencies]
+frame.workspace = true
+net.workspace = true
+gve.workspace = true
+
+[lints]
+workspace = true
