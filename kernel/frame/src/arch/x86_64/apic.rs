@@ -188,6 +188,9 @@ pub(crate) fn init_tsc() -> Option<(u64, &'static str)> {
     if found.is_none() {
         found = crate::hyperv::tsc_hz().map(|hz| (hz, "Hyper-V"));
     }
+    if found.is_none() {
+        found = crate::kvm::init().map(|hz| (hz, "kvmclock, which is the clock"));
+    }
     if found.is_none()
         && super::cpu::features().hypervisor
         && cpuid(0x4000_0000, 0)[0] >= 0x4000_0010
@@ -273,12 +276,21 @@ fn calibrate_with_pit() -> Option<u64> {
     (spins < 100_000_000).then_some(elapsed * PIT_HZ / COUNT)
 }
 
+/// The TSC frequency (kvmclock's, which a migration may change, on KVM).
 pub(crate) fn tsc_hz() -> u64 {
-    TSC_HZ.load(Relaxed)
+    crate::kvm::tsc_hz().unwrap_or_else(|| TSC_HZ.load(Relaxed))
 }
 
-/// Nanoseconds since boot.
+/// The TSC at boot.
+pub(crate) fn tsc_at_boot() -> u64 {
+    TSC_AT_BOOT.load(Relaxed)
+}
+
+/// Nanoseconds since boot (kvmclock's, on KVM).
 pub(crate) fn now_ns() -> u64 {
+    if let Some(ns) = crate::kvm::now_ns() {
+        return ns;
+    }
     let hz = tsc_hz().max(1);
     let ticks = rdtsc().wrapping_sub(TSC_AT_BOOT.load(Relaxed));
     ((u128::from(ticks) * 1_000_000_000) / u128::from(hz)) as u64

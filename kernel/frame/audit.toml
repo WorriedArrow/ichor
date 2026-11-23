@@ -30,5 +30,6 @@
 # Step 9 (ADR-0015: xAPIC): 6,450 / 270.
 # Step 10 (ADR-0016: Hyper-V's hypercalls and SynIC): 6,600 / 285.
 # Step 11 (ADR-0017: the ACPI power button and S5): 6,700 / 290.
-max_code_lines = 6700
-max_unsafe_sites = 290
+# Step 12 (ADR-0018: kvmclock is the clock on KVM): 6,850 / 295.
+max_code_lines = 6850
+max_unsafe_sites = 295

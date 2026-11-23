@@ -689,13 +689,13 @@ AMD's measures. Boot logs which apply.
 
 Frame budget: ADR-0005 sets the milestone 3 ceiling at 8,500 lines / 380
 sites; ADR-0007 raises it to 9,500 / 420 for milestone 4 (TLB shootdown,
-atomic user ops for futexes, PCID). `audit.toml` is at step 11 (6,700 / 290,
-ADR-0017); frame is at 6,663 / 279 (A5 added
+atomic user ops for futexes, PCID). `audit.toml` is at step 12 (6,850 / 295,
+ADR-0018); frame is at 6,781 / 280 (A5 added
 RDSEED/RDRAND and UEFI GetTime; B added XSAVE; C the frames tree and
 request tracking; M6 reading `\ichor\roots.pem`; ADR-0011 the checked user
 copy; ADR-0004 VERW/IBPB, page-table isolation, eIBRS and IBRS; `IoPorts`;
 xAPIC; Hyper-V; placing BARs the firmware left at 0, ADR-0005's second
-amendment; the ACPI power button and S5, ADR-0017). Growth past the step
+amendment; the ACPI power button and S5, ADR-0017; kvmclock, ADR-0018). Growth past the step
 needs an ADR and a new audit step.
 `services/rt` has its own budget (`services/rt/audit.toml`: 500 / 40; at
 417 / 30).
@@ -766,7 +766,13 @@ GCP's `maintenance-event` long-polled, the wall clock against the
 metadata server's NTP (`net::ntp`), a stall ticker, and `disk_hammer`.
 `tests/migration/` is the live-migration campaign (README there). It found
 the TSC calibrated over 10 ms of the PM timer was 14 ppm off on GCP (now
-100 ms: 0.25 ppm), and that GCP's DSDT has no `\_S5` the parser finds.
+100 ms: 0.25 ppm); that a live migration moves the guest to a host whose TSC
+runs about 96 ppm differently, after which a boot-calibrated clock loses 8 s
+a day (so on KVM frame's clock is kvmclock now, `frame::kvm`, ADR-0018:
+refreshed within 10 ms of a migration; checked only on GCP and CI's KVM,
+since TCG has none); that GCP's DSDT has no `\_S5` the parser finds; and
+that GCE's simulated maintenance takes about 11 minutes a run (6.5 before
+the notice, 80 s of migration, 3.5 before the operation ends).
 Not yet: Azure's newest sizes (PCI over VMBus: NVMe and MANA),
 Secure Boot, Azure's shutdown service; Azure's CPU enumerates no MD_CLEAR or
 SPEC_CTRL (VERW and IBRS off: look into; frame reads the right bits, and

@@ -34,6 +34,7 @@ pub mod entropy;
 pub mod hyperv;
 pub mod io;
 pub mod irq;
+mod kvm;
 pub mod mm;
 pub mod power;
 pub mod smp;

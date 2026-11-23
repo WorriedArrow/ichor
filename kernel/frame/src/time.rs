@@ -26,23 +26,24 @@ pub(crate) fn set_boot_wall_clock(secs: u64, nanos: u32, tsc: u64) {
 }
 
 /// The time of day as time since the Unix epoch (UTC): the firmware's
-/// clock as read at boot plus the TSC time since. `None` if the firmware
-/// had no clock to read. Advances with the monotonic clock; nothing
-/// disciplines it yet (no NTP).
+/// clock as read at boot plus the monotonic clock since (kvmclock's on
+/// KVM, so a migration does not make it drift). `None` if the firmware had
+/// no clock to read. Nothing disciplines it yet (no NTP).
 pub fn wall_clock() -> Option<Duration> {
     if !WALL_VALID.load(Ordering::Acquire) {
         return None;
     }
+    // From the reading to boot, by the TSC; from boot on, the clock.
     let hz = u128::from(tsc_hz().max(1));
-    let ticks =
-        u128::from(crate::arch::regs::rdtsc().wrapping_sub(WALL_TSC.load(Ordering::Relaxed)));
-    let since = Duration::from_nanos(u64::try_from(ticks * 1_000_000_000 / hz).unwrap_or(u64::MAX));
+    let before = u128::from(apic::tsc_at_boot().saturating_sub(WALL_TSC.load(Ordering::Relaxed)));
+    let before = Duration::from_nanos(u64::try_from(before * 1_000_000_000 / hz).unwrap_or(0));
     Some(
         Duration::new(
             WALL_SECS.load(Ordering::Relaxed),
             WALL_NANOS.load(Ordering::Relaxed),
         )
-        .saturating_add(since),
+        .saturating_add(before)
+        .saturating_add(now()),
     )
 }
 
