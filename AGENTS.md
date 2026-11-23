@@ -92,10 +92,12 @@ not write it; merge its branch when it lands.
   `runtest::uring_program` and `uring_worker_program` check it on every
   boot; `cargo xtask workloads uring` runs liburing 2.5's tests. Not yet:
   personalities, URING_CMD, zero-copy sends, NO_MMAP, xattr operations.
-  Seen once under the full gate's load (2026-11-22): `uring_program`'s
-  check 23 (a fixed write past its registered buffer, entered without
-  GETEVENTS) found no completion yet; it should have completed inline
-  with EFAULT. Three reruns passed; not chased yet.
+  While a thread is in `io_uring_enter` (`State::entering`), it alone
+  starts what is ready, as Linux's submitter does: the ring's worker (or
+  another thread's task work) used to take a just-submitted SQE now and
+  then, so `enter` returned before an inline completion was posted
+  (`uring_program`'s check 23 failed once under the gate's load,
+  2026-11-22).
 - M7 CPython (first suite): `cargo xtask workloads python` pulls
   `python:3.12-slim-bookworm` plus the 3.12.16 source tree's `Lib/test`
   as a pinned layer and runs `python -m test -j0` in a cell. Fixed on
@@ -746,7 +748,9 @@ version 2 (`ena::host_info`; status 6 otherwise). Links say their MTU
 m7i-flex has been tried (t3 and older types: not yet).
 Not yet: GCP gVNIC, Azure's newest sizes (PCI over VMBus: NVMe and MANA),
 Secure Boot, the ACPI power button; Azure's CPU enumerates no MD_CLEAR or
-SPEC_CTRL (VERW and IBRS off: look into). Left for milestone 8: one
+SPEC_CTRL (VERW and IBRS off: look into; frame reads the right bits, and
+on OpenVMM the guest OS ID changes nothing in CPUID leaf 7, so try it on
+Azure itself next time). Left for milestone 8: one
 bare-metal machine (the owner has none available yet).
 
 ## Commands

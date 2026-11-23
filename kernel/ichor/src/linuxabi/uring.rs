@@ -413,6 +413,11 @@ struct State {
     next_overflow: u64,
     /// SQEs are being submitted.
     assembling: bool,
+    /// Threads in `io_uring_enter`: while there are any, they start what
+    /// is ready, as Linux's submitter does, so that what can complete at
+    /// once has when `enter` returns (not a worker or another thread a
+    /// moment later).
+    entering: u32,
     /// Deadlines of armed timeouts, and the counts of completions others
     /// end at.
     timers: BTreeSet<(Duration, u64)>,
@@ -954,9 +959,11 @@ impl Ring {
         }
     }
 
-    /// Runs what can run now: SQEs whose turn it is and, with `waited`,
-    /// timeouts that are over and armed SQEs whose objects have changed.
-    fn run(&self, p: &mut LinuxProcess, waited: bool) {
+    /// Runs what can run now: SQEs whose turn it is (unless another thread
+    /// is in `io_uring_enter` and this one, `entering`, is not) and, with
+    /// `waited`, timeouts that are over and armed SQEs whose objects have
+    /// changed.
+    fn run(&self, p: &mut LinuxProcess, waited: bool, entering: bool) {
         let me = Owner::of(p);
         loop {
             let ready = {
@@ -965,7 +972,7 @@ impl Ring {
                     st.pending = false;
                     self.set_flags(&st);
                 }
-                if st.assembling {
+                if st.assembling || (!entering && st.entering > 0) {
                     Vec::new()
                 } else {
                     st.order.ready()
@@ -1678,7 +1685,7 @@ fn worker(me: &Weak<Ring>, hub: &Hub, p: &mut LinuxProcess) {
                 until = n.min(recheck);
             }
         } else {
-            ring.run(p, true);
+            ring.run(p, true, false);
             if let Some(n) = ring.next() {
                 until = n.min(recheck);
             }
@@ -1705,7 +1712,7 @@ pub(crate) fn task_work(p: &mut LinuxProcess) {
         if r.layout.has(abi::SETUP_DEFER_TASKRUN) {
             r.nudge(&Owner::of(p));
         } else {
-            r.run(p, true);
+            r.run(p, true, false);
         }
     }
 }
@@ -1791,6 +1798,7 @@ pub(super) fn setup(p: &mut LinuxProcess, entries: u64, params: u64) -> Result<u
             overflow: BTreeMap::new(),
             next_overflow: 0,
             assembling: false,
+            entering: 0,
             timers: BTreeSet::new(),
             counts: BTreeSet::new(),
             rechecks: BTreeSet::new(),
@@ -1876,24 +1884,36 @@ pub(super) fn enter(p: &mut LinuxProcess, a: &[u64; 6]) -> Result<u64, i64> {
     let issuer = ring.issuer.load(Ordering::Acquire);
     let other = issuer != 0 && issuer != p.entry.pid;
     let l = &ring.layout;
-    let mut submitted = 0;
-    if l.has(abi::SETUP_SQPOLL) {
-        // The poller that sleeps until it is woken: it takes everything.
-        if flags & abi::ENTER_SQ_WAKEUP != 0 || to_submit != 0 {
-            while ring.queued() != 0 && ring.submit(p, u32::MAX)? != 0 {}
-        }
-        submitted = u64::from(to_submit);
-    } else if to_submit != 0 {
-        if other {
-            return Err(EEXIST);
-        }
-        submitted = u64::from(ring.submit(p, to_submit)?);
+    if !l.has(abi::SETUP_SQPOLL) && to_submit != 0 && other {
+        return Err(EEXIST);
     }
+    ring.state.lock().entering += 1;
+    let submitted = if l.has(abi::SETUP_SQPOLL) {
+        // The poller that sleeps until it is woken: it takes everything.
+        let mut r = Ok(0);
+        if flags & abi::ENTER_SQ_WAKEUP != 0 || to_submit != 0 {
+            while ring.queued() != 0 && matches!(r, Ok(_)) {
+                r = ring.submit(p, u32::MAX);
+                if r == Ok(0) {
+                    break;
+                }
+            }
+        }
+        r.map(|_| to_submit)
+    } else if to_submit != 0 {
+        ring.submit(p, to_submit)
+    } else {
+        Ok(0)
+    };
     let mut st = ring.state.lock();
     ring.flush_overflow(&mut st);
     drop(st);
     let defer = l.has(abi::SETUP_DEFER_TASKRUN);
-    ring.run(p, !defer);
+    ring.run(p, !defer, true);
+    ring.state.lock().entering -= 1;
+    // What became ready while others left it to this thread.
+    ring.run(p, !defer, true);
+    let submitted = u64::from(submitted?);
     if flags & abi::ENTER_GETEVENTS == 0 || submitted != u64::from(to_submit) {
         return Ok(submitted);
     }
@@ -1944,7 +1964,7 @@ fn wait(
     let timeouts = ring.timeouts();
     let r = loop {
         let told = ring.hub.told();
-        ring.run(p, true);
+        ring.run(p, true, true);
         {
             let mut st = ring.state.lock();
             ring.flush_overflow(&mut st);
