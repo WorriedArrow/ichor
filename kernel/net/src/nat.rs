@@ -128,6 +128,21 @@ impl Nat {
         self.published.remove(&(proto, port));
     }
 
+    /// Withdraws every port published to `addr` (live connections keep
+    /// their mappings).
+    pub fn unpublish_all(&mut self, addr: Ipv4Addr) {
+        self.published.retain(|_, inside| inside.0 != addr);
+    }
+
+    /// Forgets `addr`: its published ports and every mapping. An address
+    /// that is given to another cell must not receive the old one's
+    /// traffic.
+    pub fn forget_addr(&mut self, addr: Ipv4Addr) {
+        self.unpublish_all(addr);
+        self.by_inside.retain(|&(_, inside, _), _| inside.0 != addr);
+        self.by_outside.retain(|_, m| m.inside.0 != addr);
+    }
+
     /// The published endpoint for `(proto, port)`.
     pub fn published(&self, proto: u8, port: u16) -> Option<Endpoint> {
         self.published.get(&(proto, port)).copied()
@@ -576,6 +591,41 @@ mod tests {
             n.inbound(PROTO_TCP, (FAR, 80), b.1, SYN | ACK, t(2)),
             Some((CELL, 1))
         );
+    }
+
+    #[test]
+    fn a_gone_address_takes_its_ports_and_mappings() {
+        let mut n = Nat::new(UP);
+        let client = (FAR, 50000);
+        assert!(n.publish(PROTO_TCP, 8080, (CELL, 80)));
+        assert!(n.publish(PROTO_TCP, 8081, (CELL2, 80)));
+        n.inbound(PROTO_TCP, client, 8080, SYN, t(0)).unwrap();
+        n.inbound(PROTO_TCP, client, 8081, SYN, t(0)).unwrap();
+        let out = |n: &mut Nat, c| n.outbound(PROTO_TCP, (c, 40000), (FAR, 443), SYN, t(0));
+        let a = out(&mut n, CELL).unwrap();
+        let b = out(&mut n, CELL2).unwrap();
+        // Withdrawn: no new connections, live ones go on, and the port may
+        // be published again.
+        n.unpublish_all(CELL);
+        assert_eq!(n.published(PROTO_TCP, 8080), None);
+        let late = (FAR, 50001);
+        assert_eq!(n.inbound(PROTO_TCP, late, 8080, SYN, t(1)), None);
+        let live = n.inbound(PROTO_TCP, client, 8080, ACK, t(1));
+        assert_eq!(live, Some((CELL, 80)));
+        assert!(n.publish(PROTO_TCP, 8080, (CELL2, 81)));
+        // Forgotten: nothing reaches the address, from either side.
+        n.forget_addr(CELL);
+        assert_eq!(n.inbound(PROTO_TCP, client, 8080, ACK, t(2)), None);
+        let back = n.inbound(PROTO_TCP, (FAR, 443), a.1, ACK, t(2));
+        assert_eq!(back, None);
+        // The other cell's are as they were.
+        let there = n.inbound(PROTO_TCP, (FAR, 443), b.1, ACK, t(2));
+        assert_eq!(there, Some((CELL2, 40000)));
+        let there = n.inbound(PROTO_TCP, client, 8081, ACK, t(2));
+        assert_eq!(there, Some((CELL2, 80)));
+        assert_eq!(n.published(PROTO_TCP, 8080), Some((CELL2, 81)));
+        assert_eq!(n.len(), 2);
+        assert_eq!(n.by_inside.len(), n.by_outside.len());
     }
 
     #[test]

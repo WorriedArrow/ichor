@@ -80,6 +80,16 @@ impl core::fmt::Debug for Cell {
     }
 }
 
+impl Drop for Cell {
+    /// Nothing the cell made outlives it (ADR-0002 §7). Its processes are
+    /// gone (each holds the cell), so nothing can make another segment or
+    /// socket.
+    fn drop(&mut self) {
+        crate::linuxabi::shm::free_cell(self.id);
+        crate::netstack::end_cell(self.id);
+    }
+}
+
 static NEXT_CELL_ID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
 
 impl Cell {

@@ -199,6 +199,31 @@ pub(crate) fn attach(cell: u64, stack: Weak<Stack>) -> Option<Ipv4Addr> {
     })
 }
 
+/// Withdraws every uplink port published to `cell`, which is being
+/// destroyed; its live connections go on.
+pub(crate) fn unpublish_cell(cell: u64) {
+    let mut u = UPLINK.lock();
+    if let (Some(u), Some(addr)) = (u.as_mut(), addr_of(cell)) {
+        u.nat.unpublish_all(addr);
+    }
+}
+
+/// Detaches `cell`: its address is free for another cell, so the NAT
+/// forgets it in the same step (under the uplink's lock, which every
+/// packet through the NAT takes).
+pub(crate) fn detach(cell: u64) {
+    let mut u = UPLINK.lock();
+    let addr = with_table(|t| {
+        let addr = t.switch.addr(cell);
+        t.switch.detach(cell);
+        t.stacks.remove(&cell);
+        addr
+    });
+    if let (Some(u), Some(addr)) = (u.as_mut(), addr) {
+        u.nat.forget_addr(addr);
+    }
+}
+
 /// The address assigned to `cell`.
 pub(crate) fn addr_of(cell: u64) -> Option<Ipv4Addr> {
     with_table(|t| t.switch.addr(cell))
@@ -309,7 +334,7 @@ pub(crate) fn send(from: PortId, pkts: Vec<Packet>) {
             }
             (Verdict::Uplink, _) => {
                 let Some(back) = refused(&p) else {
-                    uplink_out(p);
+                    uplink_out(port, p);
                     continue;
                 };
                 let stack = with_table(|t| t.stacks.get(&port).and_then(Weak::upgrade));
@@ -365,12 +390,16 @@ fn tcp_refusal(p: &Packet) -> Option<Vec<u8>> {
     ))
 }
 
-/// Sends a cell's packet out of the uplink, translated.
-fn uplink_out(mut p: Packet) {
+/// Sends a packet of `from`'s cell out of the uplink, translated.
+fn uplink_out(from: PortId, mut p: Packet) {
     let mut u = UPLINK.lock();
     let Some(u) = u.as_mut() else {
         return;
     };
+    // Detached since it was routed: a mapping made now would outlive it.
+    if with_table(|t| t.switch.port_of(p.src)) != Some(from) {
+        return;
+    }
     let Some((sp, dp)) = ports(p.protocol, &p.payload) else {
         return; // ICMP and others are not translated yet
     };

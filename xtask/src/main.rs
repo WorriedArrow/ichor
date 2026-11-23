@@ -380,7 +380,8 @@ fn cmd_test(o: &Opts) -> Result<()> {
         a.bytes()?;
     }
     let mut cmd = cargo();
-    cmd.args(["test", "--package", "ichor-tests"]);
+    // Every test file runs even if an earlier one failed.
+    cmd.args(["test", "--no-fail-fast", "--package", "ichor-tests"]);
     if std::env::var_os("ICHOR_TEST_VERBOSE").is_some() {
         cmd.args(["--", "--nocapture"]);
     }

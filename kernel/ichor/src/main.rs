@@ -14,6 +14,7 @@ mod alpinetest;
 mod bench;
 mod blktest;
 mod busytest;
+mod cellaccess;
 mod celltest;
 mod cloud;
 mod control;
@@ -97,6 +98,12 @@ fn kmain(info: BootInfo) -> ! {
     }
     if cmdline.flag("bench") {
         bench::enable();
+    }
+    if cmdline.flag("cell_access") {
+        cellaccess::enable();
+    }
+    if cmdline.flag("cell_access_uplink") {
+        cellaccess::enable_uplink();
     }
     if let Some(port) = cmdline.get("net_echo_port").and_then(|v| v.parse().ok()) {
         nettest::set_echo_port(port);

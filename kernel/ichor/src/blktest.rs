@@ -45,6 +45,9 @@ pub(crate) fn run() {
             crate::alpinetest::run(&vfs);
         } else if is_debian {
             crate::debiantest::run(&vfs);
+            if crate::cellaccess::enabled() {
+                crate::cellaccess::run(&m);
+            }
         } else {
             exercise("virtio-blk", &m, vfs);
         }
