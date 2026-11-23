@@ -8,6 +8,7 @@
 //! frame's `VirtQueue` writes descriptors itself.
 
 use alloc::sync::Arc;
+use core::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering::Relaxed};
 
 use crate::arch;
 use crate::mm::meta::kind;
@@ -110,32 +111,51 @@ impl DmaBuf {
         n
     }
 
-    /// Reads a little-endian `u16` at `offset` (0 if out of range).
-    pub fn read_u16(&self, offset: usize) -> u16 {
-        let mut b = [0u8; 2];
-        self.read(offset, &mut b);
-        u16::from_le_bytes(b)
+    /// Where the `T` at `offset` is, if it is in range and aligned.
+    fn slot<T>(&self, offset: usize) -> Option<*mut T> {
+        let size = core::mem::size_of::<T>();
+        let inside = offset.is_multiple_of(size) && offset.checked_add(size)? <= self.inner.len;
+        inside.then(|| core::ptr::with_exposed_provenance_mut(self.va(offset) as usize))
     }
+}
 
-    /// Reads a little-endian `u32` at `offset` (0 if out of range).
-    pub fn read_u32(&self, offset: usize) -> u32 {
-        let mut b = [0u8; 4];
-        self.read(offset, &mut b);
-        u32::from_le_bytes(b)
-    }
+macro_rules! scalars {
+    ($($read:ident, $write:ident, $t:ty, $atomic:ty;)*) => {
+        impl DmaBuf {
+            $(
+                /// Reads a little-endian value at `offset` (0 if out of
+                /// range): in one access if aligned, so a ring's index is
+                /// never seen half-written.
+                pub fn $read(&self, offset: usize) -> $t {
+                    if let Some(p) = self.slot(offset) {
+                        // SAFETY: inside this block, which lives as long as
+                        // `self`, and aligned (`slot`). Every typed access
+                        // to it is atomic, and the rest are copies by
+                        // `rep movsb` (see `read`).
+                        return unsafe { <$atomic>::from_ptr(p) }.load(Relaxed);
+                    }
+                    let mut b = [0u8; core::mem::size_of::<$t>()];
+                    self.read(offset, &mut b);
+                    <$t>::from_le_bytes(b)
+                }
 
-    /// Writes a little-endian `u16` at `offset`.
-    pub fn write_u16(&self, offset: usize, v: u16) {
-        self.write(offset, &v.to_le_bytes());
-    }
+                /// Writes a little-endian value at `offset`, as it is read.
+                pub fn $write(&self, offset: usize, v: $t) {
+                    match self.slot(offset) {
+                        // SAFETY: as in the read.
+                        Some(p) => unsafe { <$atomic>::from_ptr(p) }.store(v, Relaxed),
+                        None => {
+                            self.write(offset, &v.to_le_bytes());
+                        }
+                    }
+                }
+            )*
+        }
+    };
+}
 
-    /// Writes a little-endian `u32` at `offset`.
-    pub fn write_u32(&self, offset: usize, v: u32) {
-        self.write(offset, &v.to_le_bytes());
-    }
-
-    /// Writes a little-endian `u64` at `offset`.
-    pub fn write_u64(&self, offset: usize, v: u64) {
-        self.write(offset, &v.to_le_bytes());
-    }
+scalars! {
+    read_u16, write_u16, u16, AtomicU16;
+    read_u32, write_u32, u32, AtomicU32;
+    read_u64, write_u64, u64, AtomicU64;
 }
