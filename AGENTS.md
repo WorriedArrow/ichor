@@ -727,13 +727,18 @@ Retbleed and SRSO (`ichor_entry_barriers`), AutoIBRS on AMD, the RSB
 filled on every context switch (`switch_stacks`), and Spectre v1 masked
 indices (`frame::nospec::index`; syscall numbers, descriptors, signals,
 capability slots, io_uring's registered tables). Nothing in §2 is owed
-now. Not verified on affected hardware (the forced flags test the code
-paths). Boot logs which apply.
+now. Seen working on real hardware on GCP (2026-11-23): the BHB sequence
+on Ice Lake (n2), IBPB and IBRS on entry on EPYC Milan (n2d); that run
+found AMD's IBRS bit (CPUID 8000_0008h EBX[14]) unread, now fixed
+(`Vulnerabilities::ibrs`). CI's forced flags test the code paths. Boot
+logs which apply. GCP benchmarks against Debian 12 on the same machine
+types: `docs/benchmarks.md` (entries 2.7-2.9x Linux, page faults 3-6x,
+pipes and fork cheaper).
 
 Frame budget: ADR-0005 sets the milestone 3 ceiling at 8,500 lines / 380
 sites; ADR-0007 raises it to 9,500 / 420 for milestone 4 (TLB shootdown,
 atomic user ops for futexes, PCID). `audit.toml` is at step 13 (7,000 / 300,
-ADR-0004's 2026-11-23 amendment); frame is at 6,990 / 283 (A5 added
+ADR-0004's 2026-11-23 amendment); frame is at 6,997 / 283 (A5 added
 RDSEED/RDRAND and UEFI GetTime; B added XSAVE; C the frames tree and
 request tracking; M6 reading `\ichor\roots.pem`, later
 `\ichor\suffixes.dat` too; ADR-0011 the checked user

@@ -290,6 +290,17 @@ of §2's table has its mitigation on the CPUs it applies to.
   BHI nor an affected AMD part, so tests run the RSB fill and masked indices
   everywhere, and the BHB sequence and IBPB on entry only when forced
   (`force_bhb`, `force_ibpb_entry` on the command line).
+  *Since verified on Google Cloud, the same day* (`docs/benchmarks.md`):
+  the BHB sequence on an n2 (Ice Lake: BHI, eIBRS, no `BHI_DIS_S`); IBPB
+  on entry (SRSO) and IBRS on entry on an n2d (EPYC 7B13, Zen 3); IBPB
+  between cells on both. That run found that frame read IBRS only from
+  Intel's CPUID.7:EDX[26], so AMD parts without AutoIBRS ran the kernel
+  with no Spectre v2 mitigation and logged it as NOT MITIGATED. AMD
+  enumerates IBRS in CPUID 8000_0008h EBX[14] (`Vulnerabilities::ibrs` now
+  reads both), and such parts take IBRS on entry, as Intel's without
+  eIBRS do. On Milan, IBPB and IBRS on every entry bring a null system
+  call to about 1,050 ns, against 387 ns for Linux, which uses retpolines
+  and safe-RET thunks there, which stable Rust cannot emit.
 - Frame grows by about 155 lines and 3 unsafe sites (to 6,978 / 283; the
   wall clock's steering, ADR-0018's amendment, had taken it to 6,824);
   audit step 13 is 7,000 / 300.

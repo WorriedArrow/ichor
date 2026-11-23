@@ -117,18 +117,20 @@ pub(crate) fn enable_mitigations(
     // Enhanced IBRS: set once per CPU and left on, it keeps user-trained
     // branch predictions out of the kernel's indirect branches; BHI_DIS_S
     // does the same for branch history. Written only where enumerated
-    // (`IA32_SPEC_CTRL` needs CPUID.7:EDX[26]; a reserved bit would fault).
-    // AMD's automatic IBRS does the same through EFER.
-    let eibrs = v.eibrs && v.ibpb;
+    // (`IA32_SPEC_CTRL` needs IBRS enumerated: Intel's CPUID.7:EDX[26] or
+    // AMD's CPUID 8000_0008h EBX[14]; a reserved bit would fault). AMD's
+    // automatic IBRS does the same through EFER. Without either, IBRS is
+    // written on every entry from ring 3, on Intel and AMD alike.
+    let eibrs = v.eibrs && v.ibrs;
     let auto_ibrs = v.auto_ibrs && !eibrs;
     let bhi_dis_s = eibrs && v.bhi_ctrl;
-    let spec = if v.ibpb && !auto_ibrs {
+    let spec = if v.ibrs && !auto_ibrs {
         SPEC_CTRL_IBRS
     } else {
         0
     } | if bhi_dis_s { SPEC_CTRL_BHI_DIS_S } else { 0 };
     SPEC_CTRL.store(spec, Relaxed);
-    IBRS_ON_ENTRY.store(v.ibpb && !eibrs && !auto_ibrs, Relaxed);
+    IBRS_ON_ENTRY.store(v.ibrs && !eibrs && !auto_ibrs, Relaxed);
     AUTO_IBRS.store(auto_ibrs, Relaxed);
     // Branch history without BHI_DIS_S: cleared in software on entry.
     let bhb_clear = (v.bhi && !bhi_dis_s) || forced.bhb;
@@ -407,7 +409,7 @@ impl<'a> UserMode<'a> {
             let domain = block.task_domain.load(Relaxed);
             if block.user_domain.swap(domain, Relaxed) != domain {
                 // SAFETY: IA32_PRED_CMD exists: IBPB_ON is set only when
-                // CPUID enumerates IBRS/IBPB. Writing bit 0 issues the
+                // CPUID enumerates IBPB (`pred_cmd`). Writing bit 0 issues the
                 // barrier and has no other effect.
                 unsafe { wrmsr(MSR_PRED_CMD, 1) };
                 IBPBS.fetch_add(1, Relaxed);

@@ -252,14 +252,17 @@ pub(crate) extern "sysv64" fn kernel_space_entry() -> ! {
     let v = arch::cpu::vulnerabilities();
     let yn = |b: bool| if b { "affected" } else { "no" };
     println!(
-        "ichor: frame: cpu0 speculation (ADR-0004): meltdown {}, mds {}, taa {}, bhi {}, gds {}; eibrs {}, ibpb {}, md_clear {}",
+        "ichor: frame: cpu0 speculation (ADR-0004): meltdown {}, mds {}, taa {}, bhi {}, gds {}, retbleed {}, srso {}; eibrs {}, ibrs {}, ibpb {}, md_clear {}",
         yn(v.meltdown),
         yn(v.mds),
         yn(v.taa),
         yn(v.bhi),
         yn(v.gds),
+        yn(v.retbleed),
+        yn(v.srso),
         v.eibrs,
-        v.ibpb,
+        v.ibrs,
+        v.pred_cmd,
         v.md_clear,
     );
     let cmdline = cmdline::Cmdline::new(state.cmdline());
@@ -301,7 +304,7 @@ pub(crate) extern "sysv64" fn kernel_space_entry() -> ! {
         match (m.eibrs, m.auto_ibrs) {
             (true, _) => "eIBRS",
             (false, true) => "AutoIBRS",
-            (false, false) if v.ibpb => "IBRS on entry",
+            (false, false) if v.ibrs => "IBRS on entry",
             (false, false) => "NOT MITIGATED (no IBRS)",
         },
         match (m.bhi_dis_s, m.bhb_clear) {

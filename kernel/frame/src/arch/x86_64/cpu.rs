@@ -138,8 +138,9 @@ pub struct Vulnerabilities {
     pub bhi: bool,
     /// Gather data sampling (Downfall).
     pub gds: bool,
-    /// The CPU supports IBRS/IBPB (and so `IA32_SPEC_CTRL`).
-    pub ibpb: bool,
+    /// The CPU supports IBRS (and so `IA32_SPEC_CTRL`): Intel's
+    /// CPUID.7:EDX[26], or AMD's CPUID 8000_0008h EBX[14].
+    pub ibrs: bool,
     /// `IA32_SPEC_CTRL.BHI_DIS_S` exists (CPUID.(7,2):EDX[4]).
     pub bhi_ctrl: bool,
     /// VERW clears CPU buffers (MD_CLEAR microcode).
@@ -189,15 +190,22 @@ pub fn vulnerabilities() -> Vulnerabilities {
         } else {
             base
         };
-        let ext21 = if cpuid(0x8000_0000, 0)[0] >= 0x8000_0021 {
+        let max_ext = cpuid(0x8000_0000, 0)[0];
+        let ext21 = if max_ext >= 0x8000_0021 {
             u64::from(cpuid(0x8000_0021, 0)[0])
+        } else {
+            0
+        };
+        // AMD enumerates IBPB (bit 12) and IBRS (bit 14) here, not in leaf 7.
+        let ext8 = if max_ext >= 0x8000_0008 {
+            u64::from(cpuid(0x8000_0008, 0)[1])
         } else {
             0
         };
         return Vulnerabilities {
             intel,
             eibrs: bit(caps, 1),
-            ibpb,
+            ibrs: ibpb || bit(ext8, 14),
             bhi_ctrl,
             md_clear,
             auto_ibrs: (amd || hygon) && bit(ext21, 8),
@@ -207,9 +215,7 @@ pub fn vulnerabilities() -> Vulnerabilities {
                 && !bit(ext21, 30),
             // Zen 1 and 2's IBPB flushes return predictions without saying.
             ibpb_brtype: bit(ext21, 28) || family == 0x17,
-            pred_cmd: ibpb
-                || cpuid(0x8000_0000, 0)[0] >= 0x8000_0008
-                    && u64::from(cpuid(0x8000_0008, 0)[1]) & (1 << 12) != 0,
+            pred_cmd: ibpb || bit(ext8, 12),
             ..Vulnerabilities::default()
         };
     }
@@ -221,7 +227,7 @@ pub fn vulnerabilities() -> Vulnerabilities {
         eibrs: bit(caps, 1),
         bhi: !bit(caps, 20),
         gds: !bit(caps, 26),
-        ibpb,
+        ibrs: ibpb,
         bhi_ctrl,
         md_clear,
         pred_cmd: ibpb,
