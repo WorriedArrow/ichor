@@ -29,5 +29,6 @@
 # virtio): 6,350 / 265.
 # Step 9 (ADR-0015: xAPIC): 6,450 / 270.
 # Step 10 (ADR-0016: Hyper-V's hypercalls and SynIC): 6,600 / 285.
-max_code_lines = 6600
-max_unsafe_sites = 285
+# Step 11 (ADR-0017: the ACPI power button and S5): 6,700 / 290.
+max_code_lines = 6700
+max_unsafe_sites = 290

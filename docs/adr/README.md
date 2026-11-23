@@ -22,6 +22,7 @@ brief where they conflict with it.
 | [0014](0014-services-runtime-trusted-crate.md) | `services/rt`, the second crate allowed `unsafe`: scope, rules, budget | Accepted |
 | [0015](0015-xapic.md) | Machines without x2APIC: the local APIC as an xAPIC | Accepted |
 | [0016](0016-hyper-v.md) | Hyper-V guests: VMBus, its disks and its network | Accepted |
+| [0017](0017-power-button.md) | The ACPI power button and soft off (S5) | Accepted |
 
 ## Planned
 

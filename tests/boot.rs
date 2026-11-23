@@ -496,6 +496,22 @@ fn cloud_disk_boots_from_gpt_on_nvme() {
     ]);
 }
 
+/// A cloud's "stop" presses the ACPI power button (ADR-0017): with the
+/// control plane serving (it would run on forever), the press turns the
+/// machine off through S5, which ends QEMU with status 0.
+#[test]
+fn the_power_button_turns_the_machine_off() {
+    let out = boot_disk_with("power-button", "control=50051", 2, |cfg| {
+        cfg.power_button_after = Some("ichor: control: starting".into());
+    });
+    out.assert_exit(Exit::Other(Some(0)));
+    out.assert_in_order(&[
+        "ichor: frame: acpi: power button and S5 from the FADT and DSDT",
+        "ichor: control: starting",
+        "ichor: power button pressed: turning off",
+    ]);
+}
+
 /// A less friendly cloud VM: a blank NVMe volume ahead of the boot disk in
 /// PCI order (as instance storage can be), a boot controller that allows
 /// only 8 KiB per transfer (MDTS 1), 4 GiB and 4 vCPUs. The blank volume

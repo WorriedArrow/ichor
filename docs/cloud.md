@@ -26,10 +26,12 @@ pgbench 4,656 and 4,423 transactions (8 clients, files in memory).
 What it found: GCP's virtio devices are legacy ones, which the drivers did
 not speak (ADR-0005's amendment; tested in QEMU since); glibc's resolver
 gave up in cells (it insists on `IP_RECVERR`); and kernel Spectre v2 was not
-mitigated on such a CPU (IBRS on entry, ADR-0004's amendment, since). Still
-open: stopping or deleting the machine takes GCP about two minutes, since
-Ichor does not hear the ACPI power button, and a recreated machine may have
-another external address (look before connecting).
+mitigated on such a CPU (IBRS on entry, ADR-0004's amendment, since).
+Stopping or deleting the machine took GCP about two minutes (AWS several),
+since Ichor did not hear the ACPI power button. It does now (ADR-0017) and
+turns itself off (S5), tested in QEMU (`system_powerdown`) but not yet on
+either cloud. A recreated machine may have another external address (look
+before connecting).
 
 **AWS, 2026-11-22**, an `m7i-flex.large` (2 vCPUs, 8 GiB; Sapphire
 Rapids with enhanced IBRS, the first such CPU Ichor has met: eIBRS with
@@ -58,6 +60,9 @@ and booted (below).
 The kernel runs its self-tests and the busybox suite from the disk's root
 partition, prints `ichor: boot complete; halting` on COM1, and halts (on a
 VM without QEMU's debug-exit port it simply stops; terminate the instance).
+A running machine turns itself off when its ACPI power button is pressed,
+which is what a cloud's stop does (`ichor: power button pressed: turning
+off`; not on Azure, whose machines have no such button).
 Every line goes to the serial console, so read it there:
 
 - the TSC source (`TSC ... MHz from cpuid 0x15 | hypervisor leaf | ACPI PM timer | PIT`)

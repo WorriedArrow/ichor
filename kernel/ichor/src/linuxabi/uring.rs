@@ -1892,7 +1892,7 @@ pub(super) fn enter(p: &mut LinuxProcess, a: &[u64; 6]) -> Result<u64, i64> {
         // The poller that sleeps until it is woken: it takes everything.
         let mut r = Ok(0);
         if flags & abi::ENTER_SQ_WAKEUP != 0 || to_submit != 0 {
-            while ring.queued() != 0 && matches!(r, Ok(_)) {
+            while ring.queued() != 0 && r.is_ok() {
                 r = ring.submit(p, u32::MAX);
                 if r == Ok(0) {
                     break;

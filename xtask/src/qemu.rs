@@ -250,6 +250,9 @@ pub struct RunConfig {
     /// The API's TLS certificates and key (PEM), written to
     /// `\ichor\apitls.pem`.
     pub api_tls: Option<String>,
+    /// Press the ACPI power button (QEMU's `system_powerdown`) once this
+    /// text is on the serial console, as a cloud's "stop" does.
+    pub power_button_after: Option<String>,
 }
 
 impl RunConfig {
@@ -320,6 +323,7 @@ impl RunConfig {
             nic: "virtio-net-pci,disable-legacy=on".into(),
             api_token: None,
             api_tls: None,
+            power_button_after: None,
         }
     }
 }
@@ -675,7 +679,12 @@ fn disk_command(cfg: &RunConfig, qemu: &Path, fw: &Firmware, img: &Path) -> Resu
 
 /// Boots the kernel and waits for QEMU to exit (or the timeout).
 pub fn run(cfg: &RunConfig) -> Result<Outcome> {
-    run_command(command(cfg)?, cfg.capture, cfg.timeout)
+    run_command_pressing(
+        command(cfg)?,
+        cfg.capture,
+        cfg.timeout,
+        cfg.power_button_after.as_deref(),
+    )
 }
 
 /// A loopback port nothing listens on right now, and that nothing else is
@@ -739,7 +748,18 @@ fn vcpu_state(port: u16) -> String {
 /// Runs a prepared QEMU command to exit (or `timeout`), capturing its
 /// serial output on stdout if `capture`. A run that times out has its
 /// vCPUs' state ([`vcpu_state`]) appended to the captured output.
-pub fn run_command(mut cmd: Command, capture: bool, timeout: Option<Duration>) -> Result<Outcome> {
+pub fn run_command(cmd: Command, capture: bool, timeout: Option<Duration>) -> Result<Outcome> {
+    run_command_pressing(cmd, capture, timeout, None)
+}
+
+/// [`run_command`], pressing the power button once `power_button_after`
+/// is on the serial console.
+fn run_command_pressing(
+    mut cmd: Command,
+    capture: bool,
+    timeout: Option<Duration>,
+    mut power_button_after: Option<&str>,
+) -> Result<Outcome> {
     let monitor_port = timeout
         .filter(|_| capture)
         .and_then(|_| free_port())
@@ -786,6 +806,13 @@ pub fn run_command(mut cmd: Command, capture: bool, timeout: Option<Duration>) -
                 Some(35) => Exit::Failure,
                 code => Exit::Other(code),
             };
+        }
+        if let (Some(text), Some(port)) = (power_button_after, monitor_port)
+            && String::from_utf8_lossy(&serial.lock().unwrap()).contains(text)
+        {
+            monitor(port, &["system_powerdown".to_string()])
+                .map_err(|e| format!("pressing the power button: {e}"))?;
+            power_button_after = None;
         }
         if timeout.is_some_and(|t| start.elapsed() > t) {
             if let Some(port) = monitor_port {

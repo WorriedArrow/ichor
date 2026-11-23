@@ -219,11 +219,176 @@ pub fn fadt_pm_timer(fadt: &[u8]) -> Option<PmTimer> {
         .map(|port| PmTimer { port, bits32 })
 }
 
+/// The fixed-hardware power-management registers of a FADT (ACPI 6.5
+/// §4.8): the PM1 event blocks (status, then enable, each half the block)
+/// and control blocks, all in I/O space, and how to enter ACPI mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Pm1 {
+    pub evt_a: u16,
+    pub evt_b: Option<u16>,
+    pub cnt_a: u16,
+    pub cnt_b: Option<u16>,
+    /// Bytes in each event block.
+    pub evt_len: u8,
+    /// Where `acpi_enable` is written to enter ACPI mode (0: always in it).
+    pub smi_cmd: u16,
+    pub acpi_enable: u8,
+    /// The power button is the fixed-hardware one (`PWRBTN_STS`).
+    pub fixed_button: bool,
+}
+
+/// PM1 status and enable: the power button's bit.
+pub const PM1_PWRBTN: u16 = 1 << 8;
+/// PM1 control: ACPI mode is on, the sleep type's place, and sleep.
+pub const PM1_SCI_EN: u16 = 1;
+pub const PM1_SLP_TYP_SHIFT: u32 = 10;
+pub const PM1_SLP_EN: u16 = 1 << 13;
+
+/// An I/O port of a FADT block: the extended one (a generic address in
+/// system I/O space at `ext`) if nonzero, else the legacy one at `legacy`.
+fn fadt_port(fadt: &[u8], legacy: usize, ext: usize) -> Option<u16> {
+    if fadt.len() >= ext + 12 && u8_at(fadt, ext).ok()? == 1 {
+        let a = u64_at(fadt, ext + 4).ok()?;
+        if a != 0 {
+            return u16::try_from(a).ok();
+        }
+    }
+    let a = u32_at(fadt, legacy).ok()?;
+    (a != 0).then(|| u16::try_from(a).ok()).flatten()
+}
+
+/// The PM1 registers of a validated FADT, if it has fixed hardware (not
+/// a hardware-reduced FADT, flag 20) with both blocks in I/O space.
+pub fn fadt_pm1(fadt: &[u8]) -> Option<Pm1> {
+    let flags = u32_at(fadt, 112).ok()?;
+    if flags & (1 << 20) != 0 {
+        return None;
+    }
+    let evt_len = u8_at(fadt, 88).ok()?;
+    if evt_len < 4 {
+        return None;
+    }
+    Some(Pm1 {
+        evt_a: fadt_port(fadt, 56, 148)?,
+        evt_b: fadt_port(fadt, 60, 160),
+        cnt_a: fadt_port(fadt, 64, 172)?,
+        cnt_b: fadt_port(fadt, 68, 184),
+        evt_len,
+        smi_cmd: u16::try_from(u32_at(fadt, 48).ok()?).ok()?,
+        acpi_enable: u8_at(fadt, 52).ok()?,
+        // Flag 4: the power button is a control-method device, or none.
+        fixed_button: flags & (1 << 4) == 0,
+    })
+}
+
+/// The physical address of a validated FADT's DSDT (`X_DSDT` if nonzero).
+pub fn fadt_dsdt(fadt: &[u8]) -> Option<u64> {
+    let x = u64_at(fadt, 140).ok().unwrap_or(0);
+    let a = if x != 0 {
+        x
+    } else {
+        u64::from(u32_at(fadt, 40).ok()?)
+    };
+    (a != 0).then_some(a)
+}
+
+/// The sleep types of S5 (soft off) for PM1a and PM1b, from the `\_S5`
+/// package in a DSDT's AML: `Name (_S5, Package () { a, b, ... })`. Only
+/// that one object is read, by its usual encoding, not the AML as a whole.
+pub fn s5_sleep_types(dsdt: &[u8]) -> Option<(u8, u8)> {
+    const NAME_OP: u8 = 0x08;
+    const ROOT: u8 = b'\\';
+    const PACKAGE_OP: u8 = 0x12;
+    let at = dsdt.windows(4).position(|w| w == b"_S5_")?;
+    let named = (at >= 1 && dsdt[at - 1] == NAME_OP)
+        || (at >= 2 && dsdt[at - 1] == ROOT && dsdt[at - 2] == NAME_OP);
+    let rest = dsdt.get(at + 4..)?;
+    if !named || *rest.first()? != PACKAGE_OP {
+        return None;
+    }
+    // The package length takes 1 to 4 bytes (the first says how many
+    // follow), then the element count.
+    let len_bytes = 1 + usize::from(*rest.get(1)? >> 6);
+    let mut elements = rest.get(2 + len_bytes..)?.iter().copied();
+    let mut next = || match elements.next()? {
+        0x0a => elements.next(), // BytePrefix
+        0x00 => Some(0),         // ZeroOp
+        0x01 => Some(1),         // OneOp
+        _ => None,
+    };
+    let a = next()?;
+    Some((a, next().unwrap_or(0)))
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;
     use super::*;
     use std::vec::Vec;
+
+    #[test]
+    fn fadt_power_registers() {
+        let mut body = std::vec![0u8; 276 - HEADER_LEN];
+        let at = |o: usize| o - HEADER_LEN;
+        let put =
+            |b: &mut Vec<u8>, o: usize, v: &[u8]| b[at(o)..at(o) + v.len()].copy_from_slice(v);
+        put(&mut body, 48, &0xb2u32.to_le_bytes());
+        body[at(52)] = 0xf1;
+        put(&mut body, 56, &0x600u32.to_le_bytes());
+        put(&mut body, 64, &0x604u32.to_le_bytes());
+        body[at(88)] = 4;
+        put(&mut body, 40, &0x7ffe_0000u32.to_le_bytes());
+        let t = table(b"FACP", &body);
+        assert_eq!(
+            fadt_pm1(&t),
+            Some(Pm1 {
+                evt_a: 0x600,
+                evt_b: None,
+                cnt_a: 0x604,
+                cnt_b: None,
+                evt_len: 4,
+                smi_cmd: 0xb2,
+                acpi_enable: 0xf1,
+                fixed_button: true,
+            })
+        );
+        assert_eq!(fadt_dsdt(&t), Some(0x7ffe_0000));
+        // The extended control block, and a control-method button.
+        body[at(172)] = 1;
+        put(&mut body, 176, &0xb004u64.to_le_bytes());
+        put(&mut body, 112, &(1u32 << 4).to_le_bytes());
+        put(&mut body, 140, &0x1_0000_0000u64.to_le_bytes());
+        let t = table(b"FACP", &body);
+        let p = fadt_pm1(&t).unwrap();
+        assert_eq!((p.cnt_a, p.fixed_button), (0xb004, false));
+        assert_eq!(fadt_dsdt(&t), Some(0x1_0000_0000));
+        // Hardware-reduced: no fixed hardware at all.
+        put(&mut body, 112, &(1u32 << 20).to_le_bytes());
+        assert_eq!(fadt_pm1(&table(b"FACP", &body)), None);
+    }
+
+    #[test]
+    fn s5_sleep_types_from_aml() {
+        // QEMU's: Name (\_S5, Package (0x04) { Zero, Zero, Zero, Zero })
+        let q = [
+            0x10, 0x08, b'\\', b'_', b'S', b'5', b'_', 0x12, 0x06, 0x04, 0, 0, 0, 0,
+        ];
+        assert_eq!(s5_sleep_types(&q), Some((0, 0)));
+        // Bytes, and a two-byte package length.
+        let b = [
+            8, b'_', b'S', b'5', b'_', 0x12, 0x40, 0x01, 0x02, 0x0a, 0x07, 0x0a, 0x05,
+        ];
+        assert_eq!(s5_sleep_types(&b), Some((7, 5)));
+        let one = [8, b'_', b'S', b'5', b'_', 0x12, 0x05, 0x02, 0x01, 0x00];
+        assert_eq!(s5_sleep_types(&one), Some((1, 0)));
+        // A method, or a reference, is not read.
+        assert_eq!(
+            s5_sleep_types(&[0x14, b'_', b'S', b'5', b'_', 0x12, 3, 1, 0]),
+            None
+        );
+        assert_eq!(s5_sleep_types(&b"no such object"[..]), None);
+        assert_eq!(s5_sleep_types(&[8, b'_', b'S', b'5', b'_', 0x12]), None);
+    }
 
     #[test]
     fn fadt_pm_timer_prefers_the_extended_block() {

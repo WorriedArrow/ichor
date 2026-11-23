@@ -318,8 +318,10 @@ impl TaskOptions {
         }))
     }
 
-    /// Creates the task and hands it to the scheduler.
+    /// Creates the task and hands it to the scheduler. `None` if there is
+    /// no stack for it, or no scheduler yet (it would never run).
     pub fn spawn(self) -> Option<Arc<Task>> {
+        scheduler()?;
         let t = self.build()?;
         enqueue(t.clone(), Enqueue::Spawned);
         Some(t)

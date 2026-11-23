@@ -236,6 +236,12 @@ pub(crate) extern "sysv64" fn kernel_space_entry() -> ! {
         }
     );
     println!("ichor: frame: pci: {} functions", crate::bus::pci::init());
+    let acpi_power = match power::init_acpi() {
+        Some(true) => "power button and S5 from the FADT and DSDT",
+        Some(false) => "power button, but no S5 in the DSDT (cannot turn off)",
+        None => "no fixed-hardware power button",
+    };
+    println!("ichor: frame: acpi: {acpi_power}");
     let v = arch::cpu::vulnerabilities();
     let yn = |b: bool| if b { "affected" } else { "no" };
     println!(

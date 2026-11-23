@@ -47,6 +47,11 @@ fn copy_table(pa: u64) -> Option<Vec<u8>> {
     copy_phys(pa, header.length as usize)
 }
 
+/// Copies the table at `pa` (one a FADT points at, such as the DSDT).
+pub(crate) fn table_at(pa: u64) -> Option<Vec<u8>> {
+    copy_table(pa)
+}
+
 /// Finds and copies the first table with `signature`, validated.
 pub(crate) fn find_table(signature: &[u8; 4]) -> Option<Vec<u8>> {
     let rsdp = copy_phys(boot::acpi_rsdp()?.as_u64(), RSDP_LEN)

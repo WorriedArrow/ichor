@@ -689,13 +689,14 @@ AMD's measures. Boot logs which apply.
 
 Frame budget: ADR-0005 sets the milestone 3 ceiling at 8,500 lines / 380
 sites; ADR-0007 raises it to 9,500 / 420 for milestone 4 (TLB shootdown,
-atomic user ops for futexes, PCID). `audit.toml` is at step 10 (6,600 / 285,
-ADR-0016); frame is at 6,597 / 270, 3 lines of room (A5 added
+atomic user ops for futexes, PCID). `audit.toml` is at step 11 (6,700 / 290,
+ADR-0017); frame is at 6,663 / 279 (A5 added
 RDSEED/RDRAND and UEFI GetTime; B added XSAVE; C the frames tree and
 request tracking; M6 reading `\ichor\roots.pem`; ADR-0011 the checked user
 copy; ADR-0004 VERW/IBPB, page-table isolation, eIBRS and IBRS; `IoPorts`;
 xAPIC; Hyper-V; placing BARs the firmware left at 0, ADR-0005's second
-amendment). The next frame growth needs an ADR and a new audit step.
+amendment; the ACPI power button and S5, ADR-0017). Growth past the step
+needs an ADR and a new audit step.
 `services/rt` has its own budget (`services/rt/audit.toml`: 500 / 40; at
 417 / 30).
 
@@ -746,8 +747,18 @@ completion queue unless the host information says Linux and driver
 version 2 (`ena::host_info`; status 6 otherwise). Links say their MTU
 (`Link::mtu`, 1500); AWS's DHCP says 9001 and is not believed. Only the
 m7i-flex has been tried (t3 and older types: not yet).
+The ACPI power button (ADR-0017): frame owns the PM1 and SMI_CMD ports
+(ACPI mode on if the firmware left it off), enables the fixed button's
+event without taking the SCI, and the kernel polls it every 250 ms
+(`frame::power::power_button`, `watch_power_button` in `main.rs`); a press
+writes `\_S5`'s sleep types (read from the DSDT by `acpi::s5_sleep_types`,
+no AML run) and turns the machine off (`frame::power::power_off`). So a
+cloud's stop should end the machine at once on GCP and AWS (tested in
+QEMU only: `the_power_button_turns_the_machine_off`, `system_powerdown`
+through `RunConfig::power_button_after`); Azure's hardware-reduced FADT has no
+such button: its stop needs Hyper-V's shutdown integration service.
 Not yet: GCP gVNIC, Azure's newest sizes (PCI over VMBus: NVMe and MANA),
-Secure Boot, the ACPI power button; Azure's CPU enumerates no MD_CLEAR or
+Secure Boot, Azure's shutdown service; Azure's CPU enumerates no MD_CLEAR or
 SPEC_CTRL (VERW and IBRS off: look into; frame reads the right bits, and
 on OpenVMM the guest OS ID changes nothing in CPUID leaf 7, so try it on
 Azure itself next time). Left for milestone 8: one

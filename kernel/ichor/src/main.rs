@@ -61,6 +61,21 @@ use frame::println;
 
 frame::main!(kmain);
 
+/// Turns the machine off when its power button is pressed, which is how a
+/// cloud's "stop" asks (ADR-0017): polled four times a second.
+fn watch_power_button() {
+    let watch = || loop {
+        if frame::power::power_button() {
+            println!("ichor: power button pressed: turning off");
+            frame::power::power_off();
+        }
+        frame::task::sleep_until(frame::time::now() + core::time::Duration::from_millis(250));
+    };
+    if frame::task::TaskOptions::new(watch).spawn().is_none() {
+        println!("ichor: power: no task to watch the power button");
+    }
+}
+
 fn kmain(info: BootInfo) -> ! {
     let (major, minor) = info.uefi_revision();
     println!(
@@ -152,6 +167,7 @@ fn kmain(info: BootInfo) -> ! {
 
     // Milestone 2: tasks and scheduling.
     frame::task::inject_scheduler(&sched::SCHEDULER);
+    watch_power_button();
     selftest::threads();
     selftest::preemption();
     selftest::timed_waits();
