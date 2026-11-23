@@ -18,8 +18,14 @@ a framekernel. The founding brief is the source of truth until an ADR in
 
 ## Status
 
-**Active milestone: 7** (io_uring; postgres, node, python, go and JVM
-workloads pass their own test suites at a tracked pass rate). The design
+**Milestone 8 is done** (owner, 2026-11-23): Ichor boots and runs
+containers on AWS, GCP and Azure (details under "Milestone 8" below). The bare-metal machine is deferred, not dropped: the owner has no
+dedicated hardware yet, and declined using the development PC. Next on the
+roadmap is milestone 9 (CRI); nobody has started it.
+
+**Milestone 7** (io_uring; postgres, node, python, go and JVM workloads
+pass their own test suites at a tracked pass rate; the suites run weekly
+in `workloads.yml`). The design
 is ADR-0013: io_uring rings as cell-charged pages read through `UFrame`s
 (no frame change), inline completion for what is ready and per-ring
 worker tasks for the rest, no SQPOLL; the suites run through the control
@@ -714,10 +720,7 @@ needs an ADR and a new audit step.
 `services/rt` has its own budget (`services/rt/audit.toml`: 500 / 40; at
 417 / 30).
 
-The goal set for this effort is milestone 8, whose acceptance test needs
-cloud accounts and bare-metal hardware from the owner.
-
-Toward milestone 8 so far: `cargo xtask disk-image` writes a single
+Milestone 8 (done 2026-11-23, bare metal deferred until hardware): `cargo xtask disk-image` writes a single
 bootable GPT disk (FAT32 ESP with `\EFI\BOOT\BOOTX64.EFI` and
 `\ichor\cmdline`, plus an Ichor root partition the kernel finds by type,
 `partition.rs`). `cloud_disk_boots_from_gpt_on_nvme` boots it under OVMF
@@ -802,8 +805,8 @@ Not yet: Azure's newest sizes (PCI over VMBus: NVMe and MANA),
 Secure Boot, Azure's shutdown service; Azure's CPU enumerates no MD_CLEAR or
 SPEC_CTRL (VERW and IBRS off: look into; frame reads the right bits, and
 on OpenVMM the guest OS ID changes nothing in CPUID leaf 7, so try it on
-Azure itself next time). Left for milestone 8: one
-bare-metal machine (the owner has none available yet).
+Azure itself next time). Deferred: one bare-metal machine (the owner has
+none yet; the owner called milestone 8 done without it).
 
 ## Commands
 
