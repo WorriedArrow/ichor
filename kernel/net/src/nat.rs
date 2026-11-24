@@ -85,19 +85,28 @@ pub struct Nat {
     published: BTreeMap<(u8, u16), Endpoint>,
     by_inside: BTreeMap<InKey, OutKey>,
     by_outside: BTreeMap<OutKey, Mapping>,
-    next_port: u16,
+    /// Where the search for a free port starts, drawn anew for each
+    /// mapping (RFC 6056's second algorithm): ports that are not guessed,
+    /// and not the same from one boot to the next.
+    rng: csprng::Csprng,
 }
 
 impl Nat {
-    /// A table translating to `outside`, the uplink's address.
+    /// A table translating to `outside`, the uplink's address. Its ports
+    /// follow from an all-zero key until [`Nat::seed`].
     pub fn new(outside: Ipv4Addr) -> Nat {
         Nat {
             outside,
             published: BTreeMap::new(),
             by_inside: BTreeMap::new(),
             by_outside: BTreeMap::new(),
-            next_port: *PORTS.start(),
+            rng: csprng::Csprng::new(),
         }
+    }
+
+    /// Keys the choice of ports with `secret` (random bytes).
+    pub fn seed(&mut self, secret: &[u8]) {
+        self.rng.absorb(secret, 0);
     }
 
     /// The uplink's address.
@@ -164,18 +173,12 @@ impl Nat {
 
     fn pick_port(&mut self, proto: u8, remote: Endpoint) -> Option<u16> {
         let span = u32::from(*PORTS.end() - *PORTS.start()) + 1;
-        for _ in 0..span {
-            let p = self.next_port;
-            self.next_port = if p >= *PORTS.end() {
-                *PORTS.start()
-            } else {
-                p + 1
-            };
-            if self.port_free(proto, p, remote) {
-                return Some(p);
-            }
-        }
-        None
+        let mut r = [0u8; 4];
+        self.rng.fill(&mut r);
+        let start = u32::from_le_bytes(r) % span;
+        (0..span)
+            .map(|i| *PORTS.start() + ((start + i) % span) as u16)
+            .find(|&p| self.port_free(proto, p, remote))
     }
 
     fn insert(&mut self, proto: u8, m: Mapping) {

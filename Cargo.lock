@@ -216,6 +216,9 @@ dependencies = [
 [[package]]
 name = "ichor-net"
 version = "0.0.0"
+dependencies = [
+ "ichor-csprng",
+]
 
 [[package]]
 name = "ichor-nvme"

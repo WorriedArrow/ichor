@@ -277,8 +277,9 @@ image cached and networking attached, on the same three GCP machine types
 
 | | n2 (Ice Lake) | Milan | Rome |
 |---|---|---|---|
-| Ichor: pull | 16.5 s | 16.3 s | 11.2 s |
+| Ichor: pull, 19-27 s after boot | 0.87 s | 0.88 s | |
 | containerd: pull | 1.08 s | 1.09 s | 1.08 s |
+| Ichor: pull at boot (3.7 s after) | 15.3 s | 23.1 s | |
 | Ichor: first container, network attached | 1.63 ms | 1.48 ms | 1.51 ms |
 | containerd + CNI: first container | 958 ms | 976 ms | 955 ms |
 | Ichor: container, network attached | 1.04 ms | 0.97 ms | 0.94 ms |
@@ -293,12 +294,32 @@ Reading it:
   CNI bridge and iptables setup). CNI adds 35 ms a container to
   containerd's own 117-119 ms; Ichor's switch address costs nothing
   measurable.
-- **The pull loses**: 11-16.5 s on Ichor against 1.1 s for containerd,
-  for a 0.9 MB layer. Under OpenVMM, on a home connection, the same pull
-  took 2.6-3.2 s, so something on GCP's network path (DNS, TCP, the
-  virtio-net driver, TLS) costs seconds; not yet found. From an empty
-  node, pull plus first start is about 2 s on Linux against 11-17 s on
-  Ichor today.
+- **The pull** (2026-11-24, the same image, n2 and Milan) takes 0.87-0.88
+  s on Ichor against containerd's 1.08 s, once the machine has been up
+  about 20 s; from an empty node, pull plus first start is then about 0.9
+  s against about 2 s. It first measured 11-16.5 s. Timing each request
+  (`control: ... answered` lines: DNS, TCP, first byte, body) and the
+  uplink (`trace_uplink`: every SYN, FIN and RST) found two causes:
+  - Converting took 1.05-1.3 s of it: busybox's image links some 400
+    applets to one 1 MB binary, and each hard link was hashed, compared
+    and listed in the image again. Links now share the file's chunks
+    (`image::builder::Builder::same_file`): 30 ms, and the image is 1.5
+    MiB, not 7.
+  - In its first 20-30 s after boot, the machine's TCP connections to
+    Docker Hub's registry (AWS) and auth server (Cloudflare) wait 1-15 s:
+    SYNs go out and nothing comes back until a retransmission 3-7 s
+    later; DHCP, DNS and the metadata server answer at once, and CDN
+    (CloudFront) connections rarely wait. Later connections never do.
+    Choosing source ports at random (as Linux does, RFC 6056; they had
+    been sequential from 49152 at every boot) changed nothing. A Linux
+    VM can only look from 15.7 s of uptime on: it lost one SYN in 80
+    connections there, at 17 s. So this is most likely GCP's network
+    in a VM's first seconds, which an Ichor machine, booted in under a
+    second, meets and a Linux one mostly boots through; not proven. A
+    pull right at boot took 15-23 s; `api_bench` now pulls twice and
+    reports both (`first_pull_ns`, `pull_ns`).
+  Under OpenVMM the same pull takes 1.55 s (its NAT proxies TCP through
+  the host, so the guest's own SYNs never cross a network).
 
 Caveats: in the QEMU comparisons above (before `91a5a17`), Linux runs with
 its default CPU-vulnerability mitigations, which Ichor did not all apply

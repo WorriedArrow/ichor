@@ -83,6 +83,11 @@ pub(crate) struct Fetch {
     heard: u64,
     /// How often this was started anew.
     again: u32,
+    /// When the name resolved, the connection was made and the first byte
+    /// came back (0: not yet), for [`Fetch::timings`].
+    resolved: u64,
+    connected: u64,
+    first: u64,
 }
 
 /// Why a try failed.
@@ -116,8 +121,13 @@ fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
 impl Fetch {
     pub(crate) fn start(req: Request, net: &mut Net) -> Result<Fetch, String> {
         let host = req.url.host.clone();
+        let now = rt::monotonic();
+        let mut resolved = 0;
         let stage = match parse_ipv4(&host).or_else(|| net.cache.get(&host).copied()) {
-            Some(ip) => connect(ip, req.url.port)?,
+            Some(ip) => {
+                resolved = now;
+                connect(ip, req.url.port)?
+            }
             None => {
                 let sock = rt::udp_bind(0).map_err(|e| format!("UDP socket: {e:?}"))?;
                 net.next_id = net.next_id.wrapping_add(1);
@@ -139,10 +149,40 @@ impl Fetch {
             stage,
             parser: ResponseParser::new(MAX_BODY),
             out: Vec::new(),
-            started: rt::monotonic(),
-            heard: rt::monotonic(),
+            started: now,
+            heard: now,
             again: 0,
+            resolved,
+            connected: 0,
+            first: 0,
         })
+    }
+
+    /// Where the time went, for the log: name, connection, first byte
+    /// (TLS handshake and the server's answer) and the rest, in ms.
+    pub(crate) fn timings(&self) -> String {
+        let ms = |a: u64, b: u64| {
+            if a == 0 || b < a {
+                0
+            } else {
+                (b - a) / 1_000_000
+            }
+        };
+        let done = rt::monotonic();
+        format!(
+            "{} at {} ms since boot: dns {} ms, tcp {} ms, first byte {} ms, body {} ms{}",
+            self.req.url.host,
+            self.started / 1_000_000,
+            ms(self.started, self.resolved),
+            ms(self.resolved, self.connected),
+            ms(self.connected, self.first),
+            ms(self.first, done),
+            if self.again > 0 {
+                format!(", {} retries", self.again)
+            } else {
+                String::new()
+            }
+        )
     }
 
     /// What to wait for.
@@ -206,6 +246,7 @@ impl Fetch {
                             match dns::parse_a(&buf[..n], *id, host) {
                                 Ok(ips) if !ips.is_empty() => {
                                     net.cache.insert(host.clone(), ips[0]);
+                                    self.resolved = now;
                                     self.stage = connect(ips[0], self.req.url.port)?;
                                 }
                                 Err(dns::Error::Mismatch) => {}
@@ -233,6 +274,7 @@ impl Fetch {
                 }
                 Stage::Connect { sock } => match rt::sock_error(sock) {
                     Ok(()) => {
+                        self.connected = rt::monotonic();
                         // Move the socket on (never a stand-in handle: a
                         // dropped one would close whatever it named).
                         let Stage::Connect { sock } =
@@ -297,6 +339,9 @@ impl Fetch {
                 Ok(0) => (Vec::new(), true),
                 Ok(n) => {
                     self.heard = rt::monotonic();
+                    if self.first == 0 {
+                        self.first = self.heard;
+                    }
                     (buf[..n].to_vec(), false)
                 }
                 Err(Error::WouldBlock) => return Ok(None),

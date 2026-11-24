@@ -248,7 +248,10 @@ pub(crate) fn stats(cell: u64) -> Option<(u64, u64, u64)> {
 /// VPCs: 1460; most others 1500). `dhcp` is the client whose lease `ifc`
 /// has, renewed from here on.
 pub(crate) fn set_uplink(dev: Box<dyn Link>, ifc: Interface, mtu: u16, dhcp: Option<Client>) {
-    let nat = Nat::new(ifc.addr);
+    let mut nat = Nat::new(ifc.addr);
+    let mut secret = [0u8; 32];
+    crate::random::fill(&mut secret);
+    nat.seed(&secret);
     *UPLINK.lock() = Some(Uplink {
         dev,
         ifc,
@@ -303,6 +306,54 @@ fn flags(proto: u8, data: &[u8]) -> u8 {
     } else {
         0
     }
+}
+
+/// `trace_uplink`: log every TCP segment that opens, closes or resets a
+/// connection across the uplink (what a lost or refused handshake shows).
+static TRACE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn trace_uplink() {
+    TRACE.store(true, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// One line for `trace_uplink`, if `data` is such a TCP segment; `what`
+/// says which way it went and what became of it.
+fn trace(what: &str, src: (Ipv4Addr, u16), dst: (Ipv4Addr, u16), proto: u8, data: &[u8]) {
+    if !TRACE.load(core::sync::atomic::Ordering::Relaxed) || proto != PROTO_TCP || data.len() < 20 {
+        return;
+    }
+    let f = nat::tcp_flags(data);
+    if f & (tcp::SYN | tcp::FIN | tcp::RST) == 0 {
+        return;
+    }
+    let names = [
+        (tcp::SYN, "SYN"),
+        (tcp::ACK, "ACK"),
+        (tcp::FIN, "FIN"),
+        (tcp::RST, "RST"),
+    ];
+    let mut fl = alloc::string::String::new();
+    for (bit, name) in names {
+        if f & bit != 0 {
+            if !fl.is_empty() {
+                fl.push('+');
+            }
+            fl.push_str(name);
+        }
+    }
+    let be = |i: usize| u32::from_be_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
+    let window = u16::from_be_bytes([data[14], data[15]]);
+    let opts = (usize::from(data[12] >> 4) * 4).saturating_sub(20);
+    println!(
+        "ichor: uplink: {} ms {what} {fl} {}:{} > {}:{} seq {} ack {} win {window} opts {opts}",
+        now().as_millis(),
+        src.0,
+        src.1,
+        dst.0,
+        dst.1,
+        be(4),
+        be(8),
+    );
 }
 
 /// Routes packets that `from`'s stack sent, and every packet their
@@ -406,6 +457,13 @@ fn uplink_out(from: PortId, mut p: Packet) {
     let t = now();
     let f = flags(p.protocol, &p.payload);
     let Some(src) = u.nat.outbound(p.protocol, (p.src, sp), (p.dst, dp), f, t) else {
+        trace(
+            "out, no port",
+            (p.src, sp),
+            (p.dst, dp),
+            p.protocol,
+            &p.payload,
+        );
         return;
     };
     if !nat::rewrite(p.protocol, &mut p.payload, src, (p.dst, dp)) {
@@ -414,6 +472,7 @@ fn uplink_out(from: PortId, mut p: Packet) {
     if p.protocol == PROTO_TCP {
         nat::clamp_mss(src.0, p.dst, &mut p.payload, u.mss);
     }
+    trace("out", src, (p.dst, dp), p.protocol, &p.payload);
     u.ifc.send(t, p.dst, p.protocol, &p.payload);
     while let Some(frame) = u.ifc.transmit() {
         u.dev.transmit(&frame);
@@ -473,13 +532,28 @@ pub(crate) fn poll_uplink() -> bool {
                 if p.protocol == PROTO_TCP
                     && let Some(rst) = tcp_refusal(&p)
                 {
+                    trace(
+                        "in, refused",
+                        (p.src, sp),
+                        (p.dst, dp),
+                        p.protocol,
+                        &p.payload,
+                    );
                     u.ifc.send(t, p.src, PROTO_TCP, &rst);
                     st.refused += 1;
                 } else {
+                    trace(
+                        "in, unmapped",
+                        (p.src, sp),
+                        (p.dst, dp),
+                        p.protocol,
+                        &p.payload,
+                    );
                     st.unmapped += 1;
                 }
                 continue;
             };
+            trace("in", (p.src, sp), (p.dst, dp), p.protocol, &p.payload);
             if !nat::rewrite(p.protocol, &mut p.payload, (p.src, sp), inside) {
                 continue;
             }

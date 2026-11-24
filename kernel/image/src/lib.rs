@@ -46,7 +46,8 @@
 //! ```
 //!
 //! A directory's `first`/`count` index the dirents table; a file's index the
-//! chunk table; a symlink's index the string table. Because chunks are
+//! chunk table (files may share a range: hard links do); a symlink's index
+//! the string table. Because chunks are
 //! page-aligned, each one is a single aligned device read.
 //!
 //! The metadata of a large image (hundreds of thousands of files or chunks)

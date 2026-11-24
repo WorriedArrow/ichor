@@ -173,6 +173,12 @@ pub(crate) fn run(args: &[&str]) -> Result<(), &'static str> {
         reference: image.to_string(),
         layers: Vec::new(),
     };
+    // Pulled twice: the first right after boot, when a cloud's network may
+    // not carry the machine's traffic yet, the second (every request made
+    // anew) on a network known to work, as a long-running machine pulls.
+    let t = rt::monotonic();
+    api.ok(control::PULL_IMAGE, &req.encode())?;
+    let first_pull_ns = rt::monotonic() - t;
     let t = rt::monotonic();
     let m = api.ok(control::PULL_IMAGE, &req.encode())?;
     let pull_ns = rt::monotonic() - t;
@@ -205,7 +211,7 @@ pub(crate) fn run(args: &[&str]) -> Result<(), &'static str> {
     }
     let ns = rt::monotonic() - t0;
     rt::log!(
-        "native: api-bench pull_ns={pull_ns} cold_ns={cold_ns} n={runs} ns={ns} per_ns={}",
+        "native: api-bench first_pull_ns={first_pull_ns} pull_ns={pull_ns} cold_ns={cold_ns} n={runs} ns={ns} per_ns={}",
         ns / runs.max(1)
     );
     Ok(())

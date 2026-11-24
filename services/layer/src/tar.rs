@@ -4,7 +4,8 @@
 //! Reads ustar, GNU (`L`/`K` long names) and PAX (`x`) headers. Regular
 //! files, directories, symlinks and hard links are kept; device nodes and
 //! FIFOs are skipped (a cell's `/dev` is synthesized). Hard links become
-//! copies (the image format has no link count; dedup shares the bytes).
+//! files of their own that share the first one's chunks (the image format
+//! has no link count), so their content is hashed and listed once.
 //! OCI whiteouts: `.wh.NAME` removes `NAME` from the layers below, and
 //! `.wh..wh..opq` empties its directory of what the layers below put there.
 
@@ -408,16 +409,41 @@ impl Tree {
         const CHUNK: usize = 256;
         /// Data of at least this much goes back when it is let go of.
         const LARGE: usize = 4096;
-        fn emit(b: &mut image::builder::Builder, name: &str, e: Entry) -> image::builder::NodeId {
+        /// Content already written, by its `Rc`: its hard links share it.
+        type Written = BTreeMap<usize, image::builder::NodeId>;
+        fn emit(
+            b: &mut image::builder::Builder,
+            name: &str,
+            e: Entry,
+            written: &mut Written,
+        ) -> image::builder::NodeId {
             let (id, own) = match e {
-                Entry::File { data, mode, own } => (b.file(name, &data, mode), own),
+                Entry::File { data, mode, own } => {
+                    let key = Rc::as_ptr(&data) as usize;
+                    let id = match written.get(&key) {
+                        Some(&first) => b.same_file(name, first, mode),
+                        None => {
+                            let id = b.file(name, &data, mode);
+                            // Every file's `Rc` was made before any is let
+                            // go of, so a key is never another's address.
+                            if Rc::strong_count(&data) > 1 {
+                                written.insert(key, id);
+                            }
+                            id
+                        }
+                    };
+                    (id, own)
+                }
                 Entry::Symlink(t, own) => (b.symlink(name, &t), own),
                 Entry::Dir {
                     mode,
                     own,
                     children,
                 } => {
-                    let ids: Vec<_> = children.into_iter().map(|(n, c)| emit(b, &n, c)).collect();
+                    let ids: Vec<_> = children
+                        .into_iter()
+                        .map(|(n, c)| emit(b, &n, c, written))
+                        .collect();
                     (b.dir(name, &ids, mode), own)
                 }
             };
@@ -444,7 +470,7 @@ impl Tree {
         let (chunks, back) = sum;
         fits((chunks - back.min(chunks)) + chunks / 4096 * CHUNK, room)?;
         let mut b = image::builder::Builder::with_capacity(chunks);
-        let root = emit(&mut b, "/", self.root);
+        let root = emit(&mut b, "/", self.root, &mut BTreeMap::new());
         fits(b.finished_len(), room)?;
         let mut img = b.finish(root);
         img.resize(img.len().next_multiple_of(4096), 0);
@@ -519,6 +545,38 @@ mod tests {
         let mut t = Tree::new();
         t.add_tar(&tar).unwrap();
         assert!(t.into_image(&|| 1000).is_err());
+    }
+
+    /// Busybox's image links each applet to one binary: the links share its
+    /// chunks, so the image does not grow with them, and each reads whole.
+    #[test]
+    fn hard_links_share_their_chunks() {
+        let body: Vec<u8> = (0..40_000u32).map(|i| (i * 7 % 251) as u8).collect();
+        let image_with = |links: usize| {
+            let mut tar = entry("bin/busybox", b'0', "", &body, 0o755);
+            for i in 0..links {
+                let name = format!("bin/applet{i}");
+                tar.extend(entry(&name, b'1', "bin/busybox", b"", 0o751));
+            }
+            tar.extend(vec![0u8; 1024]);
+            let mut t = Tree::new();
+            t.add_tar(&tar).unwrap();
+            t.image()
+        };
+        let (one, many) = (image_with(1), image_with(100));
+        // 99 more nodes and names, no more chunks.
+        assert!(
+            many.len() - one.len() < 99 * 128,
+            "{} {}",
+            one.len(),
+            many.len()
+        );
+        assert_eq!(read(&many, "/bin/busybox").unwrap(), body);
+        assert_eq!(read(&many, "/bin/applet0").unwrap(), body);
+        assert_eq!(read(&many, "/bin/applet99").unwrap(), body);
+        // A link is the same inode: its mode is the file's.
+        let image = image::Image::mount(&many).unwrap();
+        assert_eq!(image.lookup("/bin/applet7").unwrap().mode & 0o777, 0o755);
     }
 
     #[test]

@@ -798,11 +798,17 @@ impl Control {
                 match f.advance(&mut self.net)? {
                     None => return Ok(false),
                     Some(resp) => {
+                        let timings = f.timings();
                         p.fetch = None;
                         let (status, len) = (resp.status, resp.body.len());
                         if p.pulled.is_none() {
+                            let t = rt::monotonic();
                             p.puller.on_response(resp).map_err(|e| format!("{e:?}"))?;
-                            rt::log!("control: {} answered {status} ({len} bytes)", p.reference);
+                            rt::log!(
+                                "control: {} answered {status} ({len} bytes; {timings}; handled in {} ms)",
+                                p.reference,
+                                (rt::monotonic() - t) / 1_000_000
+                            );
                         } else {
                             let l = &p.layers[p.extras.len()];
                             if (300..400).contains(&status) {
@@ -868,22 +874,30 @@ impl Control {
                     .collect();
                 {
                     let (conn, stream, started) = (p.conn, p.stream, p.started);
+                    let t0 = rt::monotonic();
                     let img = oci::convert_with(&mut pulled, &extras, &rt::memory_available)
                         .map_err(|e| format!("converting: {e:?}"))?;
                     drop(extras);
+                    let t1 = rt::monotonic();
                     let id = image::Image::mount(&img)
                         .map(|m| hex(&m.root_hash()))
                         .map_err(|e| format!("the converted image: {e:?}"))?;
+                    let t2 = rt::monotonic();
                     let handle =
                         rt::image_create(&img).map_err(|e| format!("IMAGE_CREATE: {e:?}"))?;
+                    let t3 = rt::monotonic();
                     let config = oci::ImageConfig::parse(&pulled.config).unwrap_or_default();
+                    let ms = |a: u64, b: u64| (b - a) / 1_000_000;
                     rt::log!(
-                        "control: pulled {} ({} layers, image {} of {} KiB) in {} ms",
+                        "control: pulled {} ({} layers, image {} of {} KiB) in {} ms (converting {} ms, mounting {} ms, IMAGE_CREATE {} ms)",
                         pulled.manifest_digest,
                         pulled.layers.len(),
                         &id[..12],
                         img.len() / 1024,
-                        (rt::monotonic() - started) / 1_000_000
+                        ms(started, t3),
+                        ms(t0, t1),
+                        ms(t1, t2),
+                        ms(t2, t3)
                     );
                     let m = control::PullImageResponse {
                         digest: pulled.manifest_digest.clone(),

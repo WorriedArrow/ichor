@@ -153,6 +153,29 @@ impl Builder {
         })
     }
 
+    /// Adds a regular file with the same content as `file` (a hard link):
+    /// the two share their chunk-table entries, so the content is neither
+    /// hashed nor listed again. Anything but a file yields an empty file.
+    pub fn same_file(&mut self, name: &str, file: NodeId, mode: u32) -> NodeId {
+        let (name_off, name_len) = self.string(name);
+        let (size, first, count) = match self.nodes.get(file.0) {
+            Some(n) if n.kind == 0 => (n.size, n.first, n.count),
+            _ => (0, self.chunk_table.len() as u64, 0),
+        };
+        self.push_node(NodeRec {
+            kind: 0,
+            mode,
+            size,
+            first,
+            count,
+            name_off,
+            name_len,
+            uid: 0,
+            gid: 0,
+            mtime: 0,
+        })
+    }
+
     /// Adds a symbolic link.
     pub fn symlink(&mut self, name: &str, target: &str) -> NodeId {
         let (name_off, name_len) = self.string(name);

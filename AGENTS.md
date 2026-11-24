@@ -748,10 +748,19 @@ it); before it 16.8-17 ms, the control plane's three log lines per
 container waiting for the 115,200-baud serial port. End to end with
 networking against containerd 1.6 + CNI (bridge, host-local) on GCP,
 image cached: about 1 ms a container against 152-157 ms (`ctr run --rm
---cni`), the first 1.5 ms against 0.96 s; but Ichor's pull of the same
-0.9 MB busybox takes 11-16.5 s there against containerd's 1.1 s (2.6-3.2
-s under OpenVMM): something on GCP's network path costs seconds, not yet
-found. `api_bench` logs `pull_ns`, `cold_ns` and a container's addresses.
+--cni`), the first 1.5 ms against 0.96 s; and the pull of the same 0.9
+MB busybox 0.87-0.88 s against containerd's 1.08 s (2026-11-24) once
+the machine has been up about 20 s. Two things had made it 11-16.5 s:
+hard links were converted as copies, each hashed and listed again
+(busybox's 400 applets: 1.05-1.3 s; now they share the file's chunks,
+`Builder::same_file`), and in a GCP machine's first 20-30 s connections
+to Docker Hub wait 1-15 s for an answer to their SYNs (seen with
+`trace_uplink`; most likely GCP's network in a VM's first seconds, which
+Linux boots through, not proven: `docs/benchmarks.md`). Source ports are
+random now (RFC 6056; NAT and stacks), which did not change that.
+`api_bench` pulls twice and logs `first_pull_ns`, `pull_ns`, `cold_ns`
+and a container's addresses; the control plane logs each request's DNS,
+TCP, first-byte and body times and each conversion's parts.
 
 Frame budget: ADR-0005 sets the milestone 3 ceiling at 8,500 lines / 380
 sites; ADR-0007 raises it to 9,500 / 420 for milestone 4 (TLB shootdown,
@@ -917,9 +926,10 @@ comment.
 | `force_safe_ret` | the Zen 3/4 safe-RET return thunks on any CPU (ADR-0004's safe-RET amendment; tests) |
 | `srso=ibpb` | on CPUs SRSO or Retbleed affects, IBPB on every entry instead of safe-RET return thunks |
 | `trace_errors` | log every failing Linux syscall (pid, number, first arguments, errno) |
+| `trace_uplink` | log every TCP segment with SYN, FIN or RST crossing the uplink, either way, after NAT (`ichor: uplink:` lines: time, flags, endpoints, sequence numbers, window), and those the NAT refuses or cannot map |
 | `trace_pid=N` | log every Linux syscall of pid N with its result |
 | `bench` | run the Phase E benchmarks (`bench.rs`) after the root disk's self-tests and print them, container start also from a native caller (`nativetest start-bench`) |
-| `api_bench=IMAGE` | with `control=PORT`: a client beside the control plane, in its cell, pulls IMAGE, then times 20 rounds of `CreateCell`, `Run /bin/true`, `Destroy` over the API on loopback (`nativetest api-bench`; logs `native: api-bench`); add `control_exit` to end the run there |
+| `api_bench=IMAGE` | with `control=PORT`: a client beside the control plane, in its cell, pulls IMAGE twice (each timed: at boot, then again), then times 20 rounds of `CreateCell`, `Run /bin/true`, `Destroy` over the API on loopback (`nativetest api-bench`; logs `native: api-bench`); add `control_exit` to end the run there |
 | `cell_access` | run the cell access-control suite (`cellaccess.rs`) after the Debian checks |
 | `cell_access_uplink` | with `cell_access`: check the uplink too; a host client must be connecting to a forward of port 7300 |
 | `net_echo_port=N` | the kernel's TCP, then a Debian cell through NAT, echo 256 KiB with the host's echo server at 10.0.2.2:N |

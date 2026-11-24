@@ -188,7 +188,6 @@ struct Inner {
     addr: Option<Ipv4Addr>,
     socks: BTreeMap<u64, Sock>,
     next_id: u64,
-    next_port: u16,
     /// Packets between local addresses, to deliver.
     local: VecDeque<Packet>,
     /// Segments for the switch, sent once the lock is released.
@@ -245,7 +244,6 @@ pub(crate) fn stack_for(c: &crate::kcell::Cell) -> Arc<Stack> {
                         addr,
                         inner: SpinLock::new(Inner {
                             addr,
-                            next_port: *EPHEMERAL.start(),
                             account: Some(c.account().clone()),
                             ..Inner::default()
                         }),
@@ -480,20 +478,25 @@ impl Inner {
         })
     }
 
+    /// A free port, searched for from a random one (RFC 6056's second
+    /// algorithm), as Linux's are not guessed or the same at every boot.
     fn ephemeral(&mut self, ip: Ipv4Addr, by: u64) -> Result<u16, i64> {
         let span = u32::from(*EPHEMERAL.end() - *EPHEMERAL.start()) + 1;
-        for _ in 0..span {
-            let p = self.next_port;
-            self.next_port = if p >= *EPHEMERAL.end() {
-                *EPHEMERAL.start()
-            } else {
-                p + 1
-            };
-            if !self.port_taken(ip, p, by, false) {
-                return Ok(p);
-            }
-        }
-        Err(EADDRINUSE)
+        let mut r = [0u8; 4];
+        crate::random::fill(&mut r);
+        let start = u32::from_le_bytes(r) % span;
+        // (Not one a connection still waits out TIME_WAIT on: the same
+        // remote would see the old connection's endpoints again.)
+        let lingers = |p: u16| {
+            self.socks.values().any(|s| {
+                s.local.is_some_and(|(_, sp)| sp == p)
+                    && matches!(&s.kind, Kind::Conn { tcp, .. } if tcp.state() == State::TimeWait)
+            })
+        };
+        (0..span)
+            .map(|i| *EPHEMERAL.start() + ((start + i) % span) as u16)
+            .find(|&p| !self.port_taken(ip, p, by, false) && !lingers(p))
+            .ok_or(EADDRINUSE)
     }
 
     /// The local endpoint socket `id` sends to `dst` from: its bound

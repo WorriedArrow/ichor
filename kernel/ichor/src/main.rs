@@ -128,6 +128,9 @@ fn kmain(info: BootInfo) -> ! {
     if let Some(mtu) = cmdline.get("uplink_mtu").and_then(|v| v.parse().ok()) {
         nettest::set_mtu(mtu);
     }
+    if cmdline.flag("trace_uplink") {
+        switch::trace_uplink();
+    }
     if let Some(secs) = cmdline.get("dhcp_lease").and_then(|v| v.parse().ok()) {
         nettest::set_lease_cap(secs);
     }
