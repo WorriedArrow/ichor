@@ -124,5 +124,52 @@ pub(crate) fn run(m: &Mounted, vfs: &Arc<Vfs>, busybox: &[u8]) {
         }
     });
     report("container start", total / STARTS);
+    caller_start(m);
     println!("ichor: bench: done");
+}
+
+/// Container start as a caller sees it, the way Linux's is measured with
+/// `unshare` or an OCI runtime: `services/nativetest` in a system cell,
+/// holding that cell (with `CREATE_CELL`) and the root disk as an image,
+/// asks for each container through the native ABI (`CELL_CREATE`,
+/// `CELL_SPAWN` of `/bin/true`, `PROCESS_WAIT` until it is reaped, then
+/// closing both handles, which ends the cell) and times the loop itself.
+/// It logs `native: start-bench n=.. ns=.. per_ns=..`.
+fn caller_start(m: &Mounted) {
+    use cap::{Cap, Rights};
+
+    use crate::kcell::{Object, rights};
+    const RUNS: &str = "20";
+    // An image object lives for the life of the system, as IMAGE_CREATE's.
+    let image: &'static Mounted = alloc::boxed::Box::leak(alloc::boxed::Box::new(Mounted {
+        image: m.image,
+        disk: m.disk,
+    }));
+    let system = System::new(CELL_PAGES * 2).unwrap_or_else(|| fail("bench: no caller cell"));
+    let cell = system.cell.clone();
+    let me = cell
+        .install(Cap::mint(Object::Cell(cell.clone()), Rights::ALL))
+        .unwrap_or_else(|| fail("bench: no cell handle"));
+    let img = cell
+        .install(Cap::mint(
+            Object::Image(image),
+            Rights::DUPLICATE | Rights::INSPECT | rights::READ,
+        ))
+        .unwrap_or_else(|| fail("bench: no image handle"));
+    let hex = |h: cap::Handle| alloc::format!("{:x}", h.raw());
+    let pages = alloc::format!("{CELL_PAGES}");
+    let argv = [
+        "nativetest",
+        "start-bench",
+        &hex(me),
+        &hex(img),
+        &pages,
+        RUNS,
+    ];
+    if crate::native::run(&cell, crate::nativetest::NATIVETEST, &argv) != Some(0) {
+        fail("bench: the caller-side container start failed");
+    }
+    // The cell holds a handle to itself; closing it breaks the cycle.
+    let _ = cell.close(me);
+    let _ = cell.close(img);
 }

@@ -10,7 +10,8 @@ use frame::println;
 use crate::kcell::{Object, System};
 
 /// The test service (built by xtask for `x86_64-unknown-none`).
-static NATIVETEST: &[u8] = include_bytes!(concat!(env!("ICHOR_SERVICES_DIR"), "/ichor-nativetest"));
+pub(crate) static NATIVETEST: &[u8] =
+    include_bytes!(concat!(env!("ICHOR_SERVICES_DIR"), "/ichor-nativetest"));
 
 fn fail(what: &str) -> ! {
     println!("ichor: nativetest FAILED: {what}");

@@ -736,8 +736,11 @@ types, Ice Lake, Milan and Rome: `docs/benchmarks.md` (second round, with
 fault-around and safe RET: system calls 1.5-3x Linux, pipes and fork
 cheaper, 4 KiB page faults cheaper on AMD and slower on Intel; Linux's
 own figures are huge-page faults, THP being on; container start 0.3-0.5
-ms against 1.3-2 ms for `unshare`, 5-7 ms crun, 15-22 ms runc, 250-600 ms
-Docker).
+ms in the kernel against 1.3-2 ms for `unshare`, 5-7 ms crun, 15-22 ms
+runc, 250-600 ms Docker). `bench` also times it from a native caller
+(`nativetest start-bench`: CELL_CREATE, CELL_SPAWN `/bin/true`,
+PROCESS_WAIT, close), the way Linux's is timed: 186 us on OpenVMM (Zen 3);
+the in-kernel row copies all of busybox per start, so it reads high.
 
 Frame budget: ADR-0005 sets the milestone 3 ceiling at 8,500 lines / 380
 sites; ADR-0007 raises it to 9,500 / 420 for milestone 4 (TLB shootdown,

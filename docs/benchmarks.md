@@ -195,6 +195,28 @@ Reading it:
 - Entries still cost Ichor more than Linux on Intel (309 against 107 ns),
   where neither has an expensive mitigation: Ichor's syscall path itself.
 
+## Container start from the caller's side
+
+Linux's container starts above are timed by the caller: a shell starts
+`unshare`, `crun` or `docker`, which asks the kernel for the container
+and waits until `/bin/true` has exited and been reaped. Ichor's "container
+start" row is timed inside the kernel instead, and it loads busybox from a
+byte buffer, copying all 1.1 MB of it into the new process on every start:
+not what a container gets. Since 2026-11-23, `bench` also
+times it the Linux way: `services/nativetest` (`start-bench`), a native
+process in a system cell holding that cell and the root disk as an image,
+runs `CELL_CREATE`, `CELL_SPAWN` of `/bin/true` from the container's root,
+`PROCESS_WAIT` until it is reaped, and closes both handles (the cell ends
+with its last one), 20 times after three to warm up, timed with the
+native clock. It logs `native: start-bench n=20 ns=.. per_ns=..`. This is
+the path the control plane's `CreateCell` and `Run` take, without the API
+around it.
+
+First run (OpenVMM on a Ryzen 5600X, 4 vCPUs, safe RET on): **186 us** a
+start from the caller, against 483 us for the in-kernel row of the same
+boot. That compares with Linux's `unshare` (1.3-2.1 ms) and crun (5-7 ms)
+on GCP; the API path, comparable to `docker run`, is not timed yet.
+
 Caveats: in the QEMU comparisons above (before `91a5a17`), Linux runs with
 its default CPU-vulnerability mitigations, which Ichor did not all apply
 yet (ADR-0004). Container start has no Linux

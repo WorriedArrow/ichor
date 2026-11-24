@@ -882,6 +882,8 @@ fn benchmarks_run_and_report() {
         "ichor: bench: fork + wait: ",
         "ichor: bench: fork + exec + wait: ",
         "ichor: bench: container start: ",
+        // The same from a native caller: create, spawn, wait, close.
+        "native: start-bench n=20 ns=",
         "ichor: bench: done",
     ]);
 }

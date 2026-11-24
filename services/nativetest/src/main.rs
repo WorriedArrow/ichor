@@ -51,6 +51,9 @@ fn wait_for(h: &Handle, events: u32) -> bool {
 }
 
 fn main(args: &[&str]) -> i32 {
+    if args.get(1) == Some(&"start-bench") {
+        return start_bench(args);
+    }
     let (Some(cell), Some(switch)) = (handle(args.get(1)), handle(args.get(2))) else {
         return fail("no cell and switch handles");
     };
@@ -61,6 +64,57 @@ fn main(args: &[&str]) -> i32 {
         }
         Err(what) => fail(what),
     }
+}
+
+/// Container start timed from the caller's side, as a container runtime
+/// sees it (`start-bench CELL IMAGE PAGES RUNS`, from the kernel's
+/// `bench`): a cell made from the image, `/bin/true` spawned in it, waited
+/// for until it has exited and been reaped, and the process and the cell
+/// closed (the cell is gone when its last handle is), `RUNS` times after
+/// three to warm up, all timed with the native clock. Logs one
+/// `native: start-bench` line with the total and per-start nanoseconds.
+fn start_bench(args: &[&str]) -> i32 {
+    let (Some(cell), Some(image)) = (handle(args.get(2)), handle(args.get(3))) else {
+        return fail("start-bench: no cell and image handles");
+    };
+    let num = |i: usize| args.get(i).and_then(|s| s.parse::<u64>().ok());
+    let (Some(pages), Some(runs)) = (num(4), num(5)) else {
+        return fail("start-bench: no pages and runs");
+    };
+    let one = || -> Result<(), &'static str> {
+        let c = rt::cell_create(&cell, &image, pages).map_err(|_| "CELL_CREATE")?;
+        let p = rt::cell_spawn(&c, &["/bin/true"], &[]).map_err(|_| "CELL_SPAWN")?;
+        let status = loop {
+            match rt::process_wait(&p) {
+                Err(Error::WouldBlock) if wait_for(&p, rt::HANGUP) => {}
+                Err(_) => return Err("PROCESS_WAIT"),
+                Ok(s) => break s,
+            }
+        };
+        if status != 0 {
+            return Err("/bin/true did not exit 0");
+        }
+        drop(p);
+        drop(c);
+        Ok(())
+    };
+    for _ in 0..3 {
+        if let Err(what) = one() {
+            return fail(what);
+        }
+    }
+    let start = rt::monotonic();
+    for _ in 0..runs {
+        if let Err(what) = one() {
+            return fail(what);
+        }
+    }
+    let ns = rt::monotonic() - start;
+    rt::log!(
+        "native: start-bench n={runs} ns={ns} per_ns={}",
+        ns / runs.max(1)
+    );
+    0
 }
 
 fn run(cell: &Handle, switch: &Handle) -> Result<(), &'static str> {
