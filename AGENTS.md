@@ -739,8 +739,12 @@ own figures are huge-page faults, THP being on; container start 0.3-0.5
 ms in the kernel against 1.3-2 ms for `unshare`, 5-7 ms crun, 15-22 ms
 runc, 250-600 ms Docker). `bench` also times it from a native caller
 (`nativetest start-bench`: CELL_CREATE, CELL_SPAWN `/bin/true`,
-PROCESS_WAIT, close), the way Linux's is timed: 186 us on OpenVMM (Zen 3);
-the in-kernel row copies all of busybox per start, so it reads high.
+PROCESS_WAIT, close), the way Linux's is timed: 209-223 us on GCP, 165-186
+us on OpenVMM; the in-kernel row copies all of busybox per start, so it
+reads high. Through the gRPC API (`api_bench=IMAGE`): 1.8 ms on OpenVMM,
+16.8-17 ms on GCP, where the control plane's three log lines per
+container wait for the 115,200-baud serial console (console writes are
+synchronous: worth making asynchronous).
 
 Frame budget: ADR-0005 sets the milestone 3 ceiling at 8,500 lines / 380
 sites; ADR-0007 raises it to 9,500 / 420 for milestone 4 (TLB shootdown,
@@ -907,7 +911,8 @@ comment.
 | `srso=ibpb` | on CPUs SRSO or Retbleed affects, IBPB on every entry instead of safe-RET return thunks |
 | `trace_errors` | log every failing Linux syscall (pid, number, first arguments, errno) |
 | `trace_pid=N` | log every Linux syscall of pid N with its result |
-| `bench` | run the Phase E benchmarks (`bench.rs`) after the root disk's self-tests and print them |
+| `bench` | run the Phase E benchmarks (`bench.rs`) after the root disk's self-tests and print them, container start also from a native caller (`nativetest start-bench`) |
+| `api_bench=IMAGE` | with `control=PORT`: a client beside the control plane, in its cell, pulls IMAGE, then times 20 rounds of `CreateCell`, `Run /bin/true`, `Destroy` over the API on loopback (`nativetest api-bench`; logs `native: api-bench`); add `control_exit` to end the run there |
 | `cell_access` | run the cell access-control suite (`cellaccess.rs`) after the Debian checks |
 | `cell_access_uplink` | with `cell_access`: check the uplink too; a host client must be connecting to a forward of port 7300 |
 | `net_echo_port=N` | the kernel's TCP, then a Debian cell through NAT, echo 256 KiB with the host's echo server at 10.0.2.2:N |

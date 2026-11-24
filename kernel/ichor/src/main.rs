@@ -269,6 +269,7 @@ fn kmain(info: BootInfo) -> ! {
             pick(info.api_token(), &from_cloud.api_token),
             pick(info.api_tls(), &from_cloud.api_tls),
             &options,
+            cmdline::Cmdline::new(&merged).get("api_bench"),
         );
         println!("ichor: control: exited with {code:?}");
         if code != Some(0) {

@@ -15,6 +15,8 @@ bench = false
 [dependencies]
 rt.workspace = true
 layer.workspace = true
+# The control-plane API client of `api-bench` (a path crate, no external code).
+grpc.workspace = true
 
 [lints]
 workspace = true

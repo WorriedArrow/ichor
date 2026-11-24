@@ -21,6 +21,8 @@ use rt::{Error, Handle, WaitItem};
 
 rt::main!(main);
 
+mod apibench;
+
 /// The recorded `hello-world` layer blob (an HTTP response; its body is
 /// the gzip'd tar).
 const LAYER: &[u8] = include_bytes!("../../oci/testdata/hello-world/07.http");
@@ -53,6 +55,12 @@ fn wait_for(h: &Handle, events: u32) -> bool {
 fn main(args: &[&str]) -> i32 {
     if args.get(1) == Some(&"start-bench") {
         return start_bench(args);
+    }
+    if args.get(1) == Some(&"api-bench") {
+        return match apibench::run(args) {
+            Ok(()) => 0,
+            Err(what) => fail(what),
+        };
     }
     let (Some(cell), Some(switch)) = (handle(args.get(1)), handle(args.get(2))) else {
         return fail("no cell and switch handles");

@@ -66,6 +66,7 @@ pub(crate) fn run(
     (token, token_from): (&'static [u8], &str),
     (tls, tls_from): (&'static [u8], &str),
     options: &[alloc::string::String],
+    api_bench: Option<&str>,
 ) -> Option<u64> {
     use alloc::format;
     // Most of memory: the control plane holds pulled layers and images,
@@ -116,8 +117,41 @@ pub(crate) fn run(
     let mut argv = alloc::vec!["control", me_s.as_str(), &switch_s, &roots_s];
     argv.extend(options.iter().map(alloc::string::String::as_str));
     argv.extend(blobs.iter().map(alloc::string::String::as_str));
+    if let Some(image) = api_bench {
+        start_api_bench(&cell, options, image);
+    }
     let code = crate::native::run(&cell, CONTROL, &argv);
     // The cell's handle to itself would keep it alive forever.
     let _ = cell.close(me);
     code
+}
+
+/// Container start through the API, timed by a client beside the control
+/// plane (`api_bench=IMAGE`; Docker's client beside `dockerd`):
+/// `nativetest api-bench` on its own task in the control plane's cell,
+/// reaching it on that cell's loopback. It pulls `IMAGE` once, then times
+/// 20 rounds of `CreateCell`, `Run` of `/bin/true` and `Destroy`, and logs
+/// `native: api-bench n=.. ns=.. per_ns=..`; with `control_exit`, its
+/// hanging up ends the run.
+fn start_api_bench(
+    cell: &alloc::sync::Arc<crate::kcell::Cell>,
+    options: &[alloc::string::String],
+    image: &str,
+) {
+    let port = options
+        .iter()
+        .find_map(|o| o.strip_prefix("port="))
+        .unwrap_or("50051");
+    let port = alloc::string::String::from(port);
+    let (cell, image) = (cell.clone(), alloc::string::String::from(image));
+    let task = frame::task::TaskOptions::new(move || {
+        let argv = ["nativetest", "api-bench", &port, &image, "20"];
+        if crate::native::run(&cell, crate::nativetest::NATIVETEST, &argv) != Some(0) {
+            println!("ichor: bench: the API container start failed");
+        }
+    })
+    .spawn();
+    if task.is_none() {
+        println!("ichor: bench: could not start the API client");
+    }
 }

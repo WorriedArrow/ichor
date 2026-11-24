@@ -212,10 +212,44 @@ native clock. It logs `native: start-bench n=20 ns=.. per_ns=..`. This is
 the path the control plane's `CreateCell` and `Run` take, without the API
 around it.
 
-First run (OpenVMM on a Ryzen 5600X, 4 vCPUs, safe RET on): **186 us** a
-start from the caller, against 483 us for the in-kernel row of the same
-boot. That compares with Linux's `unshare` (1.3-2.1 ms) and crun (5-7 ms)
-on GCP; the API path, comparable to `docker run`, is not timed yet.
+Through the API too, as `docker run --rm` is timed against `dockerd`:
+`api_bench=IMAGE` (with `control=PORT control_exit`) starts
+`nativetest api-bench` in the control plane's own cell, reaching it on
+that cell's loopback over HTTP/2 (Docker's client reaches `dockerd` over
+a local socket). It pulls the image once, untimed (Docker's was already
+present), then times 20 rounds of `CreateCell`, `Run` of `/bin/true`
+until its exit status arrives, and `Destroy`, after three to warm up. The
+image is Docker Hub's `busybox:1.36.1-musl`
+(`sha256:3c6ae8008e2c2eedd141725c30b20d9c36b026eb796688f88205845ef17aa213`),
+a static busybox like the Linux runs'.
+
+Results (2026-11-23; GCP the same machine types as the Linux rows above,
+one boot each):
+
+| Container start, from the caller | n2 (Ice Lake) | Milan | Rome | OpenVMM, Ryzen 5600X |
+|---|---|---|---|---|
+| Ichor, native ABI | 223 us | 209 us | 210 us | 165-186 us |
+| Ichor, gRPC API | 17.0 ms | 16.8 ms | 16.8 ms | 1.83 ms |
+| Linux, `unshare` | 1.29 ms | 2.06 ms | 1.92 ms | |
+| Linux, crun | 4.9 ms | 6.7 ms | 6.5 ms | |
+| Linux, runc | 15.4 ms | 22.1 ms | 21.8 ms | |
+| Linux, `docker run --rm --network none` | 251 ms | 264 ms | 256 ms | |
+| Linux, `docker run --rm` | 583 ms | 591 ms | 602 ms | |
+
+Reading it:
+
+- From a caller, an Ichor container starts in about 0.2 ms: 6-10x faster
+  than Linux's bare `unshare` and 25-30x faster than crun on the same
+  machines.
+- Through the API it took 16.8-17 ms on every GCP machine, whatever the
+  CPU, and 1.83 ms under OpenVMM. The difference is the console: the
+  control plane logs three lines per container (about 190 bytes), and a
+  kernel console write waits for the serial port, which on GCP runs at
+  115,200 baud (190 bytes take 16.5 ms); OpenVMM's port has no such
+  rate. So the API itself costs about 1.6 ms over the native call, and on
+  GCP the console log costs another 15. `dockerd` logs to journald
+  without waiting. Even so, it is 15x faster than `docker run --rm
+  --network none`.
 
 Caveats: in the QEMU comparisons above (before `91a5a17`), Linux runs with
 its default CPU-vulnerability mitigations, which Ichor did not all apply
