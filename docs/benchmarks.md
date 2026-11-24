@@ -230,6 +230,7 @@ one boot each):
 |---|---|---|---|---|
 | Ichor, native ABI | 223 us | 209 us | 210 us | 165-186 us |
 | Ichor, gRPC API | 17.0 ms | 16.8 ms | 16.8 ms | 1.83 ms |
+| Ichor, gRPC API, console buffered (ADR-0019) | 1.07 ms | 0.88 ms | 0.98 ms | |
 | Linux, `unshare` | 1.29 ms | 2.06 ms | 1.92 ms | |
 | Linux, crun | 4.9 ms | 6.7 ms | 6.5 ms | |
 | Linux, runc | 15.4 ms | 22.1 ms | 21.8 ms | |
@@ -246,10 +247,11 @@ Reading it:
   control plane logs three lines per container (about 190 bytes), and a
   kernel console write waits for the serial port, which on GCP runs at
   115,200 baud (190 bytes take 16.5 ms); OpenVMM's port has no such
-  rate. So the API itself costs about 1.6 ms over the native call, and on
-  GCP the console log costs another 15. `dockerd` logs to journald
-  without waiting. Even so, it is 15x faster than `docker run --rm
-  --network none`.
+  rate. `dockerd` logs to journald without waiting. ADR-0019 made console
+  writes buffered, drained by a kernel task: the API then took 0.88-1.07
+  ms on GCP (the native path 203-226 us in the same boots), so a
+  container through the API starts about 250x faster than `docker run
+  --rm --network none` and 5-6x faster than crun on the same machines.
 
 Caveats: in the QEMU comparisons above (before `91a5a17`), Linux runs with
 its default CPU-vulnerability mitigations, which Ichor did not all apply

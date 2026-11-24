@@ -80,6 +80,7 @@ pub fn power_button() -> bool {
 
 /// Turns the machine off (ACPI S5); if it has no way to, halts.
 pub fn power_off() -> ! {
+    crate::console::flush();
     if let Some((pm1, Some((a, b)))) = *PM1.lock() {
         arch::disable_local_interrupts();
         for (cnt, typ) in [(Some(pm1.cnt_a), a), (pm1.cnt_b, b)] {
@@ -117,6 +118,11 @@ pub enum ExitStatus {
 /// VM with a status the test harness understands. Otherwise every CPU that
 /// calls it halts. (ACPI power-off arrives with ACPI support in milestone 1.)
 pub fn shutdown(status: ExitStatus) -> ! {
+    // What the console still holds goes out first (the panic handler
+    // flushed it itself, if it could).
+    if !crate::panic::in_progress() {
+        crate::console::flush();
+    }
     if QEMU_DEBUG_EXIT.load(Ordering::Relaxed) {
         arch::qemu::exit(match status {
             ExitStatus::Success => arch::qemu::EXIT_SUCCESS,

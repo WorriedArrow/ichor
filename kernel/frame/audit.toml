@@ -35,5 +35,6 @@
 # entry, IBPB on entry, AutoIBRS, RSB filling, masked indices): 7,000 / 300.
 # Step 14 (ADR-0004's safe-RET amendment of 2026-11-23: return thunks, and
 # AMD's IBRS bit before them): 7,250 / 310.
-max_code_lines = 7250
+# Step 15 (ADR-0019: console writes buffered, drained by a task): 7,350 / 310.
+max_code_lines = 7350
 max_unsafe_sites = 310

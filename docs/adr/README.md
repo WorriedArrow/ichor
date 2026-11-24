@@ -24,6 +24,7 @@ brief where they conflict with it.
 | [0016](0016-hyper-v.md) | Hyper-V guests: VMBus, its disks and its network | Accepted |
 | [0017](0017-power-button.md) | The ACPI power button and soft off (S5) | Accepted |
 | [0018](0018-kvmclock.md) | kvmclock is the clock on KVM | Accepted |
+| [0019](0019-asynchronous-console.md) | Console writes do not wait for the serial port | Accepted |
 
 ## Planned
 

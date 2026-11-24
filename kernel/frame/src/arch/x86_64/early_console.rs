@@ -73,6 +73,27 @@ fn wait_empty() {
     }
 }
 
+/// How many bytes the transmitter takes now without waiting: a FIFO-full
+/// if it is empty, else none.
+pub(crate) fn room_now() -> usize {
+    if read_reg(LSR) & LSR_THR_EMPTY == 0 {
+        0
+    } else {
+        TX_ROOM.load(Ordering::Relaxed)
+    }
+}
+
+/// Waits (bounded) until the transmitter is empty; how many bytes it takes.
+pub(crate) fn wait_room() -> usize {
+    wait_empty();
+    TX_ROOM.load(Ordering::Relaxed)
+}
+
+/// Hands the transmitter one byte; the caller knows it has room.
+pub(crate) fn put(b: u8) {
+    write_reg(DATA, b);
+}
+
 /// Writes every byte, polling the line status once per FIFO-full rather
 /// than once per byte. Under a hypervisor each register access is a VM
 /// exit, so this nearly halves the cost of console output.

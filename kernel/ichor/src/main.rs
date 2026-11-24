@@ -78,6 +78,20 @@ fn watch_power_button() {
     }
 }
 
+/// Writes out console output the serial port could not take when it was
+/// written (ADR-0019): every millisecond while some waits, every 20 when
+/// none does. (Writers do not wake it: they print from any context, the
+/// scheduler's included.)
+fn drain_console() {
+    let drain = || loop {
+        let ms = if frame::console::drain() { 1 } else { 20 };
+        frame::task::sleep_until(frame::time::now() + core::time::Duration::from_millis(ms));
+    };
+    if frame::task::TaskOptions::new(drain).spawn().is_none() {
+        println!("ichor: console: no task to drain the console; writers drain it");
+    }
+}
+
 fn kmain(info: BootInfo) -> ! {
     let (major, minor) = info.uefi_revision();
     println!(
@@ -178,6 +192,7 @@ fn kmain(info: BootInfo) -> ! {
 
     // Milestone 2: tasks and scheduling.
     frame::task::inject_scheduler(&sched::SCHEDULER);
+    drain_console();
     watch_power_button();
     selftest::threads();
     selftest::preemption();

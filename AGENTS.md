@@ -741,10 +741,11 @@ runc, 250-600 ms Docker). `bench` also times it from a native caller
 (`nativetest start-bench`: CELL_CREATE, CELL_SPAWN `/bin/true`,
 PROCESS_WAIT, close), the way Linux's is timed: 209-223 us on GCP, 165-186
 us on OpenVMM; the in-kernel row copies all of busybox per start, so it
-reads high. Through the gRPC API (`api_bench=IMAGE`): 1.8 ms on OpenVMM,
-16.8-17 ms on GCP, where the control plane's three log lines per
-container wait for the 115,200-baud serial console (console writes are
-synchronous: worth making asynchronous).
+reads high. Through the gRPC API (`api_bench=IMAGE`): 0.88-1.07 ms on GCP
+since ADR-0019 (console writes go into a 64 KiB ring that a kernel task,
+`drain_console`, empties as the port takes it; shutdown and panics flush
+it); before it 16.8-17 ms, the control plane's three log lines per
+container waiting for the 115,200-baud serial port.
 
 Frame budget: ADR-0005 sets the milestone 3 ceiling at 8,500 lines / 380
 sites; ADR-0007 raises it to 9,500 / 420 for milestone 4 (TLB shootdown,
