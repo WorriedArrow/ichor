@@ -234,6 +234,7 @@ one boot each):
 | Linux, `unshare` | 1.29 ms | 2.06 ms | 1.92 ms | |
 | Linux, crun | 4.9 ms | 6.7 ms | 6.5 ms | |
 | Linux, runc | 15.4 ms | 22.1 ms | 21.8 ms | |
+| Linux, containerd `ctr run --rm` (no CNI) | 126.5 ms | 122.8 ms | 122.2 ms | |
 | Linux, `docker run --rm --network none` | 251 ms | 264 ms | 256 ms | |
 | Linux, `docker run --rm` | 583 ms | 591 ms | 602 ms | |
 
@@ -252,6 +253,52 @@ Reading it:
   ms on GCP (the native path 203-226 us in the same boots), so a
   container through the API starts about 250x faster than `docker run
   --rm --network none` and 5-6x faster than crun on the same machines.
+
+## End to end with networking: Ichor against containerd + CNI
+
+Process start is a small slice of a container's start in an orchestrated
+node: the image pull, the root file system snapshot and the network
+setup are where the time goes. This compares the whole path, with the
+image cached and networking attached, on the same three GCP machine types
+(2026-11-23), both pulling Docker Hub's `busybox:1.36.1-musl` by digest:
+
+- **Ichor**: the API client (`api_bench`) times `PullImage`, then the
+  first container from the image on its own (cold), then 20 after three to
+  warm up. Each is `CreateCell` (a root over the image and an address on
+  the cell switch, with NAT to the uplink), `Run` of `/bin/true` to its
+  exit, `Destroy`. A container's own `ip -4 -o addr` shows `10.88.0.30/16`.
+- **Linux**: Debian 12 with its containerd 1.6.20, runc 1.1.5 and CNI
+  plugins (`bridge` with `host-local` IPAM and masquerading: a veth into
+  the container's network namespace). `ctr image pull` timed, then the
+  first `ctr run --rm --cni` on its own (cold), then 50 after three to
+  warm up; and 50 without `--cni`, the same boot. A container's own `ip -4
+  -o addr` shows `10.22.0.3/16`. `ctr run --rm` includes the overlay
+  snapshot of the image's layers, the CNI add and delete, and runc.
+
+| | n2 (Ice Lake) | Milan | Rome |
+|---|---|---|---|
+| Ichor: pull | 16.5 s | 16.3 s | 11.2 s |
+| containerd: pull | 1.08 s | 1.09 s | 1.08 s |
+| Ichor: first container, network attached | 1.63 ms | 1.48 ms | 1.51 ms |
+| containerd + CNI: first container | 958 ms | 976 ms | 955 ms |
+| Ichor: container, network attached | 1.04 ms | 0.97 ms | 0.94 ms |
+| containerd + CNI: container | 152 ms | 157 ms | 153 ms |
+| containerd, no CNI: container | 118 ms | 119 ms | 117 ms |
+
+Reading it:
+
+- With the image cached and networking attached, a container starts about
+  150x faster on Ichor (about 1 ms against 152-157 ms), and the first one
+  about 600x faster (1.5 ms against 0.96 s, most of which is the first
+  CNI bridge and iptables setup). CNI adds 35 ms a container to
+  containerd's own 117-119 ms; Ichor's switch address costs nothing
+  measurable.
+- **The pull loses**: 11-16.5 s on Ichor against 1.1 s for containerd,
+  for a 0.9 MB layer. Under OpenVMM, on a home connection, the same pull
+  took 2.6-3.2 s, so something on GCP's network path (DNS, TCP, the
+  virtio-net driver, TLS) costs seconds; not yet found. From an empty
+  node, pull plus first start is about 2 s on Linux against 11-17 s on
+  Ichor today.
 
 Caveats: in the QEMU comparisons above (before `91a5a17`), Linux runs with
 its default CPU-vulnerability mitigations, which Ichor did not all apply

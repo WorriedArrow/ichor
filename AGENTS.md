@@ -745,7 +745,13 @@ reads high. Through the gRPC API (`api_bench=IMAGE`): 0.88-1.07 ms on GCP
 since ADR-0019 (console writes go into a 64 KiB ring that a kernel task,
 `drain_console`, empties as the port takes it; shutdown and panics flush
 it); before it 16.8-17 ms, the control plane's three log lines per
-container waiting for the 115,200-baud serial port.
+container waiting for the 115,200-baud serial port. End to end with
+networking against containerd 1.6 + CNI (bridge, host-local) on GCP,
+image cached: about 1 ms a container against 152-157 ms (`ctr run --rm
+--cni`), the first 1.5 ms against 0.96 s; but Ichor's pull of the same
+0.9 MB busybox takes 11-16.5 s there against containerd's 1.1 s (2.6-3.2
+s under OpenVMM): something on GCP's network path costs seconds, not yet
+found. `api_bench` logs `pull_ns`, `cold_ns` and a container's addresses.
 
 Frame budget: ADR-0005 sets the milestone 3 ceiling at 8,500 lines / 380
 sites; ADR-0007 raises it to 9,500 / 420 for milestone 4 (TLB shootdown,

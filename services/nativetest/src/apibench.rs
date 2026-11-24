@@ -119,8 +119,9 @@ impl Api {
         }
     }
 
-    /// One container: created, `/bin/true` run to its exit, destroyed.
-    fn start(&mut self, image_id: &str) -> Result<(), &'static str> {
+    /// One container: created (with its address on the cell switch), `argv`
+    /// run to its exit, destroyed; what it wrote.
+    fn container(&mut self, image_id: &str, argv: &[&str]) -> Result<Vec<u8>, &'static str> {
         let req = control::CreateCellRequest {
             image_id: image_id.to_string(),
             memory_bytes: 64 << 20,
@@ -131,19 +132,29 @@ impl Api {
             .cell_id;
         let run = control::RunRequest {
             cell_id: cell.clone(),
-            argv: alloc::vec![String::from("/bin/true")],
+            argv: argv.iter().map(|a| a.to_string()).collect(),
             env: Vec::new(),
         };
-        let events = self.ok(control::RUN, &run.encode())?;
-        let exited = events
-            .iter()
-            .any(|e| matches!(RunEvent::decode(e), Ok(RunEvent::ExitStatus(0))));
+        let mut output = Vec::new();
+        let mut exited = false;
+        for e in self.ok(control::RUN, &run.encode())? {
+            match RunEvent::decode(&e) {
+                Ok(RunEvent::Output(b)) => output.extend_from_slice(&b),
+                Ok(RunEvent::ExitStatus(0)) => exited = true,
+                _ => {}
+            }
+        }
         if !exited {
-            return Err("api-bench: /bin/true did not exit 0");
+            return Err("api-bench: the program did not exit 0");
         }
         let req = control::CellRequest { cell_id: cell };
         self.ok(control::DESTROY, &req.encode())?;
-        Ok(())
+        Ok(output)
+    }
+
+    /// One container running `/bin/true`.
+    fn start(&mut self, image_id: &str) -> Result<(), &'static str> {
+        self.container(image_id, &["/bin/true"]).map(|_| ())
     }
 }
 
@@ -162,10 +173,29 @@ pub(crate) fn run(args: &[&str]) -> Result<(), &'static str> {
         reference: image.to_string(),
         layers: Vec::new(),
     };
+    let t = rt::monotonic();
     let m = api.ok(control::PULL_IMAGE, &req.encode())?;
+    let pull_ns = rt::monotonic() - t;
     let image_id = control::PullImageResponse::decode(m.first().ok_or("api-bench: no image")?)
         .map_err(|_| "api-bench: bad PullImageResponse")?
         .image_id;
+    // The first container from the image, on its own: nothing of it has
+    // been read yet but what the pull wrote.
+    let t = rt::monotonic();
+    api.start(&image_id)?;
+    let cold_ns = rt::monotonic() - t;
+    // The network a container gets: its address on the cell switch, as
+    // its own `ip` reports it.
+    let out = api.container(&image_id, &["/bin/ip", "-4", "-o", "addr"])?;
+    let text = String::from_utf8_lossy(&out);
+    let addrs: Vec<&str> = text
+        .lines()
+        .filter_map(|l| l.split_whitespace().skip_while(|w| *w != "inet").nth(1))
+        .collect();
+    rt::log!(
+        "native: api-bench addresses in a container: {}",
+        addrs.join(" ")
+    );
     for _ in 0..3 {
         api.start(&image_id)?;
     }
@@ -175,7 +205,7 @@ pub(crate) fn run(args: &[&str]) -> Result<(), &'static str> {
     }
     let ns = rt::monotonic() - t0;
     rt::log!(
-        "native: api-bench n={runs} ns={ns} per_ns={}",
+        "native: api-bench pull_ns={pull_ns} cold_ns={cold_ns} n={runs} ns={ns} per_ns={}",
         ns / runs.max(1)
     );
     Ok(())
