@@ -149,6 +149,18 @@ pub(crate) fn alloc(order: u8, tag: u8) -> Option<PhysAddr> {
     Some(PhysAddr::new(pfn as u64 * PAGE_SIZE))
 }
 
+/// Allocates `2^order` contiguous pages as that many blocks of one page,
+/// each marked with `tag` and freed on its own.
+pub(crate) fn alloc_pages(order: u8, tag: u8) -> Option<PhysAddr> {
+    let pa = alloc(order, tag)?;
+    let pfn = pa.pfn() as usize;
+    for m in meta::all().get(pfn..pfn + (1 << order))? {
+        m.order.store(0, Relaxed);
+        m.kind.store(tag, Relaxed);
+    }
+    Some(pa)
+}
+
 /// Frees a block from [`alloc`]. Panics (a kernel bug) if the block is not
 /// currently allocated with this order and tag.
 pub(crate) fn free(pa: PhysAddr, order: u8, tag: u8) {

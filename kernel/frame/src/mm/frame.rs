@@ -12,6 +12,7 @@
 //! mapping) frees the page. A `VmSpace` mapping also holds a count, so a page
 //! stays allocated as long as any cell maps it.
 
+use alloc::vec::Vec;
 use core::sync::atomic::Ordering::{AcqRel, Release};
 
 use super::meta::{self, kind};
@@ -34,6 +35,29 @@ impl UFrame {
         let f = UFrame { pa };
         f.writer().fill(0);
         Some(f)
+    }
+
+    /// Allocates 512 zeroed untyped pages that make one aligned 2 MiB block,
+    /// in address order, for [`super::VmSpace::map_huge`]. Each is a page of
+    /// its own, freed when its last handle and mapping go. `None` if memory
+    /// has no such block free.
+    pub fn alloc_zeroed_huge() -> Option<Vec<UFrame>> {
+        const PAGES: usize = 512;
+        let mut frames = Vec::new();
+        frames.try_reserve_exact(PAGES).ok()?;
+        let pa = page_alloc::alloc_pages(9, kind::UNTYPED)?;
+        for i in 0..PAGES as u64 {
+            let page = PhysAddr::new(pa.as_u64() + i * PAGE_SIZE);
+            if let Some(m) = meta::get(page.pfn()) {
+                m.refcount.store(1, Release);
+            }
+            frames.push(UFrame { pa: page });
+        }
+        let dst = core::ptr::with_exposed_provenance_mut::<u8>(phys_to_virt(pa) as usize);
+        // SAFETY: the linear-map alias of the 2 MiB block just allocated, which
+        // nothing else holds yet and no Rust reference points into.
+        unsafe { arch::fill_untyped(dst, 0, PAGES * PAGE_SIZE as usize) };
+        Some(frames)
     }
 
     /// The page's physical address.

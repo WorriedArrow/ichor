@@ -111,6 +111,64 @@ impl VmSpace {
         }
     }
 
+    /// Maps `frames`, the 512 pages of one aligned 2 MiB block in address
+    /// order (as [`UFrame::alloc_zeroed_huge`] gives them), at 2 MiB-aligned
+    /// user address `va` as one 2 MiB page with `prot` (ADR-0020). Rejected
+    /// if anything is mapped in that range.
+    ///
+    /// Each page holds a mapping reference, as if mapped alone, and the
+    /// calls on part of the range (`unmap_range`, `protect`,
+    /// `write_protect`) split the 2 MiB page into 4 KiB mappings of the same
+    /// pages first. If no page is left for the table that takes, the whole
+    /// 2 MiB page is unmapped instead: its owner must be ready to map those
+    /// pages again when they fault.
+    pub fn map_huge(&self, va: u64, frames: &[UFrame], prot: UserProt) -> Result<(), MapError> {
+        let base = frames.first().map_or(1, |f| f.phys().as_u64());
+        let in_order = (0u64..)
+            .zip(frames)
+            .all(|(i, f)| f.phys().as_u64() == base + i * super::PAGE_SIZE);
+        if frames.len() != 512 || !in_order {
+            return Err(MapError::Misaligned);
+        }
+        let mut alloc = alloc_table_page;
+        let emptied = {
+            let mut inner = self.inner.lock();
+            for f in frames {
+                f.incref_for_mapping();
+            }
+            // SAFETY: as in `map`; the 512 pages are untyped pages the
+            // frames own, in order, each with a reference just taken for
+            // this mapping.
+            let r = unsafe {
+                paging::user_map_huge(self.root, va, PhysAddr::new(base), prot, &mut alloc)
+            };
+            match r {
+                Ok(emptied) => {
+                    if self.order == 1 {
+                        let shadow = arch::entry::shadow_of(self.root);
+                        // SAFETY: as in `map`.
+                        unsafe { paging::copy_entry(self.root, shadow, paging::slot_of(va)) };
+                    }
+                    inner.mapped += frames.len();
+                    emptied
+                }
+                Err(e) => {
+                    for f in frames {
+                        frame::drop_untyped(f.phys());
+                    }
+                    return Err(e);
+                }
+            }
+        };
+        if let Some(table) = emptied {
+            // A CPU may still hold the empty table in its paging-structure
+            // caches: free it only once none can walk it.
+            super::tlb::shootdown(self.root.as_u64(), None);
+            page_alloc::free(table, 0, kind::PAGE_TABLE);
+        }
+        Ok(())
+    }
+
     /// Removes the mapping at `va`, if any. The page is released only
     /// after every CPU running this space has forgotten the translation.
     /// Must not be called in atomic mode.
@@ -139,11 +197,13 @@ impl VmSpace {
         let mut unmapped = Vec::new();
         let next = {
             let mut inner = self.inner.lock();
+            let mut alloc = alloc_table_page;
             // SAFETY: as in `map`; unmapping only clears leaves of this
-            // space. Each page keeps its mapping reference until the
-            // shootdown below is done.
-            let next =
-                unsafe { paging::user_unmap_range(self.root, start, end, max, &mut unmapped) };
+            // space (and splits its 2 MiB pages). Each page keeps its
+            // mapping reference until the shootdown below is done.
+            let next = unsafe {
+                paging::user_unmap_range(self.root, start, end, max, &mut unmapped, &mut alloc)
+            };
             inner.mapped -= unmapped.len().min(inner.mapped);
             next
         };
@@ -164,29 +224,54 @@ impl VmSpace {
     }
 
     /// Changes the permissions of the mapping at `va`; on return no CPU
-    /// running this space can still use the old permissions. Must not be
-    /// called in atomic mode.
+    /// running this space can still use the old permissions. False if
+    /// nothing is mapped there (or a 2 MiB page there could not be split,
+    /// and was unmapped: see [`VmSpace::map_huge`]). Must not be called in
+    /// atomic mode.
     pub fn protect(&self, va: u64, prot: UserProt) -> bool {
-        let ok = {
+        let r = {
             let _inner = self.inner.lock();
+            let mut alloc = alloc_table_page;
             // SAFETY: as in `map`.
-            unsafe { paging::user_protect(self.root, va, prot) }
+            unsafe { paging::user_protect(self.root, va, prot, &mut alloc) }
         };
-        if ok {
-            super::tlb::shootdown(self.root.as_u64(), Some(va));
+        match r {
+            Ok(true) => super::tlb::shootdown(self.root.as_u64(), Some(va)),
+            Ok(false) => {}
+            Err(_) => self.unmap_huge_at(va),
         }
-        ok
+        r == Ok(true)
+    }
+
+    /// Unmaps the whole 2 MiB page around `va` (one that could not be split).
+    fn unmap_huge_at(&self, va: u64) {
+        let base = align_down(va, super::HUGE_PAGE_SIZE);
+        self.unmap_range(base, base.saturating_add(super::HUGE_PAGE_SIZE));
     }
 
     /// Makes the writable pages among `vas` read-only (keeping execute), with
     /// one TLB shootdown for all of them; on return no CPU running this space
-    /// can still write through the old permissions. Must not be called in
-    /// atomic mode.
+    /// can still write through the old permissions (a 2 MiB page that could
+    /// not be split is unmapped instead: see [`VmSpace::map_huge`]). Must not
+    /// be called in atomic mode.
     pub fn write_protect(&self, vas: &[u64]) {
+        let mut rest = vas;
+        // Out of memory for a split: that 2 MiB page goes whole.
+        while let Some(i) = self.write_protect_until(rest) {
+            self.unmap_huge_at(rest[i]);
+            rest = rest.get(i + 1..).unwrap_or_default();
+        }
+    }
+
+    /// `write_protect` until a 2 MiB page cannot be split: the index of its
+    /// address in `vas`.
+    fn write_protect_until(&self, vas: &[u64]) -> Option<usize> {
         let mut any = false;
+        let mut stopped = None;
         {
             let _inner = self.inner.lock();
-            for &va in vas {
+            let mut alloc = alloc_table_page;
+            for (i, &va) in vas.iter().enumerate() {
                 // SAFETY: as in `map`; a walk and a leaf update of this space.
                 if let Some((_, p)) = unsafe { paging::user_translate(self.root, va) }
                     && p.write
@@ -196,13 +281,20 @@ impl VmSpace {
                         exec: p.exec,
                     };
                     // SAFETY: as above.
-                    any |= unsafe { paging::user_protect(self.root, va, ro) };
+                    match unsafe { paging::user_protect(self.root, va, ro, &mut alloc) } {
+                        Ok(changed) => any |= changed,
+                        Err(_) => {
+                            stopped = Some(i);
+                            break;
+                        }
+                    }
                 }
             }
         }
         if any {
             super::tlb::shootdown(self.root.as_u64(), None);
         }
+        stopped
     }
 
     /// The aligned user `u32` at `va` as an atomic, under the space lock

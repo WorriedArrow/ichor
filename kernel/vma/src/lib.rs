@@ -165,8 +165,23 @@ impl<B: Clone + PartialEq> RegionMap<B> {
 
     /// The highest free, page-aligned `len`-byte range inside the window.
     pub fn find_free(&self, len: u64) -> Option<u64> {
+        self.find_free_aligned(len, PAGE)
+    }
+
+    /// The highest free `len`-byte range inside the window that starts on a
+    /// multiple of `align` (a power of two, at least a page).
+    pub fn find_free_aligned(&self, len: u64, align: u64) -> Option<u64> {
         let len = page_len(len)?;
+        if !align.is_power_of_two() || align < PAGE {
+            return None;
+        }
         let floor = self.lo.checked_add(len)?;
+        // The aligned start of a `len`-byte range ending at or below `top`,
+        // if it lies at or above `bottom`.
+        let fit = |bottom: u64, top: u64| {
+            let at = (top - len) & !(align - 1);
+            (at >= bottom).then_some(at)
+        };
         let mut top = self.hi;
         // Walk regions from the top of the window down, checking the gap
         // between each region's end and the current top.
@@ -174,12 +189,17 @@ impl<B: Clone + PartialEq> RegionMap<B> {
             if top < floor {
                 return None;
             }
-            if end <= top && top - end >= len {
-                return Some(top - len);
+            if end <= top
+                && let Some(at) = fit(end.max(self.lo), top)
+            {
+                return Some(at);
             }
             top = top.min(start);
         }
-        (top >= floor).then(|| top - len)
+        if top < floor {
+            return None;
+        }
+        fit(self.lo, top)
     }
 
     /// Reserves `[start, end)`, which must be page-aligned and free; false
@@ -369,6 +389,24 @@ mod tests {
         assert_eq!(m.find_free(PAGE), Some(a));
         // Too big for the hole: goes below `b`.
         assert_eq!(m.find_free(2 * PAGE), Some(b - 2 * PAGE));
+    }
+
+    #[test]
+    fn places_aligned_ranges_below_the_gaps_they_fit() {
+        const BIG: u64 = 2 << 20;
+        let mut m = map();
+        // A page at the top leaves the gap below it unaligned.
+        assert!(m.insert(HI - PAGE, HI, R, 0));
+        let a = m.find_free_aligned(BIG, BIG).unwrap();
+        assert_eq!(a, HI - 2 * BIG);
+        assert!(a.is_multiple_of(BIG) && m.is_free(a, a + BIG));
+        assert!(m.insert(a, a + BIG, R, 0));
+        // A gap big enough but never aligned is passed over.
+        assert!(m.insert(a - PAGE, a, R, 0));
+        assert!(m.insert(LO, a - BIG - PAGE, R, 0));
+        assert!(m.find_free_aligned(BIG, BIG).is_none());
+        assert_eq!(m.find_free(BIG), Some(a - BIG - PAGE));
+        assert!(m.find_free_aligned(PAGE, 3 * PAGE).is_none());
     }
 
     #[test]

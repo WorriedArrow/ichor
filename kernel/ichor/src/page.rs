@@ -45,6 +45,22 @@ pub(crate) fn charged(account: &Arc<Account>, frame: UFrame) -> Option<Page> {
     }))
 }
 
+/// Charges `account` for every frame of `frames` at once, or `None` (and
+/// nothing charged) if it cannot pay for all of them.
+pub(crate) fn charged_all(
+    account: &Arc<Account>,
+    frames: alloc::vec::Vec<UFrame>,
+) -> Option<alloc::vec::Vec<Page>> {
+    account.charge(frames.len() as u64).ok()?;
+    let page = |frame| {
+        Arc::new(Charged {
+            frame,
+            account: Some(account.clone()),
+        })
+    };
+    Some(frames.into_iter().map(page).collect())
+}
+
 /// Where a root's written files get their pages: the owning cell's account
 /// (a root without one is bounded by its byte budget alone).
 #[derive(Debug)]

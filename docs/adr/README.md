@@ -25,6 +25,7 @@ brief where they conflict with it.
 | [0017](0017-power-button.md) | The ACPI power button and soft off (S5) | Accepted |
 | [0018](0018-kvmclock.md) | kvmclock is the clock on KVM | Accepted |
 | [0019](0019-asynchronous-console.md) | Console writes do not wait for the serial port | Accepted |
+| [0020](0020-huge-anonymous-pages.md) | 2 MiB pages for anonymous memory | Accepted |
 
 ## Planned
 

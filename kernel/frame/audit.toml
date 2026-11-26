@@ -39,5 +39,7 @@
 # Step 16 (ADR-0008's 2026-11-25 amendment: no restore of registers that hold
 # the state, sysretq, the FS base cached, a VmSpace without a page tree, batch
 # write protection): 7,450 / 310.
-max_code_lines = 7450
+# Step 17 (ADR-0020: 2 MiB pages for anonymous memory, split on partial
+# changes): 7,650 / 310.
+max_code_lines = 7650
 max_unsafe_sites = 310

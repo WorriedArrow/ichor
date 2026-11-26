@@ -47,7 +47,7 @@ use cell::Account;
 
 use crate::file::File;
 use crate::linuxabi::shm::Attached;
-use crate::page::{Page, charged};
+use crate::page::{Page, charged, charged_all};
 use frame::mm::{PAGE_SIZE, UFrame, UserProt, VmSpace};
 use vma::{PageMap, PageSet, Prot, Region, RegionMap};
 
@@ -68,6 +68,8 @@ const PAGE_BATCH: usize = 4096;
 /// Pages an anonymous fault that follows the last one maps ahead of itself
 /// (`Mm::fault_around`): 64 KiB at a time with the faulting page.
 pub(crate) const FAULT_AROUND: u64 = 15;
+/// A 2 MiB page (`Mm::fault_huge`, ADR-0020).
+const HUGE: u64 = frame::mm::HUGE_PAGE_SIZE;
 /// Largest program break, relative to its start.
 const BRK_MAX: u64 = 1 << 30;
 
@@ -626,6 +628,10 @@ impl Mm {
             // does not explain: never loop on it.
             return (!write || p.write) && (!exec || p.exec);
         }
+        let anonymous = region.backing.anonymous();
+        if anonymous && va == self.next_anon && self.fault_huge(va, &region) {
+            return true;
+        }
         let Some(f) = self.frame(va) else {
             return false;
         };
@@ -634,17 +640,56 @@ impl Mm {
         }
         let prot = self.mapped_prot(va, region.prot);
         let ok = self.space.map(va, &f, prot).is_ok();
-        if ok && matches!(region.backing, Backing::Private | Backing::Named(_)) {
+        if ok && anonymous {
             self.fault_around(va, &region);
         }
         ok
+    }
+
+    /// A sequential anonymous fault at `va` (one that follows the last one's
+    /// pages) whose aligned 2 MiB block lies in `region` with no page in it
+    /// yet: maps the block as one 2 MiB page, zeroed and charged (512
+    /// pages), as Linux's transparent huge pages do (ADR-0020). Only a
+    /// sequential touch takes one, so a sparse one is not charged 2 MiB a
+    /// page. False, and nothing changed, if the block is not such, or memory
+    /// or the account has no 2 MiB for it (4 KiB pages do then).
+    fn fault_huge(&mut self, va: u64, region: &Region<Backing>) -> bool {
+        let block = va & !(HUGE - 1);
+        let Some(end) = block.checked_add(HUGE) else {
+            return false;
+        };
+        let room = self.account.available() >= HUGE / PAGE_SIZE;
+        if !room || block < region.start || end > region.end {
+            return false;
+        }
+        if self.pages.range(block..end).next().is_some() {
+            return false;
+        }
+        let Some(frames) = UFrame::alloc_zeroed_huge() else {
+            return false;
+        };
+        let mapped = self.space.map_huge(block, &frames, user_prot(region.prot));
+        let Some(pages) = mapped
+            .ok()
+            .and_then(|()| charged_all(&self.account, frames))
+        else {
+            self.space.unmap_range(block, end);
+            return false;
+        };
+        for (va, page) in (block..end).step_by(PAGE_SIZE as usize).zip(pages) {
+            self.pages.insert(va, page);
+        }
+        self.next_anon = end;
+        true
     }
 
     /// After an anonymous fault at `va`: if it follows the last one's pages
     /// (a sequential touch), maps up to `FAULT_AROUND` more pages of the
     /// same region ahead of it now, zeroed and charged, as Linux's
     /// multi-size THP does for anonymous memory with 64 KiB folios. Each
-    /// stops at a page already there, the region's end, or the account's.
+    /// stops at a page already there, the region's end, the account's, or
+    /// the next 2 MiB boundary (where the touch, if it goes on, may take a
+    /// 2 MiB page: `fault_huge`).
     fn fault_around(&mut self, va: u64, region: &Region<Backing>) {
         let sequential = va == self.next_anon;
         self.next_anon = va + PAGE_SIZE;
@@ -652,7 +697,11 @@ impl Mm {
             return;
         }
         let prot = user_prot(region.prot);
-        let end = region.end.min(va + (FAULT_AROUND + 1) * PAGE_SIZE);
+        let boundary = (va & !(HUGE - 1)).saturating_add(HUGE);
+        let end = region
+            .end
+            .min(va + (FAULT_AROUND + 1) * PAGE_SIZE)
+            .min(boundary);
         let mut at = va + PAGE_SIZE;
         while at < end {
             if self.pages.contains_key(&at) || self.space.translate(at).is_some() {
@@ -775,8 +824,16 @@ impl Mm {
                 && addr.is_multiple_of(PAGE_SIZE)
                 && addr.checked_add(len).is_some_and(|e| e <= USER_TOP)
                 && self.regions.is_free(addr, addr + len);
+            // Private anonymous memory a whole number of 2 MiB long starts on
+            // a 2 MiB boundary, so it can take 2 MiB pages, as on Linux.
+            let huge = file.is_none() && map_flags & MAP_SHARED == 0 && len.is_multiple_of(HUGE);
             if hinted {
                 addr
+            } else if let Some(at) = huge
+                .then(|| self.regions.find_free_aligned(len, HUGE))
+                .flatten()
+            {
+                at
             } else {
                 self.regions.find_free(len).ok_or(ENOMEM)?
             }

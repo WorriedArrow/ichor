@@ -25,6 +25,7 @@ mod debiantest;
 mod dev;
 mod file;
 mod futex;
+mod hugetest;
 mod hv;
 mod itimer;
 mod kcell;
@@ -206,6 +207,7 @@ fn kmain(info: BootInfo) -> ! {
     celltest::run();
     proctest::run();
     copytest::frame_race();
+    hugetest::run();
     runtest::run();
     // The network first: the disks' cell tests use its uplink.
     nettest::run();

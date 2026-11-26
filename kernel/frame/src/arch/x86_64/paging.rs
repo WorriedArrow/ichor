@@ -326,10 +326,18 @@ pub(crate) unsafe fn set_entry(pa: PhysAddr, index: usize, value: u64) {
 }
 
 // ---------------------------------------------------------------------------
-// User address spaces (lower half, 4 KiB pages only).
+// User address spaces (lower half): 4 KiB pages, and 2 MiB pages of 512
+// pages each (ADR-0020), split back into 4 KiB pages when part of one
+// changes.
 // ---------------------------------------------------------------------------
 
 const USER: u64 = 1 << 2;
+/// The bits of a user leaf that say what it allows.
+const USER_BITS: u64 = PRESENT | WRITABLE | USER | NO_EXECUTE;
+/// A 2 MiB leaf's page address (bit 12 is its PAT bit).
+const HUGE_ADDR: u64 = ADDR_MASK & !(SIZE_2M - 1);
+/// Bytes of a 2 MiB user page.
+pub(crate) const USER_HUGE: u64 = SIZE_2M;
 
 /// One past the highest user virtual address.
 pub(crate) const USER_END: u64 = 0x0000_7fff_ffff_f000;
@@ -361,31 +369,70 @@ impl UserProt {
     }
 }
 
-/// Finds the last-level entry for `va`, creating intermediate tables with
-/// `alloc` when given.
+/// A page-table page from `alloc`: zeroed, exclusively owned, and meeting
+/// [`table`]'s contract.
+type Alloc<'b> = &'b mut dyn FnMut() -> Option<PhysAddr>;
+
+/// What [`user_leaf`] does on its way down.
+enum Walk<'b> {
+    /// Creates absent tables; stops at a 2 MiB page (`AlreadyMapped`).
+    Create(Alloc<'b>),
+    /// Splits a 2 MiB page into a table of 4 KiB pages; stops at an absent
+    /// table.
+    Split(Alloc<'b>),
+}
+
+/// Replaces the 2 MiB leaf `entry` (holding `e`) with a table of 512 4 KiB
+/// leaves for the same pages, with the same permissions: every translation
+/// stays what it was, so the TLB needs no flush for it. False if `alloc` has
+/// no page.
+fn split(entry: &AtomicU64, e: u64, alloc: Alloc<'_>) -> bool {
+    let Some(pa) = alloc() else {
+        return false;
+    };
+    // SAFETY: a fresh page-table page from `alloc` (its contract).
+    let t = unsafe { table(pa) };
+    let base = e & HUGE_ADDR;
+    for (i, leaf) in (0u64..).zip(t.iter()) {
+        leaf.store((base + i * PAGE_SIZE) | (e & USER_BITS), Relaxed);
+    }
+    entry.store(pa.as_u64() | PRESENT | WRITABLE | USER, Relaxed);
+    true
+}
+
+/// Finds the last-level entry for `va` as `walk` says.
 ///
 /// # Safety
 ///
 /// `root` and every table reachable from its lower half must satisfy
-/// [`table`]'s contract for `'a`; `alloc` must return zeroed pages that do.
+/// [`table`]'s contract for `'a`, and each of its 2 MiB leaves must map one
+/// aligned block of 512 untyped pages, each holding the one reference that
+/// leaf was given per page (so a split's 4 KiB leaves take them over).
 unsafe fn user_leaf<'a>(
     root: PhysAddr,
     va: u64,
-    mut alloc: Option<&mut dyn FnMut() -> Option<PhysAddr>>,
+    mut walk: Walk<'_>,
 ) -> Result<Option<&'a AtomicU64>, MapError> {
     if va >= USER_END || !va.is_multiple_of(PAGE_SIZE) {
         return Err(MapError::Misaligned);
     }
     // SAFETY: caller contract.
     let mut t: &'a Table = unsafe { table(root) };
-    for index in [pml4_index(va), pdpt_index(va), pd_index(va)] {
-        let e = t[index].load(Relaxed);
-        let next = if e & PRESENT != 0 {
-            if e & HUGE != 0 {
+    for (level, index) in [(3, pml4_index(va)), (2, pdpt_index(va)), (1, pd_index(va))] {
+        let mut e = t[index].load(Relaxed);
+        if e & PRESENT != 0 && e & HUGE != 0 {
+            // Only page directories hold user pages this large.
+            let (1, Walk::Split(a)) = (level, &mut walk) else {
                 return Err(MapError::AlreadyMapped);
+            };
+            if !split(&t[index], e, &mut **a) {
+                return Err(MapError::OutOfMemory);
             }
+            e = t[index].load(Relaxed);
+        }
+        let next = if e & PRESENT != 0 {
             PhysAddr::new(e & ADDR_MASK)
-        } else if let Some(a) = alloc.as_mut() {
+        } else if let Walk::Create(a) = &mut walk {
             let pa = a().ok_or(MapError::OutOfMemory)?;
             t[index].store(pa.as_u64() | PRESENT | WRITABLE | USER, Relaxed);
             pa
@@ -410,17 +457,73 @@ pub(crate) unsafe fn user_map(
     va: u64,
     pa: PhysAddr,
     prot: UserProt,
-    alloc: &mut dyn FnMut() -> Option<PhysAddr>,
+    alloc: Alloc<'_>,
 ) -> Result<(), MapError> {
     // SAFETY: caller contract.
-    let leaf = unsafe { user_leaf(root, va, Some(alloc)) }?.ok_or(MapError::OutOfMemory)?;
+    let leaf = unsafe { user_leaf(root, va, Walk::Create(alloc)) }?.ok_or(MapError::OutOfMemory)?;
     set_leaf(leaf, pa.as_u64(), prot.bits())
 }
 
-/// Removes the mappings in `[start, end)`, at most `max` of them, adding
-/// each one's address and page to `out`; returns where to go on from if it
-/// stopped at `max`. Tables that are absent are skipped whole. The caller
-/// must flush the TLB.
+/// Maps the aligned block of 512 pages at `pa` at 2 MiB-aligned user address
+/// `va` as one 2 MiB page. A table there with nothing in it is replaced and
+/// returned: the caller frees it once no CPU can still walk it (after a TLB
+/// shootdown).
+///
+/// # Safety
+///
+/// [`user_leaf`]'s contract. The caller transfers one reference to each of
+/// the 512 untyped pages into the mapping.
+pub(crate) unsafe fn user_map_huge(
+    root: PhysAddr,
+    va: u64,
+    pa: PhysAddr,
+    prot: UserProt,
+    alloc: Alloc<'_>,
+) -> Result<Option<PhysAddr>, MapError> {
+    let aligned = va.is_multiple_of(SIZE_2M) && pa.as_u64().is_multiple_of(SIZE_2M);
+    if !aligned || va.checked_add(SIZE_2M).is_none_or(|e| e > USER_END) {
+        return Err(MapError::Misaligned);
+    }
+    // SAFETY: caller contract.
+    let mut t: &Table = unsafe { table(root) };
+    for index in [pml4_index(va), pdpt_index(va)] {
+        let e = t[index].load(Relaxed);
+        let next = if e & PRESENT != 0 {
+            PhysAddr::new(e & ADDR_MASK)
+        } else {
+            let pa = alloc().ok_or(MapError::OutOfMemory)?;
+            t[index].store(pa.as_u64() | PRESENT | WRITABLE | USER, Relaxed);
+            pa
+        };
+        // SAFETY: as in `user_leaf`.
+        t = unsafe { table(next) };
+    }
+    let entry = &t[pd_index(va)];
+    let e = entry.load(Relaxed);
+    let old = if e & PRESENT == 0 {
+        None
+    } else if e & HUGE != 0 {
+        return Err(MapError::AlreadyMapped);
+    } else {
+        let pt = PhysAddr::new(e & ADDR_MASK);
+        // SAFETY: a present non-leaf entry is one of this space's tables.
+        if unsafe { table(pt) }
+            .iter()
+            .any(|l| l.load(Relaxed) & PRESENT != 0)
+        {
+            return Err(MapError::AlreadyMapped);
+        }
+        Some(pt)
+    };
+    entry.store(pa.as_u64() | prot.bits() | HUGE, Relaxed);
+    Ok(old)
+}
+
+/// Removes the mappings in `[start, end)`, at most `max` pages of them,
+/// adding each page's address and page to `out`; returns where to go on from
+/// if it stopped at `max`. Tables that are absent are skipped whole. A 2 MiB
+/// page partly in the range is split first (a table from `alloc`); if there
+/// is no page for one, all of it goes. The caller must flush the TLB.
 ///
 /// # Safety
 ///
@@ -431,6 +534,7 @@ pub(crate) unsafe fn user_unmap_range(
     end: u64,
     max: usize,
     out: &mut alloc::vec::Vec<(u64, PhysAddr)>,
+    alloc: Alloc<'_>,
 ) -> Option<u64> {
     let end = end.min(USER_END);
     let mut va = start;
@@ -442,7 +546,24 @@ pub(crate) unsafe fn user_unmap_range(
             (30, pdpt_index(va)),
             (21, pd_index(va)),
         ] {
-            let e = t[index].load(Relaxed);
+            let mut e = t[index].load(Relaxed);
+            if e & PRESENT != 0 && e & HUGE != 0 && shift == 21 {
+                let base = va & !(SIZE_2M - 1);
+                let whole = va == base && end - base >= SIZE_2M;
+                if whole || !split(&t[index], e, &mut *alloc) {
+                    if !out.is_empty() && out.len() + 512 > max {
+                        return Some(va);
+                    }
+                    let pa = t[index].swap(0, Relaxed) & HUGE_ADDR;
+                    for i in 0..512 {
+                        let at = i * PAGE_SIZE;
+                        out.push((base + at, PhysAddr::new(pa + at)));
+                    }
+                    va = base + SIZE_2M;
+                    continue 'next;
+                }
+                e = t[index].load(Relaxed);
+            }
             if e & PRESENT == 0 || e & HUGE != 0 {
                 va = (va >> shift << shift) + (1 << shift);
                 continue 'next;
@@ -468,34 +589,63 @@ pub(crate) unsafe fn user_unmap_range(
     None
 }
 
-/// Changes the permissions of the mapping at `va`. The caller must flush
-/// the TLB.
+/// Changes the permissions of the mapping at `va`: `Ok(false)` if there is
+/// none. A 2 MiB page there is split first (a table from `alloc`);
+/// `Err(OutOfMemory)` if there is no page for one, and nothing changed. The
+/// caller must flush the TLB.
 ///
 /// # Safety
 ///
 /// [`user_leaf`]'s contract.
-pub(crate) unsafe fn user_protect(root: PhysAddr, va: u64, prot: UserProt) -> bool {
+pub(crate) unsafe fn user_protect(
+    root: PhysAddr,
+    va: u64,
+    prot: UserProt,
+    alloc: Alloc<'_>,
+) -> Result<bool, MapError> {
     // SAFETY: caller contract.
-    let Some(leaf) = unsafe { user_leaf(root, va, None) }.ok().flatten() else {
-        return false;
+    let leaf = match unsafe { user_leaf(root, va, Walk::Split(alloc)) } {
+        Ok(Some(leaf)) => leaf,
+        Err(MapError::OutOfMemory) => return Err(MapError::OutOfMemory),
+        _ => return Ok(false),
     };
     let e = leaf.load(Relaxed);
     if e & PRESENT == 0 {
-        return false;
+        return Ok(false);
     }
     leaf.store((e & ADDR_MASK) | prot.bits(), Relaxed);
-    true
+    Ok(true)
 }
 
-/// The page and permissions mapped at page-aligned `va`.
+/// The page and permissions mapped at page-aligned `va` (one of the 512
+/// pages of a 2 MiB page, in one).
 ///
 /// # Safety
 ///
 /// [`user_leaf`]'s contract.
 pub(crate) unsafe fn user_translate(root: PhysAddr, va: u64) -> Option<(PhysAddr, UserProt)> {
+    if va >= USER_END || !va.is_multiple_of(PAGE_SIZE) {
+        return None;
+    }
     // SAFETY: caller contract.
-    let leaf = unsafe { user_leaf(root, va, None) }.ok()??;
-    let e = leaf.load(Relaxed);
+    let mut t: &Table = unsafe { table(root) };
+    for (shift, index) in [
+        (39, pml4_index(va)),
+        (30, pdpt_index(va)),
+        (21, pd_index(va)),
+    ] {
+        let e = t[index].load(Relaxed);
+        if e & PRESENT == 0 || (e & HUGE != 0 && shift != 21) {
+            return None;
+        }
+        if e & HUGE != 0 {
+            let pa = (e & HUGE_ADDR) + (va & (SIZE_2M - 1));
+            return Some((PhysAddr::new(pa), UserProt::from_bits(e)));
+        }
+        // SAFETY: as in `user_leaf`.
+        t = unsafe { table(PhysAddr::new(e & ADDR_MASK)) };
+    }
+    let e = t[pt_index(va)].load(Relaxed);
     (e & PRESENT != 0).then(|| (PhysAddr::new(e & ADDR_MASK), UserProt::from_bits(e)))
 }
 
@@ -505,7 +655,7 @@ pub(crate) unsafe fn user_translate(root: PhysAddr, va: u64) -> Option<(PhysAddr
 /// # Safety
 ///
 /// [`user_leaf`]'s contract; the address space must not be active on any
-/// CPU.
+/// CPU. A 2 MiB page is a call for each of its 512 pages.
 pub(crate) unsafe fn user_teardown(
     root: PhysAddr,
     leaf: &mut dyn FnMut(PhysAddr),
@@ -525,6 +675,11 @@ pub(crate) unsafe fn user_teardown(
             let pa = PhysAddr::new(v & ADDR_MASK);
             if level == 1 {
                 leaf(pa);
+            } else if level == 2 && v & HUGE != 0 {
+                // A 2 MiB page: one reference to each of its pages.
+                for i in 0..512 {
+                    leaf(PhysAddr::new((v & HUGE_ADDR) + i * PAGE_SIZE));
+                }
             } else {
                 // SAFETY: a present non-leaf entry of a user address space
                 // points at one of its tables (`user_teardown`'s contract).

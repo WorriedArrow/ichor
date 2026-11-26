@@ -782,12 +782,21 @@ Null syscall 356 → 160 ns, page fault 1.26 → 0.44 us, fork + exec 161 →
 `cargo xtask disk-image --release --cmdline bench` under OpenVMM
 (`docs/cloud.md` has the command); the host varies runs by ~20%, so
 compare minimums of several rounds.
-Next: 2 MiB anonymous pages.
+2 MiB anonymous pages (ADR-0020, 2026-11-26): a sequential fault reaching
+an empty aligned 2 MiB block of private anonymous memory maps it whole
+(`Mm::fault_huge`, `VmSpace::map_huge`, `UFrame::alloc_zeroed_huge`: 512
+ordinary pages, each with its own reference); fault-around stops at 2 MiB
+boundaries; `mmap` aligns private anonymous mappings a whole number of
+2 MiB long. Partial `unmap_range`/`protect`/`write_protect` split one into
+4 KiB leaves (no page for the table: it is unmapped whole and faults back).
+`hugetest.rs` checks it on every boot. Page fault 455 → 261 ns locally
+(warm memory, same host load); not yet measured on GCP. Not yet:
+`MADV_HUGEPAGE`, collapse, 2 MiB pages after fork, `AnonHugePages`.
 
 Frame budget: ADR-0005 sets the milestone 3 ceiling at 8,500 lines / 380
 sites; ADR-0007 raises it to 9,500 / 420 for milestone 4 (TLB shootdown,
-atomic user ops for futexes, PCID). `audit.toml` is at step 16 (7,450 / 310,
-ADR-0008's 2026-11-25 amendment); frame is at 7,390 / 295 (A5 added
+atomic user ops for futexes, PCID). `audit.toml` is at step 17 (7,650 / 310,
+ADR-0020); frame is at 7,607 / 304 (A5 added
 RDSEED/RDRAND and UEFI GetTime; B added XSAVE; C the frames tree and
 request tracking; M6 reading `\ichor\roots.pem`, later
 `\ichor\suffixes.dat` too; ADR-0011 the checked user
@@ -797,7 +806,7 @@ amendment; the ACPI power button and S5, ADR-0017; kvmclock, ADR-0018; the
 wall clock's NTP steering; the rest of ADR-0004 §2; AMD's IBRS bit and the
 safe-RET return thunks, `arch::rethunk`; the console ring, ADR-0019;
 `sysretq`, skipped XRSTORs, a `VmSpace` without a page tree and batch
-write protection, ADR-0008's amendment). Growth past the step
+write protection, ADR-0008's amendment; 2 MiB user pages, ADR-0020). Growth past the step
 needs an ADR and a new audit step.
 `services/rt` has its own budget (`services/rt/audit.toml`: 500 / 40; at
 417 / 30).

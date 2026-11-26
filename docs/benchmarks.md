@@ -238,6 +238,29 @@ What changed:
 - **Fork** turns the parent's writable pages read-only a batch at a time
   with one TLB shootdown (`VmSpace::write_protect`), not one per page.
 
+## Local, OpenVMM: 2 MiB anonymous pages (2026-11-26)
+
+ADR-0020: a sequential touch of private anonymous memory takes a 2 MiB page
+per aligned block. The page-fault row (4,112 pages, 16 MiB) run four times
+in one boot each way, same machine and setup as above, under heavier host
+load than that section (null syscall 223-267 ns there, not 160), so compare
+these two columns only with each other. The in-program timing
+(`ichor-bench: page-fault n=4112`), per 4 KiB page:
+
+| Round | 4 KiB pages | 2 MiB pages |
+|---|---|---|
+| first (memory the guest never touched) | 1,088-1,561 ns | 693 ns |
+| best of the next three | 455 ns | 261 ns |
+
+- The first round pays the host for backing guest memory touched for the
+  first time; 2 MiB blocks come from such memory more often than single
+  pages do. Timed inside the kernel, a cold 2 MiB block took about 570 us
+  to allocate and zero, a warm one about 115 us.
+- Of a warm 2 MiB fault, zeroing is about 225 ns a 4 KiB page; mapping is
+  about 3 us a block, and the `Mm`'s 512 charges and entries about 30 us.
+- Not measured on GCP yet, where Linux's huge-page faults were 0.42-0.44
+  us on AMD and Ichor's 4 KiB faults 1.0-1.1 us.
+
 Not yet: 2 MiB anonymous pages (one fault mapping 512 pages, as Linux's
 THP does), and the same measurements on GCP.
 

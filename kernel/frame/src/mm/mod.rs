@@ -47,6 +47,10 @@ pub const MAX_ORDER: u8 = buddy::MAX_ORDER;
 /// Size of a base page on every architecture Ichor supports.
 pub const PAGE_SIZE: u64 = 4096;
 
+/// Size of a large user page ([`VmSpace::map_huge`], ADR-0020): 512 base
+/// pages.
+pub const HUGE_PAGE_SIZE: u64 = crate::arch::paging::USER_HUGE;
+
 /// Base of the linear map of physical memory.
 pub(crate) const LINEAR_BASE: u64 = 0xffff_8000_0000_0000;
 /// Size of the linear map window (the most physical memory supported).
