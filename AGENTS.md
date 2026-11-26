@@ -778,7 +778,7 @@ amendment); a `VmSpace` keeps no page tree (PTEs hold the references,
 range unmaps walk the tables); `vma::PageMap`/`PageSet` (64-page chunks)
 for `Mm`'s pages and copy-on-write set; fork write-protects in batches.
 Null syscall 356 → 160 ns, page fault 1.26 → 0.44 us, fork + exec 161 →
-114 us there; not yet measured on GCP. Measure locally by booting
+114 us there (GCP: below, with 2 MiB pages). Measure locally by booting
 `cargo xtask disk-image --release --cmdline bench` under OpenVMM
 (`docs/cloud.md` has the command); the host varies runs by ~20%, so
 compare minimums of several rounds.
@@ -790,7 +790,11 @@ boundaries; `mmap` aligns private anonymous mappings a whole number of
 2 MiB long. Partial `unmap_range`/`protect`/`write_protect` split one into
 4 KiB leaves (no page for the table: it is unmapped whole and faults back).
 `hugetest.rs` checks it on every boot. Page fault 455 → 261 ns locally
-(warm memory, same host load); not yet measured on GCP. Not yet:
+(warm memory, same host load). On GCP (2026-11-26, `docs/benchmarks.md`'s
+third round, `bench_rounds=5`): page faults 547 ns on Ice Lake and 342 on
+Milan against Linux's huge-page faults at 756 and 415 (THP checked through
+`/proc/vmstat`: they form on both), null syscall 163 / 403 ns against 106 /
+386, fork + exec 141 / 129 us against 85 / 173. Not yet:
 `MADV_HUGEPAGE`, collapse, 2 MiB pages after fork, `AnonHugePages`.
 
 Frame budget: ADR-0005 sets the milestone 3 ceiling at 8,500 lines / 380
@@ -963,6 +967,7 @@ comment.
 | `trace_uplink` | log every TCP segment with SYN, FIN or RST crossing the uplink, either way, after NAT (`ichor: uplink:` lines: time, flags, endpoints, sequence numbers, window), and those the NAT refuses or cannot map |
 | `trace_pid=N` | log every Linux syscall of pid N with its result |
 | `bench` | run the Phase E benchmarks (`bench.rs`) after the root disk's self-tests and print them, container start also from a native caller (`nativetest start-bench`) |
+| `bench_rounds=N` | with `bench`: run each microbenchmark N times (default 1, at most 20) |
 | `api_bench=IMAGE` | with `control=PORT`: a client beside the control plane, in its cell, pulls IMAGE twice (each timed: at boot, then again), then times 20 rounds of `CreateCell`, `Run /bin/true`, `Destroy` over the API on loopback (`nativetest api-bench`; logs `native: api-bench`); add `control_exit` to end the run there |
 | `cell_access` | run the cell access-control suite (`cellaccess.rs`) after the Debian checks |
 | `cell_access_uplink` | with `cell_access`: check the uplink too; a host client must be connecting to a forward of port 7300 |

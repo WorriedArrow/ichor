@@ -196,9 +196,10 @@ Reading it:
   where neither has an expensive mitigation: Ichor's syscall path itself.
 - The n2 THP row is suspect: with THP on, Linux's faults took 1.36 us,
   more than with it off (1.26 us), where on AMD THP cut them to 0.42 us.
-  Huge pages most likely never formed on n2 (alignment or the defrag
-  setting); `AnonHugePages` was not checked during the run. Do not read
-  the n2 "THP always" figure as a huge-page fault.
+  `AnonHugePages` was not checked during the run. The third round below
+  checked: huge pages do form on n2 (31 huge-page faults per 64 MiB run),
+  and Linux's n2 fault took 0.76 us with them, 1.22 us without. Do not
+  read this round's n2 "THP always" figure as a huge-page fault.
 
 ## Local, OpenVMM: the system call and user memory paths (2026-11-25)
 
@@ -258,11 +259,51 @@ these two columns only with each other. The in-program timing
   to allocate and zero, a warm one about 115 us.
 - Of a warm 2 MiB fault, zeroing is about 225 ns a 4 KiB page; mapping is
   about 3 us a block, and the `Mm`'s 512 charges and entries about 30 us.
-- Not measured on GCP yet, where Linux's huge-page faults were 0.42-0.44
-  us on AMD and Ichor's 4 KiB faults 1.0-1.1 us.
+- On GCP: the next section.
 
-Not yet: 2 MiB anonymous pages (one fault mapping 512 pages, as Linux's
-THP does), and the same measurements on GCP.
+## Google Cloud, third round (2026-11-26): 2 MiB pages, THP checked
+
+After `c6e5b77` (ADR-0020) and ADR-0008's 2026-11-25 amendment (`sysretq`,
+skipped XRSTORs, no page tree in a `VmSpace`). n2-standard-4 (Ice Lake,
+us-central1-a) and n2d-standard-4 (Milan, us-central1-b), each Ichor
+machine in the same zone as its Linux one, booted once.
+
+- **Ichor**: `bench bench_rounds=5`, five rounds in one boot; the median
+  shown, the range after it. Its page-fault row touches 16 MiB (4,096
+  pages, 8 of them 2 MiB blocks).
+- **Linux**: Debian 12 (`6.1.0-56-cloud-amd64`), the same programs as
+  before, five rounds with THP `[always]` (defrag `[madvise]`) and five
+  with `never`; the median. Its page-fault program touches 64 MiB. Around
+  every page-fault run the script read `thp_fault_alloc` and
+  `thp_fault_fallback` from `/proc/vmstat`: with THP on, every run took
+  31 huge-page faults and no fallback, on both machines (the 64 MiB
+  mapping is not 2 MiB aligned on 6.1, so 31 of its 32 blocks); with it
+  off, none. `AnonHugePages`, sampled during an extra run, rose by about
+  62 MiB on both.
+
+| Benchmark | n2: Ichor | n2: Linux THP / off | Milan: Ichor | Milan: Linux THP / off |
+|---|---|---|---|---|
+| null syscall | 163 ns (161-166) | 106 / 106 ns | 403 ns (401-405) | 386 / 388 ns |
+| pipe round trip | 3.34 us (3.34-3.40) | 9.4 / 9.4 us | 4.83 us (4.82-4.87) | 16.5 / 16.4 us |
+| page fault | 547 ns (544-763) | 756 / 1220 ns | 342 ns (338-404) | 415 / 1814 ns |
+| fork + wait | 27 us (26-28) | 34.3 / 34.4 us | 18 us (18-19) | 60.5 / 58.1 us |
+| fork + exec + wait | 141 us (138-141) | 85.4 / 86.3 us | 129 us (124-131) | 173 / 178 us |
+| container start | 474 us | | 369 us | |
+| container start, native caller | 197 us | | 204 us | |
+
+Reading it:
+
+- Anonymous page faults are now cheaper on Ichor than Linux's huge-page
+  faults on both machines: 547 against 756 ns on Ice Lake (1.86 us in the
+  second round), 342 against 415 ns on Milan (1.09 us). Ichor's first
+  round (763 and 404 ns) pays for memory the machine had not touched.
+- The null system call halved on Ice Lake (309 to 163 ns) and is now
+  1.5x Linux's 106 ns; on Milan it is 403 ns against Linux's 386 (572 in
+  the second round). Pipes and fork stay well ahead of Linux.
+- fork + exec is the row Ichor still loses on Ice Lake (141 against 85
+  us), and wins on Milan (129 against 173).
+- Linux's huge pages form on n2 as well; the second round's n2 THP figure
+  (1.36 us) is not what THP costs there (0.76 us).
 
 ## Container start from the caller's side
 

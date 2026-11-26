@@ -19,7 +19,7 @@
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use core::time::Duration;
 
 use frame::println;
@@ -36,9 +36,14 @@ const CELL_PAGES: u64 = 16384;
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
 
-/// Asks for the benchmarks to run (`bench` on the command line).
-pub(crate) fn enable() {
+/// How many times the microbenchmarks run (`bench_rounds=N`, default 1).
+static ROUNDS: AtomicU32 = AtomicU32::new(1);
+
+/// Asks for the benchmarks to run (`bench` on the command line), each
+/// microbenchmark `rounds` times (at least once).
+pub(crate) fn enable(rounds: Option<u32>) {
     ENABLED.store(true, Ordering::Relaxed);
+    ROUNDS.store(rounds.unwrap_or(1).clamp(1, 20), Ordering::Relaxed);
 }
 
 pub(crate) fn enabled() -> bool {
@@ -106,8 +111,12 @@ pub(crate) fn run(m: &Mounted, vfs: &Arc<Vfs>, busybox: &[u8]) {
         ("fork + wait", &bench::fork_wait, 4, 204),
         ("fork + exec + wait", &bench::fork_exec_wait, 4, 104),
     ];
-    for (name, prog, small, large) in rows {
-        report(name, per_op(name, &system, vfs, prog, small, large));
+    // Several rounds show how much the first one, on memory the machine
+    // has not touched yet, pays for that.
+    for _ in 0..ROUNDS.load(Ordering::Relaxed) {
+        for &(name, prog, small, large) in &rows {
+            report(name, per_op(name, &system, vfs, prog, small, large));
+        }
     }
     // Container start: a fresh root and cell per run.
     const STARTS: u32 = 10;

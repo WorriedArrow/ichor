@@ -113,7 +113,7 @@ fn kmain(info: BootInfo) -> ! {
         linuxabi::TRACE_ERRORS.store(true, core::sync::atomic::Ordering::Relaxed);
     }
     if cmdline.flag("bench") {
-        bench::enable();
+        bench::enable(cmdline.get("bench_rounds").and_then(|v| v.parse().ok()));
     }
     if cmdline.flag("cell_access") {
         cellaccess::enable();
