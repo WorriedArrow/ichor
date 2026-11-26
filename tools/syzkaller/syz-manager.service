@@ -1,0 +1,19 @@
+[Unit]
+Description=syzkaller fuzzing Ichor (syz-manager, 4 QEMU instances)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=syz
+Group=syz
+WorkingDirectory=/home/syz
+Environment=PATH=/usr/local/go/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/home/syz/syzkaller/bin/syz-manager -config /home/syz/ichor.cfg
+Restart=always
+RestartSec=30
+KillMode=control-group
+StandardOutput=append:/home/syz/manager.log
+StandardError=append:/home/syz/manager.log
+
+[Install]
+WantedBy=multi-user.target

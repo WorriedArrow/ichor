@@ -36,6 +36,10 @@ Commands:
                --azure target/ichor-azure.vhd;
                --api-token-file F puts the control plane's API token on it,
                --api-tls-file F its TLS certificate and Ed25519 key (PEM)
+  root-image TAR... OUT
+               Convert root file system tarballs (.tar or .tar.gz, applied in
+               order, OCI whiteouts honored) into an Ichor image at OUT: a
+               second disk for `autorun`
   api HOST:PORT --name NAME --ca F --token-file F IMAGE [-- COMMAND ...]
                Have a running machine pull IMAGE and run it in a cell
                (--memory MiB: the cell's, default 256)
@@ -252,6 +256,28 @@ fn cmd_bench(o: &Opts) -> Result<()> {
         "{} vCPUs, {} MiB, accel {accel:?}, host CPU {cpu}. Each program times its own loop; Linux runs with its default mitigations. Runners differ: compare ratios within one run.",
         o.smp, o.memory_mib
     );
+    Ok(())
+}
+
+/// `root-image TAR... OUT`: the tarballs, applied in order, as one Ichor
+/// image (a disk a cell's root is mounted from: `autorun`'s).
+fn cmd_root_image(args: &[String]) -> Result<()> {
+    let Some((out, tars)) = args.split_last().filter(|(_, t)| !t.is_empty()) else {
+        return Err("usage: cargo xtask root-image TAR... OUT".into());
+    };
+    let mut tree = xtask::rootfs::Tree::new();
+    for path in tars {
+        let data = std::fs::read(path).map_err(|e| format!("reading {path}: {e}"))?;
+        let tar = if data.starts_with(&[0x1f, 0x8b]) {
+            xtask::inflate::gunzip_all(&data)?
+        } else {
+            data
+        };
+        tree.add_tar(&tar).map_err(|e| format!("{path}: {e}"))?;
+    }
+    let img = tree.image();
+    std::fs::write(out, &img).map_err(|e| format!("writing {out}: {e}"))?;
+    println!("{out} ({} KiB)", img.len() >> 10);
     Ok(())
 }
 
@@ -671,7 +697,7 @@ fn main() -> ExitCode {
         .split_first()
         .map_or(("help", &[][..]), |(c, r)| (c.as_str(), r));
     // These take their own arguments.
-    let rest_for_parse = if matches!(command, "fuzz" | "workloads" | "api") {
+    let rest_for_parse = if matches!(command, "fuzz" | "workloads" | "api" | "root-image") {
         &[][..]
     } else {
         rest
@@ -692,6 +718,7 @@ fn main() -> ExitCode {
         "workloads" => cmd_workloads(rest),
         "disk-image" => cmd_disk_image(&o, rest),
         "api" => cmd_api(rest),
+        "root-image" => cmd_root_image(rest),
         "help" | "--help" | "-h" => {
             print!("{HELP}");
             Ok(())

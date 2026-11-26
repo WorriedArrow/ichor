@@ -32,6 +32,9 @@ pub(crate) fn run() {
         };
         let vfs =
             Arc::new(Vfs::mount_disk(&m).unwrap_or_else(|_| fail("disk is not an Ichor image")));
+        let Some((m, vfs)) = unless_autorun("virtio-blk", m, vfs) else {
+            continue;
+        };
         // A disk carrying a distribution's userland is a container root.
         let is_alpine = vfs
             .lock()
@@ -69,6 +72,9 @@ pub(crate) fn run() {
         };
         let vfs =
             Arc::new(Vfs::mount_disk(&m).unwrap_or_else(|_| fail("disk is not an Ichor image")));
+        let Some((m, vfs)) = unless_autorun("nvme", m, vfs) else {
+            continue;
+        };
         exercise("nvme", &m, vfs);
     }
     // Every disk behind a virtio-scsi controller (GCP's general-purpose
@@ -88,6 +94,9 @@ pub(crate) fn run() {
         };
         let vfs =
             Arc::new(Vfs::mount_disk(&m).unwrap_or_else(|_| fail("disk is not an Ichor image")));
+        let Some((m, vfs)) = unless_autorun("virtio-scsi", m, vfs) else {
+            continue;
+        };
         exercise("virtio-scsi", &m, vfs);
     }
     // Every disk of a Hyper-V machine's SCSI controllers (Azure's).
@@ -111,6 +120,9 @@ pub(crate) fn run() {
         };
         let vfs =
             Arc::new(Vfs::mount_disk(&m).unwrap_or_else(|_| fail("disk is not an Ichor image")));
+        let Some((m, vfs)) = unless_autorun("hyper-v", m, vfs) else {
+            continue;
+        };
         exercise("hyper-v", &m, vfs);
     }
     if !FIRST_DONE.load(core::sync::atomic::Ordering::Relaxed) {
@@ -124,6 +136,18 @@ pub(crate) fn run() {
     if mapped == 0 {
         fail("no executable or library page was mapped from the page cache");
     }
+}
+
+/// The disk back, unless it is the one `autorun` runs from: that one is
+/// kept for it and gets none of these checks.
+fn unless_autorun(name: &str, m: Mounted, vfs: Arc<Vfs>) -> Option<(Mounted, Arc<Vfs>)> {
+    if !crate::autorun::wants(&vfs) {
+        return Some((m, vfs));
+    }
+    println!("ichor: blk: {name}: the autorun disk; not checked");
+    drop(vfs);
+    crate::autorun::keep(m);
+    None
 }
 
 /// Mounts a disk's image: from its Ichor root partition if it has a GPT

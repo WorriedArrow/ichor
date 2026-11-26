@@ -1,0 +1,97 @@
+diff --git a/executor/common_linux.h b/executor/common_linux.h
+index 3ae4dec29..038fc23e8 100644
+--- a/executor/common_linux.h
++++ b/executor/common_linux.h
+@@ -4433,8 +4433,11 @@ static void sandbox_common_mount_tmpfs(void)
+ 	write_file("/proc/sys/fs/mount-max", "100000");
+ 	if (mkdir("./syz-tmp", 0777))
+ 		fail("mkdir(syz-tmp) failed");
+-	if (mount("", "./syz-tmp", "tmpfs", 0, NULL))
+-		fail("mount(tmpfs) failed");
++	if (mount("", "./syz-tmp", "tmpfs", 0, NULL)) {
++		// Ichor: no mounts (a cell's root is its own already); run in it.
++		debug("mount(tmpfs): %d; staying in this root\n", errno);
++		return;
++	}
+ 	if (mkdir("./syz-tmp/newroot", 0777))
+ 		fail("mkdir failed");
+ 	if (mkdir("./syz-tmp/newroot/dev", 0700))
+@@ -4581,11 +4584,15 @@ static void sandbox_common()
+ 
+ #if SYZ_EXECUTOR || __NR_syz_init_net_socket || SYZ_DEVLINK_PCI || __NR_syz_socket_connect_nvme_tcp
+ 	int netns = open("/proc/self/ns/net", O_RDONLY);
+-	if (netns == -1)
+-		fail("open(/proc/self/ns/net) failed");
+-	if (dup2(netns, kInitNetNsFd) < 0)
+-		fail("dup2(netns, kInitNetNsFd) failed");
+-	close(netns);
++	// Ichor: no namespace files (a cell is the namespace); without one,
++	// the calls that need the initial namespace's fail as they come.
++	if (netns == -1) {
++		debug("open(/proc/self/ns/net): %d\n", errno);
++	} else {
++		if (dup2(netns, kInitNetNsFd) < 0)
++			fail("dup2(netns, kInitNetNsFd) failed");
++		close(netns);
++	}
+ #endif
+ 
+ 	struct rlimit rlim;
+@@ -4673,8 +4680,11 @@ static void drop_caps(void)
+ 	struct __user_cap_data_struct cap_data[2] = {};
+ 	cap_hdr.version = _LINUX_CAPABILITY_VERSION_3;
+ 	cap_hdr.pid = getpid();
+-	if (syscall(SYS_capget, &cap_hdr, &cap_data))
+-		fail("capget failed");
++	if (syscall(SYS_capget, &cap_hdr, &cap_data)) {
++		// Ichor: a cell's bounding set is fixed; nothing to drop here.
++		debug("capget: %d\n", errno);
++		return;
++	}
+ 	// Drop CAP_SYS_PTRACE so that test processes can't attach to parent processes.
+ 	// Previously it lead to hangs because the loop process stopped due to SIGSTOP.
+ 	// Note that a process can always ptrace its direct children, which is enough for testing purposes.
+diff --git a/pkg/report/linux.go b/pkg/report/linux.go
+index 3b73c4504..cfb4a8576 100644
+--- a/pkg/report/linux.go
++++ b/pkg/report/linux.go
+@@ -1646,6 +1646,24 @@ func warningStackFmt(skip ...string) *stackFmt {
+ 
+ // nolint: lll
+ var linuxOopses = append([]*oops{
++	// Ichor's kernel panic: `ichor: KERNEL PANIC: panicked at FILE:LINE:COL:`
++	// and the message on the next line.
++	{
++		[]byte("ichor: KERNEL PANIC:"),
++		[]oopsFormat{
++			{
++				title:        compile("ichor: KERNEL PANIC: panicked at ([^:\\n]+):([0-9]+)"),
++				fmt:          "ichor panic in %[1]v:%[2]v",
++				noStackTrace: true,
++			},
++			{
++				title:        compile("ichor: KERNEL PANIC:"),
++				fmt:          "ichor panic",
++				noStackTrace: true,
++			},
++		},
++		[]*regexp.Regexp{},
++	},
+ 	{
+ 		[]byte("BUG:"),
+ 		[]oopsFormat{
+diff --git a/pkg/vminfo/linux.go b/pkg/vminfo/linux.go
+index a56dbf936..1f326bd37 100644
+--- a/pkg/vminfo/linux.go
++++ b/pkg/vminfo/linux.go
+@@ -84,7 +84,9 @@ func (linux linux) parseModules(files filesystem) ([]*KernelModule, error) {
+ 	}
+ 	_stext, _etext, err := linuxParseCoreKernel(files)
+ 	if err != nil {
+-		return nil, err
++		// Ichor: a kernel without Linux's symbols (and without kcov, so
++		// nothing to map coverage to) has no core-kernel module.
++		return modules, nil
+ 	}
+ 	modules = append(modules, &KernelModule{
+ 		Name: "",

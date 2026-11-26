@@ -11,6 +11,7 @@
 extern crate alloc;
 
 mod alpinetest;
+mod autorun;
 mod bench;
 mod blktest;
 mod busytest;
@@ -116,6 +117,7 @@ fn kmain(info: BootInfo) -> ! {
     if cmdline.flag("cell_access") {
         cellaccess::enable();
     }
+    autorun::configure(&cmdline);
     if cmdline.flag("cell_access_uplink") {
         cellaccess::enable_uplink();
     }
@@ -293,6 +295,16 @@ fn kmain(info: BootInfo) -> ! {
         if code != Some(0) {
             shutdown(ExitStatus::Failure);
         }
+    }
+
+    // `autorun=PATH`: the machine's one program, for as long as it runs.
+    if autorun::enabled() {
+        let status = autorun::run();
+        shutdown(if status == Some(0) {
+            ExitStatus::Success
+        } else {
+            ExitStatus::Failure
+        });
     }
 
     println!("ichor: boot complete; halting");

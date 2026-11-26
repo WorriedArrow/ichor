@@ -508,6 +508,26 @@ fn cloud_disk_boots_from_gpt_on_nvme() {
     ]);
 }
 
+/// `autorun=PATH`, how a machine with one job (a syzkaller target's sshd)
+/// starts it: the disk that holds PATH, here Alpine's, is kept for it and
+/// gets none of the disk checks; PATH runs in a cell of its own with its
+/// port published, and its exit status is the machine's.
+#[test]
+fn autorun_runs_a_program_from_its_disk() {
+    let out = boot(
+        "autorun",
+        "autorun=/bin/true autorun_publish=2222 autorun_mib=64",
+        2,
+    );
+    out.assert_exit(Exit::Success);
+    out.assert_in_order(&[
+        "ichor: blk: virtio-blk: the autorun disk; not checked",
+        "ichor: autorun: /bin/true in cell",
+        "64 MiB, TCP ports [2222] published",
+        "ichor: autorun: /bin/true ended, wait status 0x0",
+    ]);
+}
+
 /// A cloud's "stop" presses the ACPI power button (ADR-0017): with the
 /// control plane serving (it would run on forever), the press turns the
 /// machine off through S5, which ends QEMU with status 0.

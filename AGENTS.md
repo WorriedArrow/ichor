@@ -267,6 +267,16 @@ boot [done: VERW, IBPB, and page-table isolation (ADR-0004's second
   Azure's 168.63.129.16, where clouds answer whoever asks with the machine's
   credentials (`net::switch::is_machines`: refused with a reset at the
   uplink, DNS excepted).
+- syzkaller (2026-11-25, `docs/syzkaller.md`, `tools/syzkaller/`): a
+  manager runs persistently on one of the owner's machines (a Debian VM,
+  four Ichor instances under nested KVM), fuzzing the Linux ABI through
+  ssh into a cell. The target boots with `autorun=/sbin/ichor-autorun`: a
+  second disk (Alpine + dropbear, `cargo xtask root-image`) holds the
+  program, gets no disk checks, and runs in its own cell with port 22
+  published (`autorun.rs`; test `autorun_runs_a_program_from_its_disk`).
+  syzkaller is patched (`ichor.patch`): no kallsyms needed, Ichor's panic
+  line is a crash, and the executor's sandbox goes on without mounts,
+  `/proc/self/ns/net` or `capget`. No coverage until Ichor has kcov.
 - NICs: `virtio-net`, and `intel-gbe` (82574L and the 82576/I350/I210
   family; tested on QEMU's `e1000e` and `igb`: `RunConfig::nic`). The first
   that comes up is the uplink (`nettest::find`).
@@ -893,6 +903,7 @@ cargo xtask run --cmdline "qemu_debug_exit bench" --smp 4 --release   # benchmar
 cargo xtask bench --accel kvm --smp 4   # Ichor vs Linux, same machine and programs (Markdown table)
 cargo xtask disk-image     # target/ichor-disk.img: bootable GPT disk (ESP + Ichor root) for clouds/bare metal
 cargo xtask api HOST:50051 --name NAME --ca ca.pem --token-file F IMAGE -- CMD   # pull and run on a running machine (docs/cloud.md)
+cargo xtask root-image ROOT.tar[.gz]... OUT.img   # root file system tarballs into an Ichor image (autorun's second disk; docs/syzkaller.md)
 cargo xtask fuzz [TARGET] --iterations N   # mutation-fuzz the parsers (failing inputs: target/fuzz/)
 cargo xtask x509-limbo     # certificate validation vs x509-limbo -> docs/x509-limbo.md (fails below floors)
 cargo xtask wycheproof     # Wycheproof's ML-DSA verify vectors (malformed ones too); fails on any wrong verdict
@@ -959,6 +970,9 @@ comment.
 | `metadata_addr=IP:PORT` | ask there instead of at 169.254.169.254:80 (tests) |
 | `dhcp_lease=SECONDS` | the longest the uplink's DHCP lease is taken to last (tests: renewed sooner) |
 | `dns=A.B.C.D` | the control plane's DNS resolver (default: the uplink's DHCP lease's first DNS server, else `10.0.2.3`, QEMU's) |
+| `autorun=PATH` | after the self-tests, run PATH (absolute) in a cell of its own over the root of the disk that holds it (a second disk; that disk gets no disk checks), for as long as the machine runs; its exit status is the machine's (`autorun.rs`, `docs/syzkaller.md`) |
+| `autorun_publish=PORT[,PORT...]` | with `autorun`: publish these uplink TCP ports to the same ports of its cell |
+| `autorun_mib=N` | with `autorun`: its cell's memory (default 1024) |
 
 ## Layout
 
@@ -1020,6 +1034,7 @@ services/grpc    protobuf, gRPC over HTTP/2, ichor.v1.Control messages (host-tes
 fuzz/            mutation fuzzing of every untrusted-input parser (host-only)
 xtask/           build/run/test/lint tooling (lib + bin, no dependencies)
 tests/           QEMU integration tests (host crate using xtask's runner)
+tools/syzkaller/ syzkaller against Ichor: patch, manager config, systemd unit, autorun root script (docs/syzkaller.md)
 docs/adr/        architecture decision records
 docs/reports/    write-ups of fixes and investigations (user-copy-fix.md, direction-flag-fix.md)
 ```
