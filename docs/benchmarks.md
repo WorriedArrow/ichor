@@ -194,6 +194,52 @@ Reading it:
   shell, which is what a container runtime there pays.
 - Entries still cost Ichor more than Linux on Intel (309 against 107 ns),
   where neither has an expensive mitigation: Ichor's syscall path itself.
+- The n2 THP row is suspect: with THP on, Linux's faults took 1.36 us,
+  more than with it off (1.26 us), where on AMD THP cut them to 0.42 us.
+  Huge pages most likely never formed on n2 (alignment or the defrag
+  setting); `AnonHugePages` was not checked during the run. Do not read
+  the n2 "THP always" figure as a huge-page fault.
+
+## Local, OpenVMM: the system call and user memory paths (2026-11-25)
+
+What the null system call paid for on its way back to ring 3 (ADR-0008's
+2026-11-25 amendment), and the bookkeeping behind each anonymous page.
+Under OpenVMM on this development PC (Ryzen 5 5600X, Zen 3: safe-RET
+thunks, no IBRS or IBPB enumerated, XCR0 0x7), 4 vCPUs, a release boot
+with `bench`; the minimum of five rounds in one boot, since the host makes
+single runs vary by about 20%. Not comparable with the GCP tables above,
+only with each other.
+
+| Benchmark | Before (`31bc1f4`) | After |
+|---|---|---|
+| null syscall | 356 ns | 160 ns |
+| pipe round trip | 4.24 us | 2.83 us |
+| page fault | 1.26 us | 0.44 us |
+| fork + wait | 15 us | 13 us |
+| fork + exec + wait | 161 us | 114 us |
+| container start (in the kernel) | 426 us | 330-410 us |
+| container start, native caller | 235 us | 171 us |
+
+What changed:
+
+- **System calls**: `sysretq` where the context is what a `syscall` left
+  (it was `iretq` every time); no XRSTOR when the CPU's registers still
+  hold the thread's state (a per-CPU stamp of the last save; XSAVEOPT
+  still runs after every trap); the FS base MSR written only when it
+  changes; the TSC clock read with a multiply instead of a 128-bit
+  division, twice per call (CPU-time accounting).
+- **Anonymous pages**, per page of fault-around (timed with counters):
+  the `VmSpace` no longer keeps its own tree of pages, since each PTE's
+  counted reference already keeps the page (map: about 170 ns to 35 ns),
+  and the kernel's resident pages and copy-on-write set are chunked maps
+  of 64 pages, `vma::PageMap` and `PageSet` (insert: about 160 ns to 35
+  ns). What is left is mostly the page's allocation and zeroing (about
+  220 ns: memory bandwidth, which Linux pays as well).
+- **Fork** turns the parent's writable pages read-only a batch at a time
+  with one TLB shootdown (`VmSpace::write_protect`), not one per page.
+
+Not yet: 2 MiB anonymous pages (one fault mapping 512 pages, as Linux's
+THP does), and the same measurements on GCP.
 
 ## Container start from the caller's side
 

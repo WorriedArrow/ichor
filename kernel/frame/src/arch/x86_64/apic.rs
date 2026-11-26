@@ -40,6 +40,9 @@ const SPURIOUS_VECTOR: u8 = 0xFF;
 
 static TSC_HZ: AtomicU64 = AtomicU64::new(0);
 static TSC_AT_BOOT: AtomicU64 = AtomicU64::new(0);
+/// Nanoseconds per TSC tick, times 2^32: a multiply and a shift per clock
+/// read, where a 128-bit division cost two of every system call ~50 ns.
+static TSC_NS_MULT: AtomicU64 = AtomicU64::new(0);
 /// LAPIC timer ticks per millisecond (one-shot mode only).
 static LAPIC_TICKS_PER_MS: AtomicU64 = AtomicU64::new(0);
 static DEADLINE_MODE: AtomicBool = AtomicBool::new(false);
@@ -209,6 +212,7 @@ pub(crate) fn init_tsc() -> Option<(u64, &'static str)> {
     }
     let (hz, _) = found?;
     TSC_HZ.store(hz, Relaxed);
+    TSC_NS_MULT.store((1_000_000_000u64 << 32) / hz.max(1), Relaxed);
     found
 }
 
@@ -291,9 +295,14 @@ pub(crate) fn now_ns() -> u64 {
     if let Some(ns) = crate::kvm::now_ns() {
         return ns;
     }
-    let hz = tsc_hz().max(1);
     let ticks = rdtsc().wrapping_sub(TSC_AT_BOOT.load(Relaxed));
-    ((u128::from(ticks) * 1_000_000_000) / u128::from(hz)) as u64
+    match TSC_NS_MULT.load(Relaxed) {
+        0 => {
+            let hz = tsc_hz().max(1);
+            ((u128::from(ticks) * 1_000_000_000) / u128::from(hz)) as u64
+        }
+        m => ((u128::from(ticks) * u128::from(m)) >> 32) as u64,
+    }
 }
 
 /// Busy-waits for `us` microseconds.
@@ -354,7 +363,13 @@ crate::cpu_local! {
 }
 
 fn ns_to_tsc(ns: u64) -> u64 {
-    (u128::from(ns) * u128::from(tsc_hz()) / 1_000_000_000) as u64
+    // In u64 halves, whose divisions by a constant are multiplies (a
+    // remainder times a rate below 18 GHz fits).
+    const NS: u64 = 1_000_000_000;
+    let hz = tsc_hz();
+    (ns / NS)
+        .saturating_mul(hz)
+        .saturating_add((ns % NS) * hz.min(18 * NS) / NS)
 }
 
 /// Programs the hardware for the earliest armed deadline. If it is already

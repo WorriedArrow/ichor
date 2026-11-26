@@ -132,3 +132,53 @@ per-thread extended state, and the Linux XSAVE layout in signal frames.
   frame is at 5,504 lines / 242 sites after this change. That is inside
   `audit.toml` step 6 (5,800 / 250) and ADR-0007's 9,500 / 420.
 - Every thread costs one more 4 KiB heap allocation.
+
+## Amendment (2026-11-25): no restore when the registers hold the state
+
+§3's "later optimization", with the rest of what a system call paid for on
+its way back to ring 3. On GCP a null system call took 309-575 ns against
+Linux's 107-393 ns (`docs/benchmarks.md`).
+
+- **The restore is skipped when the registers already hold the area.**
+  Every save stamps the area with a value unique to its CPU and that save
+  (`ExtState::stamp`), and records it as what that CPU's registers hold
+  (`LOADED`, per CPU). `restore` returns at once when the two match: the
+  thread's last save was on this CPU, and nothing loaded the registers
+  since. Only `restore` loads them (the kernel is soft-float, and the
+  firmware runs at boot only), so a match means the registers are exactly
+  the area. Software writing the area (`set_fpu_state`) clears its stamp,
+  which forces the next restore; a copy keeps the stamp, as it keeps the
+  bytes. A thread that ran on another CPU in between carries that CPU's
+  stamp, so it never matches a stale one. The save stays eager.
+  - Security: ring 3 never runs with another thread's registers, which is
+    what LazyFP needs; nothing is deferred to a trap, and CR0.TS stays
+    clear.
+  - XSAVEOPT stays sound: a skipped XRSTOR leaves its tracking on the
+    area's earlier XRSTOR, and software has not written the area since.
+- **`sysretq` instead of `iretq`** when the context is what a `syscall`
+  left: rcx its RIP and r11 its (sanitized) RFLAGS. CS and SS come from
+  STAR as the same selectors, RIP is below `USER_END` (canonical, so no
+  Intel SYSRET #GP in ring 0), and the sanitized RFLAGS hold no TF or RF.
+  Ring 0 runs on the user's stack from loading RSP to `sysretq`, as it
+  already did at the syscall entry: NMI, #MC and #DF use IST stacks, and
+  interrupts are off. AMD's SYSRET leaves SS's hidden attributes as they
+  were, which matters only to 32-bit code; Ichor runs none.
+- **The FS base MSR is written only when it changes** (per-CPU, not in the
+  block the entry area maps: another thread's TLS pointer is not the
+  block's to show). Ring 3 cannot write it: CR4.FSGSBASE is off.
+- **The TSC clock reads with a multiply and a shift**, not a 128-bit
+  division (two per system call, from the CPU-time accounting), and timer
+  deadlines convert in 64-bit halves.
+
+With the user-memory changes of the same commit (a `VmSpace` keeps no tree
+of its pages: each PTE's counted reference is the record, and range
+unmaps walk the tables; `write_protect` turns a batch read-only with one
+shootdown), frame grows to 7,390 lines / 295 sites: `audit.toml` step 16,
+7,450 / 310, inside ADR-0007's 9,500 / 420.
+
+Measured under OpenVMM on a Ryzen 5 5600X (Zen 3, safe-RET thunks, no IBRS
+enumerated), the minimum of five rounds in one boot, before and after this
+amendment and the user-memory changes: null system call 356 → 160 ns, pipe
+round trip 4.24 → 2.83 us, anonymous page fault 1.26 → 0.44 us, fork +
+wait 15 → 13 us, fork + exec + wait 161 → 114 us, container start from a
+native caller 235 → 171 us.

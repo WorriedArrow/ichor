@@ -542,6 +542,8 @@ global_asm!(
     "6:",
     "mov gs:[GS_RESUME], rsp", // kernel stack to come back to
     "mov gs:[GS_UCTX], rdi",
+    "test rsi, rsi",
+    "jnz 20f",
     // The iretq frame, and the two registers loaded last, on the entry
     // stack: the kernel stack is not mapped in the user root.
     "mov rsp, gs:[GS_ESTACK]",
@@ -583,6 +585,45 @@ global_asm!(
     "verw word ptr gs:[GS_VERWSEL]",
     "8:",
     "iretq",
+    // The same by `sysretq` (rsi nonzero: `ctx` has rcx = RIP and r11 =
+    // RFLAGS, as a `syscall` left them): RSP, rax and rdi, loaded last, on
+    // the entry stack; RIP and RFLAGS from rcx and r11. Ring 0 runs on the
+    // user's RSP from its load to `sysretq`, with IF clear, as at the
+    // syscall entry: NMI, #MC and #DF have IST stacks.
+    "20:",
+    "mov rsp, gs:[GS_ESTACK]",
+    "push qword ptr [rdi + UC_RSP]",
+    "push qword ptr [rdi + UC_RAX]",
+    "push qword ptr [rdi + UC_RDI]",
+    "ichor_spec_ctrl -2",
+    "mov rbx, [rdi + UC_RBX]",
+    "mov rdx, [rdi + UC_RDX]",
+    "mov rsi, [rdi + UC_RSI]",
+    "mov rbp, [rdi + UC_RBP]",
+    "mov r8,  [rdi + UC_R8]",
+    "mov r9,  [rdi + UC_R9]",
+    "mov r10, [rdi + UC_R10]",
+    "mov r12, [rdi + UC_R12]",
+    "mov r13, [rdi + UC_R13]",
+    "mov r14, [rdi + UC_R14]",
+    "mov r15, [rdi + UC_R15]",
+    "mov rcx, [rdi + UC_RIP]",
+    "mov r11, [rdi + UC_RFLAGS]",
+    "cmp byte ptr gs:[GS_PTI], 0",
+    "je 21f",
+    "mov rax, gs:[GS_UCR3]",
+    "mov cr3, rax",
+    "or rax, gs:[GS_NOFLUSH]",
+    "mov gs:[GS_UCR3], rax",
+    "21:",
+    "pop rdi",
+    "pop rax",
+    "pop rsp",
+    "test byte ptr gs:[GS_VERW], 1",
+    "jz 22f",
+    "verw word ptr gs:[GS_VERWSEL]",
+    "22:",
+    "sysretq",
     // The syscall and trap paths come here to return to the kernel caller.
     "ichor_user_resume:",
     "mov rsp, gs:[GS_RESUME]",

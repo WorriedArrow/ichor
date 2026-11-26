@@ -761,11 +761,23 @@ random now (RFC 6056; NAT and stacks), which did not change that.
 `api_bench` pulls twice and logs `first_pull_ns`, `pull_ns`, `cold_ns`
 and a container's addresses; the control plane logs each request's DNS,
 TCP, first-byte and body times and each conversion's parts.
+Local tuning (2026-11-25, OpenVMM on the Ryzen, `docs/benchmarks.md`):
+`sysretq` after system calls, no XRSTOR when the registers hold the
+thread's state, the FS base cached, a multiply for the TSC clock (ADR-0008's
+amendment); a `VmSpace` keeps no page tree (PTEs hold the references,
+range unmaps walk the tables); `vma::PageMap`/`PageSet` (64-page chunks)
+for `Mm`'s pages and copy-on-write set; fork write-protects in batches.
+Null syscall 356 → 160 ns, page fault 1.26 → 0.44 us, fork + exec 161 →
+114 us there; not yet measured on GCP. Measure locally by booting
+`cargo xtask disk-image --release --cmdline bench` under OpenVMM
+(`docs/cloud.md` has the command); the host varies runs by ~20%, so
+compare minimums of several rounds.
+Next: 2 MiB anonymous pages.
 
 Frame budget: ADR-0005 sets the milestone 3 ceiling at 8,500 lines / 380
 sites; ADR-0007 raises it to 9,500 / 420 for milestone 4 (TLB shootdown,
-atomic user ops for futexes, PCID). `audit.toml` is at step 14 (7,250 / 310,
-ADR-0004's safe-RET amendment); frame is at 7,202 / 292 (A5 added
+atomic user ops for futexes, PCID). `audit.toml` is at step 16 (7,450 / 310,
+ADR-0008's 2026-11-25 amendment); frame is at 7,390 / 295 (A5 added
 RDSEED/RDRAND and UEFI GetTime; B added XSAVE; C the frames tree and
 request tracking; M6 reading `\ichor\roots.pem`, later
 `\ichor\suffixes.dat` too; ADR-0011 the checked user
@@ -773,7 +785,9 @@ copy; ADR-0004 VERW/IBPB, page-table isolation, eIBRS and IBRS; `IoPorts`;
 xAPIC; Hyper-V; placing BARs the firmware left at 0, ADR-0005's second
 amendment; the ACPI power button and S5, ADR-0017; kvmclock, ADR-0018; the
 wall clock's NTP steering; the rest of ADR-0004 §2; AMD's IBRS bit and the
-safe-RET return thunks, `arch::rethunk`). Growth past the step
+safe-RET return thunks, `arch::rethunk`; the console ring, ADR-0019;
+`sysretq`, skipped XRSTORs, a `VmSpace` without a page tree and batch
+write protection, ADR-0008's amendment). Growth past the step
 needs an ADR and a new audit step.
 `services/rt` has its own budget (`services/rt/audit.toml`: 500 / 40; at
 417 / 30).

@@ -8,7 +8,6 @@
 //! shares the user tables. Mappings take [`UFrame`]s only, so a typed
 //! (kernel-owned) page can never reach user space by construction.
 
-use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -31,9 +30,11 @@ pub struct VmSpace {
 
 #[derive(Debug)]
 struct Inner {
-    /// Pages mapped into this space by address, kept alive until unmapped
-    /// or teardown (a tree, so range operations need not scan every page).
-    frames: BTreeMap<u64, UFrame>,
+    /// How many pages are mapped. Each holds the reference its PTE was given
+    /// (`incref_for_mapping`), dropped only once the PTE is cleared and no
+    /// CPU can use it; the page tables are the only record (ranges walk
+    /// them, skipping absent tables).
+    mapped: usize,
 }
 
 fn alloc_table_page() -> Option<PhysAddr> {
@@ -67,9 +68,7 @@ impl VmSpace {
             unsafe { paging::copy_entry(kernel, arch::entry::shadow_of(root), slot) };
         }
         Some(VmSpace {
-            inner: SpinLock::new(Inner {
-                frames: BTreeMap::new(),
-            }),
+            inner: SpinLock::new(Inner { mapped: 0 }),
             root,
             order,
         })
@@ -101,7 +100,7 @@ impl VmSpace {
                     // the linear map; the entry is a user slot's.
                     unsafe { paging::copy_entry(self.root, shadow, paging::slot_of(va)) };
                 }
-                inner.frames.insert(va, frame.clone());
+                inner.mapped += 1;
                 Ok(())
             }
             Err(e) => {
@@ -137,23 +136,16 @@ impl VmSpace {
     /// One batch of `unmap_range` from `start`: where the next one starts,
     /// or `None` once the range is clear.
     fn unmap_batch(&self, start: u64, end: u64, max: usize) -> Option<u64> {
-        let (unmapped, frames, next) = {
+        let mut unmapped = Vec::new();
+        let next = {
             let mut inner = self.inner.lock();
-            let mut it = inner.frames.range(start..end).map(|(&v, _)| v);
-            let vas: Vec<u64> = it.by_ref().take(max).collect();
-            let next = it.next();
-            let mut unmapped = Vec::with_capacity(vas.len());
-            // Keep the `UFrame`s alive until the shootdown is done.
-            let mut kept = Vec::with_capacity(vas.len());
-            for va in vas {
-                // SAFETY: as in `map`; unmapping only clears a leaf of this
-                // space.
-                if let Some(pa) = unsafe { paging::user_unmap(self.root, va) } {
-                    unmapped.push((va, pa));
-                }
-                kept.extend(inner.frames.remove(&va));
-            }
-            (unmapped, kept, next)
+            // SAFETY: as in `map`; unmapping only clears leaves of this
+            // space. Each page keeps its mapping reference until the
+            // shootdown below is done.
+            let next =
+                unsafe { paging::user_unmap_range(self.root, start, end, max, &mut unmapped) };
+            inner.mapped -= unmapped.len().min(inner.mapped);
+            next
         };
         match unmapped.as_slice() {
             [] => {}
@@ -163,13 +155,12 @@ impl VmSpace {
         for (_, pa) in unmapped {
             frame::drop_untyped(pa);
         }
-        drop(frames);
         next
     }
 
     /// How many pages are mapped.
     pub fn mapped_pages(&self) -> usize {
-        self.inner.lock().frames.len()
+        self.inner.lock().mapped
     }
 
     /// Changes the permissions of the mapping at `va`; on return no CPU
@@ -185,6 +176,33 @@ impl VmSpace {
             super::tlb::shootdown(self.root.as_u64(), Some(va));
         }
         ok
+    }
+
+    /// Makes the writable pages among `vas` read-only (keeping execute), with
+    /// one TLB shootdown for all of them; on return no CPU running this space
+    /// can still write through the old permissions. Must not be called in
+    /// atomic mode.
+    pub fn write_protect(&self, vas: &[u64]) {
+        let mut any = false;
+        {
+            let _inner = self.inner.lock();
+            for &va in vas {
+                // SAFETY: as in `map`; a walk and a leaf update of this space.
+                if let Some((_, p)) = unsafe { paging::user_translate(self.root, va) }
+                    && p.write
+                {
+                    let ro = UserProt {
+                        write: false,
+                        exec: p.exec,
+                    };
+                    // SAFETY: as above.
+                    any |= unsafe { paging::user_protect(self.root, va, ro) };
+                }
+            }
+        }
+        if any {
+            super::tlb::shootdown(self.root.as_u64(), None);
+        }
     }
 
     /// The aligned user `u32` at `va` as an atomic, under the space lock
@@ -327,17 +345,14 @@ impl VmSpace {
 
 impl Drop for VmSpace {
     fn drop(&mut self) {
-        let mut frames = core::mem::take(&mut self.inner.lock().frames);
-        // Clear the page tables, dropping a mapping reference for every page
-        // and freeing the intermediate tables. `frames` holds the matching
-        // `UFrame`s, dropped below.
+        // Clear the page tables, dropping the mapping reference of every page
+        // and freeing the intermediate tables.
         let mut leaf = |pa: PhysAddr| frame::drop_untyped(pa);
         let mut table_page = |pa: PhysAddr| page_alloc::free(pa, 0, kind::PAGE_TABLE);
         // SAFETY: a `VmSpace` is dropped only when no task uses it, so it is
         // active on no CPU; `root` and its lower-half tables are this space's
         // own pages.
         unsafe { paging::user_teardown(self.root, &mut leaf, &mut table_page) };
-        frames.clear();
         // The shadow root (if any) goes with it: it is active nowhere
         // either, and its user entries named the tables freed above.
         page_alloc::free(self.root, self.order, kind::PAGE_TABLE);

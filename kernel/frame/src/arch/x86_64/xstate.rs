@@ -4,8 +4,9 @@
 //! With XSAVE, every CPU runs with the same XCR0, chosen once by the first
 //! CPU to initialize. Each thread's state lives in a boxed, 64-byte-aligned
 //! area in the standard (non-compacted) XSAVE format, the format Linux
-//! signal frames carry. It is restored eagerly before ring 3 and saved right
-//! after the trap. Without XSAVE, the same area holds an FXSAVE image and
+//! signal frames carry. It is saved right after every trap and restored
+//! before ring 3 unless this CPU's registers still hold it (ADR-0008's
+//! 2026-11-24 amendment). Without XSAVE, the same area holds an FXSAVE image and
 //! FXSAVE/FXRSTOR are used.
 //!
 //! An area only ever holds the init state, a hardware save, or user data
@@ -118,9 +119,24 @@ pub(crate) fn size() -> usize {
 #[derive(Clone)]
 struct Area([u8; MAX_AREA]);
 
+crate::cpu_local! {
+    /// The stamp of the state this CPU's registers hold (0: not known).
+    static LOADED: AtomicU64 = AtomicU64::new(0);
+    /// Saves made on this CPU, numbering its stamps.
+    static SAVES: AtomicU64 = AtomicU64::new(0);
+}
+
 /// One thread's extended state (see the module docs for its invariant).
 #[derive(Clone)]
-pub(crate) struct ExtState(Box<Area>);
+pub(crate) struct ExtState {
+    area: Box<Area>,
+    /// The save that wrote the area, unique to a CPU and a save (0: software
+    /// wrote it). Only [`ExtState::restore`] loads the registers and only
+    /// [`ExtState::save`] stamps, so a CPU whose [`LOADED`] equals the
+    /// stamp holds exactly the area: it saved it and loaded nothing since.
+    /// A copy keeps the stamp, as it keeps the bytes.
+    stamp: u64,
+}
 
 impl Default for ExtState {
     /// The reset state: x87 and SSE with all exceptions masked, everything
@@ -129,7 +145,7 @@ impl Default for ExtState {
         let mut a = Box::new(Area([0; MAX_AREA]));
         a.0[0..2].copy_from_slice(&0x037fu16.to_le_bytes()); // FCW
         a.0[24..28].copy_from_slice(&0x1f80u32.to_le_bytes()); // MXCSR
-        ExtState(a)
+        ExtState { area: a, stamp: 0 }
     }
 }
 
@@ -142,7 +158,7 @@ impl core::fmt::Debug for ExtState {
 impl ExtState {
     /// The state as the signal frame carries it: [`size`] bytes.
     pub(crate) fn bytes(&self) -> &[u8] {
-        &self.0.0[..size()]
+        &self.area.0[..size()]
     }
 
     /// Replaces the state from user-supplied bytes: a full area ([`size`]
@@ -150,7 +166,8 @@ impl ExtState {
     /// extended components return to their init state. Anything the restore
     /// instruction would fault on is cleared.
     pub(crate) fn set_from(&mut self, src: &[u8]) {
-        let a = &mut self.0.0;
+        self.stamp = 0;
+        let a = &mut self.area.0;
         let mask = match u32::from_le_bytes([a[28], a[29], a[30], a[31]]) {
             0 => MXCSR_DEFAULT_MASK,
             m => m,
@@ -174,9 +191,18 @@ impl ExtState {
         }
     }
 
-    /// Loads this state into the registers.
-    pub(crate) fn restore(&self) {
-        let p = self.0.0.as_ptr();
+    /// Loads this state into the registers, unless they hold it already
+    /// (the thread's last save was on this CPU, which loaded nothing since:
+    /// the kernel is soft-float). The skipped XRSTOR leaves XSAVEOPT's
+    /// tracking on the area's earlier one, which software has not written
+    /// since.
+    pub(crate) fn restore(&self, guard: &crate::cpu::IrqGuard) {
+        let loaded = LOADED.get(guard);
+        if self.stamp != 0 && loaded.load(Ordering::Relaxed) == self.stamp {
+            return;
+        }
+        loaded.store(self.stamp, Ordering::Relaxed);
+        let p = self.area.0.as_ptr();
         if features() != 0 {
             // SAFETY: the area is 64-byte aligned, MAX_AREA >= the XSAVE
             // size, in standard format with a header that passes every
@@ -194,8 +220,11 @@ impl ExtState {
     }
 
     /// Stores the registers into this state.
-    pub(crate) fn save(&mut self) {
-        let p = self.0.0.as_mut_ptr();
+    pub(crate) fn save(&mut self, guard: &crate::cpu::IrqGuard) {
+        let n = SAVES.get(guard).fetch_add(1, Ordering::Relaxed) + 1;
+        self.stamp = ((guard.cpu().index() as u64 + 1) << 48) | (n & ((1 << 48) - 1));
+        LOADED.get(guard).store(self.stamp, Ordering::Relaxed);
+        let p = self.area.0.as_mut_ptr();
         if features() == 0 {
             // SAFETY: a 16-byte-aligned 512-byte (or larger) area owned by
             // this thread; the kernel never uses the FPU, so the registers

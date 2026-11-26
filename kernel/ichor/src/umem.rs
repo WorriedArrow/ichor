@@ -40,7 +40,6 @@
 //! write that breaks a share can fail on a full account (the fault then
 //! kills the writer, as Linux's OOM handling would).
 
-use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
@@ -50,7 +49,7 @@ use crate::file::File;
 use crate::linuxabi::shm::Attached;
 use crate::page::{Page, charged};
 use frame::mm::{PAGE_SIZE, UFrame, UserProt, VmSpace};
-use vma::{Prot, Region, RegionMap};
+use vma::{PageMap, PageSet, Prot, Region, RegionMap};
 
 const EINVAL: i64 = 22;
 const ENOMEM: i64 = 12;
@@ -204,10 +203,10 @@ pub(crate) struct Mm {
     account: Arc<Account>,
     regions: RegionMap<Backing>,
     /// Every page the process holds, mapped or not (`PROT_NONE`).
-    pages: BTreeMap<u64, Page>,
+    pages: PageMap<Page>,
     /// Pages possibly shared with another process after `fork`: mapped
     /// read-only, copied on the first write.
-    cow: BTreeSet<u64>,
+    cow: PageSet,
     /// System V segments attached: `[start, end)` each.
     attached: Vec<(u64, u64, Attached)>,
     brk_start: u64,
@@ -223,8 +222,8 @@ impl Mm {
             space: Arc::new(VmSpace::new()?),
             account: account.clone(),
             regions: RegionMap::new(MMAP_LO, MMAP_HI),
-            pages: BTreeMap::new(),
-            cow: BTreeSet::new(),
+            pages: PageMap::new(),
+            cow: PageSet::new(),
             attached: Vec::new(),
             brk_start: 0,
             brk: 0,
@@ -271,7 +270,10 @@ impl Mm {
         // The child shares every page (no new charge): what either side
         // copies on write is charged then.
         let mut region: Option<Region<Backing>> = None;
-        for (&va, f) in &self.pages {
+        // This side's writable pages turn read-only a batch at a time, one
+        // TLB flush each (all before `fork` returns).
+        let mut protect: Vec<u64> = Vec::new();
+        for (va, f) in self.pages.iter() {
             child.pages.insert(va, f.clone());
             if !region.as_ref().is_some_and(|r| r.start <= va && va < r.end) {
                 region = self.regions.find(va);
@@ -300,15 +302,19 @@ impl Mm {
                     exec: prot.exec,
                 };
                 if prot.write {
-                    // This space is the active one (we are its task), so
-                    // the local TLB flush `protect` does is enough.
-                    self.space.protect(va, ro);
+                    protect.push(va);
+                    if protect.len() == PAGE_BATCH {
+                        self.space.write_protect(&protect);
+                        protect.clear();
+                    }
                 }
                 if child.space.map(va, f, ro).is_err() {
+                    self.space.write_protect(&protect);
                     return None; // `child` drops and releases its charge
                 }
             }
         }
+        self.space.write_protect(&protect);
         Some(child)
     }
 
@@ -713,7 +719,7 @@ impl Mm {
             let vas: Vec<u64> = self
                 .pages
                 .range(start..end)
-                .map(|(&v, _)| v)
+                .map(|(v, _)| v)
                 .take(PAGE_BATCH)
                 .collect();
             if vas.is_empty() {
@@ -976,7 +982,7 @@ impl Mm {
             let vas: Vec<u64> = self
                 .pages
                 .range(from..old + moved)
-                .map(|(&v, _)| v)
+                .map(|(v, _)| v)
                 .take(PAGE_BATCH)
                 .collect();
             let Some(&last) = vas.last() else {
@@ -1036,7 +1042,7 @@ impl Mm {
             let vas: Vec<u64> = self
                 .pages
                 .range(from..end)
-                .map(|(&v, _)| v)
+                .map(|(v, _)| v)
                 .take(PAGE_BATCH)
                 .collect();
             let Some(&last) = vas.last() else {

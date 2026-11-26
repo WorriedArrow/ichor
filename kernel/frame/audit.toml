@@ -36,5 +36,8 @@
 # Step 14 (ADR-0004's safe-RET amendment of 2026-11-23: return thunks, and
 # AMD's IBRS bit before them): 7,250 / 310.
 # Step 15 (ADR-0019: console writes buffered, drained by a task): 7,350 / 310.
-max_code_lines = 7350
+# Step 16 (ADR-0008's 2026-11-25 amendment: no restore of registers that hold
+# the state, sysretq, the FS base cached, a VmSpace without a page tree, batch
+# write protection): 7,450 / 310.
+max_code_lines = 7450
 max_unsafe_sites = 310

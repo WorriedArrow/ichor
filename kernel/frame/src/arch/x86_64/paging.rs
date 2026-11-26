@@ -417,17 +417,55 @@ pub(crate) unsafe fn user_map(
     set_leaf(leaf, pa.as_u64(), prot.bits())
 }
 
-/// Removes the mapping at `va`, returning the page it mapped. The caller
+/// Removes the mappings in `[start, end)`, at most `max` of them, adding
+/// each one's address and page to `out`; returns where to go on from if it
+/// stopped at `max`. Tables that are absent are skipped whole. The caller
 /// must flush the TLB.
 ///
 /// # Safety
 ///
 /// [`user_leaf`]'s contract.
-pub(crate) unsafe fn user_unmap(root: PhysAddr, va: u64) -> Option<PhysAddr> {
-    // SAFETY: caller contract.
-    let leaf = unsafe { user_leaf(root, va, None) }.ok()??;
-    let e = leaf.swap(0, Relaxed);
-    (e & PRESENT != 0).then(|| PhysAddr::new(e & ADDR_MASK))
+pub(crate) unsafe fn user_unmap_range(
+    root: PhysAddr,
+    start: u64,
+    end: u64,
+    max: usize,
+    out: &mut alloc::vec::Vec<(u64, PhysAddr)>,
+) -> Option<u64> {
+    let end = end.min(USER_END);
+    let mut va = start;
+    'next: while va < end {
+        // SAFETY: caller contract.
+        let mut t: &Table = unsafe { table(root) };
+        for (shift, index) in [
+            (39, pml4_index(va)),
+            (30, pdpt_index(va)),
+            (21, pd_index(va)),
+        ] {
+            let e = t[index].load(Relaxed);
+            if e & PRESENT == 0 || e & HUGE != 0 {
+                va = (va >> shift << shift) + (1 << shift);
+                continue 'next;
+            }
+            // SAFETY: a present non-leaf entry of this space's lower half is
+            // one of its tables (caller contract).
+            t = unsafe { table(PhysAddr::new(e & ADDR_MASK)) };
+        }
+        for e in &t[pt_index(va)..] {
+            if va >= end {
+                break;
+            }
+            if out.len() >= max {
+                return Some(va);
+            }
+            let v = e.swap(0, Relaxed);
+            if v & PRESENT != 0 {
+                out.push((va, PhysAddr::new(v & ADDR_MASK)));
+            }
+            va += PAGE_SIZE;
+        }
+    }
+    None
 }
 
 /// Changes the permissions of the mapping at `va`. The caller must flush

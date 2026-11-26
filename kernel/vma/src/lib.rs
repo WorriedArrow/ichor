@@ -14,6 +14,9 @@
 
 extern crate alloc;
 
+pub mod pagemap;
+pub use pagemap::{PageMap, PageSet};
+
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 

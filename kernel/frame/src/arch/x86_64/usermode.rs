@@ -1,6 +1,8 @@
 //! Entering and leaving ring 3.
 //!
-//! A user thread runs through `iretq` and traps back into the kernel by a
+//! A user thread runs through `iretq`, or `sysretq` where its context is
+//! what a `syscall` leaves (`rcx` its RIP, `r11` its RFLAGS), and traps back
+//! into the kernel by a
 //! `syscall` instruction, by a CPU exception, or by an interrupt. On the way
 //! back the user registers are saved into the thread's [`UserContext`], and
 //! control returns to the kernel stack frame that called
@@ -38,6 +40,12 @@ static VERW_ON: AtomicBool = AtomicBool::new(false);
 static IBPB_ON: AtomicBool = AtomicBool::new(false);
 /// IBPBs issued (all CPUs).
 static IBPBS: AtomicU64 = AtomicU64::new(0);
+
+crate::cpu_local! {
+    /// What this CPU's FS base MSR holds (`u64::MAX`: not known). Only
+    /// `execute` writes the MSR, and ring 3 cannot (CR4.FSGSBASE is off).
+    static FS_BASE: AtomicU64 = AtomicU64::new(u64::MAX);
+}
 
 /// `IA32_SPEC_CTRL`, and the bits Ichor sets in it.
 const MSR_SPEC_CTRL: u32 = 0x48;
@@ -411,7 +419,7 @@ impl<'a> UserMode<'a> {
                 cr2: 0,
             };
         }
-        let _guard = cpu::IrqGuard::new();
+        let guard = cpu::IrqGuard::new();
         if hold() {
             return UserEvent::Preempted;
         }
@@ -426,9 +434,13 @@ impl<'a> UserMode<'a> {
         // kernel block in GS and let the thread use FS for TLS. We still
         // honour an explicit gs_base request via the MSR for the rare user
         // of GS-relative TLS, restoring the block afterwards on return.
-        // SAFETY: FS base holds a user TLS pointer; it never affects kernel
-        // memory safety.
-        unsafe { wrmsr(regs::MSR_FS_BASE, self.ctx.fs_base) };
+        let fs = FS_BASE.get(&guard);
+        if fs.load(Relaxed) != self.ctx.fs_base {
+            // SAFETY: FS base holds a user TLS pointer; it never affects
+            // kernel memory safety.
+            unsafe { wrmsr(regs::MSR_FS_BASE, self.ctx.fs_base) };
+            fs.store(self.ctx.fs_base, Relaxed);
+        }
         // A predictor barrier when this CPU last ran another cell's user
         // code (ADR-0004 §2), so its training cannot steer this one's.
         if IBPB_ON.load(Relaxed) {
@@ -443,13 +455,23 @@ impl<'a> UserMode<'a> {
         }
         // Interrupts stay off from here until the save below, and the kernel
         // never uses the FPU, so the registers hold only this thread's state.
-        self.ctx.fpu.restore();
+        self.ctx.fpu.restore(&guard);
         loop {
-            // SAFETY: entry builds a ring-3 `iretq` frame from `ctx` and
-            // returns here when the thread traps (the stubs load this kernel
-            // stack back). The guard keeps us on this CPU across the round
-            // trip.
-            unsafe { ichor_enter_user(core::ptr::from_mut(self.ctx).cast::<u8>()) };
+            // `sysretq` loads RIP from rcx and RFLAGS from r11: where they
+            // already hold them, it returns as `iretq` would (CS and SS
+            // from STAR are the same selectors; RIP is below USER_END, so
+            // canonical, and the sanitized RFLAGS hold no TF or RF).
+            let sysret = self.ctx.rcx == self.ctx.rip && self.ctx.r11 == self.ctx.rflags;
+            // SAFETY: entry returns to ring 3 from `ctx` (an `iretq` frame,
+            // or `sysretq` as above) and comes back here when the thread
+            // traps (the stubs load this kernel stack back). The guard
+            // keeps us on this CPU across the round trip.
+            unsafe {
+                ichor_enter_user(
+                    core::ptr::from_mut(self.ctx).cast::<u8>(),
+                    u64::from(sysret),
+                )
+            };
             // An interrupt the thread need not hear about: straight back.
             // The trap recorded the registers ring 3 really had, apart from
             // flags it may not keep.
@@ -459,7 +481,7 @@ impl<'a> UserMode<'a> {
             self.ctx.rflags =
                 (self.ctx.rflags & USER_RFLAGS_ALLOWED) | RFLAGS_IF | RFLAGS_RESERVED1;
         }
-        self.ctx.fpu.save();
+        self.ctx.fpu.save(&guard);
         let info = block.event_info.load(Relaxed);
         match block.event_kind.load(Relaxed) {
             1 => UserEvent::Syscall,
@@ -475,8 +497,9 @@ impl<'a> UserMode<'a> {
 
 unsafe extern "sysv64" {
     /// Takes a `*mut UserContext` (the stubs in `entry.rs` only touch its
-    /// register fields, at the offsets above).
-    fn ichor_enter_user(ctx: *mut u8);
+    /// register fields, at the offsets above) and whether to leave by
+    /// `sysretq` (nonzero) rather than `iretq`.
+    fn ichor_enter_user(ctx: *mut u8, sysret: u64);
 }
 
 /// Records a ring-3 exception into the per-CPU `UserContext` and event
