@@ -1,16 +1,15 @@
 //! The program loader: maps an ELF image into a process's address space and
 //! builds its initial stack.
 //!
-//! It walks the `elf` crate's bounds-checked load plan, takes a page from
-//! the process's [`Mm`] for every virtual page a loadable segment touches
-//! (two segments may share a page; the page gets the union of their
-//! permissions), copies the file bytes in (the rest stays zero, which is
-//! `.bss`), and maps it. The stack is a demand-paged region; the loader
+//! It walks the `elf` crate's bounds-checked load plan and reserves what
+//! each loadable segment covers (two segments may share a page; the page
+//! gets the union of their permissions): whole file pages map the file
+//! lazily, `.bss` is demand-zero, and only a segment's partial edge pages
+//! are built at exec ([`map_image`]). The stack is a demand-paged region; the loader
 //! writes the System V entry frame (argc, argv, envp, auxv) at its top.
 //! Milestone 3 handles static executables; the dynamic path (`PT_INTERP`,
 //! a separate mapping of the interpreter) comes with milestone 4.
 
-use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -113,29 +112,69 @@ pub(crate) fn interp_path(image: &dyn File) -> Result<Option<String>, LoadError>
     Ok(Some(String::from(path)))
 }
 
-/// Bytes of an image read to parse its headers.
+/// Most bytes of an image read to parse its headers.
 const HEAD: usize = 64 << 10;
 
+/// Bytes read first: the ELF header, and the program headers too in every
+/// image a linker writes.
+const FIRST: usize = 4096;
+
 /// The image's first bytes (its ELF and program headers).
-fn head(image: &dyn File) -> alloc::vec::Vec<u8> {
-    let n = usize::try_from(image.size()).unwrap_or(HEAD).min(HEAD);
-    let mut v = alloc::vec![0u8; n];
+fn head(image: &dyn File) -> Vec<u8> {
+    let size = usize::try_from(image.size()).unwrap_or(HEAD).min(HEAD);
+    let mut v = alloc::vec![0u8; size.min(FIRST)];
     let got = image.read_at(0, &mut v);
     v.truncate(got);
+    // Program headers further in: read up to their end (at most `HEAD`).
+    let field = |at: usize, len: usize| {
+        v.get(at..at + len).map(|b| {
+            b.iter()
+                .rev()
+                .fold(0usize, |n, &x| n.wrapping_shl(8) | usize::from(x))
+        })
+    };
+    if let (Some(phoff), Some(size_of), Some(count)) = (field(32, 8), field(54, 2), field(56, 2)) {
+        let need = phoff
+            .saturating_add(size_of.saturating_mul(count))
+            .min(size);
+        if need > v.len() && got == FIRST {
+            v.resize(need, 0);
+            let more = image.read_at(FIRST as u64, &mut v[FIRST..]);
+            v.truncate(FIRST + more);
+        }
+    }
     v
 }
 
+/// One piece of an image's address space: pages `[start, end)` that the
+/// same segments cover.
+struct Piece<'a> {
+    start: u64,
+    end: u64,
+    /// The union of the covering segments' access.
+    prot: Prot,
+    /// The covering segments.
+    segs: Vec<&'a elf::Segment>,
+}
+
+/// Whether `seg` has file bytes on the page at `va`.
+fn has_file_bytes(seg: &elf::Segment, va: u64) -> bool {
+    va < seg.vaddr.saturating_add(seg.file_size) && va + PAGE_SIZE > seg.vaddr && seg.file_size > 0
+}
+
 /// Maps `plan`'s segments at `bias` into `mm`; returns the end of the
-/// highest page. A page that lies wholly within one segment's file bytes
-/// at a page-aligned file offset maps the page cache's copy of the file
-/// page copy-on-write when there is one; every other page is a fresh page
-/// the segment bytes are copied into.
+/// highest page.
+///
+/// The work is per piece of address space between segment boundaries, not
+/// per page, so it costs the same for a large program as for a small one.
+/// Whole file pages that belong to one segment alone, at page-aligned file
+/// offsets, are mapped lazily, like `mmap(MAP_PRIVATE)` of the file: they
+/// fault in from the page cache on first touch. Pages with no file bytes
+/// (`.bss`) are demand-zero. Only the pages left, a segment's partial first
+/// and last pages and pages two segments share, are built here: the page
+/// cache's copy, copy-on-write, for a whole file page one segment owns,
+/// else a fresh page with each segment's bytes copied in.
 fn map_image(mm: &mut Mm, plan: &LoadPlan, image: &dyn File, bias: u64) -> Result<u64, LoadError> {
-    // Every page the image touches, with the union of its segments' access.
-    let mut pages: BTreeMap<u64, Prot> = BTreeMap::new();
-    // How many segments touch each page (a shared page is always copied).
-    let mut users: BTreeMap<u64, u32> = BTreeMap::new();
-    let mut image_end = 0;
     let segs: Vec<elf::Segment> = plan
         .segments()
         .iter()
@@ -145,107 +184,137 @@ fn map_image(mm: &mut Mm, plan: &LoadPlan, image: &dyn File, bias: u64) -> Resul
             s
         })
         .collect();
+    let mut image_end = 0;
+    let mut cuts: Vec<u64> = Vec::with_capacity(segs.len() * 2);
     for seg in &segs {
         let (start, end) = seg.page_range(PAGE_SIZE);
         if end > STACK_TOP - MAX_STACK || end < start {
             return Err(LoadError::Map);
         }
         image_end = image_end.max(end);
-        let mut va = start;
-        while va < end {
-            *users.entry(va).or_insert(0) += 1;
-            let p = pages.entry(va).or_insert(Prot::NONE);
-            p.read |= seg.flags.read;
-            p.write |= seg.flags.write;
-            p.exec |= seg.flags.exec;
-            va += PAGE_SIZE;
+        cuts.extend([start, end]);
+    }
+    cuts.sort_unstable();
+    cuts.dedup();
+    // Between two cuts, the same segments cover every page.
+    let mut pieces = Vec::new();
+    for w in cuts.windows(2) {
+        let (start, end) = (w[0], w[1]);
+        let covering: Vec<&elf::Segment> = segs
+            .iter()
+            .filter(|s| {
+                let (a, b) = s.page_range(PAGE_SIZE);
+                a <= start && end <= b
+            })
+            .collect();
+        let mut prot = Prot::NONE;
+        for s in &covering {
+            prot.read |= s.flags.read;
+            prot.write |= s.flags.write;
+            prot.exec |= s.flags.exec;
+        }
+        if !covering.is_empty() {
+            pieces.push(Piece {
+                start,
+                end,
+                prot,
+                segs: covering,
+            });
         }
     }
-    // Whole file pages that belong to one segment alone are mapped lazily,
-    // like `mmap(MAP_PRIVATE)` of the file: they fault in from the page
-    // cache on first touch, so exec costs what the program touches, not
-    // its size. Edge pages (partial, shared by two segments, or bss) are
-    // built below as before.
-    let mut lazy: Vec<(u64, u64, u64, Prot)> = Vec::new(); // start, end, file offset, prot
     let source = image.mappable();
-    if source.is_some() {
-        for seg in &segs {
-            let Some(file_end) = seg.vaddr.checked_add(seg.file_size) else {
-                continue;
-            };
-            let mut s = seg.vaddr.next_multiple_of(PAGE_SIZE);
-            let mut e = file_end & !(PAGE_SIZE - 1);
-            while s < e && users.get(&s) != Some(&1) {
-                s += PAGE_SIZE;
-            }
-            while e > s && users.get(&(e - PAGE_SIZE)) != Some(&1) {
-                e -= PAGE_SIZE;
-            }
-            let offset = seg.file_offset + (s - seg.vaddr);
-            let exclusive = (s..e)
-                .step_by(PAGE_SIZE as usize)
-                .all(|va| users.get(&va) == Some(&1));
-            if s < e && exclusive && offset.is_multiple_of(PAGE_SIZE) {
-                let prot = pages.get(&s).copied().unwrap_or(Prot::NONE);
-                lazy.push((s, e, offset, prot));
-            }
-        }
-    }
-    let is_lazy = |va: u64| lazy.iter().any(|&(s, e, _, _)| s <= va && va < e);
-    let mut frames: BTreeMap<u64, UFrame> = BTreeMap::new();
-    for (&va, &prot) in &pages {
-        if is_lazy(va) {
-            continue;
-        }
-        if !mm.reserve(va, va + PAGE_SIZE, prot) {
-            return Err(LoadError::Map);
-        }
-        // A whole file page: share the cache's copy.
-        let whole = segs.iter().find_map(|seg| {
-            let off = seg.file_offset + va.checked_sub(seg.vaddr)?;
-            let inside = va >= seg.vaddr && va + PAGE_SIZE <= seg.vaddr + seg.file_size;
-            (inside && off.is_multiple_of(PAGE_SIZE)).then_some(off / PAGE_SIZE)
-        });
-        if users.get(&va) == Some(&1)
-            && let Some(f) = whole.and_then(|i| image.cached_page(i))
+    for piece in &pieces {
+        // The lazily mapped part, if any: whole file pages of one segment.
+        let mut lazy = (piece.start, piece.start, 0);
+        if let ([seg], Some(_)) = (piece.segs.as_slice(), &source)
+            && let Some(file_end) = seg.vaddr.checked_add(seg.file_size)
         {
-            if !mm.map_cow(va, f, prot) {
-                return Err(LoadError::OutOfMemory);
+            let s = seg.vaddr.next_multiple_of(PAGE_SIZE).max(piece.start);
+            let e = (file_end & !(PAGE_SIZE - 1)).min(piece.end);
+            if s < e {
+                let offset = seg.file_offset + (s - seg.vaddr);
+                if offset.is_multiple_of(PAGE_SIZE) {
+                    lazy = (s, e, offset);
+                }
             }
-            continue;
         }
-        let frame = mm.frame(va).ok_or(LoadError::OutOfMemory)?;
-        frames.insert(va, frame);
-    }
-    for seg in &segs {
-        let (start, end) = seg.page_range(PAGE_SIZE);
-        let mut va = start;
-        while va < end {
-            if let Some(f) = frames.get(&va) {
-                copy_segment_page(image, seg, va, f);
-            }
-            va += PAGE_SIZE;
-        }
-    }
-    // Map only after the bytes are in place.
-    for (&va, f) in &frames {
-        let prot = pages.get(&va).copied().unwrap_or(Prot::NONE);
-        let user = UserProt {
-            write: prot.write,
-            exec: prot.exec,
-        };
-        if prot.accessible() && mm.space().map(va, f, user).is_err() {
-            return Err(LoadError::Map);
-        }
-    }
-    if let Some(file) = source {
-        for (s, e, offset, prot) in lazy {
-            if !mm.map_file_lazily(s, e, prot, offset, file.clone()) {
+        let (ls, le, offset) = lazy;
+        for (s, e) in [(piece.start, ls), (le, piece.end)] {
+            if s < e && !mm.reserve(s, e, piece.prot) {
                 return Err(LoadError::Map);
             }
         }
+        if ls < le
+            && let Some(file) = &source
+            && !mm.map_file_lazily(ls, le, piece.prot, offset, file.clone())
+        {
+            return Err(LoadError::Map);
+        }
+        // The pages with file bytes outside the lazy part.
+        let first = piece
+            .segs
+            .iter()
+            .map(|s| s.vaddr & !(PAGE_SIZE - 1))
+            .min()
+            .unwrap_or(piece.end)
+            .max(piece.start);
+        let last = piece
+            .segs
+            .iter()
+            .map(|s| {
+                s.vaddr
+                    .saturating_add(s.file_size)
+                    .next_multiple_of(PAGE_SIZE)
+            })
+            .max()
+            .unwrap_or(piece.start)
+            .min(piece.end);
+        let mut va = first;
+        while va < last {
+            if va == ls && ls < le {
+                va = le;
+                continue;
+            }
+            if piece.segs.iter().any(|s| has_file_bytes(s, va)) {
+                build_page(mm, image, piece, va)?;
+            }
+            va += PAGE_SIZE;
+        }
     }
     Ok(image_end)
+}
+
+/// Builds the page at `va` of `piece` and maps it: the page cache's copy,
+/// copy-on-write, if it is a whole file page of one segment, else a fresh
+/// page with each covering segment's bytes copied in.
+fn build_page(mm: &mut Mm, image: &dyn File, piece: &Piece<'_>, va: u64) -> Result<(), LoadError> {
+    if let [seg] = piece.segs.as_slice() {
+        let off = seg.file_offset + va.saturating_sub(seg.vaddr);
+        let whole = va >= seg.vaddr && va + PAGE_SIZE <= seg.vaddr + seg.file_size;
+        if whole
+            && off.is_multiple_of(PAGE_SIZE)
+            && let Some(f) = image.cached_page(off / PAGE_SIZE)
+        {
+            return if mm.map_cow(va, f, piece.prot) {
+                Ok(())
+            } else {
+                Err(LoadError::OutOfMemory)
+            };
+        }
+    }
+    let frame = mm.frame(va).ok_or(LoadError::OutOfMemory)?;
+    for seg in &piece.segs {
+        copy_segment_page(image, seg, va, &frame);
+    }
+    // Mapped only once the bytes are in place.
+    let user = UserProt {
+        write: piece.prot.write,
+        exec: piece.prot.exec,
+    };
+    if piece.prot.accessible() && mm.space().map(va, &frame, user).is_err() {
+        return Err(LoadError::Map);
+    }
+    Ok(())
 }
 
 fn parse(image: &dyn File) -> Result<LoadPlan, LoadError> {

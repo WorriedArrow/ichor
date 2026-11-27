@@ -261,6 +261,32 @@ these two columns only with each other. The in-program timing
   about 3 us a block, and the `Mm`'s 512 charges and entries about 30 us.
 - On GCP: the next section.
 
+## Local, OpenVMM: exec maps per segment (2026-11-26)
+
+Where fork + exec + wait's time went, timed step by step with temporary
+counters (same machine and setup as the 2026-11-25 section, SRSO's
+safe-RET thunks forced off to come closer to an Intel CPU's paths): of 93
+us an iteration, `execve` took 65, and of that the loader took 49. It
+walked every page of the image (busybox: 274 text pages) through two
+`BTreeMap`s and several lookups, about 180 ns a page, though those pages
+were already mapped lazily. The rest of the iteration: the exiting
+process's teardown 12 us, freeing the forked copy's memory in `execve` 7
+us, finding and opening `/bin/true` 6.5 us, 18 page faults 6 us, fork 3
+us.
+
+The loader now works per piece of address space between segment
+boundaries: the lazily mapped file pages are one region each, `.bss` is
+demand-zero, and only a segment's partial first and last pages (and pages
+two segments share) are built at exec. It reads 4 KiB of the image for its
+headers, not 64 KiB (it parses them twice an exec). Five rounds in one
+boot, the thunks on as in the table above (null syscall 160-166 ns there,
+as in that section's 160):
+
+| Benchmark | Before (2026-11-25 table) | After |
+|---|---|---|
+| fork + exec + wait | 114 us | 75-82 us |
+| container start (in the kernel) | 330-410 us | 187 us |
+
 ## Google Cloud, third round (2026-11-26): 2 MiB pages, THP checked
 
 After `c6e5b77` (ADR-0020) and ADR-0008's 2026-11-25 amendment (`sysretq`,
