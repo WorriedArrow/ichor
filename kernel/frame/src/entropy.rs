@@ -23,10 +23,19 @@ const RDRAND_TRIES: usize = 10;
 /// `out.len()` only if the hardware kept failing), or `None` if the CPU has
 /// neither instruction.
 pub fn hardware_random(out: &mut [u64]) -> Option<(Source, usize)> {
-    let f = cpu::features();
-    let (source, tries) = if f.rdseed {
+    use core::sync::atomic::{AtomicU8, Ordering::Relaxed};
+    // What CPUID said, asked once: in a virtual machine each CPUID traps to
+    // the hypervisor, and this runs for every random request (every exec).
+    static HAS: AtomicU8 = AtomicU8::new(0); // 0 unknown, else 1 | 2 rdrand | 4 rdseed
+    let mut has = HAS.load(Relaxed);
+    if has == 0 {
+        let f = cpu::features();
+        has = 1 | if f.rdrand { 2 } else { 0 } | if f.rdseed { 4 } else { 0 };
+        HAS.store(has, Relaxed);
+    }
+    let (source, tries) = if has & 4 != 0 {
         (Source::Rdseed, RDSEED_TRIES)
-    } else if f.rdrand {
+    } else if has & 2 != 0 {
         (Source::Rdrand, RDRAND_TRIES)
     } else {
         return None;

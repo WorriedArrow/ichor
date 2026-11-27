@@ -22,7 +22,8 @@ pub struct Features {
     pub rdseed: bool,
 }
 
-/// Detects features with CPUID. Cheap enough to call repeatedly.
+/// Detects features with CPUID, each call anew. Not for hot paths: in a
+/// virtual machine every CPUID traps to the hypervisor (microseconds).
 pub fn features() -> Features {
     let max_leaf = cpuid(0, 0)[0];
     let max_ext = cpuid(0x8000_0000, 0)[0];

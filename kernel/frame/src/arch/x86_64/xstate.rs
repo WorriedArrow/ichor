@@ -639,12 +639,19 @@ impl ExtState {
     /// area's earlier one, which software has not written since. The
     /// caller settles the state first, before taking `guard`, so it is live
     /// nowhere else (invariant 4 keeps it so through a migration).
+    /// Inlined: on the system call path the state is live here already.
+    #[inline]
     pub(crate) fn restore(&mut self, guard: &IrqGuard) {
+        if self.s.live.load(Ordering::Acquire) != this_cpu(guard) {
+            self.load(guard);
+        }
+    }
+
+    #[inline(never)]
+    fn load(&mut self, guard: &IrqGuard) {
         let here = this_cpu(guard);
-        match self.s.live.load(Ordering::Acquire) {
-            l if l == here => return,
-            0 => {}
-            _ => crate::boot::fatal("extended state live on another CPU"),
+        if self.s.live.load(Ordering::Acquire) != 0 {
+            crate::boot::fatal("extended state live on another CPU");
         }
         // Another state live here (another context of this task) first,
         // with its own XFD.

@@ -316,11 +316,17 @@ pub(crate) fn note_close(vfs: &Vfs, ino: Ino, write: bool) {
 }
 
 /// Hands the changes recorded in `vfs` on to whoever watches them.
+/// Inlined: every system call asks, and usually nothing watches.
+#[inline]
 pub(crate) fn flush(vfs: &Vfs) {
-    static COOKIE: AtomicU32 = AtomicU32::new(1);
-    if !vfs.inotify.watching.load(Ordering::Acquire) {
-        return;
+    if vfs.inotify.watching.load(Ordering::Acquire) {
+        flush_watched(vfs);
     }
+}
+
+#[inline(never)]
+fn flush_watched(vfs: &Vfs) {
+    static COOKIE: AtomicU32 = AtomicU32::new(1);
     // Each with the directory and name of the inode it is about (while they
     // can be told), and whether that is a directory.
     let changes: Vec<_> = {

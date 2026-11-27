@@ -85,10 +85,17 @@ impl Pending {
     }
 
     /// Takes the lowest-numbered signal of `wanted` (the first of its kind).
+    /// Inlined: after every system call there is usually none.
+    #[inline]
     fn take(&self, wanted: u64) -> Option<(u32, Info)> {
         if self.set() & wanted == 0 {
             return None;
         }
+        self.take_queued(wanted)
+    }
+
+    #[inline(never)]
+    fn take_queued(&self, wanted: u64) -> Option<(u32, Info)> {
         let mut q = self.queue.lock();
         let sig = (self.set() & wanted).trailing_zeros() + 1;
         let at = q.iter().position(|&(s, _)| s == sig)?;
