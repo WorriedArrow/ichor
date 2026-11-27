@@ -50,7 +50,24 @@ crate::cpu_local! {
 /// `IA32_SPEC_CTRL`, and the bits Ichor sets in it.
 const MSR_SPEC_CTRL: u32 = 0x48;
 const SPEC_CTRL_IBRS: u64 = 1;
+const SPEC_CTRL_STIBP: u64 = 1 << 1;
+const SPEC_CTRL_SSBD: u64 = 1 << 2;
 const SPEC_CTRL_BHI_DIS_S: u64 = 1 << 10;
+/// AMD's `VIRT_SPEC_CTRL`, where a hypervisor offers SSBD through it.
+const MSR_VIRT_SPEC_CTRL: u32 = 0xc001_011f;
+/// How threads' speculative store bypass is disabled: 0 it cannot be, 1
+/// `IA32_SPEC_CTRL`, 2 `VIRT_SPEC_CTRL`.
+static SSBD_KIND: AtomicU64 = AtomicU64::new(0);
+/// Speculative store bypass applies to this CPU.
+static SSB: AtomicBool = AtomicBool::new(false);
+
+crate::cpu_local! {
+    /// What this CPU's `IA32_SPEC_CTRL` holds with SSBD off: the firmware's
+    /// bits and Ichor's.
+    static SPEC_BASE: AtomicU64 = AtomicU64::new(0);
+    /// Whether this CPU runs with SSBD on (the last thread it entered asked).
+    static SSBD_NOW: AtomicBool = AtomicBool::new(false);
+}
 /// What every CPU writes to `IA32_SPEC_CTRL` as it comes up (0: nothing;
 /// ADR-0004 §2: Spectre v2 and BHI in the kernel). With enhanced IBRS that
 /// is left on; without, it counts only for the mode it was written in, so
@@ -99,6 +116,15 @@ pub(crate) struct Mitigations {
     /// not be installed.
     pub safe_ret: Option<super::rethunk::SafeRet>,
     pub safe_ret_failed: Option<&'static str>,
+    /// Where ITS applies, why the stack probe's return could not be sent
+    /// through the aligned thunk (the thunks themselves are always aligned).
+    pub its_failed: Option<&'static str>,
+    /// STIBP kept on (SMT without enhanced or automatic IBRS), or needed
+    /// but not enumerated.
+    pub stibp: bool,
+    pub stibp_missing: bool,
+    /// Threads may disable speculative store bypass (`UserContext::set_ssbd`).
+    pub ssbd: Option<super::cpu::Ssbd>,
 }
 
 /// Mitigations a test may force on any CPU.
@@ -118,6 +144,8 @@ pub(crate) struct Forced {
     pub ibpb_not_safe_ret: bool,
     /// Retpolines, whatever the CPU.
     pub retpoline: bool,
+    /// STIBP on, whatever the topology (where the CPU has it).
+    pub stibp: bool,
 }
 
 /// Switches on the mitigations `v` calls for (once, on the boot CPU,
@@ -128,7 +156,11 @@ pub(crate) fn enable_mitigations(
     forced: Forced,
 ) -> Result<Mitigations, &'static str> {
     use core::sync::atomic::Ordering::Relaxed;
-    let needs_verw = v.mds || v.taa;
+    // MDS and TAA (Intel, MD_CLEAR), TSA (AMD, VERW_CLEAR): VERW clears
+    // the buffers before ring 3. MMIO stale data alone does not call for
+    // it: what leaks is read by MMIO, which no cell is given (Linux, too,
+    // clears for it on the way to guests, not to user space).
+    let needs_verw = v.mds || v.taa || v.tsa;
     let verw = (needs_verw && v.md_clear) || forced.verw;
     VERW_ON.store(verw, Relaxed);
     IBPB_ON.store(v.pred_cmd, Relaxed);
@@ -159,11 +191,28 @@ pub(crate) fn enable_mitigations(
         (false, None)
     };
     let ibrs_on_entry = v.ibrs && !eibrs && !auto_ibrs && !retpoline;
+    // STIBP: without enhanced or automatic IBRS, nothing else keeps one
+    // hardware thread's branch training from steering its sibling's, and
+    // the sibling may run another cell (ADR-0004 §3's dedicated cores are
+    // not built). Kept on, as Linux does where AMD prefers it; Linux's
+    // default elsewhere protects only threads that ask.
+    let stibp_needed = v.smt && !eibrs && !auto_ibrs;
+    let stibp = (stibp_needed || forced.stibp) && v.stibp;
     let spec = if eibrs || ibrs_on_entry {
         SPEC_CTRL_IBRS
     } else {
         0
-    } | if bhi_dis_s { SPEC_CTRL_BHI_DIS_S } else { 0 };
+    } | if bhi_dis_s { SPEC_CTRL_BHI_DIS_S } else { 0 }
+        | if stibp { SPEC_CTRL_STIBP } else { 0 };
+    SSB.store(v.ssb, Relaxed);
+    SSBD_KIND.store(
+        match v.ssbd {
+            None => 0,
+            Some(super::cpu::Ssbd::SpecCtrl) => 1,
+            Some(super::cpu::Ssbd::Virt) => 2,
+        },
+        Relaxed,
+    );
     SPEC_CTRL.store(spec, Relaxed);
     IBRS_ON_ENTRY.store(ibrs_on_entry, Relaxed);
     AUTO_IBRS.store(auto_ibrs, Relaxed);
@@ -185,6 +234,13 @@ pub(crate) fn enable_mitigations(
     let ibpb_needed = (v.retbleed || v.srso) && safe_ret.is_none();
     let ibpb_entry = (ibpb_needed || forced.ibpb_entry) && v.pred_cmd;
     IBPB_ENTRY.store(ibpb_entry, Relaxed);
+    // ITS: the thunks are aligned already; the safe-RET install above sent
+    // the stack probe's `ret` through them if it ran.
+    let its_failed = if v.its && safe_ret.is_none() {
+        super::rethunk::install_its().err()
+    } else {
+        None
+    };
     enable_cpu_mitigations();
     Ok(Mitigations {
         verw,
@@ -203,6 +259,10 @@ pub(crate) fn enable_mitigations(
         srso_incomplete: v.srso && !v.ibpb_brtype,
         safe_ret,
         safe_ret_failed,
+        its_failed,
+        stibp,
+        stibp_missing: stibp_needed && !v.stibp,
+        ssbd: v.ssbd,
     })
 }
 
@@ -231,18 +291,61 @@ pub(crate) fn enable_cpu_mitigations() {
     }
     super::entry::enable_cpu(block);
     let spec = SPEC_CTRL.load(Relaxed);
-    if spec != 0 {
-        // SAFETY: `spec` is nonzero only when CPUID enumerates
-        // IA32_SPEC_CTRL (on the boot CPU; all CPUs are assumed alike).
-        // Reading it has no side effects.
-        let firmware = unsafe { rdmsr(MSR_SPEC_CTRL) };
-        // SAFETY: the MSR exists, as above, and so does every bit set:
-        // those firmware set, IBRS (with the MSR) and BHI_DIS_S (only with
-        // its own CPUID bit). They only restrict speculation on this CPU.
-        unsafe { wrmsr(MSR_SPEC_CTRL, firmware | spec) };
+    if spec != 0 || SSBD_KIND.load(Relaxed) == 1 {
+        // SAFETY: `spec` is nonzero, or SSBD is in IA32_SPEC_CTRL, only when
+        // CPUID enumerates the MSR (on the boot CPU; all CPUs are assumed
+        // alike). Reading it has no side effects.
+        let firmware = unsafe { rdmsr(MSR_SPEC_CTRL) } & !SPEC_CTRL_SSBD;
+        SPEC_BASE
+            .get_on(cpu::current())
+            .store(firmware | spec, Relaxed);
+        if spec != 0 {
+            // SAFETY: the MSR exists, as above, and so does every bit set:
+            // those firmware set, IBRS (with the MSR), STIBP and BHI_DIS_S
+            // (only with their own CPUID bits). They only restrict
+            // speculation on this CPU.
+            unsafe { wrmsr(MSR_SPEC_CTRL, firmware | spec) };
+        }
         if IBRS_ON_ENTRY.load(Relaxed) {
             block.spec_ctrl.store(firmware | spec, Relaxed);
         }
+    }
+}
+
+/// Whether speculative store bypass applies here, and whether a thread can
+/// disable it ([`UserContext::set_ssbd`]).
+pub fn store_bypass() -> (bool, bool) {
+    use core::sync::atomic::Ordering::Relaxed;
+    (SSB.load(Relaxed), SSBD_KIND.load(Relaxed) != 0)
+}
+
+/// Turns this CPU's SSBD on or off for the thread about to enter ring 3.
+fn set_ssbd(guard: &cpu::IrqGuard, on: bool) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let now = SSBD_NOW.get(guard);
+    if now.load(Relaxed) == on {
+        return;
+    }
+    now.store(on, Relaxed);
+    match SSBD_KIND.load(Relaxed) {
+        1 => {
+            let value = SPEC_BASE.get(guard).load(Relaxed) | if on { SPEC_CTRL_SSBD } else { 0 };
+            // SAFETY: IA32_SPEC_CTRL and its SSBD bit exist (SSBD_KIND 1 is
+            // set only where CPUID enumerates them); the other bits are this
+            // CPU's own (`SPEC_BASE`). They only restrict speculation.
+            unsafe { wrmsr(MSR_SPEC_CTRL, value) };
+            if IBRS_ON_ENTRY.load(Relaxed) {
+                // The entry and exit writes carry it from here.
+                cpu::this_block().spec_ctrl.store(value, Relaxed);
+            }
+        }
+        2 => {
+            // SAFETY: VIRT_SPEC_CTRL exists (SSBD_KIND 2 is set only where
+            // CPUID 8000_0008h EBX[25] enumerates it); bit 2, SSBD, is its
+            // only bit. It only restricts speculation.
+            unsafe { wrmsr(MSR_VIRT_SPEC_CTRL, if on { SPEC_CTRL_SSBD } else { 0 }) };
+        }
+        _ => {}
     }
 }
 
@@ -305,6 +408,9 @@ pub struct UserContext {
     /// x87/SSE/AVX state (ADR-0008): restored before ring 3, saved when it
     /// must be.
     fpu: super::xstate::ExtState, // 160 (a pointer; the stubs never touch it)
+    /// Speculative store bypass disabled while the thread runs (where the
+    /// CPU can: [`store_bypass`]).
+    ssbd: bool,
 }
 
 impl UserContext {
@@ -316,6 +422,17 @@ impl UserContext {
             rflags: RFLAGS_IF | RFLAGS_RESERVED1,
             ..Self::default()
         }
+    }
+
+    /// Disables (or allows) speculative store bypass while this thread
+    /// runs, where the CPU can ([`store_bypass`]); clones keep it.
+    pub fn set_ssbd(&mut self, on: bool) {
+        self.ssbd = on;
+    }
+
+    /// Whether [`Self::set_ssbd`] asked for SSBD.
+    pub fn ssbd(&self) -> bool {
+        self.ssbd
     }
 
     /// The syscall number (`rax`) and six arguments, by the Linux
@@ -524,6 +641,10 @@ impl<'a> UserMode<'a> {
                 unsafe { wrmsr(MSR_PRED_CMD, 1) };
                 IBPBS.fetch_add(1, Relaxed);
             }
+        }
+        // The thread's speculative store bypass setting (`set_ssbd`).
+        if SSBD_KIND.load(Relaxed) != 0 {
+            set_ssbd(&guard, self.ctx.ssbd);
         }
         // The kernel never uses the FPU, so from here the registers hold only
         // this thread's state, until it is saved: when its task switches

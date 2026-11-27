@@ -1146,6 +1146,91 @@ fn fork_program() -> Vec<u8> {
     static_elf(&a.finish(BLOB_VADDR).unwrap_or_else(|| fail("assembler")))
 }
 
+/// Speculative store bypass by prctl, where the CPU can disable it (ADR-0004's
+/// second 2026-11-27 amendment): the state reads back after each change, a
+/// forked child keeps the parent's, and the two run with different settings
+/// side by side, yielding, so that CPUs switch SSBD between them. Exits 0,
+/// else the failed check.
+fn ssbd_program() -> Vec<u8> {
+    const GET: u64 = 52;
+    const SET: u64 = 53;
+    let mut a = Asm::new();
+    let bad = a.label();
+    let parent = a.label();
+    let child_loop = a.label();
+    let parent_loop = a.label();
+    let prctl = |a: &mut Asm, op: u64, ctrl: u64| {
+        a.mov_imm(Reg::Rdi, op);
+        a.mov_imm(Reg::Rsi, 0);
+        a.mov_imm(Reg::Rdx, ctrl);
+        a.mov_imm(Reg::R10, 0);
+        a.mov_imm(Reg::R8, 0);
+        a.sys(sys::PRCTL);
+    };
+    let expect = |a: &mut Asm, value: i32, check: u64| {
+        a.mov_imm(Reg::Rdi, check);
+        a.cmp_imm(Reg::Rax, value);
+        a.jne(bad);
+    };
+    a.mov(Reg::Rbp, Reg::Rsp);
+    a.sub_imm(Reg::Rbp, 4096);
+    prctl(&mut a, GET, 0);
+    expect(&mut a, 3, 1); // PR_SPEC_PRCTL | PR_SPEC_ENABLE
+    prctl(&mut a, SET, 4); // PR_SPEC_DISABLE
+    expect(&mut a, 0, 2);
+    prctl(&mut a, GET, 0);
+    expect(&mut a, 5, 3);
+    a.sys(sys::FORK);
+    a.mov(Reg::R12, Reg::Rax);
+    a.cmp_imm(Reg::Rax, 0);
+    a.jne(parent);
+    // Child: disabled, as its parent was; then runs and yields.
+    prctl(&mut a, GET, 0);
+    expect(&mut a, 5, 4);
+    a.mov_imm(Reg::R13, 2000);
+    a.bind(child_loop);
+    a.sys(sys::SCHED_YIELD);
+    a.sys(sys::GETPID);
+    a.sub_imm(Reg::R13, 1);
+    a.cmp_imm(Reg::R13, 0);
+    a.jne(child_loop);
+    prctl(&mut a, GET, 0);
+    expect(&mut a, 5, 5);
+    a.mov_imm(Reg::Rdi, 0);
+    a.sys(sys::EXIT_GROUP);
+    // Parent: enabled again, runs and yields beside the child.
+    a.bind(parent);
+    prctl(&mut a, SET, 2); // PR_SPEC_ENABLE
+    expect(&mut a, 0, 6);
+    prctl(&mut a, GET, 0);
+    expect(&mut a, 3, 7);
+    a.mov_imm(Reg::R13, 2000);
+    a.bind(parent_loop);
+    a.sys(sys::SCHED_YIELD);
+    a.sys(sys::GETPID);
+    a.sub_imm(Reg::R13, 1);
+    a.cmp_imm(Reg::R13, 0);
+    a.jne(parent_loop);
+    // wait4(child, rbp + 16, 0, NULL); its status is 0.
+    a.mov(Reg::Rdi, Reg::R12);
+    a.mov(Reg::Rsi, Reg::Rbp);
+    a.add_imm(Reg::Rsi, 16);
+    a.mov_imm(Reg::Rdx, 0);
+    a.mov_imm(Reg::R10, 0);
+    a.sys(sys::WAIT4);
+    a.mov_imm(Reg::Rdi, 8);
+    a.cmp(Reg::Rax, Reg::R12);
+    a.jne(bad);
+    a.load(Reg::Rax, Reg::Rbp, 16);
+    a.mov_imm(Reg::Rdi, 9);
+    a.cmp_imm(Reg::Rax, 0);
+    a.jne(bad);
+    a.mov_imm(Reg::Rdi, 0);
+    a.bind(bad);
+    a.sys(sys::EXIT_GROUP);
+    static_elf(&a.finish(BLOB_VADDR).unwrap_or_else(|| fail("assembler")))
+}
+
 /// Threads and futexes: the main thread maps a stack and clones a thread
 /// (pthread-style flags, with PARENT_SETTID and CHILD_CLEARTID); the thread
 /// stores 42 into a shared word, futex-wakes, and exits alone (`exit`, not
@@ -5001,6 +5086,27 @@ pub(crate) fn run() {
     println!(
         "ichor: linux: mremap moves and resizes mappings; prctl names and bounding set ok ({syscalls} syscalls)"
     );
+
+    match frame::user::store_bypass() {
+        (true, true) => {
+            let (status, syscalls) = run_linux(new_process(), &ssbd_program(), None, &["ssbdtest"]);
+            if status != 0 {
+                println!("ichor: linux: ssbdtest failed check {status}");
+                fail("ssbdtest");
+            }
+            println!(
+                "ichor: linux: speculative store bypass disabled by prctl, kept by fork, switched per thread ({syscalls} syscalls)"
+            );
+        }
+        (affected, _) => println!(
+            "ichor: linux: speculative store bypass {} here; ssbdtest skipped",
+            if affected {
+                "cannot be disabled"
+            } else {
+                "does not apply"
+            }
+        ),
+    }
 
     let (status, syscalls) = run_linux(new_process(), &waits_program(), None, &["waitstest"]);
     if status != 0 {

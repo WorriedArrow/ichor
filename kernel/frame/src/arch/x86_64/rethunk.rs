@@ -28,7 +28,14 @@ use crate::mm::meta::kind;
 use crate::mm::{PAGE_SIZE, PhysAddr, THUNK_BASE, kspace, page_alloc, phys_to_virt};
 
 core::arch::global_asm!(
-    ".p2align 4",
+    // Both thunks start in the upper half of a cache line, on every CPU:
+    // where Intel's indirect target selection applies (ITS), an indirect
+    // branch or return whose last byte is in the lower half may be
+    // predicted from a user's training despite enhanced IBRS (Linux's
+    // aligned thunks). Every return and indirect branch the compiler emits
+    // goes through one of them, so placing them costs nothing.
+    ".p2align 6",
+    ".skip 32, 0xcc",
     ".global __x86_return_thunk",
     "__x86_return_thunk:",
     "ret",
@@ -66,8 +73,10 @@ core::arch::global_asm!(
     // Every indirect call and jump of the compiled kernel, target in r11:
     // a plain jump, or (`install_retpoline`) a jump to the retpoline after
     // it, whose speculation is caught in the loop and whose return is the
-    // kernel's return thunk, as Linux's.
-    ".p2align 4",
+    // kernel's return thunk, as Linux's. In the upper half of its line, as
+    // above.
+    ".p2align 6",
+    ".skip 32, 0xcc",
     ".global __x86_indirect_thunk_r11",
     "__x86_indirect_thunk_r11:",
     "jmp r11",
@@ -237,6 +246,25 @@ pub(crate) fn install(kind: SafeRet) -> Result<(), &'static str> {
     unsafe { patch(untrain_stub, untrain) }?;
     UNTRAIN.store(1, Relaxed);
     Ok(())
+}
+
+/// Where ITS applies: sends the one `ret` the compiler's thunks never
+/// reach, `compiler_builtins`' stack probe's, through the aligned return
+/// thunk if it sits in the lower half of its cache line. Same contract as
+/// [`install`], and not after it (which patches that `ret` already).
+pub(crate) fn install_its() -> Result<(), &'static str> {
+    let [thunk, ..] = labels();
+    if !compiled_with_thunks(thunk) {
+        return Err("the kernel was built without return thunks");
+    }
+    let probe_ret = stack_probe_ret().ok_or("the stack probe's return was not found")?;
+    if probe_ret & 32 != 0 {
+        return Ok(());
+    }
+    // SAFETY: only the boot CPU runs (the caller's contract); the probe's
+    // `ret` is followed by four `int3`s of padding (`stack_probe_ret`
+    // checked them) that nothing executes.
+    unsafe { patch(probe_ret, thunk) }
 }
 
 /// Points `__x86_indirect_thunk_r11`, through which every indirect call and

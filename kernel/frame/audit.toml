@@ -53,5 +53,8 @@
 # Step 22 (ADR-0004's 2026-11-27 amendment: retpolines on AMD in place of
 # IBRS on entry, the entry code at its image address, mapped in shadow
 # roots under isolation): 8,100 / 320.
-max_code_lines = 8100
-max_unsafe_sites = 320
+# Step 23 (ADR-0004's second 2026-11-27 amendment: ITS, TSA, STIBP,
+# speculative store bypass by prctl; TAA, GDS and MMIO stale data tested as
+# Linux tests them): 8,350 / 325.
+max_code_lines = 8350
+max_unsafe_sites = 325

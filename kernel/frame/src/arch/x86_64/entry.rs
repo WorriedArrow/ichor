@@ -669,7 +669,9 @@ global_asm!(
     // without BHI_DIS_S (Intel's BHI guidance): five times a call and a
     // return around five taken jumps, so that the history ends up made of
     // branches the kernel chose, then LFENCE so that nothing runs ahead of
-    // it. Uses rax and rcx.
+    // it. Uses rax and rcx. Each `ret` begins the upper half of a cache
+    // line (ITS), reached by a direct jump: one more taken branch of the
+    // kernel's choosing in the history.
     ".balign 64",
     "ichor_clear_bhb:",
     "mov ecx, 5",
@@ -678,7 +680,7 @@ global_asm!(
     "dec ecx",
     "jnz 93b",
     "lfence",
-    "ret",
+    "jmp 98f",
     ".balign 64",
     "94:",
     "mov eax, 5",
@@ -688,7 +690,17 @@ global_asm!(
     "96:",
     "dec eax",
     "jnz 95b",
+    "jmp 99f",
+    ".balign 64, 0xcc",
+    ".skip 32, 0xcc",
+    "98:",
     "ret",
+    "int3",
+    ".balign 64, 0xcc",
+    ".skip 32, 0xcc",
+    "99:",
+    "ret",
+    "int3",
     ".balign 4096",
     ".global ichor_entry_end",
     "ichor_entry_end:",

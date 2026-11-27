@@ -419,6 +419,97 @@ does Ichor now.
 - Not verified as a mitigation: no Spectre v2 exploit was run against it.
 - Frame grows past audit step 21 (to 8,044 / 316); step 22 (8,100 / 320).
 
+## Amendment (2026-11-27): ITS, TSA, STIBP and speculative store bypass; TAA and GDS tested as Linux tests them
+
+Round 18 of the benchmarks put Debian 13 (Linux 6.12 and 7.3) beside
+Ichor on five cloud machines and compared
+`/sys/devices/system/cpu/vulnerabilities` with Ichor's boot log
+(`docs/reports/mitigations-vs-linux.md`). Linux mitigated four things
+Ichor did not, and Ichor mitigated one that does not apply. All five are
+closed here; detection follows Linux's tests, so that both kernels see
+the same CPU the same way.
+
+- **TAA needs TSX.** Ichor took TAA from `TAA_NO` alone. It now applies
+  only with RTM (CPUID.7:EBX[11]) or `TSX_CTRL` (`IA32_ARCH_CAPABILITIES`
+  bit 7). AWS's Sapphire Rapids (m7i) has neither but leaves `TAA_NO` clear,
+  so Ichor was running VERW on every return to ring 3 there. **GDS** is now
+  taken from Linux's list of models, with AVX, unless `GDS_NO` is set, not
+  from `GDS_NO` alone. GDS was only logged, never mitigated: its fix is
+  microcode.
+- **Indirect target selection (ITS, Intel Ice Lake to Tiger Lake and
+  Cascade Lake).** On these CPUs, an indirect branch or return whose last
+  byte is in the lower half of a 64-byte cache line can take a prediction
+  that user code trained, even with enhanced IBRS. Every indirect branch
+  and every return that the kernel's compiled code emits goes through one
+  of two thunks (`__x86_indirect_thunk_r11`,
+  `-Zretpoline-external-thunk`; `__x86_return_thunk`,
+  `-Zfunction-return=thunk-extern`). Both thunks now start at byte 32 of a
+  cache line on every CPU, so placing them costs nothing.
+  - `ichor_clear_bhb`'s two `ret`s are placed the same way. Each is now
+    reached by a direct jump, one more taken branch of the kernel's own in
+    the history.
+  - The stack probe of `compiler_builtins` is assembly that never reaches
+    the thunks. Its `ret` is patched to a jump to the return thunk, as the
+    safe-RET install already does on AMD (`rethunk::install_its`), where
+    ITS applies and that `ret` is in a lower half.
+  - Detection is Linux's: not with `ITS_NO` (bit 62), and not where
+    `BHI_DIS_S` exists, since no affected CPU has it. Otherwise a guest
+    counts as affected, because the host it runs on, or moves to, may be;
+    on bare metal, Linux's list of models and steppings decides.
+  - Linux's own name for this is aligned branch and return thunks.
+- **Transient scheduler attacks (TSA, AMD Zen 3 and 4).** TSA applies on
+  family 19h unless both `TSA_SQ_NO` and `TSA_L1_NO` (CPUID 8000_0021h
+  ECX[1:2]) rule it out. It uses the existing VERW before ring 3, which
+  AMD's `VERW_CLEAR` (8000_0021h EAX[5]) says clears what leaks; on AMD,
+  `md_clear` now means that bit.
+- **STIBP.** Without enhanced or automatic IBRS, nothing kept a hardware
+  thread's branch training from steering its sibling, which may be running
+  another cell, since §3's dedicated cores are not built. On cores with
+  more than one thread (leaf 0Bh's SMT level; on AMD, CPUID 8000_001Eh
+  EBX[15:8]) that lack both, `IA32_SPEC_CTRL.STIBP` is now set on every
+  CPU and kept on.
+  - Today that covers EPYC Rome and Milan, and Intel parts without
+    enhanced IBRS.
+  - Linux keeps STIBP always on where AMD prefers it (Rome). Elsewhere its
+    default protects only the threads that ask; Ichor's cells cannot be
+    expected to ask.
+  - Where IBRS is written on every entry, STIBP rides in the value the
+    entry and exit writes carry.
+  - `force_stibp` turns it on where the CPU has STIBP, whatever the
+    topology, for tests.
+- **Speculative store bypass.** A thread may disable speculative store
+  bypass with `PR_SET_SPECULATION_CTRL`, as on Linux, whose default this is
+  ("disabled via prctl"). Frame keeps one bit in `UserContext`
+  (`set_ssbd`, inherited by clones). Before ring 3, `execute` writes SSBD
+  only when the bit differs from what this CPU last ran, so threads that
+  never ask pay nothing.
+  - The bit is `IA32_SPEC_CTRL` bit 2 (Intel's CPUID.7:EDX[31], AMD's
+    8000_0008h EBX[24]), else AMD's `VIRT_SPEC_CTRL` (EBX[25]), which
+    hypervisors offer.
+  - The kernel keeps the prctl state per thread: enable, disable, force
+    disable, or disable until exec. Fork and clone keep it, and exec ends
+    only the last.
+  - Indirect-branch control answers "enabled" and refuses to be set, as
+    Linux does when it offers none: IBPB between cells and STIBP are not
+    the thread's to choose. L1D flushing is refused, as Linux's default
+    refuses it.
+  - Debian's perl checks every answer and state, across fork and exec, on
+    every boot (`SPEC_SCRIPT`).
+- **MMIO stale data** is now detected: Linux's models, unless
+  `SBDR_SSDP_NO`, `FBSDP_NO` and `PSDP_NO` all rule it out. It calls for
+  no VERW of its own, and the boot log says so. What leaks is read back
+  through MMIO, which no cell is given, and Linux likewise clears for it
+  only on the way into guests. Where MDS or TAA applies, VERW is on
+  anyway. §2's table counted it as covered by VERW; this is the reasoning
+  that holds.
+- The boot log names each: `its`, `tsa`, `mmio`, `ssb`, `stibp`, `ssbd`
+  and `smt` in the `cpu0 speculation` line, and indirect target selection,
+  STIBP and speculative store bypass at the end of the `mitigations` line.
+- Cost: nothing on CPUs none of these apply to. On the affected ones:
+  VERW on Milan, STIBP on Rome and Milan, the patched stack probe on Ice
+  Lake. GCP figures: `docs/benchmarks.md`.
+- Frame grows past audit step 22 (to 8,317 / 319); step 23 (8,350 / 325).
+
 ## Consequences
 
 - Nodes on modern cloud CPUs (Ice Lake and later, EPYC Milan and later)

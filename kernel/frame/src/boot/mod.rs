@@ -252,7 +252,7 @@ pub(crate) extern "sysv64" fn kernel_space_entry() -> ! {
     let v = arch::cpu::vulnerabilities();
     let yn = |b: bool| if b { "affected" } else { "no" };
     println!(
-        "ichor: frame: cpu0 speculation (ADR-0004): meltdown {}, mds {}, taa {}, bhi {}, gds {}, retbleed {}, srso {}; eibrs {}, ibrs {}, ibpb {}, md_clear {}",
+        "ichor: frame: cpu0 speculation (ADR-0004): meltdown {}, mds {}, taa {}, bhi {}, gds {}, retbleed {}, srso {}, its {}, tsa {}, mmio {}, ssb {}; eibrs {}, ibrs {}, ibpb {}, md_clear {}, stibp {}, ssbd {}, smt {}",
         yn(v.meltdown),
         yn(v.mds),
         yn(v.taa),
@@ -260,10 +260,17 @@ pub(crate) extern "sysv64" fn kernel_space_entry() -> ! {
         yn(v.gds),
         yn(v.retbleed),
         yn(v.srso),
+        yn(v.its),
+        yn(v.tsa),
+        yn(v.mmio),
+        yn(v.ssb),
         v.eibrs,
         v.ibrs,
         v.pred_cmd,
         v.md_clear,
+        v.stibp,
+        v.ssbd.is_some(),
+        v.smt,
     );
     let cmdline = cmdline::Cmdline::new(state.cmdline());
     let force_verw = cmdline.flag("force_verw");
@@ -275,6 +282,7 @@ pub(crate) extern "sysv64" fn kernel_space_entry() -> ! {
         safe_ret: cmdline.flag("force_safe_ret"),
         ibpb_not_safe_ret: cmdline.get("srso") == Some("ibpb"),
         retpoline: cmdline.flag("force_retpoline"),
+        stibp: cmdline.flag("force_stibp"),
     };
     let m = match arch::usermode::enable_mitigations(&v, forced) {
         Ok(m) => m,
@@ -283,13 +291,14 @@ pub(crate) extern "sysv64" fn kernel_space_entry() -> ! {
     let on = |b: bool| if b { "on" } else { "off (not needed)" };
     let pcid = if m.pcid { "PCID" } else { "no PCID" };
     println!(
-        "ichor: frame: mitigations (ADR-0004): VERW on return to ring 3 {}, IBPB between cells {}, page-table isolation {}, Spectre v2 in the kernel {}, branch history {}, IBPB on entry {}, return thunks {}, RSB filled on context switch, Spectre v1 masked indices",
+        "ichor: frame: mitigations (ADR-0004): VERW on return to ring 3 {}, IBPB between cells {}, page-table isolation {}, Spectre v2 in the kernel {}, branch history {}, IBPB on entry {}, return thunks {}, RSB filled on context switch, Spectre v1 masked indices, indirect target selection {}, STIBP {}, speculative store bypass {}",
         // Forced, VERW runs whatever the CPU; it clears the buffers only
-        // with MD_CLEAR microcode.
+        // with MD_CLEAR (or AMD's VERW_CLEAR) microcode.
         match (m.verw, m.verw_missing, force_verw) {
             (true, true, _) => "on (forced; clears nothing without MD_CLEAR microcode)",
-            (false, true, _) => "MISSING (no MD_CLEAR microcode)",
-            (true, false, true) if !(v.mds || v.taa) => "on (forced)",
+            (false, true, _) => "MISSING (no MD_CLEAR or VERW_CLEAR microcode)",
+            (true, false, true) if !(v.mds || v.taa || v.tsa) => "on (forced)",
+            (true, false, _) if v.tsa => "on (TSA)",
             (verw, _, _) => on(verw),
         },
         if m.ibpb {
@@ -346,7 +355,30 @@ pub(crate) extern "sysv64" fn kernel_space_entry() -> ! {
             ),
             (None, _) => "not needed".into(),
         },
+        match (v.its, m.its_failed) {
+            (true, Some(why)) => alloc::format!("aligned thunks (stack probe NOT ALIGNED: {why})"),
+            (true, None) => "aligned thunks".into(),
+            (false, _) => "not affected (thunks aligned)".into(),
+        },
+        match (m.stibp, m.stibp_missing) {
+            (_, true) => "NOT MITIGATED (SMT, no STIBP)",
+            (true, _) if forced.stibp && !v.smt => "on (forced)",
+            (true, _) => "on (SMT)",
+            (false, _) if v.smt => "not needed (eIBRS or AutoIBRS)",
+            (false, _) => "not needed (no SMT)",
+        },
+        match (v.ssb, m.ssbd) {
+            (false, _) => "not affected",
+            (true, Some(arch::cpu::Ssbd::SpecCtrl)) => "SSBD by prctl",
+            (true, Some(arch::cpu::Ssbd::Virt)) => "SSBD by prctl (VIRT_SPEC_CTRL)",
+            (true, None) => "vulnerable (no SSBD)",
+        },
     );
+    if v.mmio {
+        println!(
+            "ichor: frame: MMIO stale data applies; no cell is given MMIO, so it calls for no VERW (ADR-0004)"
+        );
+    }
     enter_kernel(BootInfo {
         cmdline: state.cmdline(),
         roots: &state.roots[..state.roots_len],

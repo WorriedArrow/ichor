@@ -161,6 +161,7 @@ fn m1_boots_on_four_cpus() {
         "debian: sockets: refused, EADDRINUSE, 1 MiB each way, half-close, non-blocking connect and accept work",
         "debian: udp: datagrams keep boundaries and sources, truncate, connect filters, ports are per protocol",
         "debian: alarm and setitimer deliver SIGALRM, getitimer reads back, CPU time skips sleep",
+        "debian: speculation control answers as Linux does (store bypass ",
         "debian: unix: socketpair, path servers, abstract datagrams, SO_PEERCRED and end of file work",
         "debian: signals: stop and continue, senders, queues, timers and process descriptors work",
         "debian: moves: splice, tee, copy_file_range, MSG_PEEK, timeouts, netlink, inotify and shared memory work",
@@ -313,6 +314,7 @@ fn m1_boots_on_one_cpu() {
         "debian: sockets: refused, EADDRINUSE, 1 MiB each way, half-close, non-blocking connect and accept work",
         "debian: udp: datagrams keep boundaries and sources, truncate, connect filters, ports are per protocol",
         "debian: alarm and setitimer deliver SIGALRM, getitimer reads back, CPU time skips sleep",
+        "debian: speculation control answers as Linux does (store bypass ",
         "debian: unix: socketpair, path servers, abstract datagrams, SO_PEERCRED and end of file work",
         "debian: signals: stop and continue, senders, queues, timers and process descriptors work",
         "debian: moves: splice, tee, copy_file_range, MSG_PEEK, timeouts, netlink, inotify and shared memory work",
@@ -335,8 +337,9 @@ fn m1_boots_on_one_cpu() {
 #[test]
 fn m2_scheduler_on_eight_cpus() {
     // Page-table isolation, retpolines, the branch-history clearing
-    // sequence, IBPB on every entry and the Zen 3/4 safe-RET return thunks,
-    // forced (ADR-0004): everything below runs with ring 3 on shadow roots
+    // sequence, IBPB on every entry, the Zen 3/4 safe-RET return thunks and
+    // STIBP (where the CPU has it), forced (ADR-0004): everything below
+    // runs with ring 3 on shadow roots
     // (the entry code mapped in them at its image address), entries
     // switching CR3 and running the entry barriers (IBPB where the CPU has
     // it, as under KVM; the untraining routine), every kernel indirect
@@ -344,7 +347,7 @@ fn m2_scheduler_on_eight_cpus() {
     // TLB shootdowns across 8 CPUs (with PCID where the CPU has it).
     let out = boot(
         "m2-smp8",
-        "force_pti force_bhb force_ibpb_entry force_safe_ret force_retpoline",
+        "force_pti force_bhb force_ibpb_entry force_safe_ret force_retpoline force_stibp",
         8,
     );
     out.assert_exit(Exit::Success);
@@ -357,6 +360,10 @@ fn m2_scheduler_on_eight_cpus() {
         "IBPB on entry ",
         "return thunks safe RET (Zen 3/4",
         "RSB filled on context switch, Spectre v1 masked indices",
+        // STIBP is on wherever the CPU has it (KVM), else not needed.
+        ", indirect target selection ",
+        ", STIBP ",
+        ", speculative store bypass ",
         "ichor: pti: user roots map only the entry area and user pages",
         "ichor: boot complete",
     ]);
@@ -469,6 +476,7 @@ fn m2_scheduler_on_eight_cpus() {
         "debian: sockets: refused, EADDRINUSE, 1 MiB each way, half-close, non-blocking connect and accept work",
         "debian: udp: datagrams keep boundaries and sources, truncate, connect filters, ports are per protocol",
         "debian: alarm and setitimer deliver SIGALRM, getitimer reads back, CPU time skips sleep",
+        "debian: speculation control answers as Linux does (store bypass ",
         "debian: unix: socketpair, path servers, abstract datagrams, SO_PEERCRED and end of file work",
         "debian: signals: stop and continue, senders, queues, timers and process descriptors work",
         "debian: moves: splice, tee, copy_file_range, MSG_PEEK, timeouts, netlink, inotify and shared memory work",

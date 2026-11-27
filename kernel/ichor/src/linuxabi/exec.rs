@@ -228,7 +228,13 @@ pub(crate) fn exec(
     // for tiles, so their charge goes back.
     p.group.prctl.lock().xtile = false;
     p.tile_charge = None;
+    // Speculative store bypass stays disabled across exec, but for
+    // PR_SPEC_DISABLE_NOEXEC, as on Linux.
+    if p.ssb == crate::process::Ssb::DisableNoexec {
+        p.ssb = crate::process::Ssb::Enable;
+    }
     *ctx = UserContext::new(loaded.entry, loaded.stack_pointer);
+    ctx.set_ssbd(p.ssb != crate::process::Ssb::Enable);
     Ok(())
 }
 

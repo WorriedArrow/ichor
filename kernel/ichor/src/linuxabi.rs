@@ -600,7 +600,7 @@ pub(crate) fn dispatch(p: &mut LinuxProcess, ctx: &mut frame::user::UserContext)
             Ok(0)
         }
         nr::GETPID => Ok(p.group.tgid),
-        nr::PRCTL => prctl(p, a[0], a[1], a[2]),
+        nr::PRCTL => prctl(p, ctx, &a),
         nr::GETPRIORITY => priority(p, i(a[0]), a[1], None),
         nr::SETPRIORITY => priority(p, i(a[0]), a[1], Some(i(a[2]))),
         nr::MEMFD_CREATE => fs::memfd_create(p, a[0], a[1]),
@@ -1493,7 +1493,12 @@ fn priority(p: &mut LinuxProcess, which: i64, who: u64, value: Option<i64>) -> R
 
 /// `prctl(option, arg2, ...)`: the options libc, apt and service managers
 /// use. Anything else is EINVAL, as Linux answers for unknown options.
-fn prctl(p: &mut LinuxProcess, option: u64, arg2: u64, arg3: u64) -> Result<u64, i64> {
+fn prctl(
+    p: &mut LinuxProcess,
+    ctx: &mut frame::user::UserContext,
+    a: &[u64; 6],
+) -> Result<u64, i64> {
+    let [option, arg2, arg3, arg4, arg5, _] = *a;
     const PR_SET_PDEATHSIG: u64 = 1;
     const PR_GET_PDEATHSIG: u64 = 2;
     const PR_GET_DUMPABLE: u64 = 3;
@@ -1505,8 +1510,13 @@ fn prctl(p: &mut LinuxProcess, option: u64, arg2: u64, arg3: u64) -> Result<u64,
     const PR_CAPBSET_READ: u64 = 23;
     const PR_SET_NO_NEW_PRIVS: u64 = 38;
     const PR_GET_NO_NEW_PRIVS: u64 = 39;
-    let _ = arg3;
+    const PR_GET_SPECULATION_CTRL: u64 = 52;
+    const PR_SET_SPECULATION_CTRL: u64 = 53;
     match option {
+        PR_GET_SPECULATION_CTRL if arg3 == 0 && arg4 == 0 && arg5 == 0 => {
+            speculation(p, ctx, arg2, None)
+        }
+        PR_SET_SPECULATION_CTRL if arg4 == 0 && arg5 == 0 => speculation(p, ctx, arg2, Some(arg3)),
         PR_SET_PDEATHSIG => {
             let sig = u32::try_from(arg2)
                 .ok()
@@ -1579,6 +1589,74 @@ fn prctl(p: &mut LinuxProcess, option: u64, arg2: u64, arg3: u64) -> Result<u64,
         }
         PR_GET_NO_NEW_PRIVS => Ok(u64::from(p.group.prctl.lock().no_new_privs)),
         _ => Err(EINVAL),
+    }
+}
+
+/// `PR_GET_SPECULATION_CTRL` (`set` is `None`) and `PR_SET_SPECULATION_CTRL`
+/// for `which`, as Linux's default modes answer. Speculative store bypass is
+/// per thread, by prctl, where the CPU can disable it (ADR-0004's
+/// 2026-11-27 amendment): kept by fork, clone and exec, but for
+/// `PR_SPEC_DISABLE_NOEXEC`, which exec ends. Indirect branch speculation
+/// is not the thread's to choose: IBPB between cells and STIBP where
+/// siblings need it are always on. L1D flushing is not offered.
+fn speculation(
+    p: &mut LinuxProcess,
+    ctx: &mut frame::user::UserContext,
+    which: u64,
+    set: Option<u64>,
+) -> Result<u64, i64> {
+    use crate::process::Ssb;
+    const PR_SPEC_STORE_BYPASS: u64 = 0;
+    const PR_SPEC_INDIRECT_BRANCH: u64 = 1;
+    const PR_SPEC_L1D_FLUSH: u64 = 2;
+    const PR_SPEC_NOT_AFFECTED: u64 = 0;
+    const PR_SPEC_PRCTL: u64 = 1;
+    const PR_SPEC_ENABLE: u64 = 2;
+    const PR_SPEC_DISABLE: u64 = 4;
+    const PR_SPEC_FORCE_DISABLE: u64 = 8;
+    const PR_SPEC_DISABLE_NOEXEC: u64 = 16;
+    const ENXIO: i64 = 6;
+    const ERANGE: i64 = 34;
+    match (which, set) {
+        (PR_SPEC_STORE_BYPASS, _) => {
+            let (affected, controlled) = frame::user::store_bypass();
+            if !controlled {
+                return match set {
+                    Some(_) => Err(ENXIO),
+                    None if affected => Ok(PR_SPEC_ENABLE),
+                    None => Ok(PR_SPEC_NOT_AFFECTED),
+                };
+            }
+            let Some(ctrl) = set else {
+                return Ok(PR_SPEC_PRCTL
+                    | match p.ssb {
+                        Ssb::Enable => PR_SPEC_ENABLE,
+                        Ssb::Disable => PR_SPEC_DISABLE,
+                        Ssb::ForceDisable => PR_SPEC_FORCE_DISABLE,
+                        Ssb::DisableNoexec => PR_SPEC_DISABLE_NOEXEC,
+                    });
+            };
+            let next = match ctrl {
+                PR_SPEC_ENABLE => Ssb::Enable,
+                PR_SPEC_DISABLE => Ssb::Disable,
+                PR_SPEC_FORCE_DISABLE => Ssb::ForceDisable,
+                PR_SPEC_DISABLE_NOEXEC => Ssb::DisableNoexec,
+                _ => return Err(ERANGE),
+            };
+            if p.ssb == Ssb::ForceDisable && next != Ssb::ForceDisable && next != Ssb::Disable {
+                return Err(EPERM);
+            }
+            if p.ssb != Ssb::ForceDisable {
+                p.ssb = next;
+            }
+            ctx.set_ssbd(p.ssb != Ssb::Enable);
+            Ok(0)
+        }
+        (PR_SPEC_INDIRECT_BRANCH, None) => Ok(PR_SPEC_ENABLE),
+        (PR_SPEC_INDIRECT_BRANCH, Some(_)) => Err(ENXIO),
+        (PR_SPEC_L1D_FLUSH, None) => Ok(PR_SPEC_FORCE_DISABLE),
+        (PR_SPEC_L1D_FLUSH, Some(_)) => Err(EPERM),
+        _ => Err(ENODEV),
     }
 }
 

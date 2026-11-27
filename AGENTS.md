@@ -1045,6 +1045,7 @@ comment.
 | `force_ibpb_entry` | IBPB on every entry from ring 3 where the CPU has IBPB (ADR-0004; tests) |
 | `force_safe_ret` | the Zen 3/4 safe-RET return thunks on any CPU (ADR-0004's safe-RET amendment; tests) |
 | `force_retpoline` | retpolines for the kernel's indirect branches on any CPU (ADR-0004's 2026-11-27 amendment; tests) |
+| `force_stibp` | `IA32_SPEC_CTRL.STIBP` on every CPU where the CPU has STIBP, whatever the topology (ADR-0004's second 2026-11-27 amendment; tests) |
 | `srso=ibpb` | on CPUs SRSO or Retbleed affects, IBPB on every entry instead of safe-RET return thunks |
 | `trace_errors` | log every failing Linux syscall (pid, number, first arguments, errno) |
 | `trace_uplink` | log every TCP segment with SYN, FIN or RST crossing the uplink, either way, after NAT (`ichor: uplink:` lines: time, flags, endpoints, sequence numbers, window), and those the NAT refuses or cannot map |

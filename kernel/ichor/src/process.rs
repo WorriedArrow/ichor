@@ -581,6 +581,20 @@ impl Drop for Group {
     }
 }
 
+/// What a thread asked of speculative store bypass
+/// (`PR_SET_SPECULATION_CTRL`); its `UserContext` carries the bit frame
+/// applies.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Ssb {
+    #[default]
+    Enable,
+    Disable,
+    /// Disabled for good: only `PR_SPEC_DISABLE` is still accepted.
+    ForceDisable,
+    /// Disabled until the next exec.
+    DisableNoexec,
+}
+
 /// A thread of a Linux process.
 pub(crate) struct LinuxProcess {
     /// This thread's table entry (its tid, pending signals).
@@ -606,6 +620,8 @@ pub(crate) struct LinuxProcess {
     /// And for room for AMX tile data, once the thread has it (ADR-0023).
     /// Not inherited: a new thread's tiles start with no room.
     pub(crate) tile_charge: Option<Reserved>,
+    /// Speculative store bypass, as asked; inherited by fork and clone.
+    pub(crate) ssb: Ssb,
 }
 
 /// Pages a thread's kernel stack takes, and those that its entry in the
@@ -674,6 +690,7 @@ impl LinuxProcess {
             uring: Default::default(),
             _stack: stack,
             tile_charge: None,
+            ssb: Ssb::Enable,
         })
     }
 
@@ -736,6 +753,7 @@ impl LinuxProcess {
             uring: Default::default(),
             _stack: stack,
             tile_charge: None,
+            ssb: self.ssb,
         })
     }
 
@@ -773,6 +791,7 @@ impl LinuxProcess {
             uring: Default::default(),
             _stack: stack,
             tile_charge: None,
+            ssb: self.ssb,
         })
     }
 
@@ -807,6 +826,7 @@ impl LinuxProcess {
             uring: Default::default(),
             _stack: stack,
             tile_charge: None,
+            ssb: Ssb::Enable,
         })
     }
 

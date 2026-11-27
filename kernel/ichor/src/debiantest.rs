@@ -763,6 +763,44 @@ $c2 > $c1 or fail("computing took no CPU time");
 print "debian: alarm and setitimer deliver SIGALRM, getitimer reads back, CPU time skips sleep\n";
 "#;
 
+/// `PR_GET/SET_SPECULATION_CTRL` (prctl 52 and 53): what each mode answers,
+/// and, where the CPU can disable speculative store bypass, the states,
+/// across fork and exec.
+const SPEC_SCRIPT: &str = r#"use strict; use warnings; use Errno;
+sub fail { print "debian: speculation control FAILED: @_\n"; exit 1 }
+sub get { my $r = syscall(157, 52, $_[0], 0, 0, 0); $r }
+sub set { syscall(157, 53, 0, $_[0], 0, 0) }
+sub child { my $v = qx(perl -e 'print syscall(157, 52, 0, 0, 0, 0)'); $v }
+syscall(157, 52, 0, 1, 0, 0) == -1 && $!{EINVAL} or fail("arg3 accepted");
+syscall(157, 52, 9, 0, 0, 0) == -1 && $!{ENODEV} or fail("an unknown control: $!");
+get(1) == 2 or fail("indirect branch: " . get(1));
+syscall(157, 53, 1, 4, 0, 0) == -1 && $!{ENXIO} or fail("indirect branch set: $!");
+my $ssb = get(0);
+my $mode;
+if ($ssb == 0 || $ssb == 2) {
+    set(4) == -1 && $!{ENXIO} or fail("set without control: $!");
+    $mode = $ssb == 0 ? "not affected" : "not controllable";
+} else {
+    $ssb == 3 or fail("initial state $ssb");
+    set(3) == -1 && $!{ERANGE} or fail("a bad control: $!");
+    set(4) == 0 && get(0) == 5 or fail("disable: " . get(0));
+    my $pid = fork() // fail("fork: $!");
+    if (!$pid) { exit(get(0) == 5 ? 0 : 1) }
+    waitpid($pid, 0) == $pid && $? == 0 or fail("fork lost it");
+    child() eq "5" or fail("exec lost disable: " . child());
+    set(16) == 0 && get(0) == 17 or fail("disable-noexec: " . get(0));
+    child() eq "3" or fail("exec kept disable-noexec: " . child());
+    set(2) == 0 && get(0) == 3 or fail("enable: " . get(0));
+    set(8) == 0 && get(0) == 9 or fail("force-disable: " . get(0));
+    set(2) == -1 && $!{EPERM} or fail("enable after force-disable");
+    set(16) == -1 && $!{EPERM} or fail("disable-noexec after force-disable");
+    set(4) == 0 && get(0) == 9 or fail("disable after force-disable: " . get(0));
+    child() eq "9" or fail("exec lost force-disable: " . child());
+    $mode = "by prctl";
+}
+print "debian: speculation control answers as Linux does (store bypass $mode)\n";
+"#;
+
 /// The server cell of the cross-cell run: `ME PEER PORT`. Accepts one
 /// connection on `PORT`, checks both ends' addresses, reads to EOF and
 /// answers with the peer's address and the byte count.
@@ -949,6 +987,7 @@ const RUNS: &[(&[&str], i32)] = &[
     // TCP sockets on the cell's own stack (loopback).
     (&["perl", "-e", SOCKET_SCRIPT], 0),
     (&["perl", "-e", TIMER_SCRIPT], 0),
+    (&["perl", "-e", SPEC_SCRIPT], 0),
     (&["perl", "-e", UNIX_SCRIPT], 0),
     (&["perl", "-e", SIGNAL_SCRIPT], 0),
     (&["perl", "-e", MOVE_SCRIPT], 0),
