@@ -582,9 +582,13 @@ pub(crate) struct Ring {
     /// completions.
     hub: Arc<Hub>,
     notify: SpinLock<Option<Notify>>,
-    /// CQEs posted so far, and those of them that count for TIMEOUT.
+    /// CQEs posted so far, those of them that count for TIMEOUT, and those
+    /// that were TIMEOUTs' own. (`ended` is its own count, not `posted -
+    /// counted`: a waiter that read the two between a post's two additions
+    /// saw a timeout end that had not, and stopped waiting early.)
     posted: AtomicU64,
     counted: AtomicU64,
+    ended: AtomicU64,
     /// Not `IORING_SETUP_R_DISABLED` (any more).
     enabled: AtomicBool,
     /// The thread that may submit (`IORING_SETUP_SINGLE_ISSUER`; 0: any).
@@ -660,8 +664,7 @@ impl Ring {
 
     /// How many CQEs were timeouts'.
     fn timeouts(&self) -> u64 {
-        let counted = self.counted.load(Ordering::Acquire);
-        self.posted.load(Ordering::Acquire).wrapping_sub(counted)
+        self.ended.load(Ordering::Acquire)
     }
 
     /// SQEs the application has queued.
@@ -737,10 +740,12 @@ impl Ring {
 
     /// Tells whoever waits for completions of one.
     fn told(&self, waited: bool, counts: bool) {
-        self.posted.fetch_add(1, Ordering::AcqRel);
         if counts {
             self.counted.fetch_add(1, Ordering::AcqRel);
+        } else {
+            self.ended.fetch_add(1, Ordering::AcqRel);
         }
+        self.posted.fetch_add(1, Ordering::AcqRel);
         self.hub.tell();
         self.watchers.notify();
         self.signal(waited);
@@ -1816,6 +1821,7 @@ pub(super) fn setup(p: &mut LinuxProcess, entries: u64, params: u64) -> Result<u
         notify: SpinLock::new(None),
         posted: AtomicU64::new(0),
         counted: AtomicU64::new(0),
+        ended: AtomicU64::new(0),
         enabled: AtomicBool::new(enabled),
         issuer: AtomicU64::new(issuer),
         limits: SpinLock::new(None),

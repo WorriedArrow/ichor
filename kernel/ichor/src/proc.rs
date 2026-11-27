@@ -941,13 +941,49 @@ fn exited(e: &Arc<ProcEntry>, status: u32) {
     *e.task.lock() = None;
     let mut t = TABLE.lock();
     *e.status.lock() = Some(status);
+    // Groups of the session that this exit may leave orphaned: its own, if
+    // its parent was in another group of the session, and its children's,
+    // if they are in another group of its session.
+    let (pgid, sid) = e.group();
+    let mut groups = alloc::vec::Vec::new();
+    if t.get(&e.ppid())
+        .is_some_and(|p| p.group().0 != pgid && p.group().1 == sid)
+    {
+        groups.push((pgid, sid));
+    }
     let orphans: alloc::vec::Vec<_> = t.values().filter(|c| c.ppid() == e.pid).cloned().collect();
     for c in orphans {
+        let g = c.group();
+        if g.0 != pgid && g.1 == sid && !groups.contains(&g) {
+            groups.push(g);
+        }
         c.ppid.store(0, Ordering::Release);
         let sig = c.pdeathsig.load(Ordering::Acquire);
         if sig != 0 && c.status.lock().is_none() {
             let (uid, _) = e.uids();
             post_process(&t, &c, sig, Info::sent(signal::SI_USER, e.pid, uid));
+        }
+    }
+    // A group left orphaned with a stopped member is sent SIGHUP, then
+    // SIGCONT (POSIX; Linux's `kill_orphaned_pgrp`): nobody is left who
+    // could continue it. Without this, the stopped children of a killed
+    // process stayed stopped, and charged to their cell, for good.
+    for g in groups {
+        if !orphaned_group(&t, e.cell, g) {
+            continue;
+        }
+        let members: alloc::vec::Vec<_> = t
+            .values()
+            .filter(|m| m.cell == e.cell && m.pid == m.tgid && m.group() == g)
+            .filter(|m| m.status.lock().is_none())
+            .cloned()
+            .collect();
+        if members.iter().any(|m| stopping(m)) {
+            for sig in [signal::SIGHUP, signal::SIGCONT] {
+                for m in &members {
+                    post_process(&t, m, sig, Info::kernel());
+                }
+            }
         }
     }
     if let Some(parent) = t.get(&e.ppid()) {

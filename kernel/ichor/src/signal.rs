@@ -18,6 +18,7 @@ use frame::user::UserContext;
 use crate::proc;
 use crate::process::LinuxProcess;
 
+pub(crate) const SIGHUP: u32 = 1;
 pub(crate) const SIGKILL: u32 = 9;
 pub(crate) const SIGSEGV: u32 = 11;
 pub(crate) const SIGPIPE: u32 = 13;

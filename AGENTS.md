@@ -277,6 +277,14 @@ boot [done: VERW, IBPB, and page-table isolation (ADR-0004's second
   syzkaller is patched (`ichor.patch`): no kallsyms needed, Ichor's panic
   line is a crash, and the executor's sandbox goes on without mounts,
   `/proc/self/ns/net` or `capget`. No coverage until Ichor has kcov.
+  Its first day (e8656e6, 2026-11-27) found no panic, but two bugs: a
+  process group left orphaned with a stopped member was never sent
+  SIGHUP and SIGCONT (POSIX), so stopped children of killed programs
+  piled up until the cell's 2 GiB was gone and every process that
+  faulted died, ssh's server too (`proc::exited`, `runtest::orphan_program`);
+  and `io_uring_enter` took a timeout to have ended when it read
+  `posted` and `counted` between a post's two additions, returning with
+  too few CQEs (uringtest check 17 failed a boot; `Ring::ended`).
 - NICs: `virtio-net`, and `intel-gbe` (82574L and the 82576/I350/I210
   family; tested on QEMU's `e1000e` and `igb`: `RunConfig::nic`). The first
   that comes up is the uplink (`nettest::find`).

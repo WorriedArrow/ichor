@@ -114,6 +114,105 @@ mod sys {
     pub(super) const IO_URING_SETUP: u64 = 425;
     pub(super) const IO_URING_ENTER: u64 = 426;
     pub(super) const IO_URING_REGISTER: u64 = 427;
+    pub(super) const SETPGID: u64 = 109;
+}
+
+/// A process group left orphaned with a stopped member is hung up (POSIX):
+/// a grandchild moves into a group of its own and stops; when its parent,
+/// the group's only link to the rest of the session, exits, SIGHUP and
+/// SIGCONT end it. (syzkaller's programs left such processes stopped, and
+/// charged to their cell, for good.) The test sees it through a pipe the
+/// grandchild held: end of file within 5 s. Exits 0, or the failed check.
+fn orphan_program() -> Vec<u8> {
+    let mut a = Asm::new();
+    let bad = a.label();
+    let test = a.label();
+    let middle = a.label();
+    let stopped = a.label();
+    let ts = a.data(&[60, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]); // 60 s
+    let expect = |a: &mut Asm, n: u64, v: i32| {
+        a.mov_imm(Reg::R15, n);
+        a.cmp_imm(Reg::Rax, v);
+        a.jne(bad);
+    };
+    a.mov(Reg::Rbp, Reg::Rsp);
+    a.sub_imm(Reg::Rbp, 4096);
+    // 1: pipe2 -> fds 3 (read) and 4 (write).
+    a.mov(Reg::Rdi, Reg::Rbp);
+    a.mov_imm(Reg::Rsi, 0);
+    a.sys(sys::PIPE2);
+    expect(&mut a, 1, 0);
+    a.sys(sys::FORK);
+    a.cmp_imm(Reg::Rax, 0);
+    a.jne(test);
+    // The middle process: forks the grandchild, waits for it to stop,
+    // exits.
+    a.sys(sys::FORK);
+    a.cmp_imm(Reg::Rax, 0);
+    a.jne(middle);
+    // The grandchild: keeps the write end, leaves the group, stops, and
+    // would sleep on for good if it went on.
+    a.mov_imm(Reg::Rdi, 3);
+    a.sys(sys::CLOSE);
+    a.mov_imm(Reg::Rdi, 0);
+    a.mov_imm(Reg::Rsi, 0);
+    a.sys(sys::SETPGID);
+    a.sys(sys::GETPID);
+    a.mov(Reg::Rdi, Reg::Rax);
+    a.mov_imm(Reg::Rsi, u64::from(crate::signal::SIGSTOP));
+    a.sys(sys::KILL);
+    a.bind(stopped);
+    a.mov_data(Reg::Rdi, ts);
+    a.mov_imm(Reg::Rsi, 0);
+    a.sys(sys::NANOSLEEP);
+    a.jmp(stopped);
+    // Middle: wait4(grandchild, &status, WUNTRACED); stopped, or exit 9.
+    a.bind(middle);
+    a.mov(Reg::Rdi, Reg::Rax);
+    a.mov(Reg::Rsi, Reg::Rbp);
+    a.add_imm(Reg::Rsi, 32);
+    a.mov_imm(Reg::Rdx, 2);
+    a.mov_imm(Reg::R10, 0);
+    a.sys(sys::WAIT4);
+    a.load32(Reg::Rax, Reg::Rbp, 32);
+    a.mov_imm(Reg::R15, 9);
+    a.cmp_imm(Reg::Rax, (crate::signal::SIGSTOP << 8 | 0x7f) as i32);
+    a.jne(bad);
+    a.mov_imm(Reg::Rdi, 0);
+    a.sys(sys::EXIT_GROUP);
+    // The test: 2: the middle process exited 0.
+    a.bind(test);
+    a.mov_imm(Reg::Rdi, 4);
+    a.sys(sys::CLOSE);
+    a.mov_imm(Reg::Rdi, u64::MAX);
+    a.mov(Reg::Rsi, Reg::Rbp);
+    a.add_imm(Reg::Rsi, 32);
+    a.mov_imm(Reg::Rdx, 0);
+    a.mov_imm(Reg::R10, 0);
+    a.sys(sys::WAIT4);
+    a.load32(Reg::Rax, Reg::Rbp, 32);
+    expect(&mut a, 2, 0);
+    // 3: poll({fd 3, POLLIN}, 1, 5000) == 1: the grandchild is gone.
+    a.mov_imm(Reg::Rax, 3 | (1 << 32));
+    a.store(Reg::Rbp, 16, Reg::Rax);
+    a.mov(Reg::Rdi, Reg::Rbp);
+    a.add_imm(Reg::Rdi, 16);
+    a.mov_imm(Reg::Rsi, 1);
+    a.mov_imm(Reg::Rdx, 5000);
+    a.sys(sys::POLL);
+    expect(&mut a, 3, 1);
+    // 4: and the pipe reads end-of-file.
+    a.mov_imm(Reg::Rdi, 3);
+    a.mov(Reg::Rsi, Reg::Rbp);
+    a.add_imm(Reg::Rsi, 48);
+    a.mov_imm(Reg::Rdx, 1);
+    a.sys(sys::READ);
+    expect(&mut a, 4, 0);
+    a.mov_imm(Reg::R15, 0);
+    a.bind(bad);
+    a.mov(Reg::Rdi, Reg::R15);
+    a.sys(sys::EXIT_GROUP);
+    static_elf(&a.finish(BLOB_VADDR).unwrap_or_else(|| fail("assembler")))
 }
 
 /// io_uring completions without `io_uring_enter` (the ring's worker): a
@@ -4802,6 +4901,13 @@ pub(crate) fn run() {
         fail("polltest");
     }
     println!("ichor: linux: poll timeout and wakeup, epoll, eventfd ok ({syscalls} syscalls)");
+
+    let (status, _) = run_linux(new_process(), &orphan_program(), None, &["orphantest"]);
+    if status != 0 {
+        println!("ichor: linux: orphantest failed check {status}");
+        fail("orphaned process group");
+    }
+    println!("ichor: linux: an orphaned process group with a stopped member is hung up");
 
     let (status, _) = run_linux(new_process(), &epoll_threads_program(), None, &["epollthr"]);
     if status != 0 {

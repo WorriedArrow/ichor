@@ -50,7 +50,7 @@ const ENOSPC: i64 = 28;
 const ENOTTY: i64 = 25;
 const EMFILE: i64 = 24;
 
-const SIGHUP: u32 = 1;
+use crate::signal::SIGHUP;
 const SIGINT: u32 = 2;
 const SIGQUIT: u32 = 3;
 const SIGCONT: u32 = 18;
