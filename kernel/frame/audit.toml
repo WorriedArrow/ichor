@@ -43,5 +43,8 @@
 # changes): 7,650 / 310.
 # Step 18 (ADR-0021: each task's time on a CPU, kept at context switches):
 # 7,700 / 310.
-max_code_lines = 7700
-max_unsafe_sites = 310
+# Step 19 (ADR-0008's 2026-11-26 amendment: user registers saved when the
+# task switches out or software needs them, not after every trap):
+# 7,800 / 315.
+max_code_lines = 7800
+max_unsafe_sites = 315

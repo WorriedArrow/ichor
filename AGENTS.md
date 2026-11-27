@@ -796,11 +796,21 @@ Milan against Linux's huge-page faults at 756 and 415 (THP checked through
 `/proc/vmstat`: they form on both), null syscall 163 / 403 ns against 106 /
 386, fork + exec 141 / 129 us against 85 / 173. Not yet:
 `MADV_HUGEPAGE`, collapse, 2 MiB pages after fork, `AnonHugePages`.
+The n2 losses (2026-11-26, `docs/benchmarks.md`'s exec section): exec
+walked every page of the image through two BTreeMaps (now per segment:
+fork + exec 114 → 75-82 us locally); every trap read the clock twice for
+CPU time (now the scheduler's, ADR-0021: CPU time is user and system
+together) and saved the user's registers (now only at a switch-out or
+when the kernel needs them, ADR-0008's 2026-11-26 amendment; the restore
+stays eager). Null syscall locally 160 → 98-102 ns. That rests on the
+kernel never touching vector registers: only frame may hold `unsafe`, the
+target is soft-float, and `fpu_stress_program` plus `avx_program` (every
+boot) fail on each broken variant tried. Not yet measured on GCP.
 
 Frame budget: ADR-0005 sets the milestone 3 ceiling at 8,500 lines / 380
 sites; ADR-0007 raises it to 9,500 / 420 for milestone 4 (TLB shootdown,
-atomic user ops for futexes, PCID). `audit.toml` is at step 17 (7,650 / 310,
-ADR-0020); frame is at 7,607 / 304 (A5 added
+atomic user ops for futexes, PCID). `audit.toml` is at step 19 (7,800 / 315,
+ADR-0008's 2026-11-26 amendment); frame is at 7,738 / 308 (A5 added
 RDSEED/RDRAND and UEFI GetTime; B added XSAVE; C the frames tree and
 request tracking; M6 reading `\ichor\roots.pem`, later
 `\ichor\suffixes.dat` too; ADR-0011 the checked user
@@ -810,7 +820,9 @@ amendment; the ACPI power button and S5, ADR-0017; kvmclock, ADR-0018; the
 wall clock's NTP steering; the rest of ADR-0004 §2; AMD's IBRS bit and the
 safe-RET return thunks, `arch::rethunk`; the console ring, ADR-0019;
 `sysretq`, skipped XRSTORs, a `VmSpace` without a page tree and batch
-write protection, ADR-0008's amendment; 2 MiB user pages, ADR-0020). Growth past the step
+write protection, ADR-0008's amendment; 2 MiB user pages, ADR-0020; each
+task's CPU time, ADR-0021; user registers saved only when they must be,
+ADR-0008's 2026-11-26 amendment). Growth past the step
 needs an ADR and a new audit step.
 `services/rt` has its own budget (`services/rt/audit.toml`: 500 / 40; at
 417 / 30).

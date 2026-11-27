@@ -293,6 +293,12 @@ context switch instead of twice per return from ring 3. Null syscall
 read costs more), pipe round trip unchanged (2.72-2.86 us against
 2.83-2.89).
 
+Then the user's registers saved only when they must be (ADR-0008's
+2026-11-26 amendment: at a switch-out, or when the kernel reads or copies
+them), not after every trap: null syscall 137-148 → 98-102 ns, pipe round
+trip 2.63-2.78 us, page fault and fork + exec unchanged (247-368 ns,
+75-80 us).
+
 ## Google Cloud, third round (2026-11-26): 2 MiB pages, THP checked
 
 After `c6e5b77` (ADR-0020) and ADR-0008's 2026-11-25 amendment (`sysretq`,

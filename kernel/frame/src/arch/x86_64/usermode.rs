@@ -284,7 +284,8 @@ pub struct UserContext {
     rflags: u64,      // 136
     pub fs_base: u64, // 144
     pub gs_base: u64, // 152
-    /// x87/SSE/AVX state (ADR-0008), saved and restored around ring 3.
+    /// x87/SSE/AVX state (ADR-0008): restored before ring 3, saved when it
+    /// must be.
     fpu: super::xstate::ExtState, // 160 (a pointer; the stubs never touch it)
 }
 
@@ -419,6 +420,9 @@ impl<'a> UserMode<'a> {
                 cr2: 0,
             };
         }
+        // Live on no other CPU before the guard (it cannot become so while
+        // the context is borrowed here; see `xstate`).
+        self.ctx.fpu.settle(false);
         let guard = cpu::IrqGuard::new();
         if hold() {
             return UserEvent::Preempted;
@@ -453,8 +457,10 @@ impl<'a> UserMode<'a> {
                 IBPBS.fetch_add(1, Relaxed);
             }
         }
-        // Interrupts stay off from here until the save below, and the kernel
-        // never uses the FPU, so the registers hold only this thread's state.
+        // The kernel never uses the FPU, so from here the registers hold only
+        // this thread's state, until it is saved: when its task switches
+        // out, another state is loaded here, or the kernel reads or copies
+        // it (`xstate`).
         self.ctx.fpu.restore(&guard);
         loop {
             // `sysretq` loads RIP from rcx and RFLAGS from r11: where they
@@ -481,7 +487,6 @@ impl<'a> UserMode<'a> {
             self.ctx.rflags =
                 (self.ctx.rflags & USER_RFLAGS_ALLOWED) | RFLAGS_IF | RFLAGS_RESERVED1;
         }
-        self.ctx.fpu.save(&guard);
         let info = block.event_info.load(Relaxed);
         match block.event_kind.load(Relaxed) {
             1 => UserEvent::Syscall,

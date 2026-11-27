@@ -3185,16 +3185,20 @@ fn waits_program() -> Vec<u8> {
 
 /// AVX state is per thread and survives signals (ADR-0008). YMM0 is set to
 /// all ones; a forked child zeroes its own YMM0 and yields while the parent
-/// yields too, and the parent's upper 128 bits must still be ones. A
-/// SIGUSR1 handler checks that its frame's `fpstate` carries the XSAVE
-/// software bytes (`magic`) and YMM0's upper half (at offset 576, the AVX
-/// component), then zeroes YMM0; after `rt_sigreturn` the ones are back.
+/// yields too, and the parent's upper 128 bits must still be ones. Then
+/// YMM15 gets a pattern, set just before `kill` (so a signal frame written
+/// from a stale save would miss it), and a SIGUSR1 handler checks that its
+/// frame's `fpstate` carries the XSAVE software bytes (`magic`) and the
+/// upper halves of YMM0 and YMM15 (the AVX component, at offset 576, 16
+/// bytes a register), then zeroes both; after `rt_sigreturn` both are back.
 /// Exits 0, or the number of the failed check.
 fn avx_program(magic: u64) -> Vec<u8> {
     const SIGUSR1: u64 = 10;
     const SA_RESTORER: u64 = 0x0400_0000;
     const YMM0_ONES: [u8; 4] = [0xc5, 0xfd, 0x76, 0xc0]; // vpcmpeqd ymm0, ymm0, ymm0
     const YMM0_ZERO: [u8; 4] = [0xc5, 0xfd, 0xef, 0xc0]; // vpxor ymm0, ymm0, ymm0
+    const YMM15_ZERO: [u8; 5] = [0xc4, 0x41, 0x05, 0xef, 0xff]; // vpxor ymm15, ymm15, ymm15
+    const PATTERN: u64 = 0x5a5a_0f0f_a5a5_f0f0;
     let store_ymm0 = |a: &mut Asm, disp: i32| {
         a.raw(&[0xc5, 0xfe, 0x7f, 0x85]); // vmovdqu [rbp + disp32], ymm0
         a.raw(&disp.to_le_bytes());
@@ -3268,14 +3272,26 @@ fn avx_program(magic: u64) -> Vec<u8> {
     a.mov_imm(Reg::R10, 8);
     a.sys(sys::RT_SIGACTION);
     expect(&mut a, 2, 0);
+    a.mov_imm(Reg::R12, PATTERN);
+    a.raw(&[0xc4, 0x41, 0xf9, 0x6e, 0xfc]); // vmovq xmm15, r12
+    a.raw(&[0xc4, 0x42, 0x7d, 0x59, 0xff]); // vpbroadcastq ymm15, xmm15
     a.sys(sys::GETPID);
     a.mov(Reg::Rdi, Reg::Rax);
     a.mov_imm(Reg::Rsi, SIGUSR1);
     a.sys(sys::KILL);
-    // 3: the handler saw the XSAVE frame; 4: YMM0 is whole again.
+    // 3: the handler saw the XSAVE frame; 4: YMM0 is whole again; 5: so is
+    // YMM15.
     a.load(Reg::Rax, Reg::Rbp, 300);
     expect(&mut a, 3, 1);
     upper_ones(&mut a, 4, 32);
+    a.raw(&[0xc5, 0x7e, 0x7f, 0xbd]); // vmovdqu [rbp + 64], ymm15
+    a.raw(&64i32.to_le_bytes());
+    a.mov_imm(Reg::R15, 5);
+    for q in 0..4 {
+        a.load(Reg::Rax, Reg::Rbp, 64 + 8 * q);
+        a.cmp(Reg::Rax, Reg::R12);
+        a.jne(bad);
+    }
     a.mov_imm(Reg::R15, 0);
     a.bind(bad);
     a.mov(Reg::Rdi, Reg::R15);
@@ -3292,13 +3308,206 @@ fn avx_program(magic: u64) -> Vec<u8> {
     a.load(Reg::R14, Reg::Rax, 576);
     a.cmp_imm(Reg::R14, -1);
     a.jne(h_bad);
+    // YMM15's upper half, as it was when the signal came.
+    for at in [576 + 15 * 16, 576 + 15 * 16 + 8] {
+        a.load(Reg::R14, Reg::Rax, at);
+        a.cmp(Reg::R14, Reg::R12);
+        a.jne(h_bad);
+    }
     a.mov_imm(Reg::R14, 1);
     a.store(Reg::Rbp, 300, Reg::R14);
     a.bind(h_bad);
     a.raw(&YMM0_ZERO);
+    a.raw(&YMM15_ZERO);
     a.ret();
     a.bind(restorer);
     a.sys(sys::RT_SIGRETURN);
+    static_elf(&a.finish(BLOB_VADDR).unwrap_or_else(|| fail("assembler")))
+}
+
+/// Ping-pong rounds of [`fpu_stress_program`], and its third process's
+/// yields.
+const FPU_ROUNDS: u64 = 1000;
+const FPU_YIELDS: u64 = 3000;
+
+/// Every thread's vector registers stay its own while threads block, wake,
+/// switch and move between CPUs (ADR-0008: the registers are saved when
+/// they must be, not after every trap). Three processes fill YMM0 and YMM15
+/// with their own pattern: two play ping-pong over a pair of pipes, so each
+/// blocks in `read` and is woken by the other (spinning a little first, so
+/// the other is often woken onto another CPU), and a third calls
+/// `sched_yield` and `getpid` over and over beside them. Each checks both
+/// registers after every system call. A fourth forks a child, changes its
+/// own registers at once and exits: the child, which may first run after
+/// it is gone, must start with the registers as they were at the fork, and
+/// reports over a third pipe. Exits 0, or the failed check: 1-3 the first
+/// process's, a child's failure as its own status (4-5 the pinger's, 6-7
+/// the yielder's), 8 the orphan's.
+fn fpu_stress_program() -> Vec<u8> {
+    const ONES: [u64; 4] = [
+        0x1111_1111_1111_1111,
+        0x2222_2222_2222_2222,
+        0x3333_3333_3333_3333,
+        0x4444_4444_4444_4444,
+    ];
+    let mut a = Asm::new();
+    let bad = a.label();
+    let pinger = a.label();
+    let yielder = a.label();
+    let orphan = a.label();
+    // YMM0 and YMM15: the pattern in r12 in every quadword.
+    let fill = |a: &mut Asm| {
+        a.raw(&[0xc4, 0xc1, 0xf9, 0x6e, 0xc4]); // vmovq xmm0, r12
+        a.raw(&[0xc4, 0xe2, 0x7d, 0x59, 0xc0]); // vpbroadcastq ymm0, xmm0
+        a.raw(&[0xc4, 0x41, 0xf9, 0x6e, 0xfc]); // vmovq xmm15, r12
+        a.raw(&[0xc4, 0x42, 0x7d, 0x59, 0xff]); // vpbroadcastq ymm15, xmm15
+    };
+    // Both registers still hold r12's pattern, else to `fail` with `n` in
+    // r15.
+    let check_into = |a: &mut Asm, n: u64, fail: testprog::Label| {
+        a.raw(&[0xc5, 0xfe, 0x7f, 0x85]); // vmovdqu [rbp + 64], ymm0
+        a.raw(&64i32.to_le_bytes());
+        a.raw(&[0xc5, 0x7e, 0x7f, 0xbd]); // vmovdqu [rbp + 96], ymm15
+        a.raw(&96i32.to_le_bytes());
+        a.mov_imm(Reg::R15, n);
+        for q in 0..8 {
+            a.load(Reg::Rax, Reg::Rbp, 64 + 8 * q);
+            a.cmp(Reg::Rax, Reg::R12);
+            a.jne(fail);
+        }
+    };
+    let check = |a: &mut Asm, n: u64| check_into(a, n, bad);
+    // A little time in ring 3.
+    let spin = |a: &mut Asm| {
+        let l = a.label();
+        a.mov_imm(Reg::Rbx, 2000);
+        a.bind(l);
+        a.add_imm(Reg::Rbx, -1);
+        a.cmp_imm(Reg::Rbx, 0);
+        a.jne(l);
+    };
+    // One byte through the pipe whose descriptor is the i32 at rbp+`at`.
+    let io = |a: &mut Asm, nr: u64, at: i32| {
+        a.load32(Reg::Rdi, Reg::Rbp, at);
+        a.mov(Reg::Rsi, Reg::Rbp);
+        a.add_imm(Reg::Rsi, 200);
+        a.mov_imm(Reg::Rdx, 1);
+        a.sys(nr);
+    };
+    a.mov(Reg::Rbp, Reg::Rsp);
+    a.sub_imm(Reg::Rbp, 4096);
+    // Pipe A (first process to pinger) at rbp+0, pipe B (back) at rbp+8,
+    // pipe C (the orphan's report) at rbp+16.
+    for at in [0, 8, 16] {
+        a.mov(Reg::Rdi, Reg::Rbp);
+        a.add_imm(Reg::Rdi, at);
+        a.mov_imm(Reg::Rsi, 0);
+        a.sys(sys::PIPE2);
+    }
+    // The fourth process: fork, then change the registers and exit.
+    let first = a.label();
+    a.mov_imm(Reg::R12, ONES[3]);
+    a.sys(sys::FORK);
+    a.cmp_imm(Reg::Rax, 0);
+    a.jne(first);
+    fill(&mut a);
+    a.sys(sys::FORK);
+    a.cmp_imm(Reg::Rax, 0);
+    a.je(orphan);
+    a.raw(&[0xc5, 0xfd, 0xef, 0xc0]); // vpxor ymm0, ymm0, ymm0
+    a.raw(&[0xc4, 0x41, 0x05, 0xef, 0xff]); // vpxor ymm15, ymm15, ymm15
+    a.mov_imm(Reg::Rdi, 0);
+    a.sys(sys::EXIT_GROUP);
+    a.bind(first);
+    a.mov_imm(Reg::R12, ONES[2]);
+    a.sys(sys::FORK);
+    a.cmp_imm(Reg::Rax, 0);
+    a.je(yielder);
+    a.mov_imm(Reg::R12, ONES[1]);
+    a.sys(sys::FORK);
+    a.cmp_imm(Reg::Rax, 0);
+    a.je(pinger);
+    // The first process: write to A, read B's answer, yield.
+    a.mov_imm(Reg::R12, ONES[0]);
+    fill(&mut a);
+    a.mov_imm(Reg::R13, FPU_ROUNDS);
+    let round = a.label();
+    a.bind(round);
+    spin(&mut a);
+    io(&mut a, sys::WRITE, 4);
+    check(&mut a, 1);
+    io(&mut a, sys::READ, 8);
+    check(&mut a, 2);
+    a.sys(sys::SCHED_YIELD);
+    check(&mut a, 3);
+    a.add_imm(Reg::R13, -1);
+    a.cmp_imm(Reg::R13, 0);
+    a.jne(round);
+    // The orphan's report: 0, or its failed check.
+    io(&mut a, sys::READ, 16);
+    a.mov_imm(Reg::R15, 0);
+    a.raw(&[0x44, 0x8a, 0xbd]); // mov r15b, [rbp + 200]
+    a.raw(&200i32.to_le_bytes());
+    a.cmp_imm(Reg::R15, 0);
+    a.jne(bad);
+    // The three children exit 0, or this exits with the first one's status.
+    for _ in 0..3 {
+        a.mov_imm(Reg::Rdi, u64::MAX);
+        a.mov(Reg::Rsi, Reg::Rbp);
+        a.add_imm(Reg::Rsi, 300);
+        a.mov_imm(Reg::Rdx, 0);
+        a.mov_imm(Reg::R10, 0);
+        a.sys(sys::WAIT4);
+        a.load32(Reg::R15, Reg::Rbp, 300);
+        a.raw(&[0x49, 0xc1, 0xef, 0x08]); // shr r15, 8
+        a.cmp_imm(Reg::R15, 0);
+        a.jne(bad);
+    }
+    a.mov_imm(Reg::R15, 0);
+    a.bind(bad);
+    a.mov(Reg::Rdi, Reg::R15);
+    a.sys(sys::EXIT_GROUP);
+    // The pinger: read from A, answer on B.
+    a.bind(pinger);
+    fill(&mut a);
+    a.mov_imm(Reg::R13, FPU_ROUNDS);
+    let pong = a.label();
+    a.bind(pong);
+    io(&mut a, sys::READ, 0);
+    check(&mut a, 4);
+    spin(&mut a);
+    io(&mut a, sys::WRITE, 12);
+    check(&mut a, 5);
+    a.add_imm(Reg::R13, -1);
+    a.cmp_imm(Reg::R13, 0);
+    a.jne(pong);
+    a.mov_imm(Reg::R15, 0);
+    a.jmp(bad);
+    // The yielder.
+    a.bind(yielder);
+    fill(&mut a);
+    a.mov_imm(Reg::R13, FPU_YIELDS);
+    let again = a.label();
+    a.bind(again);
+    a.sys(sys::SCHED_YIELD);
+    check(&mut a, 6);
+    a.sys(sys::GETPID);
+    check(&mut a, 7);
+    a.add_imm(Reg::R13, -1);
+    a.cmp_imm(Reg::R13, 0);
+    a.jne(again);
+    a.mov_imm(Reg::R15, 0);
+    a.jmp(bad);
+    // The orphan: its registers as at the fork, reported as one byte.
+    a.bind(orphan);
+    let report = a.label();
+    check_into(&mut a, 8, report);
+    a.mov_imm(Reg::R15, 0);
+    a.bind(report);
+    a.store(Reg::Rbp, 200, Reg::R15);
+    io(&mut a, sys::WRITE, 20);
+    a.mov_imm(Reg::Rdi, 0);
+    a.sys(sys::EXIT_GROUP);
     static_elf(&a.finish(BLOB_VADDR).unwrap_or_else(|| fail("assembler")))
 }
 
@@ -3866,6 +4075,14 @@ pub(crate) fn run() {
         }
         println!(
             "ichor: linux: AVX state is per thread and survives signals (XSAVE frame, {syscalls} syscalls)"
+        );
+        let (status, _) = run_linux(new_process(), &fpu_stress_program(), None, &["fpustress"]);
+        if status != 0 {
+            println!("ichor: linux: fpustress failed check {status}");
+            fail("fpustress");
+        }
+        println!(
+            "ichor: linux: vector registers stay each thread's across {FPU_ROUNDS} blocking ping-pongs and {FPU_YIELDS} yields"
         );
     } else {
         println!("ichor: linux: no AVX: AVX state test skipped");

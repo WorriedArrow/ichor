@@ -649,6 +649,9 @@ fn schedule_inner(why: Enqueue, from_idle: bool) {
     let now = arch::apic::now_ns();
     cur.ran.switch(now, false);
     next.ran.switch(now, true);
+    // The user registers live on this CPU are the outgoing task's: saved
+    // before another task can take its context elsewhere (ADR-0008).
+    arch::xstate::switch_out();
     {
         let g = IrqGuard::new();
         let s = SCHED.get(&g);

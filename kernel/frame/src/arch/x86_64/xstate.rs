@@ -2,22 +2,47 @@
 //! (ADR-0008).
 //!
 //! With XSAVE, every CPU runs with the same XCR0, chosen once by the first
-//! CPU to initialize. Each thread's state lives in a boxed, 64-byte-aligned
+//! CPU to initialize. Each thread's state lives in a 64-byte-aligned heap
 //! area in the standard (non-compacted) XSAVE format, the format Linux
-//! signal frames carry. It is saved right after every trap and restored
-//! before ring 3 unless this CPU's registers still hold it (ADR-0008's
-//! 2026-11-24 amendment). Without XSAVE, the same area holds an FXSAVE image and
-//! FXSAVE/FXRSTOR are used.
+//! signal frames carry. Without XSAVE, the same area holds an FXSAVE image
+//! and FXSAVE/FXRSTOR are used.
+//!
+//! The state is restored before every entry to ring 3, unless the
+//! registers hold it already, and saved only when it must be (ADR-0008's
+//! 2026-11-26 amendment): when the task running it switches out, when
+//! another state is loaded on its CPU, and when software reads, copies or
+//! replaces it. Until then the registers are newer than the area: the
+//! state is *live* on that CPU. This is sound because nothing but this
+//! module touches the registers: the kernel is soft-float (no other crate
+//! may hold `unsafe`, so none can reach them), and the firmware runs at
+//! boot only.
 //!
 //! An area only ever holds the init state, a hardware save, or user data
 //! that [`ExtState::set_from`] sanitized against every #GP condition of the
 //! restore instruction, so restoring it cannot fault.
+//!
+//! # Invariants
+//!
+//! 1. A state is live on CPU `c` (its `live` is `c + 1`) exactly when CPU
+//!    `c`'s [`OWNER`] holds it; both change together, on `c`, with
+//!    interrupts off.
+//! 2. While a state is live on `c`, CPU `c`'s registers hold it and only
+//!    `c` touches its area, by saving into it ([`flush`]).
+//! 3. Software reads or writes an area only while its state is not live,
+//!    and only [`ExtState::restore`], which takes `&mut`, makes it live, so
+//!    no reference into an area outlives that.
+//! 4. A live state belongs to the task running on its CPU: a switch saves
+//!    it first ([`switch_out`]), so a state never moves between CPUs
+//!    unsaved.
 
-use alloc::boxed::Box;
+use alloc::sync::Arc;
 use core::arch::asm;
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::cell::UnsafeCell;
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use super::regs::cpuid;
+use crate::cpu::IrqGuard;
+use crate::sync::SpinLock;
 
 /// Bytes reserved per thread. CPUID-reported sizes above this make frame
 /// drop AVX-512; the allowed components fit in about 2.7 KiB.
@@ -119,33 +144,129 @@ pub(crate) fn size() -> usize {
 #[derive(Clone)]
 struct Area([u8; MAX_AREA]);
 
+/// A thread's area, and where its state is live.
+struct Shared {
+    area: UnsafeCell<Area>,
+    /// The save that wrote the area, unique to a CPU and a save (0: software
+    /// wrote it). Only [`ExtState::restore`] loads the registers and only
+    /// [`flush`] stamps, so a CPU whose [`LOADED`] equals the stamp holds
+    /// exactly the area: it saved it and loaded nothing since. A copy keeps
+    /// the stamp, as it keeps the bytes.
+    stamp: AtomicU64,
+    /// The CPU (index + 1) the state is live on; 0: none (invariant 1).
+    live: AtomicU32,
+}
+
+// SAFETY: the area is reached only by the CPU its state is live on, to save
+// into it (invariant 2), or, while it is live nowhere, through its one
+// `ExtState` (invariant 3); everything else in it is atomic.
+unsafe impl Sync for Shared {}
+
+impl Shared {
+    fn new(area: Area, stamp: u64) -> Arc<Self> {
+        Arc::new(Shared {
+            area: UnsafeCell::new(area),
+            stamp: AtomicU64::new(stamp),
+            live: AtomicU32::new(0),
+        })
+    }
+}
+
 crate::cpu_local! {
-    /// The stamp of the state this CPU's registers hold (0: not known).
+    /// The stamp of the state this CPU's registers hold (0: none, or a live
+    /// state's, which the registers have moved on from).
     static LOADED: AtomicU64 = AtomicU64::new(0);
     /// Saves made on this CPU, numbering its stamps.
     static SAVES: AtomicU64 = AtomicU64::new(0);
+    /// The state live on this CPU, if any (invariant 1).
+    static OWNER: SpinLock<Option<Arc<Shared>>> = SpinLock::new(None);
 }
 
-/// One thread's extended state (see the module docs for its invariant).
-#[derive(Clone)]
+/// This CPU as a `live` value.
+fn this_cpu(guard: &IrqGuard) -> u32 {
+    guard.cpu().index() as u32 + 1
+}
+
+/// Saves the state live on this CPU, if there is one, into its area; then it
+/// is live nowhere.
+fn flush(guard: &IrqGuard) {
+    let Some(s) = OWNER.get(guard).lock().take() else {
+        return;
+    };
+    let n = SAVES.get(guard).fetch_add(1, Ordering::Relaxed) + 1;
+    let stamp = ((guard.cpu().index() as u64 + 1) << 48) | (n & ((1 << 48) - 1));
+    s.stamp.store(stamp, Ordering::Relaxed);
+    LOADED.get(guard).store(stamp, Ordering::Relaxed);
+    let p = s.area.get().cast::<u8>();
+    if features() == 0 {
+        // SAFETY: a 16-byte-aligned area of at least 512 bytes that only this
+        // CPU reaches while the state is live here (invariant 2); the
+        // registers hold that state (the kernel never uses the FPU).
+        unsafe { asm!("fxsave64 [{}]", in(reg) p, options(nostack, preserves_flags)) };
+    } else if XSAVEOPT.load(Ordering::Relaxed) {
+        // SAFETY: as above, 64-byte aligned and at least the XSAVE size.
+        // XSAVEOPT's tracking is sound because software never writes the
+        // area between its XRSTOR and this save (ADR-0008 §2).
+        unsafe {
+            asm!("xsaveopt64 [{}]", in(reg) p, in("eax") u32::MAX, in("edx") u32::MAX, options(nostack, preserves_flags))
+        };
+    } else {
+        // SAFETY: as above.
+        unsafe {
+            asm!("xsave64 [{}]", in(reg) p, in("eax") u32::MAX, in("edx") u32::MAX, options(nostack, preserves_flags))
+        };
+    }
+    s.live.store(0, Ordering::Release);
+}
+
+/// Saves the state live on this CPU before the task running it switches
+/// out (invariant 4).
+pub(crate) fn switch_out() {
+    flush(&IrqGuard::new());
+}
+
+/// One thread's extended state (see the module docs for its invariants).
 pub(crate) struct ExtState {
-    area: Box<Area>,
-    /// The save that wrote the area, unique to a CPU and a save (0: software
-    /// wrote it). Only [`ExtState::restore`] loads the registers and only
-    /// [`ExtState::save`] stamps, so a CPU whose [`LOADED`] equals the
-    /// stamp holds exactly the area: it saved it and loaded nothing since.
-    /// A copy keeps the stamp, as it keeps the bytes.
-    stamp: u64,
+    s: Arc<Shared>,
 }
 
 impl Default for ExtState {
     /// The reset state: x87 and SSE with all exceptions masked, everything
     /// else in its init state (XSTATE_BV 0).
     fn default() -> Self {
-        let mut a = Box::new(Area([0; MAX_AREA]));
+        let mut a = Area([0; MAX_AREA]);
         a.0[0..2].copy_from_slice(&0x037fu16.to_le_bytes()); // FCW
         a.0[24..28].copy_from_slice(&0x1f80u32.to_le_bytes()); // MXCSR
-        ExtState { area: a, stamp: 0 }
+        ExtState {
+            s: Shared::new(a, 0),
+        }
+    }
+}
+
+impl Clone for ExtState {
+    /// A copy of the state as it is now (saved first if it is live).
+    fn clone(&self) -> Self {
+        self.settle(true);
+        // SAFETY: the state is live nowhere, and only `restore`, which needs
+        // `&mut self`, could make it live (invariant 3).
+        let area = unsafe { (*self.s.area.get()).clone() };
+        ExtState {
+            s: Shared::new(area, self.s.stamp.load(Ordering::Relaxed)),
+        }
+    }
+}
+
+impl Drop for ExtState {
+    fn drop(&mut self) {
+        let g = IrqGuard::new();
+        if self.s.live.load(Ordering::Relaxed) == this_cpu(&g) {
+            // Live here: no save, since nothing will read it.
+            let owner = OWNER.get(&g).lock().take();
+            self.s.live.store(0, Ordering::Relaxed);
+            drop(owner);
+        }
+        // Live on another CPU (the context left the task running it): that
+        // CPU saves into the area at its next switch, then lets it go.
     }
 }
 
@@ -156,9 +277,36 @@ impl core::fmt::Debug for ExtState {
 }
 
 impl ExtState {
+    /// Waits until the state is live on no other CPU, then, with
+    /// `save_here`, saves it if it is live on this one, leaving it live
+    /// nowhere. It is live on another CPU only if its context left the task
+    /// running it before that task switched out, which saves it.
+    pub(crate) fn settle(&self, save_here: bool) {
+        loop {
+            {
+                let g = IrqGuard::new();
+                let live = self.s.live.load(Ordering::Acquire);
+                if live == 0 {
+                    return;
+                }
+                if live == this_cpu(&g) {
+                    if save_here {
+                        flush(&g);
+                    }
+                    return;
+                }
+            }
+            core::hint::spin_loop();
+        }
+    }
+
     /// The state as the signal frame carries it: [`size`] bytes.
     pub(crate) fn bytes(&self) -> &[u8] {
-        &self.area.0[..size()]
+        self.settle(true);
+        // SAFETY: live nowhere now, and only `restore`, which needs `&mut
+        // self`, could make it live while this borrow lasts (invariant 3).
+        let a = unsafe { &*self.s.area.get() };
+        &a.0[..size()]
     }
 
     /// Replaces the state from user-supplied bytes: a full area ([`size`]
@@ -166,8 +314,12 @@ impl ExtState {
     /// extended components return to their init state. Anything the restore
     /// instruction would fault on is cleared.
     pub(crate) fn set_from(&mut self, src: &[u8]) {
-        self.stamp = 0;
-        let a = &mut self.area.0;
+        // Saved first, so that no later save overwrites what is written here.
+        self.settle(true);
+        self.s.stamp.store(0, Ordering::Relaxed);
+        // SAFETY: live nowhere, and `&mut self` is the only way to the area
+        // (no CPU's OWNER holds it: invariant 1).
+        let a = unsafe { &mut (*self.s.area.get()).0 };
         let mask = match u32::from_le_bytes([a[28], a[29], a[30], a[31]]) {
             0 => MXCSR_DEFAULT_MASK,
             m => m,
@@ -191,57 +343,45 @@ impl ExtState {
         }
     }
 
-    /// Loads this state into the registers, unless they hold it already
-    /// (the thread's last save was on this CPU, which loaded nothing since:
-    /// the kernel is soft-float). The skipped XRSTOR leaves XSAVEOPT's
-    /// tracking on the area's earlier one, which software has not written
-    /// since.
-    pub(crate) fn restore(&self, guard: &crate::cpu::IrqGuard) {
+    /// Makes this state the registers' and live on this CPU, for ring 3.
+    /// Loads it unless they hold it already: it is live here still, or this
+    /// CPU saved it last and has loaded nothing since (the kernel is
+    /// soft-float). The skipped XRSTOR leaves XSAVEOPT's tracking on the
+    /// area's earlier one, which software has not written since. The
+    /// caller settles the state first, before taking `guard`, so it is live
+    /// nowhere else (invariant 4 keeps it so through a migration).
+    pub(crate) fn restore(&mut self, guard: &IrqGuard) {
+        let here = this_cpu(guard);
+        match self.s.live.load(Ordering::Acquire) {
+            l if l == here => return,
+            0 => {}
+            _ => crate::boot::fatal("extended state live on another CPU"),
+        }
+        // Another state live here (another context of this task) first.
+        flush(guard);
         let loaded = LOADED.get(guard);
-        if self.stamp != 0 && loaded.load(Ordering::Relaxed) == self.stamp {
-            return;
+        let stamp = self.s.stamp.load(Ordering::Relaxed);
+        if stamp == 0 || loaded.load(Ordering::Relaxed) != stamp {
+            let p = self.s.area.get().cast::<u8>().cast_const();
+            if features() != 0 {
+                // SAFETY: the area is 64-byte aligned, MAX_AREA >= the XSAVE
+                // size, in standard format with a header that passes every
+                // XRSTOR check (module invariant), XCR0 is loaded, and
+                // nothing else reaches the area (live nowhere, `&mut self`).
+                unsafe {
+                    asm!("xrstor64 [{}]", in(reg) p, in("eax") u32::MAX, in("edx") u32::MAX, options(nostack, readonly, preserves_flags))
+                };
+            } else {
+                // SAFETY: a 16-byte-aligned FXSAVE image with a valid MXCSR
+                // (module invariant), reached by nothing else.
+                unsafe {
+                    asm!("fxrstor64 [{}]", in(reg) p, options(nostack, readonly, preserves_flags))
+                };
+            }
         }
-        loaded.store(self.stamp, Ordering::Relaxed);
-        let p = self.area.0.as_ptr();
-        if features() != 0 {
-            // SAFETY: the area is 64-byte aligned, MAX_AREA >= the XSAVE
-            // size, in standard format with a header that passes every
-            // XRSTOR check (module invariant), and XCR0 is loaded.
-            unsafe {
-                asm!("xrstor64 [{}]", in(reg) p, in("eax") u32::MAX, in("edx") u32::MAX, options(nostack, readonly, preserves_flags))
-            };
-        } else {
-            // SAFETY: a 16-byte-aligned FXSAVE image with a valid MXCSR
-            // (module invariant).
-            unsafe {
-                asm!("fxrstor64 [{}]", in(reg) p, options(nostack, readonly, preserves_flags))
-            };
-        }
-    }
-
-    /// Stores the registers into this state.
-    pub(crate) fn save(&mut self, guard: &crate::cpu::IrqGuard) {
-        let n = SAVES.get(guard).fetch_add(1, Ordering::Relaxed) + 1;
-        self.stamp = ((guard.cpu().index() as u64 + 1) << 48) | (n & ((1 << 48) - 1));
-        LOADED.get(guard).store(self.stamp, Ordering::Relaxed);
-        let p = self.area.0.as_mut_ptr();
-        if features() == 0 {
-            // SAFETY: a 16-byte-aligned 512-byte (or larger) area owned by
-            // this thread; the kernel never uses the FPU, so the registers
-            // hold this thread's state.
-            unsafe { asm!("fxsave64 [{}]", in(reg) p, options(nostack, preserves_flags)) };
-        } else if XSAVEOPT.load(Ordering::Relaxed) {
-            // SAFETY: as above, 64-byte aligned and at least the XSAVE size.
-            // XSAVEOPT's tracking is sound because software never writes
-            // the area between its XRSTOR and this save (ADR-0008 §2).
-            unsafe {
-                asm!("xsaveopt64 [{}]", in(reg) p, in("eax") u32::MAX, in("edx") u32::MAX, options(nostack, preserves_flags))
-            };
-        } else {
-            // SAFETY: as above.
-            unsafe {
-                asm!("xsave64 [{}]", in(reg) p, in("eax") u32::MAX, in("edx") u32::MAX, options(nostack, preserves_flags))
-            };
-        }
+        // From here the registers move on from every area.
+        loaded.store(0, Ordering::Relaxed);
+        *OWNER.get(guard).lock() = Some(self.s.clone());
+        self.s.live.store(here, Ordering::Release);
     }
 }

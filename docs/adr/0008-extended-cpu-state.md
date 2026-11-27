@@ -1,6 +1,8 @@
 # ADR-0008: Extended CPU state (XSAVE), saved eagerly
 
-Status: Accepted (2026-11-15)
+Status: Accepted (2026-11-15); amended 2026-11-25 and 2026-11-26 (the
+save deferred to when it must be: the title's "eagerly" is now the
+restore's)
 
 ## Context
 
@@ -182,3 +184,77 @@ amendment and the user-memory changes: null system call 356 → 160 ns, pipe
 round trip 4.24 → 2.83 us, anonymous page fault 1.26 → 0.44 us, fork +
 wait 15 → 13 us, fork + exec + wait 161 → 114 us, container start from a
 native caller 235 → 171 us.
+
+## Amendment (2026-11-26): saved only when it must be
+
+The rest of §3's "later optimization". The XSAVEOPT after every trap was
+the largest software cost of a null system call: about 29 of 100 ns
+locally (with SRSO's thunks off), more on CPUs whose XCR0 has AVX-512.
+Ichor's null system call on GCP's Ice Lake (n2) was 163 ns against Debian
+12's 106. Linux saves a task's registers only when it switches away from
+it (or the kernel needs them); so does Ichor now.
+
+- **The state stays in the registers while the kernel runs** ("live" on
+  that CPU), and is saved:
+  - when the task running it switches out (`xstate::switch_out`, from
+    `schedule_inner`), so a state never reaches another CPU unsaved and a
+    migrated thread restores what it last ran with;
+  - when another state is loaded on that CPU (another context of the same
+    task);
+  - when software reads, copies or replaces it: the signal frame
+    (`fpu_state`), `fork` and `clone` (`Clone`), `rt_sigreturn`
+    (`set_fpu_state`, saved first so that no later save overwrites what
+    it writes).
+
+  A context dropped while live (exit, `execve`) is not saved.
+- **The restore stays eager**: before every entry to ring 3, unless the
+  registers already hold the state (live here, or this CPU saved it last
+  and loaded nothing since). Ring 3 never runs with another thread's
+  registers, CR0.TS stays clear and #NM is never used, so this is not lazy
+  switching and LazyFP does not apply. What is newly in the registers
+  while the kernel runs is the interrupted thread's own state, as on
+  Linux.
+- **Why the kernel cannot clobber them.** The target is soft-float
+  (`-mmx,-sse,+soft-float`), so the compiler emits no FPU or vector
+  instruction; using them otherwise needs `asm!`, intrinsics or a call to
+  a `#[target_feature]` function, all `unsafe`, which only frame may hold
+  (ADR-0001 §5). On 2026-11-26 the release kernel image disassembled to
+  no x87, MMX, SSE, AVX or AVX-512 instruction outside this module's
+  FXSAVE/XSAVE/XRSTOR sites. The firmware runs at boot only, and
+  frame's one Hyper-V fast hypercall passes its input in general
+  registers, not XMM.
+- **The record** (`xstate.rs`'s invariants): each area is an `Arc` shared
+  by the context and, while live, its CPU's `OWNER`; `live` names the CPU,
+  and both change together on it with interrupts off. Only that CPU
+  touches a live area (to save into it); software reaches an area only
+  while it is live nowhere, and only `restore`, which takes `&mut`, makes
+  it live, so no reference into an area outlives that. A state live on
+  another CPU (possible only if a context moved to another task before
+  the task that ran it switched out) is waited for, not read. The
+  per-CPU stamp of what the registers hold (the 2026-11-25 amendment) is
+  cleared when a state goes live, since the registers then move on from
+  every area: else a fork's child, which shares its parent's stamp, could
+  start with registers the parent changed before exiting.
+- XSAVEOPT stays sound for the same reason as before: an area is written
+  between its XRSTOR and its next save only by saves.
+
+Tests, on every boot (1, 4 and 8 vCPUs): `fpu_stress_program` (three
+processes with their own YMM0 and YMM15 patterns, blocking ping-pong over
+pipes, spinning so that wakers run elsewhere, `sched_yield`, each checked
+after every system call; and a child forked by a process that changes its
+registers and exits at once), and `avx_program`'s signal check now sets
+YMM15 just before `kill`, so a frame written from a stale save fails.
+Each was checked against a broken build: without the clearing of the
+stamp the AVX test fails (check 1); without the save before a signal
+frame, check 3; with one `pxor xmm15` added to frame's return from ring
+3, check 5; without the save at switch-out the boot hangs (a migrated
+thread waits for its old CPU to save).
+
+Frame: 84 more lines and 4 unsafe sites (the `Sync` claim and three
+references into an area), 7,738 / 308: `audit.toml` step 19, 7,800 /
+315, inside ADR-0007's 9,500 / 420.
+
+Measured as before (OpenVMM, Ryzen 5 5600X, safe-RET thunks on, five
+rounds in one boot), with ADR-0021 (CPU time from the scheduler) in
+between: null system call 160-166 → 137-148 ns (ADR-0021) → 98-102 ns
+(this amendment); pipe round trip 2.83-2.89 → 2.63-2.78 us.
