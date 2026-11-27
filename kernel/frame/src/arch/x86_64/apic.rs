@@ -171,28 +171,34 @@ pub(crate) fn start_ap(dest: u32, page: u8) {
 // Time.
 // ---------------------------------------------------------------------------
 
-/// Determines the TSC frequency: CPUID leaf 0x15, then the hypervisor
-/// timing leaf, then calibration against the ACPI PM timer, then against
-/// the PIT (absent on some cloud VMs). Returns the frequency and where it
-/// came from; `None` if every source failed.
+/// Determines the TSC frequency: kvmclock on KVM, which then is the clock
+/// (ADR-0018), then CPUID leaf 0x15, Hyper-V's, the hypervisor timing leaf,
+/// then calibration against the ACPI PM timer, then against the PIT
+/// (absent on some cloud VMs). Returns the frequency and where it came
+/// from; `None` if every source failed. kvmclock comes first: leaf 0x15
+/// exists in guests too (GCP's n2 and c3), and kvmclock alone follows a
+/// migration's new rate.
 pub(crate) fn init_tsc() -> Option<(u64, &'static str)> {
     TSC_AT_BOOT.store(rdtsc(), Relaxed);
     let max = cpuid(0, 0)[0];
-    let mut found = None;
+    let kvm = crate::kvm::init();
+    let mut found = kvm.map(|hz| (hz, "kvmclock, which is the clock"));
     if max >= 0x15 {
         let [den, num, crystal, _] = cpuid(0x15, 0);
         if den != 0 && num != 0 && crystal != 0 {
-            found = Some((
-                u64::from(crystal) * u64::from(num) / u64::from(den),
-                "cpuid 0x15",
-            ));
+            let hz = u64::from(crystal) * u64::from(num) / u64::from(den);
+            match kvm {
+                Some(k) => crate::println!(
+                    "ichor: frame: tsc: kvmclock says {} kHz, cpuid 0x15 {} kHz",
+                    k / 1000,
+                    hz / 1000
+                ),
+                None => found = Some((hz, "cpuid 0x15")),
+            }
         }
     }
     if found.is_none() {
         found = crate::hyperv::tsc_hz().map(|hz| (hz, "Hyper-V"));
-    }
-    if found.is_none() {
-        found = crate::kvm::init().map(|hz| (hz, "kvmclock, which is the clock"));
     }
     if found.is_none()
         && super::cpu::features().hypervisor
