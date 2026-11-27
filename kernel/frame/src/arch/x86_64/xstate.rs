@@ -460,6 +460,14 @@ impl ExtState {
     /// `save_here`, saves it if it is live on this one, leaving it live
     /// nowhere. It is live on another CPU only if its context left the task
     /// running it before that task switched out, which saves it.
+    /// Whether the state is live nowhere or on this CPU, so [`Self::settle`]
+    /// (without saving) has nothing to do.
+    #[inline]
+    pub(crate) fn settled(&self, g: &IrqGuard) -> bool {
+        let live = self.s.live.load(Ordering::Acquire);
+        live == 0 || live == this_cpu(g)
+    }
+
     pub(crate) fn settle(&self, save_here: bool) {
         loop {
             {

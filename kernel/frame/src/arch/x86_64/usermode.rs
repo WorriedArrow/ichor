@@ -480,10 +480,15 @@ impl<'a> UserMode<'a> {
                 cr2: 0,
             };
         }
-        // Live on no other CPU before the guard (it cannot become so while
-        // the context is borrowed here; see `xstate`).
-        self.ctx.fpu.settle(false);
-        let guard = cpu::IrqGuard::new();
+        // Live on no other CPU under the guard (it cannot become so while
+        // the context is borrowed here; see `xstate`). Waiting for another
+        // CPU is done with interrupts on.
+        let mut guard = cpu::IrqGuard::new();
+        if !self.ctx.fpu.settled(&guard) {
+            drop(guard);
+            self.ctx.fpu.settle(false);
+            guard = cpu::IrqGuard::new();
+        }
         if hold() {
             return UserEvent::Preempted;
         }
@@ -509,7 +514,10 @@ impl<'a> UserMode<'a> {
         // code (ADR-0004 §2), so its training cannot steer this one's.
         if IBPB_ON.load(Relaxed) {
             let domain = block.task_domain.load(Relaxed);
-            if block.user_domain.swap(domain, Relaxed) != domain {
+            // This CPU's own field, under the guard: a load and a store, not
+            // a locked exchange on every way into ring 3.
+            if block.user_domain.load(Relaxed) != domain {
+                block.user_domain.store(domain, Relaxed);
                 // SAFETY: IA32_PRED_CMD exists: IBPB_ON is set only when
                 // CPUID enumerates IBPB (`pred_cmd`). Writing bit 0 issues the
                 // barrier and has no other effect.

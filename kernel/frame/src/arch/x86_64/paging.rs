@@ -586,8 +586,10 @@ pub(crate) unsafe fn user_unmap_range(
             if out.len() >= max {
                 return Some(va);
             }
-            let v = e.swap(0, Relaxed);
-            if v & PRESENT != 0 {
+            // An exchange only where present (the CPU may set its accessed
+            // and dirty bits meanwhile; an absent entry it never writes).
+            if e.load(Relaxed) & PRESENT != 0 {
+                let v = e.swap(0, Relaxed);
                 out.push((va, PhysAddr::new(v & ADDR_MASK)));
             }
             va += PAGE_SIZE;
@@ -674,11 +676,15 @@ pub(crate) unsafe fn user_teardown(
         leaf: &mut dyn FnMut(PhysAddr),
         table_page: &mut dyn FnMut(PhysAddr),
     ) {
+        // Read, and cleared only where present: the space is active on no
+        // CPU, so a plain load and store do (an exchange on each of a
+        // table's 512 entries cost microseconds per address space).
         for e in t {
-            let v = e.swap(0, Relaxed);
+            let v = e.load(Relaxed);
             if v & PRESENT == 0 {
                 continue;
             }
+            e.store(0, Relaxed);
             let pa = PhysAddr::new(v & ADDR_MASK);
             if level == 1 {
                 leaf(pa);
@@ -698,10 +704,11 @@ pub(crate) unsafe fn user_teardown(
     // SAFETY: caller contract.
     let root_t = unsafe { table(root) };
     for e in root_t.iter().take(256) {
-        let v = e.swap(0, Relaxed);
+        let v = e.load(Relaxed);
         if v & PRESENT == 0 {
             continue;
         }
+        e.store(0, Relaxed);
         let pa = PhysAddr::new(v & ADDR_MASK);
         // SAFETY: as in `walk`.
         walk(unsafe { table(pa) }, 3, leaf, table_page);
