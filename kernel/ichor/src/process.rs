@@ -260,6 +260,9 @@ pub(crate) struct Prctl {
     pub(crate) affinity: Option<u64>,
     /// `personality`.
     pub(crate) personality: u32,
+    /// AMX tile data permitted (`ARCH_REQ_XCOMP_PERM`, ADR-0023): kept
+    /// across fork, cleared by exec, as on Linux.
+    pub(crate) xtile: bool,
 }
 
 impl Default for Prctl {
@@ -271,6 +274,7 @@ impl Default for Prctl {
             nice: 0,
             affinity: None,
             personality: 0,
+            xtile: false,
         }
     }
 }
@@ -599,6 +603,9 @@ pub(crate) struct LinuxProcess {
     pub(crate) uring: crate::linuxabi::uring::Thread,
     /// The cell pays for its kernel stack.
     _stack: Reserved,
+    /// And for room for AMX tile data, once the thread has it (ADR-0023).
+    /// Not inherited: a new thread's tiles start with no room.
+    pub(crate) tile_charge: Option<Reserved>,
 }
 
 /// Pages a thread's kernel stack takes, and those that its entry in the
@@ -666,6 +673,7 @@ impl LinuxProcess {
             resume_until: None,
             uring: Default::default(),
             _stack: stack,
+            tile_charge: None,
         })
     }
 
@@ -727,6 +735,7 @@ impl LinuxProcess {
             resume_until: None,
             uring: Default::default(),
             _stack: stack,
+            tile_charge: None,
         })
     }
 
@@ -763,6 +772,7 @@ impl LinuxProcess {
             resume_until: None,
             uring: Default::default(),
             _stack: stack,
+            tile_charge: None,
         })
     }
 
@@ -796,6 +806,7 @@ impl LinuxProcess {
             resume_until: None,
             uring: Default::default(),
             _stack: stack,
+            tile_charge: None,
         })
     }
 

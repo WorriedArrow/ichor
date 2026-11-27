@@ -110,9 +110,16 @@ pub(crate) fn enable_protections() -> Features {
     if xcr0 != 0 {
         cr4 |= regs::CR4_OSXSAVE;
     }
+    // Protection keys exactly when PKRU is saved with the rest (ADR-0022).
+    // The kernel never reaches user pages through user addresses (above),
+    // so the user's PKRU, loaded while the kernel runs, never limits it.
+    if xcr0 & super::xstate::PKRU != 0 {
+        cr4 |= regs::CR4_PKE;
+    }
     // SAFETY: the bits set above are accounted for as described (OSXSAVE
-    // only makes XSAVE/XSETBV usable, which `decide` checked CPUID for); no
-    // other bit changes.
+    // only makes XSAVE/XSETBV usable, which `decide` checked CPUID for; PKE
+    // only lets keys in user PTEs limit user-page accesses); no other bit
+    // changes.
     unsafe { regs::write_cr4(cr4) };
     super::xstate::enable(xcr0);
     f

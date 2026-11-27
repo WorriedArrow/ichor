@@ -83,12 +83,9 @@ pub(crate) fn frame_race() {
     let space = Arc::new(VmSpace::new().unwrap_or_else(|| fail("usercopy: no space")));
     let rw = UserProt {
         write: true,
-        exec: false,
+        ..UserProt::default()
     };
-    let ro = UserProt {
-        write: false,
-        exec: false,
-    };
+    let ro = UserProt::default();
 
     // A read-only page refuses a kernel write and still reads.
     let page = UFrame::alloc_zeroed().unwrap_or_else(|| fail("usercopy: no page"));

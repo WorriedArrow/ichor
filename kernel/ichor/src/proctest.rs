@@ -88,6 +88,7 @@ pub(crate) fn run() {
         UserProt {
             write: false,
             exec: true,
+            key: 0,
         },
     );
     map(
@@ -96,6 +97,7 @@ pub(crate) fn run() {
         UserProt {
             write: true,
             exec: false,
+            key: 0,
         },
     );
     map(
@@ -104,6 +106,7 @@ pub(crate) fn run() {
         UserProt {
             write: true,
             exec: false,
+            key: 0,
         },
     );
 

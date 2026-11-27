@@ -276,10 +276,7 @@ impl VmSpace {
                 if let Some((_, p)) = unsafe { paging::user_translate(self.root, va) }
                     && p.write
                 {
-                    let ro = UserProt {
-                        write: false,
-                        exec: p.exec,
-                    };
+                    let ro = UserProt { write: false, ..p };
                     // SAFETY: as above.
                     match unsafe { paging::user_protect(self.root, va, ro, &mut alloc) } {
                         Ok(changed) => any |= changed,

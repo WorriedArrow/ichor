@@ -41,18 +41,23 @@ const SI_TKILL: i32 = -6;
 pub(crate) const FPE_INTDIV: i32 = 1;
 pub(crate) const FPE_FLTINV: i32 = 7;
 pub(crate) const TRAP_TRACE: i32 = 2;
+pub(crate) const ILL_ILLOPC: i32 = 1;
 pub(crate) const ILL_ILLOPN: i32 = 2;
 pub(crate) const SEGV_MAPERR: i32 = 1;
 pub(crate) const SEGV_ACCERR: i32 = 2;
+/// A protection key denied the access (`si_pkey` says which).
+pub(crate) const SEGV_PKUERR: i32 = 4;
 
 /// What a signal carries besides its number: the fields of a `siginfo_t`
 /// at 8 (the code), 16 and 24 (by kind: sender's pid and uid, then a
-/// value; a child's pid and uid, then its status; a fault's address).
+/// value; a child's pid and uid, then its status; a fault's address), and
+/// at 32 a protection-key fault's key.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Info {
     code: i32,
     a: u64,
     b: u64,
+    pkey: u32,
 }
 
 impl Info {
@@ -66,6 +71,7 @@ impl Info {
             code,
             a: Info::ids(pid, uid),
             b: 0,
+            pkey: 0,
         }
     }
 
@@ -75,6 +81,7 @@ impl Info {
             code: SI_KERNEL,
             a: 0,
             b: 0,
+            pkey: 0,
         }
     }
 
@@ -85,6 +92,7 @@ impl Info {
             code,
             a: Info::ids(c.pid, c.uids().0),
             b: u64::from(status),
+            pkey: 0,
         }
     }
 
@@ -95,15 +103,17 @@ impl Info {
             code: SI_TIMER,
             a: Info::ids(id as u64, overrun),
             b: value,
+            pkey: 0,
         }
     }
 
     /// A CPU exception at `addr`.
-    fn fault(code: i32, addr: u64) -> Info {
+    fn fault(code: i32, addr: u64, pkey: u8) -> Info {
         Info {
             code,
             a: addr,
             b: 0,
+            pkey: u32::from(pkey),
         }
     }
 
@@ -114,6 +124,7 @@ impl Info {
         f[8..12].copy_from_slice(&self.code.to_le_bytes());
         f[16..24].copy_from_slice(&self.a.to_le_bytes());
         f[24..32].copy_from_slice(&self.b.to_le_bytes());
+        f[32..36].copy_from_slice(&self.pkey.to_le_bytes());
         f
     }
 
@@ -123,6 +134,7 @@ impl Info {
             code: i32::from_le_bytes([f[8], f[9], f[10], f[11]]),
             a: crate::linuxabi::le_u64(&f[16..24]),
             b: crate::linuxabi::le_u64(&f[24..32]),
+            pkey: 0,
         }
     }
 }
@@ -240,6 +252,11 @@ impl Signals {
     /// `execve` and new threads start without an alternate stack.
     pub(crate) fn clear_alt_stack(&mut self) {
         self.alt = None;
+    }
+
+    /// Bytes of the alternate stack, if there is one.
+    pub(crate) fn alt_size(&self) -> Option<u64> {
+        self.alt.map(|(_, size)| size)
     }
 
     fn on_alt(&self, sp: u64) -> bool {
@@ -807,7 +824,12 @@ pub(crate) fn fault(
     if !caught {
         return Some(sig | 0x80);
     }
-    setup_frame(p, ctx, sig, Info::fault(code, addr), trap, &act).err()
+    let pkey = if code == SEGV_PKUERR {
+        p.mm().pkey_of(addr)
+    } else {
+        0
+    };
+    setup_frame(p, ctx, sig, Info::fault(code, addr, pkey), trap, &act).err()
 }
 
 /// The CPU exception behind a signal, as its frame shows it.
@@ -844,8 +866,10 @@ const SW_BYTES: usize = 464;
 /// XSAVE) the software bytes and the trailing `FP_XSTATE_MAGIC2`.
 fn fpstate_image(ctx: &UserContext) -> alloc::vec::Vec<u8> {
     let mut v = ctx.fpu_state().to_vec();
-    let xfeatures = frame::cpu::xstate_features();
-    if xfeatures != 0 {
+    // The thread's own components and size: tile data only once it has
+    // room (ADR-0023), as Linux's frames say.
+    let xfeatures = ctx.fpu_components();
+    if frame::cpu::xstate_features() != 0 {
         let size = v.len() as u32;
         v[SW_BYTES..SW_BYTES + 4].copy_from_slice(&FP_XSTATE_MAGIC1.to_le_bytes());
         v[SW_BYTES + 4..SW_BYTES + 8].copy_from_slice(&(size + 4).to_le_bytes());
@@ -860,9 +884,11 @@ fn fpstate_image(ctx: &UserContext) -> alloc::vec::Vec<u8> {
 }
 
 /// The most stack one signal frame takes (`AT_MINSIGSTKSZ`): the frame,
-/// the extended state with its magic, and alignment slack.
+/// the extended state with its magic (AMX tile data included where the CPU
+/// has it, as Linux counts), and alignment slack.
 pub(crate) fn frame_stack_size() -> u64 {
-    FRAME_SIZE + frame::cpu::xstate_size() as u64 + 4 + 64 + 16
+    let state = frame::cpu::xstate_size().max(frame::cpu::xstate_tile_size());
+    FRAME_SIZE + state as u64 + 4 + 64 + 16
 }
 
 /// The general registers in `struct sigcontext` order (r8..r15, rdi, rsi,
@@ -982,7 +1008,9 @@ pub(crate) fn sigreturn(p: &mut LinuxProcess, ctx: &mut UserContext) -> Result<(
             return Err(EFAULT);
         }
         // The full XSAVE area only if the frame says it holds one, sized as
-        // ours, with the trailing magic; otherwise just the legacy region.
+        // ours or as one without tile data (the thread may have first used
+        // tiles in the handler), with the trailing magic; otherwise just the
+        // legacy region.
         let sw = |o: usize| {
             u32::from_le_bytes(
                 fx[SW_BYTES + o..SW_BYTES + o + 4]
@@ -990,10 +1018,10 @@ pub(crate) fn sigreturn(p: &mut LinuxProcess, ctx: &mut UserContext) -> Result<(
                     .unwrap_or([0; 4]),
             )
         };
-        let size = frame::cpu::xstate_size();
+        let size = sw(16) as usize;
         let xsave = frame::cpu::xstate_features() != 0
             && sw(0) == FP_XSTATE_MAGIC1
-            && sw(16) as usize == size
+            && (size == frame::cpu::xstate_size() || size == ctx.fpu_size())
             && sw(4) as usize == size + 4;
         if xsave {
             let mut full = alloc::vec![0u8; size + 4];
@@ -1051,7 +1079,10 @@ pub(crate) fn sigaltstack(
         match flags {
             SS_DISABLE => p.sig.alt = None,
             0 | SS_ONSTACK => {
-                if size < MINSIGSTKSZ {
+                // With AMX permitted, a frame with tile data must fit, as
+                // Linux checks (`sigaltstack_size_valid`).
+                if size < MINSIGSTKSZ || (p.group.prctl.lock().xtile && size <= frame_stack_size())
+                {
                     return Err(ENOMEM);
                 }
                 p.sig.alt = Some((sp, size));

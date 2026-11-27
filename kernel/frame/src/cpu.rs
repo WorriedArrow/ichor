@@ -57,9 +57,26 @@ pub fn xstate_features() -> u64 {
     crate::arch::xstate::features()
 }
 
-/// Bytes of a thread's extended state as a signal frame carries it.
+/// Bytes of a thread's extended state as a signal frame carries it, without
+/// AMX tile data.
 pub fn xstate_size() -> usize {
     crate::arch::xstate::size()
+}
+
+/// Bytes of a thread's extended state with AMX tile data (0 without AMX,
+/// ADR-0023).
+pub fn xstate_tile_size() -> usize {
+    crate::arch::xstate::tile_size()
+}
+
+/// The XSAVE component that holds AMX tile data, which threads use only
+/// with room for it (ADR-0023).
+pub const XSTATE_TILE_DATA: u64 = crate::arch::xstate::XTILEDATA;
+
+/// Whether user pages have protection keys: CR4.PKE, with PKRU saved per
+/// thread (ADR-0022).
+pub fn protection_keys() -> bool {
+    crate::arch::xstate::features() & crate::arch::xstate::PKRU != 0
 }
 
 /// Where the standard-format XSAVE area keeps `component` (an XCR0 bit

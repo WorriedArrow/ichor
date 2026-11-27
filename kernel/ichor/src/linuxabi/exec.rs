@@ -224,6 +224,10 @@ pub(crate) fn exec(
     }
     p.sig.clear_alt_stack();
     crate::signal::sync(p);
+    // A new program asks for AMX afresh (ADR-0023); its state has no room
+    // for tiles, so their charge goes back.
+    p.group.prctl.lock().xtile = false;
+    p.tile_charge = None;
     *ctx = UserContext::new(loaded.entry, loaded.stack_pointer);
     Ok(())
 }

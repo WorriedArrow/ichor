@@ -46,5 +46,9 @@
 # Step 19 (ADR-0008's 2026-11-26 amendment: user registers saved when the
 # task switches out or software needs them, not after every trap):
 # 7,800 / 315.
-max_code_lines = 7800
+# Step 20 (ADR-0022: protection keys: CR4.PKE, PKRU saved with the rest,
+# keys in user PTEs): 7,850 / 315.
+# Step 21 (ADR-0023: AMX tile data behind XFD, per-thread area sizes):
+# 8,000 / 315.
+max_code_lines = 8000
 max_unsafe_sites = 315

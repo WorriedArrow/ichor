@@ -176,6 +176,7 @@ fn user_prot(p: Prot) -> UserProt {
     UserProt {
         write: p.write,
         exec: p.exec,
+        key: p.key,
     }
 }
 
@@ -215,6 +216,9 @@ pub(crate) struct Mm {
     brk: u64,
     /// The page after the last anonymous fault's (`fault_around`).
     next_anon: u64,
+    /// Protection keys allocated (`pkey_alloc`), a bit each; key 0 from
+    /// the start, as on Linux.
+    pkeys: u16,
 }
 
 impl Mm {
@@ -230,7 +234,39 @@ impl Mm {
             brk_start: 0,
             brk: 0,
             next_anon: 0,
+            pkeys: 1,
         })
+    }
+
+    /// `pkey_alloc`: the lowest free protection key, now allocated. None
+    /// when all are taken, and always without protection keys (as Linux,
+    /// whose only key is then 0).
+    pub(crate) fn pkey_alloc(&mut self) -> Option<u8> {
+        let keys = if frame::cpu::protection_keys() { 16 } else { 1 };
+        let k = (!self.pkeys).trailing_zeros();
+        (k < keys).then(|| {
+            self.pkeys |= 1 << k;
+            k as u8
+        })
+    }
+
+    /// `pkey_free`: false if `key` is not allocated. Key 0 can be freed, as
+    /// on Linux.
+    pub(crate) fn pkey_free(&mut self, key: i64) -> bool {
+        let ok = self.pkey_allocated(key);
+        if ok {
+            self.pkeys &= !(1 << key);
+        }
+        ok
+    }
+
+    pub(crate) fn pkey_allocated(&self, key: i64) -> bool {
+        (0..16).contains(&key) && self.pkeys & (1 << key) != 0
+    }
+
+    /// The protection key of the region holding `va` (0 outside any).
+    pub(crate) fn pkey_of(&self, va: u64) -> u8 {
+        self.regions.find(page_down(va)).map_or(0, |r| r.prot.key)
     }
 
     /// The address space.
@@ -269,6 +305,7 @@ impl Mm {
         child.attached = self.attached.clone();
         child.brk_start = self.brk_start;
         child.brk = self.brk;
+        child.pkeys = self.pkeys;
         // The child shares every page (no new charge): what either side
         // copies on write is charged then.
         let mut region: Option<Region<Backing>> = None;
@@ -301,7 +338,7 @@ impl Mm {
             if let Some((_, prot)) = self.space.translate(va) {
                 let ro = UserProt {
                     write: false,
-                    exec: prot.exec,
+                    ..prot
                 };
                 if prot.write {
                     protect.push(va);
@@ -1070,9 +1107,20 @@ impl Mm {
         Ok(dst)
     }
 
-    /// `mprotect`.
-    pub(crate) fn mprotect(&mut self, addr: u64, len: u64, prot: u64) -> Result<u64, i64> {
+    /// `mprotect`, and `pkey_mprotect` with `key` (allocated: the caller
+    /// checked). Without one, each region keeps its key.
+    pub(crate) fn mprotect(
+        &mut self,
+        addr: u64,
+        len: u64,
+        prot: u64,
+        key: Option<u8>,
+    ) -> Result<u64, i64> {
         let prot = Prot::from_linux(prot).ok_or(EINVAL)?;
+        let new = |old: Prot| Prot {
+            key: key.unwrap_or(old.key),
+            ..prot
+        };
         if !addr.is_multiple_of(PAGE_SIZE) {
             return Err(EINVAL);
         }
@@ -1089,12 +1137,13 @@ impl Mm {
         if prot.write && self.regions.overlapping(addr, end).any(denied) {
             return Err(EACCES);
         }
-        if !self.regions.protect(addr, end, prot) {
+        if !self.regions.protect_with(addr, end, new) {
             return Err(ENOMEM);
         }
         // A batch at a time: a list of every page of a large region would
         // itself be a large allocation.
         let mut from = addr;
+        let mut region: Option<Region<Backing>> = None;
         loop {
             let vas: Vec<u64> = self
                 .pages
@@ -1111,7 +1160,11 @@ impl Mm {
                     continue; // Faulted in with the new protection on next use.
                 }
                 if prot.accessible() {
-                    let mapped = self.mapped_prot(va, prot);
+                    if !region.as_ref().is_some_and(|r| r.start <= va && va < r.end) {
+                        region = self.regions.find(va);
+                    }
+                    let key = region.as_ref().map_or(0, |r| r.prot.key);
+                    let mapped = self.mapped_prot(va, Prot { key, ..prot });
                     self.space.protect(va, mapped);
                 } else {
                     self.space.unmap(va); // `pages` keeps the frame.

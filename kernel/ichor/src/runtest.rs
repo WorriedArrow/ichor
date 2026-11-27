@@ -72,6 +72,10 @@ mod sys {
     pub(super) const FALLOCATE: u64 = 285;
     pub(super) const SYNC_FILE_RANGE: u64 = 277;
     pub(super) const MEMBARRIER: u64 = 324;
+    pub(super) const ARCH_PRCTL: u64 = 158;
+    pub(super) const PKEY_MPROTECT: u64 = 329;
+    pub(super) const PKEY_ALLOC: u64 = 330;
+    pub(super) const PKEY_FREE: u64 = 331;
     pub(super) const SETXATTR: u64 = 188;
     pub(super) const WAITID: u64 = 247;
     pub(super) const PREADV: u64 = 295;
@@ -3361,18 +3365,26 @@ struct XLayout {
     /// all but the x87 control word, MXCSR and its mask, the header and
     /// PKRU, whose reset values are not zero.
     zero: Vec<(usize, usize)>,
+    /// Where AMX tile data starts, if `rfbm` has it (then the program asks
+    /// for it first, ADR-0023).
+    tiles_at: Option<usize>,
 }
 
 fn xstate_layout(rfbm: u64) -> XLayout {
     const PKRU: u32 = 9;
+    const TILE_DATA: u32 = 18;
     let mut size = 576; // the legacy region and the header
     let mut pkru = None;
+    let mut tiles_at = None;
     for c in 2..64 {
         if rfbm & (1 << c) != 0 {
             let (off, len) = frame::cpu::xstate_component(c);
             size = size.max(off + len);
             if c == PKRU {
                 pkru = Some((off, off + len));
+            }
+            if c == TILE_DATA {
+                tiles_at = Some(off);
             }
         }
     }
@@ -3382,7 +3394,12 @@ fn xstate_layout(rfbm: u64) -> XLayout {
         None => zero.push((576, size)),
     }
     zero.retain(|&(s, e)| e > s);
-    XLayout { rfbm, size, zero }
+    XLayout {
+        rfbm,
+        size,
+        zero,
+        tiles_at,
+    }
 }
 
 /// A standard-format XSAVE image with every component of `l.rfbm` in use
@@ -3561,6 +3578,16 @@ fn xstate_program(l: &XLayout) -> Vec<u8> {
     // The first process's pid at rbp+24, for children that fail.
     a.sys(sys::GETPID);
     a.store(Reg::Rbp, 24, Reg::Rax);
+    // 9: AMX tile data, if the images hold it, may be used (inherited by
+    // the forks to come).
+    if l.tiles_at.is_some() {
+        a.mov_imm(Reg::Rdi, 0x1023); // ARCH_REQ_XCOMP_PERM
+        a.mov_imm(Reg::Rsi, 18);
+        a.sys(sys::ARCH_PRCTL);
+        a.mov_imm(Reg::R15, 9);
+        a.cmp_imm(Reg::Rax, 0);
+        a.jne(bad);
+    }
     // 10: the image loaded as given (MXCSR_MASK aside).
     start(&mut a, own);
     a.mov_data(Reg::Rsi, own);
@@ -3697,10 +3724,25 @@ fn xstate_program(l: &XLayout) -> Vec<u8> {
     a.jne(again);
     a.mov_imm(Reg::R15, 0);
     a.jmp(bad);
-    // The orphan: its registers as at the fork, reported as one byte.
+    // The orphan: its registers as at the fork, reported as one byte. Tile
+    // data is not inherited (Linux: tiles are caller-saved): it starts in
+    // its init state, so the header says no tile data and the rest is as
+    // at the fork.
     a.bind(orphan);
     let report = a.label();
-    check_into(&mut a, 8, report);
+    match l.tiles_at {
+        None => check_into(&mut a, 8, report),
+        Some(tiles_at) => {
+            save(&mut a, xs::CUR);
+            cmp_at(&mut a, 8, xs::GOLD, xs::CUR, (0, 512), report);
+            cmp_at(&mut a, 8, xs::GOLD, xs::CUR, (520, tiles_at), report);
+            a.load(Reg::Rax, Reg::Rbp, xs::CUR + 512);
+            a.mov_imm(Reg::Rbx, l.rfbm & !frame::cpu::XSTATE_TILE_DATA);
+            a.mov_imm(Reg::R15, 8);
+            a.cmp(Reg::Rax, Reg::Rbx);
+            a.jne(report);
+        }
+    }
     a.mov_imm(Reg::R15, 0);
     a.bind(report);
     a.store(Reg::Rbp, 200, Reg::R15);
@@ -3807,6 +3849,504 @@ fn xstate_program(l: &XLayout) -> Vec<u8> {
     cmp_at(&mut a, 16, xs::TGOLD, xs::TCUR, (0, size), mismatch);
     a.mov_imm(Reg::Rax, 1);
     a.store(Reg::Rbp, 400, Reg::Rax);
+    a.ret();
+    a.bind(restorer);
+    a.sys(sys::RT_SIGRETURN);
+    static_elf(&a.finish(BLOB_VADDR).unwrap_or_else(|| fail("assembler")))
+}
+
+/// Protection keys (ADR-0022), as Linux has them. `pkey_alloc` gives key 1
+/// and sets the calling thread's rights for it as asked (PKRU starts at
+/// Linux's 0x55555554); `pkey_mprotect` puts a page under it. With access
+/// denied in PKRU, a read is SIGSEGV with `SEGV_PKUERR`, the key in
+/// `si_pkey` and the address; the handler starts with the default PKRU,
+/// opens the key in the frame's XSAVE area (PKRU at `pkru_at`), and
+/// `rt_sigreturn` restores that, so the read goes through. The same for a
+/// write with only writes denied, and after `mprotect`, which keeps the
+/// key. Then the errors: freeing twice, bad flags or rights, an
+/// unallocated key; all fifteen keys allocated, then ENOSPC, in a forked
+/// child too, whose PKRU is its parent's. Exits 0, or the failed check
+/// (40-43 the handler's).
+fn pkey_program(pkru_at: usize) -> Vec<u8> {
+    const SIGSEGV: u64 = 11;
+    const SA_SIGINFO_RESTORER: u64 = 0x0400_0004;
+    const INIT: u32 = 0x5555_5554;
+    const OPEN1: u32 = INIT & !(3 << 2); // key 1: reads and writes
+    let pkru_at = pkru_at as i32;
+    let mut a = Asm::new();
+    let bad = a.label();
+    let handler = a.label();
+    let restorer = a.label();
+    let child = a.label();
+    let expect = |a: &mut Asm, n: u64, v: i32| {
+        a.mov_imm(Reg::R15, n);
+        a.cmp_imm(Reg::Rax, v);
+        a.jne(bad);
+    };
+    let rdpkru = |a: &mut Asm| {
+        a.mov_imm(Reg::Rcx, 0);
+        a.raw(&[0x0f, 0x01, 0xee]); // rdpkru
+    };
+    let wrpkru = |a: &mut Asm, v: u32| {
+        a.mov_imm(Reg::Rax, u64::from(v));
+        a.mov_imm(Reg::Rcx, 0);
+        a.mov_imm(Reg::Rdx, 0);
+        a.raw(&[0x0f, 0x01, 0xef]); // wrpkru
+    };
+    // The faults the handler has taken (at rbp+400).
+    let faults = |a: &mut Asm, n: u64, count: i32| {
+        a.load(Reg::Rax, Reg::Rbp, 400);
+        expect(a, n, count);
+    };
+    let call = |a: &mut Asm, nr: u64, args: &[u64]| {
+        for (r, v) in [Reg::Rdi, Reg::Rsi, Reg::Rdx, Reg::R10]
+            .into_iter()
+            .zip(args)
+        {
+            a.mov_imm(r, *v);
+        }
+        a.sys(nr);
+    };
+    // With the page (r12) as the first argument.
+    let on_page = |a: &mut Asm, nr: u64, args: &[u64]| {
+        for (r, v) in [Reg::Rsi, Reg::Rdx, Reg::R10].into_iter().zip(args) {
+            a.mov_imm(r, *v);
+        }
+        a.mov(Reg::Rdi, Reg::R12);
+        a.sys(nr);
+    };
+    a.mov(Reg::Rbp, Reg::Rsp);
+    a.sub_imm(Reg::Rbp, 4096);
+    a.mov_imm(Reg::Rax, 0);
+    a.store(Reg::Rbp, 400, Reg::Rax);
+    // 1: key 1, no rights withheld; 2: PKRU opens it for this thread.
+    call(&mut a, sys::PKEY_ALLOC, &[0, 0]);
+    expect(&mut a, 1, 1);
+    rdpkru(&mut a);
+    expect(&mut a, 2, OPEN1 as i32);
+    // A page holding 0x1234 (r12, and rbp+500 for the handler); 3: under
+    // key 1.
+    a.mov_imm(Reg::R8, u64::MAX);
+    a.mov_imm(Reg::R9, 0);
+    call(&mut a, sys::MMAP, &[0, 4096, 3, 0x22]);
+    a.mov(Reg::R12, Reg::Rax);
+    a.store(Reg::Rbp, 500, Reg::Rax);
+    a.mov_imm(Reg::Rax, 0x1234);
+    a.store(Reg::R12, 0, Reg::Rax);
+    on_page(&mut a, sys::PKEY_MPROTECT, &[4096, 3, 1]);
+    expect(&mut a, 3, 0);
+    // 4: sigaction(SIGSEGV, handler, SA_SIGINFO).
+    let words = [0, SA_SIGINFO_RESTORER, 0, 0];
+    for (i, w) in words.into_iter().enumerate() {
+        a.mov_imm(Reg::Rax, w);
+        a.store(Reg::Rbp, 128 + 8 * i as i32, Reg::Rax);
+    }
+    a.mov_label(Reg::Rax, handler);
+    a.store(Reg::Rbp, 128, Reg::Rax);
+    a.mov_label(Reg::Rax, restorer);
+    a.store(Reg::Rbp, 144, Reg::Rax);
+    a.mov(Reg::Rsi, Reg::Rbp);
+    a.add_imm(Reg::Rsi, 128);
+    a.mov_imm(Reg::Rdi, SIGSEGV);
+    a.mov_imm(Reg::Rdx, 0);
+    a.mov_imm(Reg::R10, 8);
+    a.sys(sys::RT_SIGACTION);
+    expect(&mut a, 4, 0);
+    // 5, 6: access denied: the read faults once, then reads 0x1234; 7: the
+    // PKRU the handler left in the frame is this thread's.
+    wrpkru(&mut a, INIT);
+    a.load(Reg::Rax, Reg::R12, 0);
+    expect(&mut a, 5, 0x1234);
+    faults(&mut a, 6, 1);
+    rdpkru(&mut a);
+    expect(&mut a, 7, OPEN1 as i32);
+    // 8, 9: writes denied: a read goes, 10: a write faults once.
+    wrpkru(&mut a, OPEN1 | (2 << 2));
+    a.load(Reg::Rax, Reg::R12, 0);
+    expect(&mut a, 8, 0x1234);
+    faults(&mut a, 9, 1);
+    a.mov_imm(Reg::Rax, 0x5678);
+    a.store(Reg::R12, 0, Reg::Rax);
+    faults(&mut a, 10, 2);
+    a.load(Reg::Rax, Reg::R12, 0);
+    expect(&mut a, 11, 0x5678);
+    // 12: mprotect keeps the key: read-only, access denied, 13: a fault.
+    on_page(&mut a, sys::MPROTECT, &[4096, 1]);
+    expect(&mut a, 12, 0);
+    wrpkru(&mut a, INIT);
+    a.load(Reg::Rax, Reg::R12, 0);
+    expect(&mut a, 13, 0x5678);
+    faults(&mut a, 14, 3);
+    // 15-21: freed, freed twice, bad flags, bad rights, an unallocated
+    // key, -1 (keep the key).
+    call(&mut a, sys::PKEY_FREE, &[1]);
+    expect(&mut a, 15, 0);
+    call(&mut a, sys::PKEY_FREE, &[1]);
+    expect(&mut a, 16, -22);
+    call(&mut a, sys::PKEY_ALLOC, &[1, 0]);
+    expect(&mut a, 17, -22);
+    call(&mut a, sys::PKEY_ALLOC, &[0, 4]);
+    expect(&mut a, 18, -22);
+    on_page(&mut a, sys::PKEY_MPROTECT, &[4096, 3, 5]);
+    expect(&mut a, 19, -22);
+    on_page(&mut a, sys::PKEY_MPROTECT, &[4096, 3, u64::MAX]);
+    expect(&mut a, 20, 0);
+    // 21: fifteen keys (1-15), 22: then ENOSPC.
+    a.mov_imm(Reg::R13, 15);
+    let more = a.label();
+    a.bind(more);
+    call(&mut a, sys::PKEY_ALLOC, &[0, 0]);
+    a.mov_imm(Reg::R15, 21);
+    a.cmp_imm(Reg::Rax, 0);
+    a.je(bad);
+    a.cmp_imm(Reg::Rax, 15);
+    a.ja(bad);
+    a.add_imm(Reg::R13, -1);
+    a.cmp_imm(Reg::R13, 0);
+    a.jne(more);
+    call(&mut a, sys::PKEY_ALLOC, &[0, 0]);
+    expect(&mut a, 22, -28);
+    // 23, 24: a forked child has this PKRU and these keys.
+    const FORKED: u32 = OPEN1 & !(1 << 30);
+    wrpkru(&mut a, FORKED);
+    a.sys(sys::FORK);
+    a.cmp_imm(Reg::Rax, 0);
+    a.je(child);
+    a.mov_imm(Reg::Rdi, u64::MAX);
+    a.mov(Reg::Rsi, Reg::Rbp);
+    a.add_imm(Reg::Rsi, 300);
+    a.mov_imm(Reg::Rdx, 0);
+    a.mov_imm(Reg::R10, 0);
+    a.sys(sys::WAIT4);
+    // The child's status: 0, or its failed check.
+    a.load32(Reg::R15, Reg::Rbp, 300);
+    a.raw(&[0x49, 0xc1, 0xef, 0x08]); // shr r15, 8
+    a.bind(bad);
+    a.mov(Reg::Rdi, Reg::R15);
+    a.sys(sys::EXIT_GROUP);
+    a.bind(child);
+    rdpkru(&mut a);
+    expect(&mut a, 23, FORKED as i32);
+    call(&mut a, sys::PKEY_ALLOC, &[0, 0]);
+    expect(&mut a, 24, -28);
+    a.mov_imm(Reg::R15, 0);
+    a.jmp(bad);
+    // The handler (rsi = siginfo, rdx = ucontext): 40: SEGV_PKUERR, 41: key
+    // 1, 42: the page's address, 43: the handler runs with the default PKRU.
+    // Then key 1 opened in the frame, and one more fault counted.
+    a.bind(handler);
+    a.mov(Reg::R13, Reg::Rdx);
+    a.load32(Reg::Rax, Reg::Rsi, 8);
+    expect(&mut a, 40, 4);
+    a.load32(Reg::Rax, Reg::Rsi, 32);
+    expect(&mut a, 41, 1);
+    a.load(Reg::Rax, Reg::Rsi, 16);
+    a.load(Reg::Rbx, Reg::Rbp, 500);
+    a.mov_imm(Reg::R15, 42);
+    a.cmp(Reg::Rax, Reg::Rbx);
+    a.jne(bad);
+    rdpkru(&mut a);
+    expect(&mut a, 43, INIT as i32);
+    a.load(Reg::R14, Reg::R13, 40 + 184);
+    a.load32(Reg::Rax, Reg::R14, pkru_at);
+    a.raw(&[0x25]); // and eax, imm32
+    a.raw(&(!0xcu32).to_le_bytes());
+    a.store32(Reg::R14, pkru_at, Reg::Rax);
+    a.load(Reg::Rax, Reg::Rbp, 400);
+    a.add_imm(Reg::Rax, 1);
+    a.store(Reg::Rbp, 400, Reg::Rax);
+    a.ret();
+    a.bind(restorer);
+    a.sys(sys::RT_SIGRETURN);
+    static_elf(&a.finish(BLOB_VADDR).unwrap_or_else(|| fail("assembler")))
+}
+
+/// AMX (ADR-0023), as Linux has it. `ARCH_GET_XCOMP_SUPP` says XCR0
+/// (`supported`, with x87 and SSE), `ARCH_GET_XCOMP_PERM` all but tile data
+/// until it is asked for. Without permission, the first tile instruction is
+/// SIGILL (`ILL_ILLOPC`, at its address). An alternate stack too small for
+/// a frame with tiles makes the request ENOSPC; without one it is granted
+/// (again: 0); past Linux's last component is EINVAL, any but tile data
+/// EOPNOTSUPP; then
+/// a small alternate stack is ENOMEM and a large one fine. With permission
+/// the same instructions work (the first #NM gives the thread room): a tile
+/// loaded from memory, kept across `sched_yield` and `getpid`, stores back
+/// what was loaded. A forked child inherits the permission but not the
+/// tiles: its own save says no tile data, and its tile stores zeros. A
+/// signal frame whose tile configuration LDTILECFG would refuse comes back
+/// as the reset configuration (the kernel's XRSTOR would fault on it). On a
+/// CPU without AMX (`supported` without tile data), only the first two
+/// answers and EOPNOTSUPP for the request. Exits 0, or the failed check
+/// (40-41 the SIGILL handler's).
+fn amx_program(supported: u64, tilecfg_at: usize) -> Vec<u8> {
+    const SIGILL: u64 = 4;
+    const SA_SIGINFO_RESTORER: u64 = 0x0400_0004;
+    const SUPP: u64 = 0x1021;
+    const PERM: u64 = 0x1022;
+    const REQ: u64 = 0x1023;
+    const TILE: u64 = 1 << 18;
+    let amx = supported & TILE != 0;
+    let mut a = Asm::new();
+    let bad = a.label();
+    let handler = a.label();
+    let restorer = a.label();
+    let resume = a.label();
+    let child = a.label();
+    let garbler = a.label();
+    let expect = |a: &mut Asm, n: u64, v: i32| {
+        a.mov_imm(Reg::R15, n);
+        a.cmp_imm(Reg::Rax, v);
+        a.jne(bad);
+    };
+    // The u64 at rbp+`at` is `v`.
+    let expect_at = |a: &mut Asm, n: u64, at: i32, v: u64| {
+        a.load(Reg::Rax, Reg::Rbp, at);
+        a.mov_imm(Reg::Rbx, v);
+        a.mov_imm(Reg::R15, n);
+        a.cmp(Reg::Rax, Reg::Rbx);
+        a.jne(bad);
+    };
+    let arch = |a: &mut Asm, code: u64, arg: u64| {
+        a.mov_imm(Reg::Rdi, code);
+        a.mov_imm(Reg::Rsi, arg);
+        a.sys(sys::ARCH_PRCTL);
+    };
+    // arch_prctl(code, rbp + 600).
+    let arch_get = |a: &mut Asm, code: u64| {
+        a.mov_imm(Reg::Rdi, code);
+        a.mov(Reg::Rsi, Reg::Rbp);
+        a.add_imm(Reg::Rsi, 600);
+        a.sys(sys::ARCH_PRCTL);
+    };
+    // sigaltstack({sp, flags, size}, NULL), the stack_t at rbp+640.
+    let altstack = |a: &mut Asm, sp: Reg, flags: u64, size: u64| {
+        a.store(Reg::Rbp, 640, sp);
+        a.mov_imm(Reg::Rax, flags);
+        a.store(Reg::Rbp, 648, Reg::Rax);
+        a.mov_imm(Reg::Rax, size);
+        a.store(Reg::Rbp, 656, Reg::Rax);
+        a.mov(Reg::Rdi, Reg::Rbp);
+        a.add_imm(Reg::Rdi, 640);
+        a.mov_imm(Reg::Rsi, 0);
+        a.sys(sys::SIGALTSTACK);
+    };
+    // LDTILECFG from rbp+0x1000, then TILELOADD tmm0 from rbp+0x3000 (16
+    // rows of 64 bytes).
+    let load_tile = |a: &mut Asm| {
+        a.mov(Reg::Rax, Reg::Rbp);
+        a.add_imm(Reg::Rax, 0x1000);
+        a.raw(&[0xc4, 0xe2, 0x78, 0x49, 0x00]); // ldtilecfg [rax]
+        a.mov(Reg::Rax, Reg::Rbp);
+        a.add_imm(Reg::Rax, 0x3000);
+        a.mov_imm(Reg::Rcx, 64);
+        a.raw(&[0xc4, 0xe2, 0x7b, 0x4b, 0x04, 0x08]); // tileloadd tmm0, [rax + rcx]
+    };
+    // TILESTORED tmm0 to rbp+`at`.
+    let store_tile = |a: &mut Asm, at: i32| {
+        a.mov(Reg::Rdx, Reg::Rbp);
+        a.add_imm(Reg::Rdx, at);
+        a.mov_imm(Reg::Rcx, 64);
+        a.raw(&[0xc4, 0xe2, 0x7a, 0x4b, 0x04, 0x0a]); // tilestored [rdx + rcx], tmm0
+    };
+    // 1024 bytes at rbp+`want` and rbp+`got` are equal.
+    let same = |a: &mut Asm, n: u64, want: i32, got: i32| {
+        a.mov(Reg::Rsi, Reg::Rbp);
+        a.add_imm(Reg::Rsi, want);
+        a.mov(Reg::Rdi, Reg::Rbp);
+        a.add_imm(Reg::Rdi, got);
+        a.mov_imm(Reg::Rcx, 128);
+        a.raw(&[0xf3, 0x48, 0xa7]); // repe cmpsq
+        a.mov_imm(Reg::R15, n);
+        a.jne(bad);
+    };
+    a.mov(Reg::Rbp, Reg::Rsp);
+    a.sub_imm(Reg::Rbp, 0x10000);
+    a.raw(&[0x48, 0x81, 0xe5, 0x00, 0xf0, 0xff, 0xff]); // and rbp, -4096
+    // 1, 2: what there is, and what this process may use.
+    arch_get(&mut a, SUPP);
+    expect(&mut a, 1, 0);
+    expect_at(&mut a, 1, 600, supported);
+    arch_get(&mut a, PERM);
+    expect(&mut a, 2, 0);
+    expect_at(&mut a, 2, 600, supported & !TILE);
+    if !amx {
+        arch(&mut a, REQ, 18);
+        expect(&mut a, 3, -95);
+        a.mov_imm(Reg::R15, 0);
+        a.jmp(bad);
+    }
+    // The tile configuration at rbp+0x1000: palette 1, eight tiles of 16
+    // rows of 64 bytes. The data at rbp+0x3000: 1 KiB of a pattern.
+    a.mov_imm(Reg::Rax, 0);
+    for at in [8, 32, 40, 56] {
+        a.store(Reg::Rbp, 0x1000 + at, Reg::Rax); // reserved, tiles 8-15
+    }
+    a.mov_imm(Reg::Rax, 1);
+    a.store(Reg::Rbp, 0x1000, Reg::Rax);
+    // colsb (u16 each) of tiles 0-7 only: palette 1 has eight.
+    a.mov_imm(Reg::Rax, 0x0040_0040_0040_0040);
+    for i in 0..2 {
+        a.store(Reg::Rbp, 0x1000 + 16 + 8 * i, Reg::Rax);
+    }
+    a.mov_imm(Reg::Rax, 0x1010_1010_1010_1010);
+    a.store(Reg::Rbp, 0x1000 + 48, Reg::Rax);
+    a.mov_imm(Reg::Rax, 0x0123_4567_89ab_cdef);
+    for i in 0..128 {
+        a.add_imm(Reg::Rax, 0x1111);
+        a.store(Reg::Rbp, 0x3000 + 8 * i, Reg::Rax);
+    }
+    // sigaction(SIGILL, handler, SA_SIGINFO); the handler counts at rbp+400.
+    a.mov_imm(Reg::Rax, 0);
+    a.store(Reg::Rbp, 400, Reg::Rax);
+    a.mov_label(Reg::Rax, handler);
+    a.store(Reg::Rbp, 128, Reg::Rax);
+    a.mov_imm(Reg::Rax, SA_SIGINFO_RESTORER);
+    a.store(Reg::Rbp, 136, Reg::Rax);
+    a.mov_label(Reg::Rax, restorer);
+    a.store(Reg::Rbp, 144, Reg::Rax);
+    a.mov_imm(Reg::Rax, 0);
+    a.store(Reg::Rbp, 152, Reg::Rax);
+    a.mov_imm(Reg::Rdi, SIGILL);
+    a.mov(Reg::Rsi, Reg::Rbp);
+    a.add_imm(Reg::Rsi, 128);
+    a.mov_imm(Reg::Rdx, 0);
+    a.mov_imm(Reg::R10, 8);
+    a.sys(sys::RT_SIGACTION);
+    expect(&mut a, 3, 0);
+    // 4: tiles without permission: SIGILL once (the handler resumes after
+    // them).
+    load_tile(&mut a);
+    a.bind(resume);
+    a.load(Reg::Rax, Reg::Rbp, 400);
+    expect(&mut a, 4, 1);
+    // 5: an alternate stack of 4 KiB; 6: too small for a frame with tiles;
+    // 7: without it, granted; 8: again; 9: past Linux's last component
+    // (EINVAL); 10: tile configuration and 11: one the CPU lacks, neither
+    // asked for on Linux (EOPNOTSUPP).
+    a.mov(Reg::R12, Reg::Rbp);
+    a.add_imm(Reg::R12, 0x2000);
+    altstack(&mut a, Reg::R12, 0, 4096);
+    expect(&mut a, 5, 0);
+    arch(&mut a, REQ, 18);
+    expect(&mut a, 6, -28);
+    altstack(&mut a, Reg::R12, 2, 0); // SS_DISABLE
+    arch(&mut a, REQ, 18);
+    expect(&mut a, 7, 0);
+    arch(&mut a, REQ, 18);
+    expect(&mut a, 8, 0);
+    arch(&mut a, REQ, 20);
+    expect(&mut a, 9, -22);
+    arch(&mut a, REQ, 17);
+    expect(&mut a, 10, -95);
+    arch(&mut a, REQ, 19);
+    expect(&mut a, 11, -95);
+    // 12: everything may be used now; 13: a 4 KiB alternate stack is too
+    // small; 14: 64 KiB is enough.
+    arch_get(&mut a, PERM);
+    expect_at(&mut a, 12, 600, supported);
+    altstack(&mut a, Reg::R12, 0, 4096);
+    expect(&mut a, 13, -12);
+    a.mov_imm(Reg::R8, u64::MAX);
+    a.mov_imm(Reg::R9, 0);
+    a.mov_imm(Reg::Rdi, 0);
+    a.mov_imm(Reg::Rsi, 0x1_0000);
+    a.mov_imm(Reg::Rdx, 3);
+    a.mov_imm(Reg::R10, 0x22);
+    a.sys(sys::MMAP);
+    a.mov(Reg::R12, Reg::Rax);
+    altstack(&mut a, Reg::R12, 0, 0x1_0000);
+    expect(&mut a, 14, 0);
+    altstack(&mut a, Reg::R12, 2, 0);
+    // 15: the same tiles, no SIGILL now; 16: what tmm0 holds after a yield
+    // and a system call is what it loaded.
+    load_tile(&mut a);
+    a.load(Reg::Rax, Reg::Rbp, 400);
+    expect(&mut a, 15, 1);
+    a.sys(sys::SCHED_YIELD);
+    a.sys(sys::GETPID);
+    store_tile(&mut a, 0x4000);
+    same(&mut a, 16, 0x3000, 0x4000);
+    // 17-19: a child.
+    a.sys(sys::FORK);
+    a.cmp_imm(Reg::Rax, 0);
+    a.je(child);
+    a.mov_imm(Reg::Rdi, u64::MAX);
+    a.mov(Reg::Rsi, Reg::Rbp);
+    a.add_imm(Reg::Rsi, 300);
+    a.mov_imm(Reg::Rdx, 0);
+    a.mov_imm(Reg::R10, 0);
+    a.sys(sys::WAIT4);
+    a.load32(Reg::R15, Reg::Rbp, 300);
+    a.raw(&[0x49, 0xc1, 0xef, 0x08]); // shr r15, 8
+    a.cmp_imm(Reg::R15, 0);
+    a.jne(bad);
+    // 20: a SIGUSR1 handler leaves palette 7 (which LDTILECFG refuses) in
+    // its frame's tile configuration: sigreturn resets it rather than let
+    // the kernel's XRSTOR fault, so STTILECFG reads palette 0.
+    a.mov_label(Reg::Rax, garbler);
+    a.store(Reg::Rbp, 128, Reg::Rax);
+    a.mov_imm(Reg::Rdi, 10);
+    a.mov(Reg::Rsi, Reg::Rbp);
+    a.add_imm(Reg::Rsi, 128);
+    a.mov_imm(Reg::Rdx, 0);
+    a.mov_imm(Reg::R10, 8);
+    a.sys(sys::RT_SIGACTION);
+    a.sys(sys::GETPID);
+    a.mov(Reg::Rdi, Reg::Rax);
+    a.mov_imm(Reg::Rsi, 10);
+    a.sys(sys::KILL);
+    a.mov_imm(Reg::Rax, u64::MAX);
+    a.store(Reg::Rbp, 0x9000, Reg::Rax);
+    a.mov(Reg::Rax, Reg::Rbp);
+    a.add_imm(Reg::Rax, 0x9000);
+    a.raw(&[0xc4, 0xe2, 0x79, 0x49, 0x00]); // sttilecfg [rax]
+    a.load(Reg::Rax, Reg::Rbp, 0x9000);
+    a.raw(&[0x48, 0x25, 0xff, 0x00, 0x00, 0x00]); // and rax, 0xff
+    expect(&mut a, 20, 0);
+    a.raw(&[0xc4, 0xe2, 0x78, 0x49, 0xc0]); // tilerelease
+    a.mov_imm(Reg::R15, 0);
+    a.bind(bad);
+    a.mov(Reg::Rdi, Reg::R15);
+    a.sys(sys::EXIT_GROUP);
+    // The child: 17: its own save (XSAVE of everything, to rbp+0x5000)
+    // says no tile data; 18: its tile stores zeros; 19: it may use tiles.
+    a.bind(child);
+    a.mov(Reg::R14, Reg::Rbp);
+    a.add_imm(Reg::R14, 0x5000);
+    a.mov_imm(Reg::Rax, u64::from(u32::MAX));
+    a.mov_imm(Reg::Rdx, u64::from(u32::MAX));
+    a.raw(&[0x49, 0x0f, 0xae, 0x26]); // xsave64 [r14]
+    a.load(Reg::Rax, Reg::Rbp, 0x5000 + 512);
+    a.mov_imm(Reg::Rbx, TILE);
+    a.raw(&[0x48, 0x21, 0xd8]); // and rax, rbx
+    expect(&mut a, 17, 0);
+    store_tile(&mut a, 0x4000);
+    same(&mut a, 18, 0x6000 + 0x2000, 0x4000);
+    arch_get(&mut a, PERM);
+    expect_at(&mut a, 19, 600, supported);
+    a.mov_imm(Reg::R15, 0);
+    a.jmp(bad);
+    // The SIGILL handler: 40: ILL_ILLOPC, 41: at the instruction; then on
+    // at `resume`.
+    a.bind(handler);
+    a.load32(Reg::Rax, Reg::Rsi, 8);
+    expect(&mut a, 40, 1);
+    a.load(Reg::Rax, Reg::Rsi, 16);
+    a.load(Reg::Rbx, Reg::Rdx, 40 + 16 * 8);
+    a.mov_imm(Reg::R15, 41);
+    a.cmp(Reg::Rax, Reg::Rbx);
+    a.jne(bad);
+    a.mov_label(Reg::Rax, resume);
+    a.store(Reg::Rdx, 40 + 16 * 8, Reg::Rax);
+    a.load(Reg::Rax, Reg::Rbp, 400);
+    a.add_imm(Reg::Rax, 1);
+    a.store(Reg::Rbp, 400, Reg::Rax);
+    a.ret();
+    // The SIGUSR1 handler: palette 7 in the frame's tile configuration.
+    a.bind(garbler);
+    a.load(Reg::R14, Reg::Rdx, 40 + 184);
+    a.mov_imm(Reg::Rax, 7);
+    a.store(Reg::R14, tilecfg_at as i32, Reg::Rax);
     a.ret();
     a.bind(restorer);
     a.sys(sys::RT_SIGRETURN);
@@ -4051,7 +4591,7 @@ fn limits_selftest(system: &System, vfs: &Arc<Vfs>) {
             .mmap(0, n * PAGE, 0, anonymous, None)
             .unwrap_or_else(|_| fail("limits: mmap"));
         let mut i = 1;
-        while i < n && mm.mprotect(at + i * PAGE, PAGE, 1).is_ok() {
+        while i < n && mm.mprotect(at + i * PAGE, PAGE, 1, None).is_ok() {
             i += 2;
         }
         let (mut lines, mut from) = (0, Some(0));
@@ -4072,7 +4612,7 @@ fn limits_selftest(system: &System, vfs: &Arc<Vfs>) {
         }
         let inside = at + (n - 2) * PAGE;
         let one_too_many = [
-            mm.mprotect(inside, PAGE, 1),
+            mm.mprotect(inside, PAGE, 1, None),
             mm.munmap(inside, PAGE),
             mm.mmap(inside, PAGE, 3, anonymous | 0x10, None),
         ];
@@ -4381,23 +4921,65 @@ pub(crate) fn run() {
     } else {
         println!("ichor: linux: no AVX: AVX state test skipped");
     }
-    // Every component XCR0 enables, through the program's own XSAVE.
+    // Every component XCR0 enables, through the program's own XSAVE: first
+    // without AMX tile data, then (where there is AMX) with it, asked for.
     let xcr0 = frame::cpu::xstate_features();
-    if xcr0 != 0 {
-        let l = xstate_layout(xcr0);
+    let tile = frame::cpu::XSTATE_TILE_DATA;
+    let mut runs = alloc::vec![xcr0 & !tile];
+    if xcr0 & tile != 0 {
+        runs.push(xcr0);
+    }
+    for rfbm in runs.into_iter().filter(|_| xcr0 != 0) {
+        let l = xstate_layout(rfbm);
         if l.size > xs::MAX {
             fail("xstatetest: the area outgrows its buffers");
         }
         let (status, _) = run_linux(new_process(), &xstate_program(&l), None, &["xstatetest"]);
         if status != 0 {
-            println!("ichor: linux: xstatetest (XCR0 {xcr0:#x}) failed check {status}");
+            println!("ichor: linux: xstatetest ({rfbm:#x}) failed check {status}");
             fail("xstatetest");
         }
         println!(
-            "ichor: linux: every XSAVE component (XCR0 {xcr0:#x}, {} bytes) stays each thread's across {FPU_ROUNDS} blocking ping-pongs, {FPU_YIELDS} yields, a fork, and a signal whose handler starts reset and loads its own",
+            "ichor: linux: every XSAVE component ({rfbm:#x} of XCR0 {xcr0:#x}, {} bytes) stays each thread's across {FPU_ROUNDS} blocking ping-pongs, {FPU_YIELDS} yields, a fork, and a signal whose handler starts reset and loads its own",
             l.size
         );
-    } else {
+    }
+    if xcr0 == 0 {
         println!("ichor: linux: no XSAVE: XSAVE state test skipped");
+    }
+    // AMX's permission and first use, or (without AMX) that it says so.
+    let (tilecfg_at, _) = frame::cpu::xstate_component(17);
+    let (status, syscalls) = run_linux(
+        new_process(),
+        &amx_program(xcr0 | 3, tilecfg_at),
+        None,
+        &["amxtest"],
+    );
+    if status != 0 {
+        println!("ichor: linux: amxtest failed check {status}");
+        fail("amxtest");
+    }
+    if xcr0 & tile != 0 {
+        println!(
+            "ichor: linux: amxtest: tiles are SIGILL until asked for, granted as on Linux (ENOSPC, ENOMEM for small alternate stacks), kept across a yield; a fork's child starts without them ({syscalls} syscalls)"
+        );
+    } else {
+        println!(
+            "ichor: linux: amxtest: no AMX, and arch_prctl says so (EOPNOTSUPP) ({syscalls} syscalls)"
+        );
+    }
+    if frame::cpu::protection_keys() {
+        let (pkru_at, _) = frame::cpu::xstate_component(9);
+        let (status, syscalls) =
+            run_linux(new_process(), &pkey_program(pkru_at), None, &["pkeytest"]);
+        if status != 0 {
+            println!("ichor: linux: pkeytest failed check {status}");
+            fail("pkeytest");
+        }
+        println!(
+            "ichor: linux: protection keys deny reads and writes as PKRU says (SEGV_PKUERR, si_pkey), handlers start with the default PKRU and sigreturn restores the frame's ({syscalls} syscalls)"
+        );
+    } else {
+        println!("ichor: linux: no protection keys: pkey test skipped");
     }
 }

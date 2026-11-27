@@ -14,6 +14,7 @@ pub(crate) const CR4_LA57: u64 = 1 << 12;
 pub(crate) const CR4_PCIDE: u64 = 1 << 17;
 pub(crate) const CR4_SMEP: u64 = 1 << 20;
 pub(crate) const CR4_SMAP: u64 = 1 << 21;
+pub(crate) const CR4_PKE: u64 = 1 << 22;
 pub(crate) const CR4_OSXSAVE: u64 = 1 << 18;
 
 pub(crate) const MSR_EFER: u32 = 0xC000_0080;

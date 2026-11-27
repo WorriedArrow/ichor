@@ -27,6 +27,8 @@ brief where they conflict with it.
 | [0019](0019-asynchronous-console.md) | Console writes do not wait for the serial port | Accepted |
 | [0020](0020-huge-anonymous-pages.md) | 2 MiB pages for anonymous memory | Accepted |
 | [0021](0021-cpu-time-from-the-scheduler.md) | CPU time comes from the scheduler | Accepted |
+| [0022](0022-protection-keys.md) | Protection keys for user pages | Accepted |
+| [0023](0023-amx-tile-data.md) | AMX tile data behind XFD | Accepted |
 
 ## Planned
 

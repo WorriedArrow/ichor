@@ -332,8 +332,12 @@ pub(crate) unsafe fn set_entry(pa: PhysAddr, index: usize, value: u64) {
 // ---------------------------------------------------------------------------
 
 const USER: u64 = 1 << 2;
+/// A user leaf's protection key (bits 59-62), which PKRU's two bits for it
+/// govern when CR4.PKE is set; ignored otherwise.
+const KEY_SHIFT: u32 = 59;
+const KEY: u64 = 0xf << KEY_SHIFT;
 /// The bits of a user leaf that say what it allows.
-const USER_BITS: u64 = PRESENT | WRITABLE | USER | NO_EXECUTE;
+const USER_BITS: u64 = PRESENT | WRITABLE | USER | NO_EXECUTE | KEY;
 /// A 2 MiB leaf's page address (bit 12 is its PAT bit).
 const HUGE_ADDR: u64 = ADDR_MASK & !(SIZE_2M - 1);
 /// Bytes of a 2 MiB user page.
@@ -342,16 +346,18 @@ pub(crate) const USER_HUGE: u64 = SIZE_2M;
 /// One past the highest user virtual address.
 pub(crate) const USER_END: u64 = 0x0000_7fff_ffff_f000;
 
-/// Permissions of a user page. User pages are always readable.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Permissions of a user page. User pages are always readable. `key` is
+/// the page's protection key (0-15; only its low four bits count).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct UserProt {
     pub write: bool,
     pub exec: bool,
+    pub key: u8,
 }
 
 impl UserProt {
     fn bits(self) -> u64 {
-        let mut e = PRESENT | USER;
+        let mut e = PRESENT | USER | ((u64::from(self.key) << KEY_SHIFT) & KEY);
         if self.write {
             e |= WRITABLE;
         }
@@ -365,6 +371,7 @@ impl UserProt {
         Self {
             write: e & WRITABLE != 0,
             exec: e & NO_EXECUTE == 0,
+            key: ((e & KEY) >> KEY_SHIFT) as u8,
         }
     }
 }

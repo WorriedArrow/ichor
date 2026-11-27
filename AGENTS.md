@@ -811,11 +811,25 @@ word, MXCSR, XMM/YMM/ZMM, opmasks; AVX-512 only where the CPU has it, not
 under TCG) after every system call, across blocking, yields, fork and a
 signal; signal handlers now start with the reset state, as on Linux
 (ADR-0008's second 2026-11-26 amendment). Not yet measured on GCP.
+Protection keys (ADR-0022, 2026-11-26): CR4.PKE and PKRU in XCR0 where
+the CPU has PKU (TCG's `max` does), keys in user PTEs (`UserProt::key`,
+`vma::Prot::key`; `mprotect` keeps them), `pkey_alloc`/`pkey_free`/
+`pkey_mprotect`, `SEGV_PKUERR` with `si_pkey`, PKRU 0x55555554 at `execve`
+and for every signal handler; `pkey_program` on every boot. System calls
+ignore keys (Linux's copies fault): not yet.
+AMX (ADR-0023, 2026-11-26): XCR0's tile bits only with XFD; a thread's
+area is a heap buffer, small (tile data left out of RFBM, XFD armed) until
+its first tile instruction's #NM (`UserEvent::Exception` vector 7, `error`
+= IA32_XFD_ERR) finds the process permitted (`ARCH_REQ_XCOMP_PERM`,
+`Prctl::xtile`), then large (3 pages charged to the cell); SIGILL without
+permission; `ARCH_GET_XCOMP_SUPP`/`PERM`; fork and new threads start
+without tiles. `amx_program` and a tile run of `xstate_program` check it
+only where the CPU has AMX (GCP c3, AWS m7i): not under TCG.
 
 Frame budget: ADR-0005 sets the milestone 3 ceiling at 8,500 lines / 380
 sites; ADR-0007 raises it to 9,500 / 420 for milestone 4 (TLB shootdown,
-atomic user ops for futexes, PCID). `audit.toml` is at step 19 (7,800 / 315,
-ADR-0008's 2026-11-26 amendment); frame is at 7,738 / 308 (A5 added
+atomic user ops for futexes, PCID). `audit.toml` is at step 21 (8,000 / 315,
+ADR-0023); frame is at 7,976 / 311 (A5 added
 RDSEED/RDRAND and UEFI GetTime; B added XSAVE; C the frames tree and
 request tracking; M6 reading `\ichor\roots.pem`, later
 `\ichor\suffixes.dat` too; ADR-0011 the checked user
@@ -827,7 +841,8 @@ safe-RET return thunks, `arch::rethunk`; the console ring, ADR-0019;
 `sysretq`, skipped XRSTORs, a `VmSpace` without a page tree and batch
 write protection, ADR-0008's amendment; 2 MiB user pages, ADR-0020; each
 task's CPU time, ADR-0021; user registers saved only when they must be,
-ADR-0008's 2026-11-26 amendment). Growth past the step
+ADR-0008's 2026-11-26 amendment; protection keys, ADR-0022; AMX behind
+XFD and per-thread area sizes, ADR-0023). Growth past the step
 needs an ADR and a new audit step.
 `services/rt` has its own budget (`services/rt/audit.toml`: 500 / 40; at
 417 / 30).

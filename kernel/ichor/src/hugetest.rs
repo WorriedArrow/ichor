@@ -101,7 +101,7 @@ pub(crate) fn run() {
     let b1 = start + HUGE_PAGE_SIZE;
     let ro = b1 + 5 * PAGE_SIZE;
     let before = mm.space().translate(b1 + 6 * PAGE_SIZE);
-    if mm.mprotect(ro, PAGE_SIZE, READ).is_err()
+    if mm.mprotect(ro, PAGE_SIZE, READ, None).is_err()
         || mm.space().translate(ro).is_none_or(|(_, p)| p.write)
         || mm.space().translate(b1 + 6 * PAGE_SIZE) != before
         || mm.copy_to_user(ro, &[0]) != 0

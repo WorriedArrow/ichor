@@ -26,12 +26,14 @@ pub const PAGE: u64 = 4096;
 /// Most regions one address space has: Linux's default `vm.max_map_count`.
 pub const MAX_REGIONS: usize = 65_530;
 
-/// Access a region allows.
+/// Access a region allows, and its protection key (`pkey_mprotect`; 0
+/// unless one was given).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct Prot {
     pub read: bool,
     pub write: bool,
     pub exec: bool,
+    pub key: u8,
 }
 
 impl Prot {
@@ -39,15 +41,17 @@ impl Prot {
         read: false,
         write: false,
         exec: false,
+        key: 0,
     };
     pub const RW: Prot = Prot {
         read: true,
         write: true,
         exec: false,
+        key: 0,
     };
 
-    /// From Linux `PROT_*` bits (`READ = 1, WRITE = 2, EXEC = 4`). Unknown
-    /// bits are rejected.
+    /// From Linux `PROT_*` bits (`READ = 1, WRITE = 2, EXEC = 4`), with key
+    /// 0. Unknown bits are rejected.
     pub fn from_linux(bits: u64) -> Option<Prot> {
         if bits & !7 != 0 {
             return None;
@@ -56,6 +60,7 @@ impl Prot {
             read: bits & 1 != 0,
             write: bits & 2 != 0,
             exec: bits & 4 != 0,
+            key: 0,
         })
     }
 
@@ -246,12 +251,18 @@ impl<B: Clone + PartialEq> RegionMap<B> {
     /// regions at the boundaries; false (changing nothing) if that would be
     /// too many regions.
     pub fn protect(&mut self, start: u64, end: u64, prot: Prot) -> bool {
+        self.protect_with(start, end, |_| prot)
+    }
+
+    /// [`Self::protect`] with each region's new protection made from its
+    /// old one by `f` (`mprotect` keeps each region's key).
+    pub fn protect_with(&mut self, start: u64, end: u64, f: impl Fn(Prot) -> Prot) -> bool {
         if start >= end || !self.covered(start, end) {
             return false;
         }
         let splits = |at: u64| {
             self.find(at)
-                .is_some_and(|r| r.start < at && r.prot != prot)
+                .is_some_and(|r| r.start < at && r.prot != f(r.prot))
         };
         let more = usize::from(splits(start)) + usize::from(splits(end));
         if self.map.len() + more > MAX_REGIONS {
@@ -261,6 +272,7 @@ impl<B: Clone + PartialEq> RegionMap<B> {
         while let Some(r) = self.next_overlap(at, end) {
             at = r.end;
             let from = r.start.max(start);
+            let prot = f(r.prot);
             if r.prot != prot {
                 self.cut(&r, start, end);
                 self.map.insert(
@@ -365,10 +377,34 @@ mod tests {
         read: true,
         write: false,
         exec: false,
+        key: 0,
     };
 
     fn map() -> RegionMap<u8> {
         RegionMap::new(LO, HI)
+    }
+
+    #[test]
+    fn protect_with_keeps_each_regions_key() {
+        let mut m = map();
+        assert!(m.insert(LO, LO + 4 * PAGE, Prot::RW, 0));
+        // A key on the middle two pages splits the region.
+        let keyed = |p: Prot| Prot { key: 3, ..p };
+        assert!(m.protect_with(LO + PAGE, LO + 3 * PAGE, keyed));
+        assert_eq!(m.len(), 3);
+        // mprotect of all four to read-only keeps the keys apart.
+        assert!(m.protect_with(LO, LO + 4 * PAGE, |p| Prot { key: p.key, ..R }));
+        assert_eq!(
+            snapshot(&m),
+            [
+                (LO, LO + PAGE, R),
+                (LO + PAGE, LO + 3 * PAGE, Prot { key: 3, ..R }),
+                (LO + 3 * PAGE, LO + 4 * PAGE, R),
+            ]
+        );
+        // Back to key 0, the three join again.
+        assert!(m.protect_with(LO, LO + 4 * PAGE, |p| Prot { key: 0, ..p }));
+        assert_eq!(snapshot(&m), [(LO, LO + 4 * PAGE, R)]);
     }
 
     fn snapshot(m: &RegionMap<u8>) -> Vec<(u64, u64, Prot)> {

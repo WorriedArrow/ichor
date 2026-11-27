@@ -310,6 +310,7 @@ fn build_page(mm: &mut Mm, image: &dyn File, piece: &Piece<'_>, va: u64) -> Resu
     let user = UserProt {
         write: piece.prot.write,
         exec: piece.prot.exec,
+        key: 0,
     };
     if piece.prot.accessible() && mm.space().map(va, &frame, user).is_err() {
         return Err(LoadError::Map);

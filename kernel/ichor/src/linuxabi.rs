@@ -152,7 +152,7 @@ mod nr {
     pub(super) const STATFS: u64 = 137;
     pub(super) const FSTATFS: u64 = 138;
     pub(super) const PRCTL: u64 = 157; // partial: NAME (per process), CAPBSET_READ, PDEATHSIG, KEEPCAPS, DUMPABLE, NO_NEW_PRIVS
-    pub(super) const ARCH_PRCTL: u64 = 158; // partial: ARCH_SET_FS only
+    pub(super) const ARCH_PRCTL: u64 = 158; // partial: ARCH_SET_FS and the XCOMP calls (AMX permission checks only the calling thread's alternate stack); no GS, no guest permissions
     pub(super) const GETTID: u64 = 186;
     pub(super) const TIME: u64 = 201; // firmware clock at boot plus monotonic time (no NTP)
     pub(super) const TKILL: u64 = 200;
@@ -231,6 +231,9 @@ mod nr {
     pub(super) const MEMBARRIER: u64 = 324; // partial: CMD_QUERY reports no commands
     pub(super) const MEMFD_CREATE: u64 = 319; // partial: no sealing (F_ADD_SEALS); /proc/self/fd shows anon_inode:[file], not /memfd:NAME
     pub(super) const STATX: u64 = 332;
+    pub(super) const PKEY_MPROTECT: u64 = 329;
+    pub(super) const PKEY_ALLOC: u64 = 330; // partial: no execute-only key; system calls reach memory whatever PKRU says of its key
+    pub(super) const PKEY_FREE: u64 = 331;
     pub(super) const PRLIMIT64: u64 = 302; // partial: NOFILE, STACK and FSIZE enforced, others stored
     pub(super) const GETRANDOM: u64 = 318; // ChaCha20 seeded from RDSEED/RDRAND and virtio-rng
     pub(super) const RENAMEAT2: u64 = 316; // partial: RENAME_NOREPLACE only
@@ -301,6 +304,7 @@ const ENODEV: i64 = 19;
 const EINVAL: i64 = 22;
 const EMFILE: i64 = 24;
 const ENOTTY: i64 = 25;
+const ENOSPC: i64 = 28;
 const ENOSYS: i64 = 38;
 
 /// `trace_errors` on the command line: log every Linux syscall that fails.
@@ -471,7 +475,13 @@ pub(crate) fn dispatch(p: &mut LinuxProcess, ctx: &mut frame::user::UserContext)
         nr::IOCTL => ioctl(p, a[0], a[1], a[2]),
         // Memory.
         nr::MMAP => mmap(p, &a),
-        nr::MPROTECT => p.mm().mprotect(a[0], a[1], a[2]),
+        nr::MPROTECT => p.mm().mprotect(a[0], a[1], a[2], None),
+        nr::PKEY_MPROTECT => pkey_mprotect(p, &a),
+        nr::PKEY_ALLOC => pkey_alloc(p, ctx, a[0], a[1]),
+        nr::PKEY_FREE => match p.mm().pkey_free(i64::from(a[0] as i32)) {
+            true => Ok(0),
+            false => Err(EINVAL),
+        },
         nr::MUNMAP => p.mm().munmap(a[0], a[1]),
         nr::BRK => Ok(p.mm().brk(a[0])),
         nr::MSYNC => p.mm().msync(a[0], a[1], a[2]),
@@ -677,7 +687,7 @@ pub(crate) fn dispatch(p: &mut LinuxProcess, ctx: &mut frame::user::UserContext)
             Ok(()) => return Outcome::Continue,
             Err(e) => Err(e),
         },
-        nr::ARCH_PRCTL => arch_prctl(ctx, a[0], a[1]),
+        nr::ARCH_PRCTL => arch_prctl(p, ctx, a[0], a[1]),
         nr::SET_TID_ADDRESS => {
             p.clear_tid = a[0];
             Ok(p.entry.pid)
@@ -1989,9 +1999,100 @@ const USER_ADDR_END: u64 = 0x0000_7fff_ffff_f000;
 const ARCH_SET_GS: u64 = 0x1001;
 const ARCH_SET_FS: u64 = 0x1002;
 
+/// `pkey_alloc(flags, rights)`: a protection key, with the calling thread's
+/// PKRU set to `rights` for it (`PKEY_DISABLE_ACCESS` 1, `_WRITE` 2), as
+/// Linux does. ENOSPC when none is free, and always on a CPU without
+/// protection keys.
+fn pkey_alloc(
+    p: &mut LinuxProcess,
+    ctx: &mut frame::user::UserContext,
+    flags: u64,
+    rights: u64,
+) -> Result<u64, i64> {
+    if flags != 0 || rights & !3 != 0 {
+        return Err(EINVAL);
+    }
+    let key = p.mm().pkey_alloc().ok_or(ENOSPC)?;
+    let pkru = ctx.pkru();
+    let at = 2 * u32::from(key);
+    ctx.set_pkru((pkru & !(3 << at)) | ((rights as u32) << at));
+    Ok(u64::from(key))
+}
+
+/// `pkey_mprotect(addr, len, prot, pkey)`: `mprotect` that also gives the
+/// pages key `pkey`, which must be allocated (-1: keep each one's, as
+/// `mprotect`).
+fn pkey_mprotect(p: &mut LinuxProcess, a: &[u64; 6]) -> Result<u64, i64> {
+    let pkey = i64::from(a[3] as i32);
+    let mut mm = p.mm();
+    let key = match pkey {
+        -1 => None,
+        k if mm.pkey_allocated(k) => Some(k as u8),
+        _ => return Err(EINVAL),
+    };
+    mm.mprotect(a[0], a[1], a[2], key)
+}
+
+const ARCH_GET_XCOMP_SUPP: u64 = 0x1021;
+const ARCH_GET_XCOMP_PERM: u64 = 0x1022;
+const ARCH_REQ_XCOMP_PERM: u64 = 0x1023;
+
 /// `arch_prctl`: lets a static binary set its FS base (TLS). GS is not
-/// settable (the kernel keeps its per-CPU block there; see ADR-0001).
-fn arch_prctl(ctx: &mut frame::user::UserContext, code: u64, addr: u64) -> Result<u64, i64> {
+/// settable (the kernel keeps its per-CPU block there; see ADR-0001). And
+/// the XSAVE components a process may use (ADR-0023): what there are, what
+/// it may use, and AMX tile data on request, as Linux.
+fn arch_prctl(
+    p: &mut LinuxProcess,
+    ctx: &mut frame::user::UserContext,
+    code: u64,
+    addr: u64,
+) -> Result<u64, i64> {
+    const EOPNOTSUPP: i64 = 95;
+    let tile = frame::cpu::XSTATE_TILE_DATA;
+    // x87 and SSE, whatever XCR0 says (Linux's legacy features).
+    let supported = frame::cpu::xstate_features() | 3;
+    let put = |p: &mut LinuxProcess, v: u64| match p.copy_to_user(addr, &v.to_le_bytes()) {
+        8 => Ok(0),
+        _ => Err(EFAULT),
+    };
+    match code {
+        ARCH_GET_XCOMP_SUPP => return put(p, supported),
+        ARCH_GET_XCOMP_PERM => {
+            let granted = p.group.prctl.lock().xtile;
+            return put(
+                p,
+                if granted {
+                    supported
+                } else {
+                    supported & !tile
+                },
+            );
+        }
+        ARCH_REQ_XCOMP_PERM => {
+            // As Linux: EINVAL past its last component (XFEATURE_MAX, 20
+            // since APX), EOPNOTSUPP for any but tile data (the only one
+            // that is asked for) or tile data the CPU lacks.
+            if addr >= 20 {
+                return Err(EINVAL);
+            }
+            if 1 << addr != tile || supported & tile == 0 {
+                return Err(EOPNOTSUPP);
+            }
+            if !p.group.prctl.lock().xtile {
+                // A frame with tile data must fit this thread's alternate
+                // stack. Linux checks every thread's; Ichor this one's.
+                if p.sig
+                    .alt_size()
+                    .is_some_and(|z| z < crate::signal::frame_stack_size())
+                {
+                    return Err(ENOSPC);
+                }
+                p.group.prctl.lock().xtile = true;
+            }
+            return Ok(0);
+        }
+        _ => {}
+    }
     match code {
         ARCH_SET_FS => {
             // Like Linux: the base must be a user address (anything else

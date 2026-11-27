@@ -303,6 +303,7 @@ pub fn isolation_selftest() -> Result<bool, &'static str> {
     let prot = UserProt {
         write: false,
         exec: false,
+        key: 0,
     };
     space
         .map(va, &page, prot)

@@ -355,7 +355,41 @@ impl UserContext {
     /// signal handler: x87 and SSE defaults, everything else in its init
     /// state. Read [`Self::fpu_state`] first to keep the old one.
     pub fn reset_fpu_state(&mut self) {
-        self.fpu = super::xstate::ExtState::default();
+        self.fpu.reset();
+    }
+
+    /// Bytes of [`Self::fpu_state`]: [`crate::cpu::xstate_size`], or more
+    /// once the thread has room for AMX tile data.
+    pub fn fpu_size(&self) -> usize {
+        self.fpu.len()
+    }
+
+    /// The XSAVE components the state holds (a signal frame's
+    /// `xfeatures`).
+    pub fn fpu_components(&self) -> u64 {
+        self.fpu.components()
+    }
+
+    /// Whether the thread has room for AMX tile data.
+    pub fn fpu_tiles(&self) -> bool {
+        self.fpu.tiles()
+    }
+
+    /// Gives the thread room for AMX tile data and its use (ADR-0023): what
+    /// a tile instruction's first #NM ([`UserEvent::Exception`] vector 7,
+    /// tile data in `error`) asks for, once the process may.
+    pub fn enable_tiles(&mut self) {
+        self.fpu.enable_tiles();
+    }
+
+    /// The thread's protection-key rights register (0 without keys).
+    pub fn pkru(&self) -> u32 {
+        self.fpu.pkru()
+    }
+
+    /// Sets the thread's PKRU (`pkey_alloc`); nothing without keys.
+    pub fn set_pkru(&mut self, pkru: u32) {
+        self.fpu.set_pkru(pkru);
     }
 }
 
@@ -364,7 +398,8 @@ impl UserContext {
 pub enum UserEvent {
     /// A `syscall` instruction.
     Syscall,
-    /// A CPU exception while in ring 3.
+    /// A CPU exception while in ring 3. For #NM (vector 7), `error` holds
+    /// the XSAVE components XFD stopped (IA32_XFD_ERR).
     Exception { vector: u8, error: u64, cr2: u64 },
     /// The thread's timeslice ran out while it was in ring 3. The caller
     /// should yield (`task::yield_now`) and then execute again.
@@ -498,6 +533,12 @@ impl<'a> UserMode<'a> {
         match block.event_kind.load(Relaxed) {
             1 => UserEvent::Syscall,
             3 => UserEvent::Preempted,
+            // #NM has no error code: report what XFD stopped instead.
+            _ if info as u8 == 7 => UserEvent::Exception {
+                vector: 7,
+                error: super::xstate::take_xfd_err(&guard),
+                cr2: 0,
+            },
             _ => UserEvent::Exception {
                 vector: info as u8,
                 error: info >> 8,

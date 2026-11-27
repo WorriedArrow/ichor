@@ -30,6 +30,8 @@ const EAGAIN: i64 = 11;
 const SIGILL: u32 = 4;
 const SIGTRAP: u32 = 5;
 const SIGFPE: u32 = 8;
+/// A page fault's error code: a protection key denied the access.
+const PF_PK: u64 = 1 << 5;
 const ESRCH: i64 = 3;
 const EINTR: i64 = 4;
 
@@ -1057,6 +1059,23 @@ pub(crate) fn wait(
     })
 }
 
+/// A tile instruction's first #NM (ADR-0023): the thread's state gets room
+/// for tile data, charged to its cell, and the instruction runs again. False
+/// (a signal, as Linux sends: SIGILL without permission, SIGSEGV when the
+/// cell cannot pay) otherwise.
+fn first_tile_use(p: &mut LinuxProcess, ctx: &mut UserContext) -> bool {
+    if !p.group.prctl.lock().xtile || ctx.fpu_tiles() {
+        return false;
+    }
+    let pages = (frame::cpu::xstate_tile_size() as u64).div_ceil(4096);
+    let Some(charge) = Reserved::new(p.cell.account(), pages) else {
+        return false;
+    };
+    p.tile_charge = Some(charge);
+    ctx.enable_tiles();
+    true
+}
+
 /// Runs `p` in ring 3 from `ctx` until it exits, then frees it and records
 /// its exit. Returns the wait status and how many syscalls it made.
 pub(crate) fn run(mut p: LinuxProcess, mut ctx: UserContext) -> (u32, u32) {
@@ -1092,11 +1111,17 @@ pub(crate) fn run(mut p: LinuxProcess, mut ctx: UserContext) -> (u32, u32) {
                 linuxabi::uring::task_work(&mut p);
             }
             UserEvent::Preempted => frame::task::yield_now(),
+            // Not a protection-key violation (error bit 5): no mapping
+            // change serves that.
             UserEvent::Exception {
                 vector: 14,
                 error,
                 cr2,
-            } if p.mm().fault(cr2, error & 2 != 0, error & 16 != 0) => {}
+            } if error & PF_PK == 0 && p.mm().fault(cr2, error & 2 != 0, error & 16 != 0) => {}
+            // A tile instruction's first use (XFD's #NM): room, then again.
+            UserEvent::Exception {
+                vector: 7, error, ..
+            } if error & frame::cpu::XSTATE_TILE_DATA != 0 && first_tile_use(&mut p, &mut ctx) => {}
             UserEvent::Exception { vector, error, cr2 } => {
                 // The signal, its code and its address, as Linux reports.
                 let trap = signal::Trap {
@@ -1111,6 +1136,9 @@ pub(crate) fn run(mut p: LinuxProcess, mut ctx: UserContext) -> (u32, u32) {
                     1 => (SIGTRAP, signal::TRAP_TRACE, rip),
                     3 => (SIGTRAP, signal::SI_KERNEL, 0),
                     6 => (SIGILL, signal::ILL_ILLOPN, rip),
+                    // Tiles without permission; with it, the cell was full.
+                    7 if !p.group.prctl.lock().xtile => (SIGILL, signal::ILL_ILLOPC, rip),
+                    14 if error & PF_PK != 0 => (signal::SIGSEGV, signal::SEGV_PKUERR, cr2),
                     14 if p.mm().mapped(cr2) => (signal::SIGSEGV, signal::SEGV_ACCERR, cr2),
                     14 => (signal::SIGSEGV, signal::SEGV_MAPERR, cr2),
                     _ => (signal::SIGSEGV, signal::SI_KERNEL, 0),
