@@ -83,7 +83,9 @@ uses keys on Linux had to go without.
 ## Consequences
 
 - `pkey_program` (every boot where the CPU has PKU: QEMU's TCG `max`,
-  KVM on the CI host, GCP): key 1 allocated with PKRU opened for it, a
+  and KVM on a host that passes PKU through; GCP's n2, n2d and c3 and
+  OpenVMM here do not, so on 2026-11-27 it had run under TCG only): key 1
+  allocated with PKRU opened for it, a
   page put under it, a read with access denied is SIGSEGV with
   `SEGV_PKUERR`, the key and the address; the handler starts with
   0x55555554, opens the key in its frame, and the read goes through

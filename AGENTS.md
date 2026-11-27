@@ -810,7 +810,10 @@ user-mode XSAVE of every component XCR0 enables (x87 and its control
 word, MXCSR, XMM/YMM/ZMM, opmasks; AVX-512 only where the CPU has it, not
 under TCG) after every system call, across blocking, yields, fork and a
 signal; signal handlers now start with the reset state, as on Linux
-(ADR-0008's second 2026-11-26 amendment). Not yet measured on GCP.
+(ADR-0008's second 2026-11-26 amendment). On GCP (2026-11-27,
+`docs/benchmarks.md`'s fourth round): n2 null syscall 163 → 116 ns
+(Linux 106), fork + exec 141 → 100 us (Linux 85); Milan 295 ns and 83 us,
+ahead of Linux's 386 ns and 173 us; c3 161 ns and 143 us (no Linux run).
 Protection keys (ADR-0022, 2026-11-26): CR4.PKE and PKRU in XCR0 where
 the CPU has PKU (TCG's `max` does), keys in user PTEs (`UserProt::key`,
 `vma::Prot::key`; `mprotect` keeps them), `pkey_alloc`/`pkey_free`/
@@ -824,7 +827,9 @@ its first tile instruction's #NM (`UserEvent::Exception` vector 7, `error`
 `Prctl::xtile`), then large (3 pages charged to the cell); SIGILL without
 permission; `ARCH_GET_XCOMP_SUPP`/`PERM`; fork and new threads start
 without tiles. `amx_program` and a tile run of `xstate_program` check it
-only where the CPU has AMX (GCP c3, AWS m7i): not under TCG.
+only where the CPU has AMX (GCP c3, AWS m7i): not under TCG. Passed on
+GCP c3 (2026-11-27). GCP's n2, n2d and c3 expose no PKU to guests, nor
+does OpenVMM here: `pkey_program` has run under TCG only.
 
 Frame budget: ADR-0005 sets the milestone 3 ceiling at 8,500 lines / 380
 sites; ADR-0007 raises it to 9,500 / 420 for milestone 4 (TLB shootdown,

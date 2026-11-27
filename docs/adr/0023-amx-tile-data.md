@@ -106,8 +106,10 @@ containers ran on vector code only.
   child's first XRSTOR trapping for room, the signal frame carrying the
   tiles, the orphan starting with them in their init state. On other
   CPUs `amx_program` checks that arch_prctl says there is no AMX.
-- None of this runs under TCG or on the development PC (no AMX there):
-  the first run is on GCP.
+- None of this runs under TCG or on the development PC (no AMX there).
+  First run on GCP's c3-standard-4 (2026-11-27): XCR0 0x600e7, both
+  `xstate_program` runs (2,816 and 11,008 bytes) and `amx_program`
+  passed.
 - Frame: XFD, the two sizes, the heap area (two unsafe sites for its byte
   views, in place of four reaching into the old array), `take_xfd_err`,
   the tile configuration check: 7,976 code lines / 311 unsafe sites. `audit.toml` step 21: 8,000 / 315.

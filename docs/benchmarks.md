@@ -343,6 +343,46 @@ Reading it:
 - Linux's huge pages form on n2 as well; the second round's n2 THP figure
   (1.36 us) is not what THP costs there (0.76 us).
 
+## Google Cloud, fourth round (2026-11-27): the Ice Lake losses
+
+After `dbf5a6a` (exec maps per segment), `3bbe2d6` (ADR-0021: CPU time
+from the scheduler), ADR-0008's 2026-11-26 amendments (user registers
+saved only when they must be; signal handlers start reset), ADR-0022
+and ADR-0023 (`0ee287c`). Same machine types and zone as the third
+round (us-central1-a), one boot each, `bench bench_rounds=5`; the median
+and the range. Linux's figures are the third round's (Debian 12, same
+programs, THP on), not run again. A c3-standard-4 (Sapphire Rapids) ran
+too, for AMX; there is no Linux figure for it.
+
+| Benchmark | n2: Ichor (third round) | n2: Linux | Milan: Ichor (third round) | Milan: Linux | c3: Ichor |
+|---|---|---|---|---|---|
+| null syscall | 116 ns (115-118; was 163) | 106 ns | 295 ns (291-298; was 403) | 386 ns | 161 ns (160-163) |
+| pipe round trip | 3.43 us (3.41-3.45; was 3.34) | 9.4 us | 4.66 us (4.60-4.68; was 4.83) | 16.5 us | 5.46 us |
+| page fault | 545 ns (506-750; was 547) | 756 ns | 357 ns (346-398; was 342) | 415 ns | 737 ns (732-775) |
+| fork + wait | 28 us (was 27) | 34.3 us | 19 us (was 18) | 60.5 us | 41 us |
+| fork + exec + wait | 100 us (98-101; was 141) | 85.4 us | 83 us (81-87; was 129) | 173 us | 143 us (140-146) |
+| container start | 293 us (was 474) | | 265 us (was 369) | | 385 us |
+| container start, native caller | 148 us (was 197) | | 159 us (was 204) | | 173 us |
+
+Reading it:
+
+- On Ice Lake the null system call went from 1.54x Linux's to 1.09x (116
+  against 106 ns), and fork + exec from 1.65x to 1.17x (100 against 85
+  us). Both are still behind Linux there; everything else is ahead.
+- On Milan every row is ahead of Linux: the null system call 295 against
+  386 ns, fork + exec 83 against 173 us.
+- c3 is slower than n2 on every row (null syscall 161 ns, fork + exec 143
+  us, page faults 737 ns). Without a Linux run on c3 this says nothing
+  about Ichor against Linux there; the boot log's mitigation line is the
+  first place to look.
+- Correctness on the same boots: the XSAVE test (every component, after
+  every system call) passed with ZMM0-31 and k0-k7 on n2 and c3 (XCR0
+  0xe7 and 0x600e7), and on c3 also with AMX tile data (11,008-byte
+  areas); `amxtest` passed on c3, including a signal frame with a tile
+  configuration LDTILECFG refuses. None of the three VMs exposes PKU to
+  its guest (XCR0 without PKRU, `pkey test skipped`): protection keys
+  have run under QEMU's TCG only.
+
 ## Container start from the caller's side
 
 Linux's container starts above are timed by the caller: a shell starts
