@@ -98,3 +98,17 @@ is given.
 `now()`, which timers, timeouts and the scheduler use, is not steered: a
 71 ppm error in an interval does not matter, and a monotonic clock whose
 rate changes under it would make intervals harder to reason about.
+
+## Amendment (2026-11-27): kvmclock before CPUID leaf 0x15
+
+The decision above was built after CPUID leaf 0x15 in the order of
+sources, so it held only where the leaf is empty (GCP's E2, where this
+ADR was measured). GCP's n2 and c3 have the leaf: they ran on the raw TSC
+at its rate, which no migration updates, and on c3 the leaf said 1,900
+MHz while every Ichor figure there read about 1.5 times its AWS m7i one
+(the same CPU generation, kvmclock there), where Linux's differed by 1.1
+times. `apic::init_tsc` now asks kvmclock first. Where the leaf exists as
+well, the boot logs both (`ichor: frame: tsc: kvmclock says ... kHz,
+cpuid 0x15 ... kHz`). Benchmark figures from c3 before this
+(`docs/benchmarks.md`, fourth round and round 16) are in the leaf's
+units.

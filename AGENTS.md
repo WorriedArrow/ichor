@@ -838,11 +838,35 @@ without tiles. `amx_program` and a tile run of `xstate_program` check it
 only where the CPU has AMX (GCP c3, AWS m7i): not under TCG. Passed on
 GCP c3 (2026-11-27). GCP's n2, n2d and c3 expose no PKU to guests, nor
 does OpenVMM here: `pkey_program` has run under TCG only.
+Ahead of Linux everywhere (2026-11-27, `docs/benchmarks.md`'s fifth
+round; GCP n2, n2d Milan and Rome, c3, AWS m7i-flex, each beside Debian
+12): retpolines on AMD without automatic IBRS in place of IBRS on every
+entry (ADR-0004's 2026-11-27 amendment: `-Zretpoline-external-thunk`,
+`__x86_indirect_thunk_r11` patched at boot; the entry code runs at its
+image address, no indirect branch; `force_retpoline`); the fast checks
+on the system call path inline (`inotify::flush`, `Pending::take`,
+`ExtState::restore`; a traced `getpid` went from 477 instructions and
+five returns to 384 and two); one interrupt guard a call and no locked
+exchange on the way to ring 3; CPUID asked once for randomness (five VM
+exits every exec); address-space teardown loads entries instead of
+exchanging all 4,600 (8 → 2.6 us a space); kvmclock is the clock on KVM
+even where CPUID leaf 0x15 has a rate (ADR-0018's 2026-11-27 amendment:
+on GCP's c3 the leaf said 1.9 GHz against kvmclock's 2.7, so Ichor's
+figures there had read 1.42x high). Null syscall Ichor / Linux: n2 95 /
+106 ns, c3 86 / 109, Milan 100 / 388, Rome 104 / 153, AWS m7i 81 / 99;
+fork + exec + wait 54 / 98, 53 / 83, 56 / 174, 54 / 175, 48 / 79 us; the
+closest row is m7i's page fault (576 / 589 ns). File fault-around was tried
+and dropped: `cached_page` may read and hash a chunk, so mapping 15
+neighbours cost more than the faults it saved. Profile the way it was
+found: QEMU's gdb stub single-stepping one system call (a Python client;
+breakpoints must be stepped over by hand), and temporary `now()` buckets
+around phases (fork + exec); OpenVMM's gdb stub (`--features gdb`, needs
+`PROTOC`) stops vCPUs only at exits, so sampling through it is biased.
 
 Frame budget: ADR-0005 sets the milestone 3 ceiling at 8,500 lines / 380
 sites; ADR-0007 raises it to 9,500 / 420 for milestone 4 (TLB shootdown,
-atomic user ops for futexes, PCID). `audit.toml` is at step 21 (8,000 / 315,
-ADR-0023); frame is at 7,976 / 311 (A5 added
+atomic user ops for futexes, PCID). `audit.toml` is at step 22 (8,100 / 320,
+ADR-0004's 2026-11-27 amendment); frame is at 8,056 / 316 (A5 added
 RDSEED/RDRAND and UEFI GetTime; B added XSAVE; C the frames tree and
 request tracking; M6 reading `\ichor\roots.pem`, later
 `\ichor\suffixes.dat` too; ADR-0011 the checked user
@@ -855,7 +879,9 @@ safe-RET return thunks, `arch::rethunk`; the console ring, ADR-0019;
 write protection, ADR-0008's amendment; 2 MiB user pages, ADR-0020; each
 task's CPU time, ADR-0021; user registers saved only when they must be,
 ADR-0008's 2026-11-26 amendment; protection keys, ADR-0022; AMX behind
-XFD and per-thread area sizes, ADR-0023). Growth past the step
+XFD and per-thread area sizes, ADR-0023; retpolines, the untraining stub
+and the entry code at its image address, mapped in shadow roots,
+ADR-0004's 2026-11-27 amendment). Growth past the step
 needs an ADR and a new audit step.
 `services/rt` has its own budget (`services/rt/audit.toml`: 500 / 40; at
 417 / 30).
@@ -1007,6 +1033,7 @@ comment.
 | `force_bhb` | the branch-history clearing sequence on every entry from ring 3, on any CPU (ADR-0004; tests) |
 | `force_ibpb_entry` | IBPB on every entry from ring 3 where the CPU has IBPB (ADR-0004; tests) |
 | `force_safe_ret` | the Zen 3/4 safe-RET return thunks on any CPU (ADR-0004's safe-RET amendment; tests) |
+| `force_retpoline` | retpolines for the kernel's indirect branches on any CPU (ADR-0004's 2026-11-27 amendment; tests) |
 | `srso=ibpb` | on CPUs SRSO or Retbleed affects, IBPB on every entry instead of safe-RET return thunks |
 | `trace_errors` | log every failing Linux syscall (pid, number, first arguments, errno) |
 | `trace_uplink` | log every TCP segment with SYN, FIN or RST crossing the uplink, either way, after NAT (`ichor: uplink:` lines: time, flags, endpoints, sequence numbers, window), and those the NAT refuses or cannot map |

@@ -383,6 +383,119 @@ Reading it:
   its guest (XCR0 without PKRU, `pkey test skipped`): protection keys
   have run under QEMU's TCG only.
 
+## Fifth round (2026-11-27): ahead of Linux on every machine, GCP and AWS
+
+The goal was every row ahead of Linux on every machine. Three cloud rounds
+in one day (15, 16, 17), each batching several changes, with the work
+between them done locally (OpenVMM on the Ryzen 5600X, Zen 3, where every
+change below was first measured):
+
+- **`d7eca17`**: the system call path's fast checks inline. A `getpid`
+  single-stepped through QEMU's gdb stub ran 477 instructions round trip
+  and made four calls whose work was one failed test (`inotify::flush`,
+  `Pending::take` twice, `ExtState::restore`); on AMD with safe-RET thunks
+  each return is a deliberate mispredict. Now 384 instructions and two
+  returns. And `entropy::hardware_random` asked CPUID (five VM exits) for
+  every random request, every exec's `AT_RANDOM`; it asks once.
+- **`82d8d18`** (ADR-0004's 2026-11-27 amendment): retpolines in place of
+  IBRS on every entry on AMD CPUs without automatic IBRS (Zen 1-3), as
+  Linux does there; the entry code runs at its image address, with no
+  indirect branch.
+- **`fa58955`**: address-space teardown loaded each page-table entry
+  instead of exchanging it (a locked `xchg` on some 4,600 entries a space,
+  present or not): 7.7 → 2.6 us to drop a small space, twice per fork +
+  exec (the forked copy at exec, the process at exit). One interrupt guard
+  per system call instead of two, and no locked exchange for the IBPB
+  domain on the way to ring 3 (about 20 ns a system call on Sapphire
+  Rapids).
+- **`7c25b7d`**: kvmclock is the clock on KVM even where CPUID leaf 0x15
+  gives a frequency (ADR-0018 meant that; the code tried the leaf first).
+  On GCP's c3 the leaf said 1,900 MHz and every Ichor figure there read
+  about 1.5x its AWS m7i one, where Linux's differed by 1.1x.
+
+Locally (OpenVMM, same day, A/B): null syscall 127-148 → 70-80 ns, fork +
+exec + wait 101-117 → 49-53 us, container start 284 → 169 us. Tried and
+dropped: fault-around for file pages (Linux maps up to 16 cached
+neighbours on a read fault); here `cached_page` may read and hash a chunk,
+so faults fell from 18 to 9 an exec but each cost 5.9 us, not 0.7.
+
+**Setup.** Ichor: the release disk with `bench bench_rounds=5` and then
+`api_bench` (pull, cold start, 20 containers through gRPC); five rounds in
+one boot, the median shown. Linux: Debian 12 (`6.1.0-56-cloud-amd64`,
+default mitigations, THP `[always]`) on the same machine type and zone,
+running `linux-full.sh` from the startup script: the same benchmark
+programs five rounds, then container start of `/bin/true` from the same
+static busybox root with `unshare`, crun 1.8.1, runc 1.1.5, containerd
+1.6.20 (`ctr run --rm`, with and without CNI) and Docker 20.10.24, each
+timed over its runs after three to warm up, and containerd's pull of the
+image `api_bench` pulls. GCP: 4 vCPUs (n2-standard-4 Ice Lake,
+n2d-standard-4 Milan and Rome, c3-standard-4 Sapphire Rapids),
+us-central1. AWS: m7i-flex.large (2 vCPUs, Sapphire Rapids 8488C),
+us-east-2; the account may launch free-tier types only, so m7a.large
+(Genoa) was refused, and c3d (GCP's Genoa) had no quota. Ichor's figures
+are from the latest round that ran each machine (16 for n2, Milan, Rome
+and m7i; 17 for c3); Linux's from round 16 (n2, c3, m7i) or 15 (Milan,
+Rome).
+
+| Benchmark | n2: Ichor / Linux | c3: Ichor / Linux | Milan: Ichor / Linux | Rome: Ichor / Linux | AWS m7i: Ichor / Linux |
+|---|---|---|---|---|---|
+| null syscall | **95** / 106 ns | **86** / 109 ns | **100** / 388 ns | **104** / 153 ns | **81** / 99 ns |
+| pipe round trip | **3.36** / 8.76 us | **3.83** / 8.81 us | **3.72** / 14.2 us | **3.72** / 15.6 us | **3.35** / 12.9 us |
+| page fault | **555** / 897 ns | **534** / 686 ns | **393** / 427 ns | **317** / 433 ns | **576** / 589 ns |
+| fork + wait | **10** / 38 us | **11** / 36 us | **11** / 52 us | **10** / 64 us | **11** / 33 us |
+| fork + exec + wait | **54** / 98 us | **53** / 83 us | **56** / 174 us | **54** / 175 us | **48** / 79 us |
+
+Container start, from the caller (Ichor: `nativetest start-bench`, and
+`api_bench` through gRPC; Linux: from a shell):
+
+| | n2 | c3 | Milan | Rome | AWS m7i |
+|---|---|---|---|---|---|
+| Ichor, native ABI | 106 us | 98 us | 139 us | 122 us | 79 us |
+| Ichor, gRPC API | 0.59 ms | 0.54 ms | 0.55 ms | 0.54 ms | 0.85 ms |
+| Ichor, gRPC API, first container | 1.14 ms | 0.95 ms | 1.25 ms | 1.04 ms | 1.77 ms |
+| Linux, `unshare` | 1.44 ms | 1.27 ms | 2.18 ms | 2.03 ms | 1.33 ms |
+| Linux, crun | 5.5 ms | 4.3 ms | 7.0 ms | 6.8 ms | 4.3 ms |
+| Linux, runc | 18.3 ms | 11.6 ms | 25.7 ms | 22.5 ms | 14.4 ms |
+| Linux, `ctr run --rm` | 126 ms (round 15) | 110 ms | | 118 ms | 102 ms |
+| Linux, `ctr run --rm --cni` | 212 ms (round 15) | 179 ms | 222 ms | 209 ms | 163 ms |
+| Linux, `ctr run --rm --cni`, first | 487 ms | 377 ms | 521 ms | 491 ms | 185 ms |
+| Linux, `docker run --rm --network none` | 520 ms (round 15) | 600 ms | 487 ms | 536 ms | 250 ms |
+| Linux, `docker run --rm` | 565 ms (round 15) | | 592 ms | 600 ms | 428 ms |
+
+The pull of the same busybox image, once the machine has been up about a
+minute: containerd 0.76-1.2 s; Ichor's second pull 0.46 s on AWS and
+0.84-1.22 s on GCP, with outliers on both sides (Rome 12 s once, n2 6 s
+once: GCP's network in a machine's first minute, as before).
+
+Reading it:
+
+- Every row is ahead of Linux on every machine. The closest is the
+  4 KiB-touch page fault on Sapphire Rapids (576 against 589 ns on m7i),
+  where both mostly zero 2 MiB pages and memory bandwidth decides.
+- The null system call: Linux pays retpolines and safe RET on AMD too, so
+  Ichor is 1.5-3.9x faster there; on Intel, where neither kernel has an
+  expensive mitigation (Ice Lake clears the branch history on entry in
+  both), Ichor is 10-27% faster (95 against 106 ns on n2: 116 in the
+  fourth round, 163 in the third; 86 against 109 on c3).
+- n2 ran again in round 17 (kvmclock now, which agrees with its leaf
+  0x15 to 7 ppm, so round 16's units stand), on a noisier host: null
+  syscall 94-106 ns (median 104), fork + exec 53-60 us, page fault 617-929
+  ns, against round 16's 93-97, 53-55 and 535-750. Linux was not run
+  beside it; round 16's pair is the comparison.
+- fork + exec + wait halved from the fourth round (n2 100 → 54 us, Milan
+  83 → 56): CPUID once and the teardown without exchanges.
+- Rounds 15 and 16 ran Linux on n2 on different hosts: 109 and 98 us for
+  fork + exec, 85 in the third round. Same-round pairs are what to compare.
+- What c3 showed before the clock fix (round 16, leaf 0x15's rate): null
+  syscall 122, page fault 809 ns, fork + exec 78 us, against m7i's 81,
+  576 and 48 on the same CPU generation. Round 17's boot logged
+  `kvmclock says 2699999 kHz, cpuid 0x15 1900000 kHz`: the clock had run
+  1.42x fast, and 122 / 1.42 is the 86 measured since. The fourth
+  round's c3 figures (161 ns, 143 us) are in the same wrong units.
+- Round 15's Linux run on c3 and on AWS lost all output: it wrote
+  `/dev/ttyS0` directly, which reached neither console there; round 16's
+  writes through the cloud's own startup-script logging.
+
 ## Container start from the caller's side
 
 Linux's container starts above are timed by the caller: a shell starts
