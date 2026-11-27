@@ -862,6 +862,17 @@ found: QEMU's gdb stub single-stepping one system call (a Python client;
 breakpoints must be stepped over by hand), and temporary `now()` buckets
 around phases (fork + exec); OpenVMM's gdb stub (`--features gdb`, needs
 `PROTOC`) stops vCPUs only at exits, so sampling through it is biased.
+Against Debian 13 on Linux 7.3.4 (trixie-backports; round 18, same day,
+`docs/benchmarks.md`): Linux takes the page fault back on c3, Milan, Rome
+and m7i (363 / 247 / 325 / 350 ns against Ichor's 407 / 352 / 361 / 577),
+and ties the null syscall on m7i (80 / 80); Ichor keeps the rest. Locally
+a 2 MiB fault is ~80% clearing, ~25 us per-page charging and bookkeeping;
+4 KiB-piece clearing was slower. The same round compared what each kernel
+mitigates (`docs/reports/mitigations-vs-linux.md`): Ichor lacks ITS on n2
+(Ice Lake), TSA's VERW on Milan, STIBP on Milan and Rome, speculative
+store bypass control, and an MMIO-stale-data check; and it runs VERW on
+AWS's m7i needlessly (TAA taken from `TAA_NO` alone; Linux also wants
+TSX). Not fixed yet.
 
 Frame budget: ADR-0005 sets the milestone 3 ceiling at 8,500 lines / 380
 sites; ADR-0007 raises it to 9,500 / 420 for milestone 4 (TLB shootdown,

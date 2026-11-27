@@ -496,6 +496,75 @@ Reading it:
   `/dev/ttyS0` directly, which reached neither console there; round 16's
   writes through the cloud's own startup-script logging.
 
+## Round 18 (2026-11-27): Debian 13 on Linux 7.3
+
+The same machines against the newest Linux Debian ships: Debian 13 with
+trixie-backports' kernel, `7.3.4+deb13-cloud-amd64` (default mitigations,
+THP `[always]`), crun 1.21, runc 1.1.15, containerd 1.7.24 and Docker
+26.1.5. The script (`linux13.sh`) first boots Debian 13's own 6.12
+kernel only to list the CPU's vulnerabilities, installs the backports
+kernel, reboots, lists them again and runs round 16's suite. Ichor is the
+round-17 image (the kernel code of `main`; on AWS round 16's, whose code
+path on the m7i is the same), beside it in the same zone. What each
+kernel mitigates on each machine is in
+`docs/reports/mitigations-vs-linux.md`. Medians of five rounds.
+
+| Benchmark | n2: Ichor / Linux | c3: Ichor / Linux | Milan: Ichor / Linux | Rome: Ichor / Linux | AWS m7i: Ichor / Linux |
+|---|---|---|---|---|---|
+| null syscall | **93** / 95 ns | **83** / 86 ns | **93** / 342 ns | **104** / 123 ns | 80 / 80 ns |
+| pipe round trip | **3.43** / 8.48 us | **3.81** / 8.18 us | **3.75** / 15.6 us | **3.70** / 13.3 us | **3.28** / 11.2 us |
+| page fault | **595** / 660 ns | 407 / **363** ns | 352 / **247** ns | 361 / **325** ns | 577 / **350** ns |
+| fork + wait | **10** / 45 us | **11** / 39 us | **11** / 74 us | **11** / 61 us | **10** / 36 us |
+| fork + exec + wait | **55** / 133 us | **53** / 98 us | **55** / 218 us | **54** / 210 us | **46** / 89 us |
+
+Container start, from the caller (as in the fifth round):
+
+| | n2 | c3 | Milan | Rome | AWS m7i |
+|---|---|---|---|---|---|
+| Ichor, native ABI | 117 us | 93 us | 130 us | 138 us | 76 us |
+| Ichor, gRPC API | 0.63 ms | 0.53 ms | 0.54 ms | 0.52 ms | 0.84 ms |
+| Ichor, gRPC API, first container | 1.12 ms | 0.96 ms | 1.12 ms | 1.00 ms | 1.71 ms |
+| Linux 7.3, `unshare` | 1.72 ms | 1.43 ms | 2.21 ms | 2.30 ms | 1.52 ms |
+| Linux 7.3, crun | 5.7 ms | 4.2 ms | 7.4 ms | 7.3 ms | 4.2 ms |
+| Linux 7.3, runc | 27.6 ms | 20.3 ms | 33.4 ms | 33.1 ms | |
+| Linux 7.3, `ctr run --rm` | 116 ms | 94 ms | 121 ms | 124 ms | |
+| Linux 7.3, `ctr run --rm --cni` | 183 ms | 165 ms | 193 ms | 193 ms | |
+| Linux 7.3, `ctr run --rm --cni`, first | 557 ms | 430 ms | 570 ms | 548 ms | |
+| Linux 7.3, `docker run --rm --network none` | 570 ms | 654 ms | 537 ms | 532 ms | |
+| Linux 7.3, `docker run --rm` | 524 ms | 525 ms | 560 ms | 575 ms | |
+
+Reading it:
+
+- **Linux 7.3 takes the page fault back** on four of five machines: Ichor
+  is 11% (Rome) to 65% (m7i) slower there. Against Debian 12's 6.1 on the
+  same machine types (rounds 15 and 16, other hosts) Linux's figure fell
+  by a quarter to a half (c3 686 → 363 ns, Milan 427 → 247, m7i 589 →
+  350). In both kernels the benchmark is mostly the zeroing of 2 MiB
+  pages. Measured locally (OpenVMM, Zen 3, temporary timers in
+  `Mm::fault_huge`): clearing a 2 MiB page took 115-126 us, about 80% of
+  the fault, and charging the 512 pages and entering them in `Mm::pages`
+  one by one about 25 us; the first 2 MiB of a mapping is not taken as a
+  2 MiB page at all (a 2 MiB fault needs a sequential touch before it),
+  and some rounds took fewer 2 MiB faults than the touch pattern should
+  give, not explained yet. Clearing in 4 KiB pieces instead of one `rep
+  stosb` was tried and was slower (median 418 against 296 ns locally).
+  Where the rest of Linux 7.3's advantage comes from is open.
+- **The null system call is a tie on AWS's m7i** (80 against 80 ns) and
+  within 2-3 ns on n2 and c3. On the m7i Ichor runs VERW on every return
+  to ring 3 that it does not need: it takes TAA as applying because AWS
+  does not set `TAA_NO`, where Linux sees that the CPU has no TSX (the
+  report has the details). On n2 Linux pays its ITS mitigation (aligned
+  branch and return thunks), which Ichor lacks.
+- fork + exec + wait is slower on Linux 7.3 than on 6.1 on every machine
+  (n2 98 → 133 us, Milan 174 → 218), and Ichor's lead there grew to
+  1.8-4x.
+- The Debian machine on AWS stopped in the runc timing (its last line,
+  crun, at 66 s of uptime; nothing in 18 minutes after) and was ended
+  there; its micro rounds and vulnerability listings were complete.
+- containerd's pull of the busybox image took 0.97-1.09 s; Ichor's second
+  pull 0.47 s on AWS, 0.86-0.90 s on n2 and Rome, and 3-4 s on c3 and
+  Milan this time.
+
 ## Container start from the caller's side
 
 Linux's container starts above are timed by the caller: a shell starts
