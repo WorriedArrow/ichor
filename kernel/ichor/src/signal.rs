@@ -953,6 +953,9 @@ fn setup_frame(
     // The handler starts as a function call does: direction flag clear.
     // The frame keeps the interrupted code's flag for `rt_sigreturn`.
     ctx.clear_direction();
+    // And, as on Linux, with the extended state reset (default rounding,
+    // vector registers zero); the frame keeps the interrupted code's.
+    ctx.reset_fpu_state();
     Ok(())
 }
 

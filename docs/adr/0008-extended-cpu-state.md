@@ -1,8 +1,8 @@
 # ADR-0008: Extended CPU state (XSAVE), saved eagerly
 
-Status: Accepted (2026-11-15); amended 2026-11-25 and 2026-11-26 (the
-save deferred to when it must be: the title's "eagerly" is now the
-restore's)
+Status: Accepted (2026-11-15); amended 2026-11-25 and twice 2026-11-26
+(the save deferred to when it must be: the title's "eagerly" is now the
+restore's; signal handlers start with the reset state)
 
 ## Context
 
@@ -258,3 +258,33 @@ Measured as before (OpenVMM, Ryzen 5 5600X, safe-RET thunks on, five
 rounds in one boot), with ADR-0021 (CPU time from the scheduler) in
 between: null system call 160-166 → 137-148 ns (ADR-0021) → 98-102 ns
 (this amendment); pipe round trip 2.83-2.89 → 2.63-2.78 us.
+
+## Amendment (2026-11-26, second): handlers start reset; every component tested
+
+A signal handler used to start with the interrupted code's extended
+state, so a rounding mode or flush-to-zero the code had set reached the
+handler. Linux starts every handler with the reset state
+(`fpu__clear_user_states`): x87 control word 0x037f, MXCSR 0x1f80,
+everything else in its init state, PKRU at its default. Ichor now does
+the same: once the frame holds the interrupted state, the context's is
+replaced by the default one (`UserContext::reset_fpu_state`), and
+`rt_sigreturn` brings the frame's back.
+
+`fpu_stress_program` checked YMM0 and YMM15 only. `xstate_program`
+replaces it and checks every component XCR0 enables, whatever the CPU:
+it loads the registers from an image with its own XRSTOR (x87 registers
+and control word, MXCSR, XMM, YMM, ZMM0-31, k0-k7, and later components
+as they are enabled, at the offsets CPUID gives), saves them with its own
+XSAVE, and after every system call compares a fresh save byte for byte.
+The same three processes, fork and orphan as before, each with its own
+image; first a signal whose handler must find the reset state (control
+words by FNSTCW and STMXCSR, the rest zero in a save to fresh memory),
+the interrupted area in its frame, values of its own that survive its
+system calls, and, after `rt_sigreturn`, exactly the registers it
+interrupted. A mismatch prints the check, the offset in the area and the
+two quadwords. Checked against broken builds: a save leaving out AVX
+(check 15: the frame's XSTATE_BV), no reset for the handler (11), one
+bit flipped by `rt_sigreturn` (17, at its offset), and the stamp not
+cleared when a state goes live (2 on four vCPUs: the first process found
+another's registers). AVX-512 components are covered only where the CPU
+has them: not under TCG or on the development PC, so on GCP's n2.

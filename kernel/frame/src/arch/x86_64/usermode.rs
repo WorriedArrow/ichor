@@ -350,6 +350,13 @@ impl UserContext {
     pub fn set_fpu_state(&mut self, state: &[u8]) {
         self.fpu.set_from(state);
     }
+
+    /// Returns the extended state to its reset values, as Linux starts a
+    /// signal handler: x87 and SSE defaults, everything else in its init
+    /// state. Read [`Self::fpu_state`] first to keep the old one.
+    pub fn reset_fpu_state(&mut self) {
+        self.fpu = super::xstate::ExtState::default();
+    }
 }
 
 /// Why [`UserMode::execute`] returned.

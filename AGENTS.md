@@ -804,8 +804,13 @@ together) and saved the user's registers (now only at a switch-out or
 when the kernel needs them, ADR-0008's 2026-11-26 amendment; the restore
 stays eager). Null syscall locally 160 → 98-102 ns. That rests on the
 kernel never touching vector registers: only frame may hold `unsafe`, the
-target is soft-float, and `fpu_stress_program` plus `avx_program` (every
-boot) fail on each broken variant tried. Not yet measured on GCP.
+target is soft-float, and `xstate_program` plus `avx_program` (every
+boot) fail on each broken variant tried. `xstate_program` compares a
+user-mode XSAVE of every component XCR0 enables (x87 and its control
+word, MXCSR, XMM/YMM/ZMM, opmasks; AVX-512 only where the CPU has it, not
+under TCG) after every system call, across blocking, yields, fork and a
+signal; signal handlers now start with the reset state, as on Linux
+(ADR-0008's second 2026-11-26 amendment). Not yet measured on GCP.
 
 Frame budget: ADR-0005 sets the milestone 3 ceiling at 8,500 lines / 380
 sites; ADR-0007 raises it to 9,500 / 420 for milestone 4 (TLB shootdown,

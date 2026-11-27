@@ -62,6 +62,13 @@ pub fn xstate_size() -> usize {
     crate::arch::xstate::size()
 }
 
+/// Where the standard-format XSAVE area keeps `component` (an XCR0 bit
+/// number, 2 or above): its offset and size in bytes, as CPUID reports them.
+pub fn xstate_component(component: u32) -> (usize, usize) {
+    let [size, offset, _, _] = crate::arch::regs::cpuid(0xd, component);
+    (offset as usize, size as usize)
+}
+
 pub fn online_count() -> usize {
     ONLINE.load(Ordering::Acquire) as usize
 }

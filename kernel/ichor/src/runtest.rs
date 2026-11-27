@@ -14,7 +14,7 @@ use crate::loader;
 use crate::proc;
 use crate::process::LinuxProcess;
 use crate::vfs::Vfs;
-use testprog::{Asm, BLOB_VADDR, Reg, static_elf};
+use testprog::{Asm, BLOB_VADDR, Data, Reg, static_elf};
 
 pub(crate) fn fail(what: &str) -> ! {
     println!("ichor: runtest FAILED: {what}");
@@ -3325,58 +3325,214 @@ fn avx_program(magic: u64) -> Vec<u8> {
     static_elf(&a.finish(BLOB_VADDR).unwrap_or_else(|| fail("assembler")))
 }
 
-/// Ping-pong rounds of [`fpu_stress_program`], and its third process's
-/// yields.
+/// Ping-pong rounds of [`xstate_program`], and its third process's yields.
 const FPU_ROUNDS: u64 = 1000;
 const FPU_YIELDS: u64 = 3000;
 
-/// Every thread's vector registers stay its own while threads block, wake,
-/// switch and move between CPUs (ADR-0008: the registers are saved when
-/// they must be, not after every trap). Three processes fill YMM0 and YMM15
-/// with their own pattern: two play ping-pong over a pair of pipes, so each
-/// blocks in `read` and is woken by the other (spinning a little first, so
-/// the other is often woken onto another CPU), and a third calls
-/// `sched_yield` and `getpid` over and over beside them. Each checks both
-/// registers after every system call. A fourth forks a child, changes its
-/// own registers at once and exits: the child, which may first run after
-/// it is gone, must start with the registers as they were at the fork, and
-/// reports over a third pipe. Exits 0, or the failed check: 1-3 the first
-/// process's, a child's failure as its own status (4-5 the pinger's, 6-7
-/// the yielder's), 8 the orphan's.
-fn fpu_stress_program() -> Vec<u8> {
-    const ONES: [u64; 4] = [
-        0x1111_1111_1111_1111,
-        0x2222_2222_2222_2222,
-        0x3333_3333_3333_3333,
-        0x4444_4444_4444_4444,
-    ];
+/// Where [`xstate_program`] keeps things, from its `rbp` (page aligned,
+/// [`xs::BELOW_RSP`] under the initial stack pointer). Each area buffer
+/// holds up to 12 KiB.
+mod xs {
+    /// What the registers held right after the image was loaded.
+    pub(super) const GOLD: i32 = 0x1000;
+    /// Saves to compare with it.
+    pub(super) const CUR: i32 = 0x4000;
+    /// An image copied to aligned memory for XRSTOR.
+    pub(super) const LOAD: i32 = 0x7000;
+    /// The signal handler's own `GOLD` and `CUR`.
+    pub(super) const TGOLD: i32 = 0xa000;
+    pub(super) const TCUR: i32 = 0xd000;
+    /// Never written: zeros to compare with.
+    pub(super) const ZERO: i32 = 0x1_0000;
+    /// Written once, by the handler's first save.
+    pub(super) const FRESH: i32 = 0x1_3000;
+    pub(super) const BELOW_RSP: i32 = 0x3_0000;
+    /// The largest area these buffers hold.
+    pub(super) const MAX: usize = 0x3000;
+}
+
+/// What [`xstate_program`] knows of the XSAVE area.
+struct XLayout {
+    /// The components it loads, saves and compares (XCR0's, or some).
+    rfbm: u64,
+    /// Bytes of a standard-format area holding them.
+    size: usize,
+    /// The byte ranges a signal handler's first save must hold zero in:
+    /// all but the x87 control word, MXCSR and its mask, the header and
+    /// PKRU, whose reset values are not zero.
+    zero: Vec<(usize, usize)>,
+}
+
+fn xstate_layout(rfbm: u64) -> XLayout {
+    const PKRU: u32 = 9;
+    let mut size = 576; // the legacy region and the header
+    let mut pkru = None;
+    for c in 2..64 {
+        if rfbm & (1 << c) != 0 {
+            let (off, len) = frame::cpu::xstate_component(c);
+            size = size.max(off + len);
+            if c == PKRU {
+                pkru = Some((off, off + len));
+            }
+        }
+    }
+    let mut zero = alloc::vec![(0, 24), (32, 512)];
+    match pkru {
+        Some((s, e)) => zero.extend([(576, s), (e, size)]),
+        None => zero.push((576, size)),
+    }
+    zero.retain(|&(s, e)| e > s);
+    XLayout { rfbm, size, zero }
+}
+
+/// A standard-format XSAVE image with every component of `l.rfbm` in use
+/// and full of `seed`'s pattern: x87 precision and rounding and MXCSR off
+/// their defaults, every x87 register valid, PKRU leaving key 0 open (the
+/// program's own memory), and the tile configuration valid (palette 1,
+/// eight tiles of 16 rows of 64 bytes).
+fn xstate_image(l: &XLayout, seed: u64) -> Vec<u8> {
+    let mut x = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+    let mut fill = |b: &mut [u8]| {
+        for c in b.chunks_mut(8) {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            c.copy_from_slice(&x.to_le_bytes()[..c.len()]);
+        }
+    };
+    let mut a = alloc::vec![0u8; l.size];
+    let precision = [0u16, 2, 3][(seed / 4 % 3) as usize];
+    let mut fcw = 0x7f | (precision << 8) | (((seed % 4) as u16) << 10);
+    if fcw == 0x037f {
+        fcw = 0x0f7f;
+    }
+    a[0..2].copy_from_slice(&fcw.to_le_bytes());
+    a[4] = 0xff; // the abridged tag word: every register valid
+    let mxcsr = 0x1f80 | (((seed % 4) as u32) << 13) | (((seed & 1) as u32) << 15) | 0x21;
+    a[24..28].copy_from_slice(&mxcsr.to_le_bytes());
+    for r in 0..8 {
+        fill(&mut a[32 + 16 * r..42 + 16 * r]);
+    }
+    fill(&mut a[160..416]);
+    a[512..520].copy_from_slice(&l.rfbm.to_le_bytes());
+    for c in 2..64 {
+        if l.rfbm & (1 << c) == 0 {
+            continue;
+        }
+        let (off, len) = frame::cpu::xstate_component(c);
+        let r = &mut a[off..off + len];
+        match c {
+            9 => {
+                fill(r);
+                r[0] &= !3;
+                r[4..].fill(0);
+            }
+            17 => {
+                r[0] = 1;
+                for t in 0..8 {
+                    r[16 + 2 * t..18 + 2 * t].copy_from_slice(&64u16.to_le_bytes());
+                    r[48 + t] = 16;
+                }
+            }
+            _ => fill(r),
+        }
+    }
+    a
+}
+
+/// Every XSAVE component of `l.rfbm` stays each thread's while threads
+/// block, wake, switch, fork, take signals and move between CPUs (ADR-0008:
+/// the registers are saved when they must be, not after every trap). The
+/// program loads the registers from an image with its own XRSTOR, saves
+/// them once (`GOLD`), and after every system call saves them again and
+/// compares every byte of the area: x87 with its control word, MXCSR, the
+/// XMM, YMM and ZMM registers, the opmasks, and whatever else is enabled.
+///
+/// First a SIGUSR1 to itself: the handler must start with the reset state
+/// (x87 and MXCSR defaults, everything else zero), find the interrupted
+/// registers in its frame, load other values of its own, which must
+/// survive its own system calls, and return; then the registers must be
+/// exactly as before. Then three processes with their own images: two play
+/// ping-pong over a pair of pipes, so each blocks in `read` and is woken by
+/// the other (spinning a little first, so the other is often woken onto
+/// another CPU), and a third calls `sched_yield` and `getpid` over and over
+/// beside them. A fourth forks a child, loads other values at once and
+/// exits: the child, which may first run after it is gone, must start with
+/// the registers as they were at the fork, and reports over a third pipe.
+///
+/// Exits 0, or the failed check: 1-3 the first process's, a child's
+/// failure as its own status (4-5 the pinger's, 6-7 the yielder's), 8 the
+/// orphan's, 10 an image that did not load as given (this program's
+/// fault), 11-18 the signal's. A failed comparison also prints the check,
+/// the offset in the area, and the quadwords wanted and found (in hex), and
+/// a child that fails kills the first process (status -9), so that nothing
+/// waits on it.
+fn xstate_program(l: &XLayout) -> Vec<u8> {
+    const SIGUSR1: u64 = 10;
+    const SIGKILL: u64 = 9;
+    const SA_RESTORER: u64 = 0x0400_0000;
+    let size = l.size;
+    let (lo, hi) = (l.rfbm & 0xffff_ffff, l.rfbm >> 32);
     let mut a = Asm::new();
+    let images: Vec<Vec<u8>> = (1..=5).map(|s| xstate_image(l, s)).collect();
+    let own_mxcsr =
+        u32::from_le_bytes([images[0][24], images[0][25], images[0][26], images[0][27]]);
+    let data: Vec<Data> = images.iter().map(|i| a.data(i)).collect();
+    let (own, pinger_img, yielder_img, forker_img, trash) =
+        (data[0], data[1], data[2], data[3], data[4]);
+    let banner = a.data(b"xstate mismatch: check, offset, wanted, found: ");
     let bad = a.label();
+    let mismatch = a.label();
+    let handler = a.label();
+    let restorer = a.label();
     let pinger = a.label();
     let yielder = a.label();
     let orphan = a.label();
-    // YMM0 and YMM15: the pattern in r12 in every quadword.
-    let fill = |a: &mut Asm| {
-        a.raw(&[0xc4, 0xc1, 0xf9, 0x6e, 0xc4]); // vmovq xmm0, r12
-        a.raw(&[0xc4, 0xe2, 0x7d, 0x59, 0xc0]); // vpbroadcastq ymm0, xmm0
-        a.raw(&[0xc4, 0x41, 0xf9, 0x6e, 0xfc]); // vmovq xmm15, r12
-        a.raw(&[0xc4, 0x42, 0x7d, 0x59, 0xff]); // vpbroadcastq ymm15, xmm15
+    let at = |a: &mut Asm, r: Reg, off: i32| {
+        a.mov(r, Reg::Rbp);
+        a.add_imm(r, off);
     };
-    // Both registers still hold r12's pattern, else to `fail` with `n` in
-    // r15.
-    let check_into = |a: &mut Asm, n: u64, fail: testprog::Label| {
-        a.raw(&[0xc5, 0xfe, 0x7f, 0x85]); // vmovdqu [rbp + 64], ymm0
-        a.raw(&64i32.to_le_bytes());
-        a.raw(&[0xc5, 0x7e, 0x7f, 0xbd]); // vmovdqu [rbp + 96], ymm15
-        a.raw(&96i32.to_le_bytes());
+    // The registers from `img`, copied to aligned memory first.
+    let load = |a: &mut Asm, img: Data| {
+        a.mov_data(Reg::Rsi, img);
+        at(a, Reg::Rdi, xs::LOAD);
+        a.mov_imm(Reg::Rcx, size as u64);
+        a.raw(&[0xf3, 0xa4]); // rep movsb
+        at(a, Reg::R14, xs::LOAD);
+        a.mov_imm(Reg::Rax, lo);
+        a.mov_imm(Reg::Rdx, hi);
+        a.raw(&[0x49, 0x0f, 0xae, 0x2e]); // xrstor64 [r14]
+    };
+    // The registers into the buffer at rbp+`to`.
+    let save = |a: &mut Asm, to: i32| {
+        at(a, Reg::R14, to);
+        a.mov_imm(Reg::Rax, lo);
+        a.mov_imm(Reg::Rdx, hi);
+        a.raw(&[0x49, 0x0f, 0xae, 0x26]); // xsave64 [r14]
+    };
+    // `len` bytes at rsi (wanted) against rdi (found), starting at offset
+    // `from` of the area, else to `fail` with `n` in r15 (and where the
+    // wanted area starts in r9).
+    let cmp = |a: &mut Asm, n: u64, from: usize, len: usize, fail: testprog::Label| {
+        a.mov(Reg::R9, Reg::Rsi);
+        a.sub_imm(Reg::R9, from as i32);
+        a.mov_imm(Reg::Rcx, (len / 8) as u64);
+        a.raw(&[0xf3, 0x48, 0xa7]); // repe cmpsq
         a.mov_imm(Reg::R15, n);
-        for q in 0..8 {
-            a.load(Reg::Rax, Reg::Rbp, 64 + 8 * q);
-            a.cmp(Reg::Rax, Reg::R12);
-            a.jne(fail);
-        }
+        a.jne(fail);
     };
-    let check = |a: &mut Asm, n: u64| check_into(a, n, bad);
+    // Bytes `from..to` of the buffers at rbp+`want` and rbp+`got`.
+    let cmp_at = |a: &mut Asm, n: u64, want: i32, got: i32, (from, to): (usize, usize), fail| {
+        at(a, Reg::Rsi, want + from as i32);
+        at(a, Reg::Rdi, got + from as i32);
+        cmp(a, n, from, to - from, fail);
+    };
+    // The registers still hold what `GOLD` does.
+    let check_into = |a: &mut Asm, n: u64, fail| {
+        save(a, xs::CUR);
+        cmp_at(a, n, xs::GOLD, xs::CUR, (0, size), fail);
+    };
+    let check = |a: &mut Asm, n: u64| check_into(a, n, mismatch);
     // A little time in ring 3.
     let spin = |a: &mut Asm| {
         let l = a.label();
@@ -3394,8 +3550,56 @@ fn fpu_stress_program() -> Vec<u8> {
         a.mov_imm(Reg::Rdx, 1);
         a.sys(nr);
     };
+    // Its own image, loaded and saved.
+    let start = |a: &mut Asm, img: Data| {
+        load(a, img);
+        save(a, xs::GOLD);
+    };
     a.mov(Reg::Rbp, Reg::Rsp);
-    a.sub_imm(Reg::Rbp, 4096);
+    a.sub_imm(Reg::Rbp, xs::BELOW_RSP);
+    a.raw(&[0x48, 0x81, 0xe5, 0x00, 0xf0, 0xff, 0xff]); // and rbp, -4096
+    // The first process's pid at rbp+24, for children that fail.
+    a.sys(sys::GETPID);
+    a.store(Reg::Rbp, 24, Reg::Rax);
+    // 10: the image loaded as given (MXCSR_MASK aside).
+    start(&mut a, own);
+    a.mov_data(Reg::Rsi, own);
+    at(&mut a, Reg::Rdi, xs::GOLD);
+    cmp(&mut a, 10, 0, 24, mismatch);
+    a.mov_data(Reg::Rsi, own);
+    a.add_imm(Reg::Rsi, 32);
+    at(&mut a, Reg::Rdi, xs::GOLD + 32);
+    cmp(&mut a, 10, 32, size - 32, mismatch);
+    a.load32(Reg::Rax, Reg::Rbp, xs::GOLD + 24);
+    a.cmp_imm(Reg::Rax, own_mxcsr as i32);
+    a.jne(bad);
+    // sigaction(SIGUSR1, handler); the handler leaves 1 at rbp+400.
+    a.mov_imm(Reg::Rax, 0);
+    a.store(Reg::Rbp, 400, Reg::Rax);
+    a.mov_label(Reg::Rax, handler);
+    a.store(Reg::Rbp, 128, Reg::Rax);
+    a.mov_imm(Reg::Rax, SA_RESTORER);
+    a.store(Reg::Rbp, 136, Reg::Rax);
+    a.mov_label(Reg::Rax, restorer);
+    a.store(Reg::Rbp, 144, Reg::Rax);
+    a.mov_imm(Reg::Rax, 0);
+    a.store(Reg::Rbp, 152, Reg::Rax);
+    a.mov_imm(Reg::Rdi, SIGUSR1);
+    a.mov(Reg::Rsi, Reg::Rbp);
+    a.add_imm(Reg::Rsi, 128);
+    a.mov_imm(Reg::Rdx, 0);
+    a.mov_imm(Reg::R10, 8);
+    a.sys(sys::RT_SIGACTION);
+    a.sys(sys::GETPID);
+    a.mov(Reg::Rdi, Reg::Rax);
+    a.mov_imm(Reg::Rsi, SIGUSR1);
+    a.sys(sys::KILL);
+    // 18: the handler ran; 17: the registers are as they were, exactly.
+    a.load(Reg::Rax, Reg::Rbp, 400);
+    a.mov_imm(Reg::R15, 18);
+    a.cmp_imm(Reg::Rax, 1);
+    a.jne(bad);
+    check(&mut a, 17);
     // Pipe A (first process to pinger) at rbp+0, pipe B (back) at rbp+8,
     // pipe C (the orphan's report) at rbp+16.
     for at in [0, 8, 16] {
@@ -3404,32 +3608,27 @@ fn fpu_stress_program() -> Vec<u8> {
         a.mov_imm(Reg::Rsi, 0);
         a.sys(sys::PIPE2);
     }
-    // The fourth process: fork, then change the registers and exit.
+    // The fourth process: fork, then load other values and exit.
     let first = a.label();
-    a.mov_imm(Reg::R12, ONES[3]);
     a.sys(sys::FORK);
     a.cmp_imm(Reg::Rax, 0);
     a.jne(first);
-    fill(&mut a);
+    start(&mut a, forker_img);
     a.sys(sys::FORK);
     a.cmp_imm(Reg::Rax, 0);
     a.je(orphan);
-    a.raw(&[0xc5, 0xfd, 0xef, 0xc0]); // vpxor ymm0, ymm0, ymm0
-    a.raw(&[0xc4, 0x41, 0x05, 0xef, 0xff]); // vpxor ymm15, ymm15, ymm15
+    load(&mut a, trash);
     a.mov_imm(Reg::Rdi, 0);
     a.sys(sys::EXIT_GROUP);
     a.bind(first);
-    a.mov_imm(Reg::R12, ONES[2]);
     a.sys(sys::FORK);
     a.cmp_imm(Reg::Rax, 0);
     a.je(yielder);
-    a.mov_imm(Reg::R12, ONES[1]);
     a.sys(sys::FORK);
     a.cmp_imm(Reg::Rax, 0);
     a.je(pinger);
-    // The first process: write to A, read B's answer, yield.
-    a.mov_imm(Reg::R12, ONES[0]);
-    fill(&mut a);
+    // The first process, still with its own image: write to A, read B's
+    // answer, yield.
     a.mov_imm(Reg::R13, FPU_ROUNDS);
     let round = a.label();
     a.bind(round);
@@ -3469,7 +3668,7 @@ fn fpu_stress_program() -> Vec<u8> {
     a.sys(sys::EXIT_GROUP);
     // The pinger: read from A, answer on B.
     a.bind(pinger);
-    fill(&mut a);
+    start(&mut a, pinger_img);
     a.mov_imm(Reg::R13, FPU_ROUNDS);
     let pong = a.label();
     a.bind(pong);
@@ -3485,7 +3684,7 @@ fn fpu_stress_program() -> Vec<u8> {
     a.jmp(bad);
     // The yielder.
     a.bind(yielder);
-    fill(&mut a);
+    start(&mut a, yielder_img);
     a.mov_imm(Reg::R13, FPU_YIELDS);
     let again = a.label();
     a.bind(again);
@@ -3508,6 +3707,109 @@ fn fpu_stress_program() -> Vec<u8> {
     io(&mut a, sys::WRITE, 20);
     a.mov_imm(Reg::Rdi, 0);
     a.sys(sys::EXIT_GROUP);
+    // A failed comparison: rsi and rdi are a quadword past the difference,
+    // r9 is where the wanted bytes start. Prints the check, the offset, and
+    // the two quadwords, in hex.
+    a.bind(mismatch);
+    a.mov(Reg::R8, Reg::Rsi);
+    a.raw(&[0x4d, 0x29, 0xc8]); // sub r8, r9
+    a.sub_imm(Reg::R8, 8);
+    a.load(Reg::R10, Reg::Rsi, -8);
+    a.load(Reg::R11, Reg::Rdi, -8);
+    for (i, r) in [Reg::R15, Reg::R8, Reg::R10, Reg::R11]
+        .into_iter()
+        .enumerate()
+    {
+        a.store(Reg::Rbp, 0x600 + 8 * i as i32, r);
+    }
+    for i in 0..4 {
+        let (next, digit) = (a.label(), a.label());
+        a.load(Reg::Rax, Reg::Rbp, 0x600 + 8 * i);
+        at(&mut a, Reg::R11, 0x500 + 17 * i);
+        a.mov_imm(Reg::Rdx, 16);
+        a.bind(next);
+        a.raw(&[0x48, 0xc1, 0xc0, 0x04]); // rol rax, 4
+        a.mov(Reg::Rbx, Reg::Rax);
+        a.raw(&[0x48, 0x83, 0xe3, 0x0f]); // and rbx, 15
+        a.cmp_imm(Reg::Rbx, 9);
+        a.jbe(digit);
+        a.add_imm(Reg::Rbx, i32::from(b'a' - b'0' - 10));
+        a.bind(digit);
+        a.add_imm(Reg::Rbx, i32::from(b'0'));
+        a.raw(&[0x41, 0x88, 0x1b]); // mov [r11], bl
+        a.add_imm(Reg::R11, 1);
+        a.add_imm(Reg::Rdx, -1);
+        a.cmp_imm(Reg::Rdx, 0);
+        a.jne(next);
+        a.mov_imm(Reg::Rbx, u64::from(b' '));
+        a.raw(&[0x41, 0x88, 0x1b]); // mov [r11], bl
+    }
+    a.mov_imm(Reg::Rax, u64::from(b'\n'));
+    a.store(Reg::Rbp, 0x500 + 68, Reg::Rax);
+    a.mov_imm(Reg::Rdi, 1);
+    a.mov_data(Reg::Rsi, banner);
+    a.mov_imm(Reg::Rdx, 47);
+    a.sys(sys::WRITE);
+    a.mov_imm(Reg::Rdi, 1);
+    at(&mut a, Reg::Rsi, 0x500);
+    a.mov_imm(Reg::Rdx, 69);
+    a.sys(sys::WRITE);
+    // A child takes the first process down with it.
+    a.sys(sys::GETPID);
+    a.load(Reg::Rbx, Reg::Rbp, 24);
+    a.cmp(Reg::Rax, Reg::Rbx);
+    a.je(bad);
+    a.mov(Reg::Rdi, Reg::Rbx);
+    a.mov_imm(Reg::Rsi, SIGKILL);
+    a.sys(sys::KILL);
+    a.jmp(bad);
+    // The handler: rdx = ucontext; its fpstate pointer is at uc_mcontext
+    // (40) + 184. 11, 12: the x87 control word and MXCSR are the defaults.
+    a.bind(handler);
+    a.load(Reg::R12, Reg::Rdx, 40 + 184);
+    a.raw(&[0xd9, 0xbd]); // fnstcw [rbp + 0x700]
+    a.raw(&0x700i32.to_le_bytes());
+    a.raw(&[0x0f, 0xae, 0x9d]); // stmxcsr [rbp + 0x708]
+    a.raw(&0x708i32.to_le_bytes());
+    a.load32(Reg::Rax, Reg::Rbp, 0x700);
+    a.mov_imm(Reg::R15, 11);
+    a.cmp_imm(Reg::Rax, 0x037f);
+    a.jne(bad);
+    a.load32(Reg::Rax, Reg::Rbp, 0x708);
+    a.mov_imm(Reg::R15, 12);
+    a.cmp_imm(Reg::Rax, 0x1f80);
+    a.jne(bad);
+    // 13: everything else is in its reset state, which is zero, in a save
+    // to memory never written (a component in its init state is not
+    // written at all). The control word was checked: clear it here.
+    save(&mut a, xs::FRESH);
+    a.load(Reg::Rax, Reg::Rbp, xs::FRESH);
+    a.raw(&[0x48, 0x25, 0x00, 0x00, 0xff, 0xff]); // and rax, !0xffff
+    a.store(Reg::Rbp, xs::FRESH, Reg::Rax);
+    for &r in &l.zero {
+        cmp_at(&mut a, 13, xs::ZERO, xs::FRESH, r, mismatch);
+    }
+    // 14, 15: the frame holds the interrupted registers, all but its
+    // software bytes.
+    at(&mut a, Reg::Rsi, xs::GOLD);
+    a.mov(Reg::Rdi, Reg::R12);
+    cmp(&mut a, 14, 0, 464, mismatch);
+    at(&mut a, Reg::Rsi, xs::GOLD + 512);
+    a.mov(Reg::Rdi, Reg::R12);
+    a.add_imm(Reg::Rdi, 512);
+    cmp(&mut a, 15, 512, size - 512, mismatch);
+    // 16: values of the handler's own survive its system calls.
+    load(&mut a, trash);
+    save(&mut a, xs::TGOLD);
+    a.sys(sys::GETPID);
+    a.sys(sys::SCHED_YIELD);
+    save(&mut a, xs::TCUR);
+    cmp_at(&mut a, 16, xs::TGOLD, xs::TCUR, (0, size), mismatch);
+    a.mov_imm(Reg::Rax, 1);
+    a.store(Reg::Rbp, 400, Reg::Rax);
+    a.ret();
+    a.bind(restorer);
+    a.sys(sys::RT_SIGRETURN);
     static_elf(&a.finish(BLOB_VADDR).unwrap_or_else(|| fail("assembler")))
 }
 
@@ -4076,15 +4378,26 @@ pub(crate) fn run() {
         println!(
             "ichor: linux: AVX state is per thread and survives signals (XSAVE frame, {syscalls} syscalls)"
         );
-        let (status, _) = run_linux(new_process(), &fpu_stress_program(), None, &["fpustress"]);
-        if status != 0 {
-            println!("ichor: linux: fpustress failed check {status}");
-            fail("fpustress");
-        }
-        println!(
-            "ichor: linux: vector registers stay each thread's across {FPU_ROUNDS} blocking ping-pongs and {FPU_YIELDS} yields"
-        );
     } else {
         println!("ichor: linux: no AVX: AVX state test skipped");
+    }
+    // Every component XCR0 enables, through the program's own XSAVE.
+    let xcr0 = frame::cpu::xstate_features();
+    if xcr0 != 0 {
+        let l = xstate_layout(xcr0);
+        if l.size > xs::MAX {
+            fail("xstatetest: the area outgrows its buffers");
+        }
+        let (status, _) = run_linux(new_process(), &xstate_program(&l), None, &["xstatetest"]);
+        if status != 0 {
+            println!("ichor: linux: xstatetest (XCR0 {xcr0:#x}) failed check {status}");
+            fail("xstatetest");
+        }
+        println!(
+            "ichor: linux: every XSAVE component (XCR0 {xcr0:#x}, {} bytes) stays each thread's across {FPU_ROUNDS} blocking ping-pongs, {FPU_YIELDS} yields, a fork, and a signal whose handler starts reset and loads its own",
+            l.size
+        );
+    } else {
+        println!("ichor: linux: no XSAVE: XSAVE state test skipped");
     }
 }
