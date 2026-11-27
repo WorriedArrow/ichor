@@ -292,8 +292,23 @@ pub(crate) fn map_thunk(va: u64, pa: u64) -> Option<()> {
 }
 
 fn map_fixed(va: u64, pa: u64, len: u64, props: Props) -> Option<()> {
+    map_into(
+        PhysAddr::new(KERNEL_ROOT.load(Ordering::Relaxed)),
+        va,
+        pa,
+        len,
+        props,
+    )
+}
+
+/// Maps the entry code's pages (`va`, image text) into `root`, the kernel's
+/// shadow root under page-table isolation (`arch::entry`), once.
+pub(crate) fn map_entry_text(root: PhysAddr, va: u64, len: u64) -> Option<()> {
+    map_into(root, va, kernel_phys(va)?, len, Props::CODE)
+}
+
+fn map_into(root: PhysAddr, va: u64, pa: u64, len: u64, props: Props) -> Option<()> {
     let _serial = KSPACE_LOCK.lock();
-    let root = PhysAddr::new(KERNEL_ROOT.load(Ordering::Relaxed));
     let mut alloc = || {
         let pa = page_alloc::alloc(0, kind::ALLOCATED)?;
         // SAFETY: a fresh page from the allocator, reachable via the linear
@@ -301,11 +316,13 @@ fn map_fixed(va: u64, pa: u64, len: u64, props: Props) -> Option<()> {
         unsafe { paging::zero_page(pa) };
         Some(pa)
     };
-    // SAFETY: `root` is the live kernel PML4 and `alloc` yields zeroed,
-    // owned pages, all reachable through the linear map.
+    // SAFETY: `root` is the live kernel PML4 or the kernel's shadow root
+    // (frame-built, reachable through the linear map), and `alloc` yields
+    // zeroed, owned pages, all reachable through the linear map.
     let mut m = unsafe { Mapper::new(root, false, &mut alloc) };
     // SAFETY: the range lies in the entry area or the thunk window, both
-    // otherwise unused, and each part is mapped once (by its callers). The
+    // otherwise unused, or is the entry code in the shadow root, where
+    // nothing else is mapped; each part is mapped once (by its callers). The
     // pages are frame's own (image text, its per-CPU tables, stacks and
     // blocks, the thunks' code pages), already reachable through their usual
     // mapping; an alias of them creates no new Rust reference.

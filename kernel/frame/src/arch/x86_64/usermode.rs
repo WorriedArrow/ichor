@@ -83,6 +83,10 @@ pub(crate) struct Mitigations {
     pub bhi_dis_s: bool,
     /// AMD's automatic IBRS on, in place of IBRS on entry.
     pub auto_ibrs: bool,
+    /// Retpolines in place of IBRS on entry (AMD without automatic IBRS),
+    /// or why they could not be installed.
+    pub retpoline: bool,
+    pub retpoline_failed: Option<&'static str>,
     /// The branch history cleared on every entry from ring 3.
     pub bhb_clear: bool,
     /// IBPB on every entry from ring 3 (Retbleed, SRSO), and whether it is
@@ -112,6 +116,8 @@ pub(crate) struct Forced {
     pub safe_ret: bool,
     /// IBPB on entry instead of safe RET where the CPU needs one (`srso=ibpb`).
     pub ibpb_not_safe_ret: bool,
+    /// Retpolines, whatever the CPU.
+    pub retpoline: bool,
 }
 
 /// Switches on the mitigations `v` calls for (once, on the boot CPU,
@@ -135,18 +141,31 @@ pub(crate) fn enable_mitigations(
     // does the same for branch history. Written only where enumerated
     // (`IA32_SPEC_CTRL` needs IBRS enumerated: Intel's CPUID.7:EDX[26] or
     // AMD's CPUID 8000_0008h EBX[14]; a reserved bit would fault). AMD's
-    // automatic IBRS does the same through EFER. Without either, IBRS is
-    // written on every entry from ring 3, on Intel and AMD alike.
+    // automatic IBRS does the same through EFER. Without either, AMD CPUs
+    // get retpolines, as on Linux: every indirect branch the compiler emits
+    // goes through `__x86_indirect_thunk_r11`, and the entry code has none.
+    // Intel's without enhanced IBRS write IBRS on every entry from ring 3
+    // (retpolines are not enough where returns fall back on the branch
+    // predictor).
     let eibrs = v.eibrs && v.ibrs;
     let auto_ibrs = v.auto_ibrs && !eibrs;
     let bhi_dis_s = eibrs && v.bhi_ctrl;
-    let spec = if v.ibrs && !auto_ibrs {
+    let (retpoline, retpoline_failed) = if (!v.intel && !eibrs && !auto_ibrs) || forced.retpoline {
+        match super::rethunk::install_retpoline() {
+            Ok(()) => (true, None),
+            Err(e) => (false, Some(e)),
+        }
+    } else {
+        (false, None)
+    };
+    let ibrs_on_entry = v.ibrs && !eibrs && !auto_ibrs && !retpoline;
+    let spec = if eibrs || ibrs_on_entry {
         SPEC_CTRL_IBRS
     } else {
         0
     } | if bhi_dis_s { SPEC_CTRL_BHI_DIS_S } else { 0 };
     SPEC_CTRL.store(spec, Relaxed);
-    IBRS_ON_ENTRY.store(v.ibrs && !eibrs && !auto_ibrs, Relaxed);
+    IBRS_ON_ENTRY.store(ibrs_on_entry, Relaxed);
     AUTO_IBRS.store(auto_ibrs, Relaxed);
     // Branch history without BHI_DIS_S: cleared in software on entry.
     let bhb_clear = (v.bhi && !bhi_dis_s) || forced.bhb;
@@ -176,6 +195,8 @@ pub(crate) fn enable_mitigations(
         eibrs,
         bhi_dis_s,
         auto_ibrs,
+        retpoline,
+        retpoline_failed,
         bhb_clear,
         ibpb_entry,
         ibpb_entry_missing: ibpb_needed && !v.pred_cmd,
@@ -200,9 +221,6 @@ pub(crate) fn enable_cpu_mitigations() {
     block
         .untrain
         .store(super::rethunk::UNTRAIN.load(Relaxed), Relaxed);
-    block
-        .rethunk
-        .store(super::rethunk::RETHUNK.load(Relaxed), Relaxed);
     if AUTO_IBRS.load(Relaxed) {
         // SAFETY: EFER exists on every x86_64 CPU, and AIBRSE only where
         // CPUID 8000_0021h:EAX[8] enumerates it (on the boot CPU; all CPUs

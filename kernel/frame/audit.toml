@@ -50,5 +50,8 @@
 # keys in user PTEs): 7,850 / 315.
 # Step 21 (ADR-0023: AMX tile data behind XFD, per-thread area sizes):
 # 8,000 / 315.
-max_code_lines = 8000
-max_unsafe_sites = 315
+# Step 22 (ADR-0004's 2026-11-27 amendment: retpolines on AMD in place of
+# IBRS on entry, the entry code at its image address, mapped in shadow
+# roots under isolation): 8,100 / 320.
+max_code_lines = 8100
+max_unsafe_sites = 320

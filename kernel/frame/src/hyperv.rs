@@ -149,16 +149,18 @@ impl Hyperv {
         let status: u64;
         // SAFETY: the hypervisor's page of code, which follows this calling
         // convention and touches no other memory than `input`, the page
-        // of input (or, in a fast call, none).
+        // of input (or, in a fast call, none). It is called through the
+        // indirect-branch thunk (a plain jump, or a retpoline), as every
+        // indirect call of the kernel's (ADR-0004's 2026-11-27 amendment).
         unsafe {
             core::arch::asm!(
-                "call {entry}",
-                entry = in(reg) self.entry,
+                "call __x86_indirect_thunk_r11",
+                inout("r11") self.entry => _,
                 inout("rcx") control => _,
                 inout("rdx") input => _,
                 inout("r8") 0u64 => _,
                 out("rax") status,
-                out("r9") _, out("r10") _, out("r11") _,
+                out("r9") _, out("r10") _,
             )
         };
         status as u16

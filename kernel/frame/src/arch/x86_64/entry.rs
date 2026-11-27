@@ -1,18 +1,21 @@
 //! The entry area and kernel page-table isolation (ADR-0004 §2).
 //!
 //! Everything the CPU and the entry code touch while CR3 may still hold a
-//! user root lives in one PML4 slot, the *entry area* (`mm::ENTRY_BASE`):
-//! an alias of the entry code below (trap stubs, the trap tail, the way
-//! into and out of ring 3, the syscall entry), an alias of the IDT, and per
-//! CPU an alias of its block (GS) and GDT/TSS, its entry stack (TSS RSP0)
-//! and its IST stacks. The CPU always runs entry code, and loads its
-//! descriptor tables, through these aliases, isolated or not, so there is
-//! one path.
+//! user root is the entry code below (trap stubs, the trap tail, the way
+//! into and out of ring 3, the syscall entry: whole pages of the image) and
+//! what lives in one PML4 slot, the *entry area* (`mm::ENTRY_BASE`): an
+//! alias of the IDT, and per CPU an alias of its block (GS) and GDT/TSS, its
+//! entry stack (TSS RSP0) and its IST stacks. The CPU always loads its
+//! descriptor tables through these aliases, isolated or not, so there is
+//! one path. The entry code runs at its image address (ADR-0004's
+//! 2026-11-27 amendment; it ran at an alias in the entry area before), so
+//! its calls into the kernel and its untraining and returns are direct.
 //!
 //! With isolation on (Meltdown-affected CPUs, or `force_pti`), each user
 //! address space has two roots in one 8 KiB block: the full root (kernel
 //! half and user half), which the kernel runs on, and above it a shadow
-//! root whose kernel half is only the entry area's slot and whose user
+//! root whose kernel half is only the entry area's slot and the entry
+//! code's pages, and whose user
 //! slots point at the same tables as the full root's. Ring 3 runs on the
 //! shadow. Every entry from ring 3 loads the full root first; the way back
 //! loads the shadow right before `iretq`. Kernel mappings are global, so
@@ -31,8 +34,7 @@ use crate::mm::kspace::{self, map_entry};
 use crate::mm::meta::kind;
 use crate::mm::{ENTRY_BASE, PAGE_SIZE, PhysAddr, align_down, align_up, page_alloc};
 
-/// Entry code alias (at most `TEXT_PAGES` pages).
-const TEXT: u64 = ENTRY_BASE;
+/// The most pages of entry code (in shadow roots under isolation).
 const TEXT_PAGES: u64 = 256;
 /// IDT alias.
 pub(crate) const IDT: u64 = ENTRY_BASE + 0x10_0000;
@@ -66,8 +68,6 @@ const _: () = {
     assert!(offset_of!(CpuBlock, kernel_cr3) == 104);
     assert!(offset_of!(CpuBlock, user_cr3) == 112);
     assert!(offset_of!(CpuBlock, cr3_noflush) == 120);
-    assert!(offset_of!(CpuBlock, alias_delta) == 128);
-    assert!(offset_of!(CpuBlock, dispatch) == 136);
     assert!(offset_of!(CpuBlock, pti) == 144);
     assert!(offset_of!(CpuBlock, verw) == 152);
     assert!(offset_of!(CpuBlock, verw_sel) == 160);
@@ -75,7 +75,6 @@ const _: () = {
     assert!(offset_of!(CpuBlock, bhb_clear) == 176);
     assert!(offset_of!(CpuBlock, ibpb_entry) == 184);
     assert!(offset_of!(CpuBlock, untrain) == 192);
-    assert!(offset_of!(CpuBlock, rethunk) == 200);
     assert!(core::mem::size_of::<CpuBlock>() == PAGE_SIZE as usize);
 };
 
@@ -97,37 +96,28 @@ fn symbols() -> [u64; 4] {
     [s, e, t, y]
 }
 
-/// The entry-area alias of an address in the entry code.
-fn alias(addr: u64) -> u64 {
-    let start = align_down(symbols()[0], PAGE_SIZE);
-    TEXT + (addr - start)
-}
-
-/// The alias of trap stub `vector` (IDT gates point here).
+/// Trap stub `vector` (IDT gates point here).
 pub(crate) fn stub(vector: u8) -> u64 {
-    alias(symbols()[2] + u64::from(vector) * 16)
+    symbols()[2] + u64::from(vector) * 16
 }
 
-/// The alias of the syscall entry (LSTAR).
+/// The syscall entry (LSTAR).
 pub(crate) fn syscall_entry() -> u64 {
-    alias(symbols()[3])
+    symbols()[3]
 }
 
-/// Maps the entry code and the IDT page (at `idt`, page-aligned) into the
-/// entry area. Once, on the boot CPU.
-pub(crate) fn map_shared(idt: u64) -> Option<()> {
+/// The entry code's pages.
+fn text() -> core::ops::Range<u64> {
     let [s, e, ..] = symbols();
-    let (start, end) = (align_down(s, PAGE_SIZE), align_up(e, PAGE_SIZE));
-    if (end - start) / PAGE_SIZE > TEXT_PAGES || !idt.is_multiple_of(PAGE_SIZE) {
+    align_down(s, PAGE_SIZE)..align_up(e, PAGE_SIZE)
+}
+
+/// Maps the IDT page (at `idt`, page-aligned) into the entry area. Once,
+/// on the boot CPU.
+pub(crate) fn map_shared(idt: u64) -> Option<()> {
+    let t = text();
+    if (t.end - t.start) / PAGE_SIZE > TEXT_PAGES || !idt.is_multiple_of(PAGE_SIZE) {
         return None;
-    }
-    for page in (start..end).step_by(PAGE_SIZE as usize) {
-        map_entry(
-            TEXT + (page - start),
-            kspace::kernel_phys(page)?,
-            PAGE_SIZE,
-            Props::CODE,
-        )?;
     }
     map_entry(IDT, kspace::kernel_phys(idt)?, PAGE_SIZE, Props::RO_DATA)
 }
@@ -180,13 +170,7 @@ pub(crate) fn map_cpu(index: usize, block: &CpuBlock, tables: u64) -> Option<Cpu
         )?;
         *top = bottom + IST_PAGES * PAGE_SIZE;
     }
-    let dispatch = super::trap::trap_dispatch as extern "sysv64" fn(_) -> u64;
     block.entry_rsp.store(base + 4 * PAGE_SIZE, Relaxed);
-    block.alias_delta.store(
-        TEXT.wrapping_sub(align_down(symbols()[0], PAGE_SIZE)),
-        Relaxed,
-    );
-    block.dispatch.store(dispatch as usize as u64, Relaxed);
     block
         .verw_sel
         .store(u64::from(super::trap::KERNEL_SS), Relaxed);
@@ -224,6 +208,9 @@ pub(crate) fn enable() -> Result<(), &'static str> {
     unsafe { paging::zero_page(shadow) };
     // SAFETY: as above.
     unsafe { paging::copy_entry(kernel, shadow, paging::slot_of(ENTRY_BASE)) };
+    // The entry code at its image address, in tables of the shadow's own.
+    let t = text();
+    kspace::map_entry_text(shadow, t.start, t.end - t.start).ok_or("out of memory")?;
     KERNEL_SHADOW.store(shadow.as_u64(), Relaxed);
     PCID.store(super::cpu::features().pcid, Relaxed);
     PTI.store(true, Relaxed);
@@ -289,6 +276,20 @@ pub(crate) fn shadow_of(root: PhysAddr) -> PhysAddr {
     PhysAddr::new(root.as_u64() + PAGE_SIZE)
 }
 
+/// Gives a new shadow root the kernel half every shadow has: the entry
+/// area's slot and the entry code's.
+///
+/// # Safety
+///
+/// `shadow` must satisfy `paging::table`'s contract; isolation is on.
+pub(crate) unsafe fn share_kernel_half(shadow: PhysAddr) {
+    let kernel = PhysAddr::new(KERNEL_SHADOW.load(Relaxed));
+    for slot in [paging::slot_of(ENTRY_BASE), paging::slot_of(text().start)] {
+        // SAFETY: the kernel's shadow is a frame-built root; caller contract.
+        unsafe { paging::copy_entry(kernel, shadow, slot) };
+    }
+}
+
 /// Checks, with isolation on, that a user root maps its user pages and the
 /// entry area and none of the kernel: its text, the current stack, the
 /// heap, the linear map, the per-CPU block outside the entry area. Ok(false)
@@ -348,8 +349,6 @@ global_asm!(
     ".set GS_KCR3, 104",
     ".set GS_UCR3, 112",
     ".set GS_NOFLUSH, 120",
-    ".set GS_DELTA, 128",
-    ".set GS_DISPATCH, 136",
     ".set GS_PTI, 144",
     ".set GS_VERW, 152",
     ".set GS_VERWSEL, 160",
@@ -370,7 +369,6 @@ global_asm!(
     ".set GS_BHB, 176",
     ".set GS_IBPBE, 184",
     ".set GS_UNTRAIN, 192",
-    ".set GS_RETHUNK, 200",
     // The rest of what an entry from ring 3 owes (ADR-0004's 2026-11-23
     // amendment), after `ichor_spec_ctrl -1`, on a stack of the kernel's
     // and before any indirect branch: IBPB (AMD's Retbleed and SRSO), then
@@ -389,12 +387,11 @@ global_asm!(
     "call ichor_clear_bhb",
     "92:",
     // AMD's SRSO with safe-RET return thunks: untrain before the kernel's
-    // first return (`rethunk`; an absolute address, as this runs at the
-    // entry area's alias; IBRS is on by now where the CPU needs it). The
-    // Zen 1/2 routine uses rax.
+    // first return (`rethunk` points the stub at the routine; IBRS is on by
+    // now where the CPU needs it). The Zen 1/2 routine uses rax.
     "cmp qword ptr gs:[GS_UNTRAIN], 0",
     "je 97f",
-    "call qword ptr gs:[GS_UNTRAIN]",
+    "call ichor_untrain_stub",
     "97:",
     ".endm",
     // UserContext offsets (`usermode::UserContext`).
@@ -420,9 +417,9 @@ global_asm!(
     ".set SEL_USER_SS, 0x1b",
     // TrapFrame offset of the interrupted CS, after the 15 pushed GPRs.
     ".set TF_CS, 144",
-    // Everything up to `ichor_entry_end` runs from its entry-area alias,
-    // so it reaches outside itself only through GS (the block's alias) and
-    // the stacks; calls out are absolute (`GS_DISPATCH`).
+    // Everything up to `ichor_entry_end` is whole pages that shadow roots
+    // map: until CR3 holds the full root it reaches outside them only
+    // through GS (the block's alias) and the stacks. Calls out are direct.
     ".section .text",
     ".balign 4096",
     ".global ichor_entry_start",
@@ -486,7 +483,7 @@ global_asm!(
     "2:",
     // 22 quadwords from the 16-byte aligned interrupt frame: aligned.
     "mov rdi, rsp",
-    "call qword ptr gs:[GS_DISPATCH]",
+    "call {dispatch}",
     "test r12, r12",
     "jz 3f",
     "ichor_spec_ctrl -2",
@@ -525,10 +522,9 @@ global_asm!(
     "mov rdi, rsp",
     "mov rsp, gs:[GS_RESUME]",
     "and rsp, -16",
-    "call qword ptr gs:[GS_DISPATCH]",
+    "call {dispatch}",
     "jmp ichor_user_resume",
     // fn ichor_enter_user(ctx: *mut UserContext)  [ctx in rdi]
-    // Called at its image address; continues at its alias.
     ".global ichor_enter_user",
     "ichor_enter_user:",
     "push rbx",
@@ -537,10 +533,6 @@ global_asm!(
     "push r13",
     "push r14",
     "push r15",
-    "lea rax, [rip + 6f]",
-    "add rax, gs:[GS_DELTA]",
-    "jmp rax",
-    "6:",
     "mov gs:[GS_RESUME], rsp", // kernel stack to come back to
     "mov gs:[GS_UCTX], rdi",
     "test rsi, rsi",
@@ -634,13 +626,9 @@ global_asm!(
     "pop r12",
     "pop rbp",
     "pop rbx",
-    // The kernel's first return after ring 3: through the return thunk
-    // where there is one (absolute, as this runs at the alias).
-    "cmp qword ptr gs:[GS_RETHUNK], 0",
-    "je 98f",
-    "jmp qword ptr gs:[GS_RETHUNK]",
-    "98:",
-    "ret",
+    // The kernel's first return after ring 3: through the return thunk, as
+    // every return of the kernel's.
+    "jmp __x86_return_thunk",
     // fn ichor_syscall_entry()  [via LSTAR: rcx=rip, r11=rflags, GS=block]
     ".global ichor_syscall_entry",
     "ichor_syscall_entry:",
@@ -704,4 +692,5 @@ global_asm!(
     ".balign 4096",
     ".global ichor_entry_end",
     "ichor_entry_end:",
+    dispatch = sym super::trap::trap_dispatch,
 );

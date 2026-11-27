@@ -78,7 +78,11 @@ pub fn kernel(profile: Profile) -> Result<PathBuf> {
     // AMD's safe-RET sequence where SRSO applies. `core`, `alloc` and
     // `compiler_builtins` are rebuilt with it, or their returns would stay
     // plain (but for `compiler_builtins`' stack probe, which is assembly:
-    // frame patches its return at boot). Both flags are unstable; the
+    // frame patches its return at boot). Retpolines too (ADR-0004's
+    // 2026-11-27 amendment): every indirect call and jump becomes a direct
+    // one to `__x86_indirect_thunk_r11`, a plain `jmp r11` that frame
+    // points at a retpoline on AMD CPUs without automatic IBRS (and the
+    // compiler makes no jump tables). The flags are unstable; the
     // pinned stable compiler takes them
     // with RUSTC_BOOTSTRAP, for this build only (AGENTS.md, "Unstable
     // features").
@@ -92,7 +96,7 @@ pub fn kernel(profile: Profile) -> Result<PathBuf> {
     .env("RUSTC_WRAPPER", "")
     .env(
         "CARGO_TARGET_X86_64_UNKNOWN_UEFI_RUSTFLAGS",
-        "-Zfunction-return=thunk-extern",
+        "-Zfunction-return=thunk-extern -Zretpoline-external-thunk",
     );
     if profile == Profile::Release {
         cmd.arg("--release");

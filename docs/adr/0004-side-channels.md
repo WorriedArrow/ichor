@@ -359,6 +359,66 @@ routine before the kernel's first return.
 - Frame grows past audit step 13 (to 7,202 / 292); step 14 (7,250 / 310)
   covers the thunks and the AMD IBRS change before them.
 
+## Amendment (2026-11-27): retpolines on AMD; the entry code at its image address
+
+IBRS on every entry from ring 3 (the 2026-11-22 amendment) is two writes
+of `IA32_SPEC_CTRL` per system call, fault or interrupt: about 110 ns of
+a null system call on EPYC Milan. Linux does not pay it on AMD CPUs
+without automatic IBRS (Zen 1 to 3): it uses retpolines there, and so
+does Ichor now.
+
+- **Build.** The kernel is also compiled with
+  `-Zretpoline-external-thunk` (`core`, `alloc` and `compiler_builtins`
+  too): every indirect call and jump the compiler emits becomes a direct
+  `call` or `jmp` to `__x86_indirect_thunk_r11`, with the target in r11,
+  and LLVM makes no jump tables. The thunk (`arch::rethunk`) is `jmp r11`
+  until the boot CPU patches it, before any other CPU or user code runs,
+  into a jump to a retpoline: `call` past a `pause; lfence` loop that
+  catches speculation, overwrite the return address with r11, then the
+  kernel's return thunk (Linux's `RETPOLINE` macro ends in `RET` too), so
+  on Zen 1 to 3 the retpoline's return is a safe RET as well. The
+  hypercall page is called through the same thunk.
+- **Policy.** Retpolines on every CPU that is not Intel and has neither
+  enhanced nor automatic IBRS, whether or not it enumerates IBRS; IBRS on
+  entry stays for Intel CPUs without enhanced IBRS (Skylake's returns fall
+  back on the branch predictor, where a retpoline does not help: Linux uses
+  IBRS there too) and for an AMD CPU if the retpoline cannot be installed.
+  `install_retpoline` checks the thunk's bytes and that one of frame's
+  compiled indirect calls reaches it, else installs nothing and the boot
+  log says why. `force_retpoline` installs it on any CPU (CI's
+  `m2_scheduler_on_eight_cpus`, with isolation and the safe-RET thunks
+  forced). The log says `Spectre v2 in the kernel retpolines`.
+- **The entry code has no indirect branch.** It ran at an alias in the
+  entry area, far from the image, so it called the trap dispatcher and the
+  untraining routine and jumped to the return thunk through pointers in
+  the per-CPU block, and jumped from `ichor_enter_user`'s image address to
+  its alias through a register: five indirect branches that retpolines in
+  compiled code would not cover (and untraining must be a direct call,
+  before the kernel's first return). The entry code now runs at its image
+  address: IDT gates and LSTAR name it there, its calls and jumps are
+  direct (`ichor_untrain_stub`, which `install` points at the CPU's
+  untraining routine, and `__x86_return_thunk`), and under page-table
+  isolation every shadow root maps its pages (whole pages of the image, at
+  their own addresses, in tables of the shadows' own: the kernel's shadow
+  builds them once, `share_kernel_half` gives each user shadow that slot
+  and the entry area's). The entry area keeps the IDT, the per-CPU blocks,
+  GDTs, TSSs and stacks; `isolation_selftest` checks as before that a user
+  root maps the syscall entry, the IDT and the entry stack, and none of
+  the rest of the kernel's text, its stack, heap or linear map.
+- **Cost on Intel.** An indirect call is a direct call and a `jmp r11`, and
+  switches compile to compare trees. Nothing on the system call path
+  needs one. Under OpenVMM on a Ryzen 5 5600X (Zen 3, which enumerates no
+  IBRS there, so it had no Spectre v2 mitigation in the kernel before),
+  with retpolines and the direct entry code: null system call 70-80 ns
+  against 127-148 ns the same day before (most of that four calls taken
+  off the path, `inotify::flush`, `Pending::take` twice and
+  `ExtState::restore`, whose fast checks are inline now: each return is a
+  mispredicted safe RET on that CPU), fork + exec + wait 49-53 us against 101-117 us (most
+  of that five CPUIDs, each a VM exit, on every random request: now asked
+  once). GCP figures: `docs/benchmarks.md`.
+- Not verified as a mitigation: no Spectre v2 exploit was run against it.
+- Frame grows past audit step 21 (to 8,044 / 316); step 22 (8,100 / 320).
+
 ## Consequences
 
 - Nodes on modern cloud CPUs (Ice Lake and later, EPYC Milan and later)

@@ -49,7 +49,8 @@ impl VmSpace {
     /// Creates an empty user address space sharing the kernel half. Under
     /// page-table isolation (ADR-0004 §2) its root is the first page of an
     /// 8 KiB block whose second page is the shadow root ring 3 runs on:
-    /// the entry area for a kernel half, and the same user tables.
+    /// the entry area and the entry code for a kernel half, and the same
+    /// user tables.
     pub fn new() -> Option<VmSpace> {
         let order = u8::from(arch::entry::isolating());
         let root = page_alloc::alloc(order, kind::PAGE_TABLE)?;
@@ -63,9 +64,8 @@ impl VmSpace {
         // `root` is fresh, the kernel root is live and only read.
         unsafe { paging::copy_upper_half(kernel, root) };
         if order == 1 {
-            let slot = paging::slot_of(super::ENTRY_BASE);
-            // SAFETY: as above, for the shadow root.
-            unsafe { paging::copy_entry(kernel, arch::entry::shadow_of(root), slot) };
+            // SAFETY: as above, for the shadow root; isolation is on.
+            unsafe { arch::entry::share_kernel_half(arch::entry::shadow_of(root)) };
         }
         Some(VmSpace {
             inner: SpinLock::new(Inner { mapped: 0 }),

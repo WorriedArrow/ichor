@@ -140,10 +140,9 @@ pub(crate) struct CpuBlock {
     pub(crate) user_cr3: AtomicU64,
     /// 120: bit 63 if CR3 loads may keep a PCID's entries (PCID on), else 0.
     pub(crate) cr3_noflush: AtomicU64,
-    /// 128: entry-area alias address minus image address of the entry code.
-    pub(crate) alias_delta: AtomicU64,
-    /// 136: address of the trap dispatcher, called from the entry area.
-    pub(crate) dispatch: AtomicU64,
+    /// 128, 136: unused (the entry code's alias and the trap dispatcher's
+    /// address, before the entry code ran at its image address).
+    _unused: [AtomicU64; 2],
     /// 144: nonzero when page-table isolation is on.
     pub(crate) pti: AtomicU64,
     /// 152: nonzero for VERW before `iretq` to ring 3.
@@ -159,12 +158,9 @@ pub(crate) struct CpuBlock {
     /// 184: nonzero for IBPB on every entry from ring 3 (AMD Retbleed and
     /// SRSO, without safe-RET return thunks).
     pub(crate) ibpb_entry: AtomicU64,
-    /// 192: the safe-RET untraining routine, called on every entry from
-    /// ring 3 (AMD SRSO, `arch::rethunk`); 0 when none.
+    /// 192: nonzero to untrain on every entry from ring 3 (AMD SRSO with
+    /// safe-RET return thunks, `arch::rethunk`).
     pub(crate) untrain: AtomicU64,
-    /// 200: the return thunk the entry code's own return jumps to; 0 for a
-    /// plain `ret`.
-    pub(crate) rethunk: AtomicU64,
 }
 
 impl CpuBlock {
@@ -186,8 +182,7 @@ impl CpuBlock {
             kernel_cr3: AtomicU64::new(0),
             user_cr3: AtomicU64::new(0),
             cr3_noflush: AtomicU64::new(0),
-            alias_delta: AtomicU64::new(0),
-            dispatch: AtomicU64::new(0),
+            _unused: [AtomicU64::new(0), AtomicU64::new(0)],
             pti: AtomicU64::new(0),
             verw: AtomicU64::new(0),
             verw_sel: AtomicU64::new(0),
@@ -195,7 +190,6 @@ impl CpuBlock {
             bhb_clear: AtomicU64::new(0),
             ibpb_entry: AtomicU64::new(0),
             untrain: AtomicU64::new(0),
-            rethunk: AtomicU64::new(0),
         }
     }
 }

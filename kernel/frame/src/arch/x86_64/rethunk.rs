@@ -54,6 +54,34 @@ core::arch::global_asm!(
     "ichor_srso_return_thunk:",
     "call ichor_srso_safe_ret",
     "ud2",
+    // What the entry code calls to untrain (`install` makes it a jump to
+    // the CPU's routine; it is called only then).
+    ".p2align 4",
+    ".global ichor_untrain_stub",
+    "ichor_untrain_stub:",
+    "ud2",
+    "int3",
+    "int3",
+    "int3",
+    // Every indirect call and jump of the compiled kernel, target in r11:
+    // a plain jump, or (`install_retpoline`) a jump to the retpoline after
+    // it, whose speculation is caught in the loop and whose return is the
+    // kernel's return thunk, as Linux's.
+    ".p2align 4",
+    ".global __x86_indirect_thunk_r11",
+    "__x86_indirect_thunk_r11:",
+    "jmp r11",
+    "int3",
+    "int3",
+    "ichor_retpoline_r11:",
+    "call 2f",
+    "1:",
+    "pause",
+    "lfence",
+    "jmp 1b",
+    "2:",
+    "mov [rsp], r11",
+    "jmp __x86_return_thunk",
 );
 
 /// The safe-RET sequence a CPU needs.
@@ -65,24 +93,24 @@ pub(crate) enum SafeRet {
     Alias,
 }
 
-/// What `install` chose, for each CPU's block (`usermode`): the untraining
-/// routine and the return thunk.
+/// Nonzero once `install` has pointed `ichor_untrain_stub` at the CPU's
+/// untraining routine: every CPU's block tells the entry code (`usermode`).
 pub(crate) static UNTRAIN: AtomicU64 = AtomicU64::new(0);
-pub(crate) static RETHUNK: AtomicU64 = AtomicU64::new(0);
 
-fn labels() -> [u64; 3] {
-    let (t, u, r): (u64, u64, u64);
-    // SAFETY: computes three addresses RIP-relatively; no memory access.
+fn labels() -> [u64; 4] {
+    let (t, u, r, s): (u64, u64, u64, u64);
+    // SAFETY: computes four addresses RIP-relatively; no memory access.
     unsafe {
         core::arch::asm!(
             "lea {t}, [rip + __x86_return_thunk]",
             "lea {u}, [rip + ichor_srso_untrain]",
             "lea {r}, [rip + ichor_srso_return_thunk]",
-            t = out(reg) t, u = out(reg) u, r = out(reg) r,
+            "lea {s}, [rip + ichor_untrain_stub]",
+            t = out(reg) t, u = out(reg) u, r = out(reg) r, s = out(reg) s,
             options(nomem, nostack, preserves_flags)
         )
     };
-    [t, u, r]
+    [t, u, r, s]
 }
 
 /// `jmp rel32` at `from` to `to`, as bytes.
@@ -174,7 +202,7 @@ unsafe fn patch(at: u64, target: u64) -> Result<(), &'static str> {
 /// Zen 3/4 pair first) and records the routines for the entry code. Must
 /// run on the boot CPU before any other CPU or user code runs.
 pub(crate) fn install(kind: SafeRet) -> Result<(), &'static str> {
-    let [thunk, zen12_untrain, zen12_thunk] = labels();
+    let [thunk, zen12_untrain, zen12_thunk, untrain_stub] = labels();
     if !compiled_with_thunks(thunk) {
         return Err("the kernel was built without return thunks");
     }
@@ -204,7 +232,53 @@ pub(crate) fn install(kind: SafeRet) -> Result<(), &'static str> {
     // SAFETY: as above; the probe's `ret` is followed by four `int3`s of
     // padding (`stack_probe_ret` checked them) that nothing executes.
     unsafe { patch(probe_ret, thunk) }?;
-    UNTRAIN.store(untrain, Relaxed);
-    RETHUNK.store(target, Relaxed);
+    // SAFETY: as above; the entry code calls the stub only once UNTRAIN is
+    // set, below.
+    unsafe { patch(untrain_stub, untrain) }?;
+    UNTRAIN.store(1, Relaxed);
     Ok(())
+}
+
+/// Points `__x86_indirect_thunk_r11`, through which every indirect call and
+/// jump the compiler emits goes (`-Zretpoline-external-thunk`), at a
+/// retpoline: Spectre v2 in the kernel on AMD CPUs without automatic IBRS
+/// (ADR-0004's 2026-11-27 amendment). Same contract as [`install`].
+pub(crate) fn install_retpoline() -> Result<(), &'static str> {
+    let [thunk, retpoline] = retpoline_labels();
+    // The thunk starts `jmp r11` (41 ff e3), then two `int3`s.
+    if code::<5>(thunk) != [0x41, 0xff, 0xe3, 0xcc, 0xcc] {
+        return Err("the indirect-branch thunk is not as built");
+    }
+    // An indirect call of frame's own reaches it as a `call` or `jmp rel32`.
+    #[inline(never)]
+    fn probe() -> u64 {
+        let f: fn() -> u64 = || 7;
+        core::hint::black_box(f)()
+    }
+    let start = probe as *const () as usize as u64;
+    let direct = |at| {
+        [0xe8, 0xe9]
+            .iter()
+            .any(|&op| code::<5>(at) == jmp(op, at, thunk))
+    };
+    if !(start..start + 64).any(direct) {
+        return Err("the kernel was built without retpolines");
+    }
+    // SAFETY: only the boot CPU runs; until the last store it may execute
+    // the thunk's first three bytes, which `patch` leaves until then.
+    unsafe { patch(thunk, retpoline) }
+}
+
+fn retpoline_labels() -> [u64; 2] {
+    let (t, r): (u64, u64);
+    // SAFETY: computes two addresses RIP-relatively; no memory access.
+    unsafe {
+        core::arch::asm!(
+            "lea {t}, [rip + __x86_indirect_thunk_r11]",
+            "lea {r}, [rip + ichor_retpoline_r11]",
+            t = out(reg) t, r = out(reg) r,
+            options(nomem, nostack, preserves_flags)
+        )
+    };
+    [t, r]
 }

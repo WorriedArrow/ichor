@@ -334,22 +334,25 @@ fn m1_boots_on_one_cpu() {
 
 #[test]
 fn m2_scheduler_on_eight_cpus() {
-    // Page-table isolation, the branch-history clearing sequence, IBPB on
-    // every entry and the Zen 3/4 safe-RET return thunks, forced
-    // (ADR-0004): everything below runs with ring 3 on shadow roots,
-    // entries switching CR3 and running the entry barriers (IBPB where the
-    // CPU has it, as under KVM; the untraining routine), every kernel
-    // return through the thunk, and TLB shootdowns across 8 CPUs (with PCID
-    // where the CPU has it).
+    // Page-table isolation, retpolines, the branch-history clearing
+    // sequence, IBPB on every entry and the Zen 3/4 safe-RET return thunks,
+    // forced (ADR-0004): everything below runs with ring 3 on shadow roots
+    // (the entry code mapped in them at its image address), entries
+    // switching CR3 and running the entry barriers (IBPB where the CPU has
+    // it, as under KVM; the untraining routine), every kernel indirect
+    // branch through a retpoline and every return through the thunk, and
+    // TLB shootdowns across 8 CPUs (with PCID where the CPU has it).
     let out = boot(
         "m2-smp8",
-        "force_pti force_bhb force_ibpb_entry force_safe_ret",
+        "force_pti force_bhb force_ibpb_entry force_safe_ret force_retpoline",
         8,
     );
     out.assert_exit(Exit::Success);
     out.assert_in_order(&[
         "ichor: frame: mitigations (ADR-0004): VERW on return to ring 3 ",
         "page-table isolation on (", // "forced, " unless the host is affected
+        "Spectre v2 in the kernel ",
+        "retpolines",
         "branch history cleared on entry",
         "IBPB on entry ",
         "return thunks safe RET (Zen 3/4",

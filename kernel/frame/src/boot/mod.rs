@@ -274,6 +274,7 @@ pub(crate) extern "sysv64" fn kernel_space_entry() -> ! {
         ibpb_entry: cmdline.flag("force_ibpb_entry"),
         safe_ret: cmdline.flag("force_safe_ret"),
         ibpb_not_safe_ret: cmdline.get("srso") == Some("ibpb"),
+        retpoline: cmdline.flag("force_retpoline"),
     };
     let m = match arch::usermode::enable_mitigations(&v, forced) {
         Ok(m) => m,
@@ -303,11 +304,15 @@ pub(crate) extern "sysv64" fn kernel_space_entry() -> ! {
         } else {
             alloc::format!("on (forced, {pcid})")
         },
-        match (m.eibrs, m.auto_ibrs) {
-            (true, _) => "eIBRS",
-            (false, true) => "AutoIBRS",
-            (false, false) if v.ibrs => "IBRS on entry",
-            (false, false) => "NOT MITIGATED (no IBRS)",
+        match (m.eibrs, m.auto_ibrs, m.retpoline, m.retpoline_failed) {
+            (true, _, true, _) => "eIBRS, retpolines (forced)".into(),
+            (true, ..) => "eIBRS".into(),
+            (_, true, ..) => "AutoIBRS".into(),
+            (_, _, true, _) => "retpolines".into(),
+            (_, _, _, Some(why)) if v.ibrs => alloc::format!("IBRS on entry (retpolines: {why})"),
+            (_, _, _, Some(why)) => alloc::format!("NOT MITIGATED (retpolines: {why})"),
+            _ if v.ibrs => "IBRS on entry".into(),
+            _ => alloc::string::String::from("NOT MITIGATED (no IBRS)"),
         },
         match (m.bhi_dis_s, m.bhb_clear) {
             (true, _) => "BHI_DIS_S",
