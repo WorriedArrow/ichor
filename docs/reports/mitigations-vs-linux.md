@@ -14,6 +14,27 @@ boot log (`cpu0 speculation` and `mitigations` lines) on the same machine
 type in the same zone, and its code (`arch::cpu::vulnerabilities`,
 `usermode::enable_mitigations`).
 
+**Since round 19 (the same day) the gaps below are closed** (ADR-0004's
+second 2026-11-27 amendment):
+
+- ITS on n2: aligned thunks.
+- TSA on Milan: VERW on the way to ring 3.
+- STIBP on Milan and Rome: always on.
+- Speculative store bypass: disabled by prctl.
+- MMIO stale data: detected, and no VERW, as Linux does for user space.
+- TAA and GDS: tested as Linux tests them, so VERW is off on AWS's m7i.
+
+Every machine's boot log in round 19 agrees with Linux's sysfs above, but
+for three differences, each by design:
+
+- Ichor puts IBPB between cells unconditionally.
+- Ichor keeps STIBP always on where Linux's default on Milan is
+  conditional.
+- Indirect-branch speculation cannot be set by prctl.
+
+The costs are in `docs/benchmarks.md`, round 19. What follows is the
+comparison as it stood in round 18.
+
 Both kernels see the CPU through the hypervisor: what a guest is told
 (CPUID, `IA32_ARCH_CAPABILITIES`) decides what is "affected". So "Not
 affected" below is per cloud and machine type, not per microarchitecture.

@@ -349,9 +349,10 @@ fn set_ssbd(guard: &cpu::IrqGuard, on: bool) {
     }
 }
 
-/// Whether the kernel runs with IBRS on this CPU, if it is to.
+/// Whether the kernel runs with IBRS on this CPU, if it is to (`None`:
+/// it is not to, whatever else `IA32_SPEC_CTRL` holds, such as STIBP).
 pub fn ibrs_in_kernel() -> Option<bool> {
-    if SPEC_CTRL.load(core::sync::atomic::Ordering::Relaxed) == 0 {
+    if SPEC_CTRL.load(core::sync::atomic::Ordering::Relaxed) & SPEC_CTRL_IBRS == 0 {
         return None;
     }
     // SAFETY: the MSR exists (as in `enable_cpu_mitigations`); reading it

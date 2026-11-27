@@ -868,16 +868,45 @@ and m7i (363 / 247 / 325 / 350 ns against Ichor's 407 / 352 / 361 / 577),
 and ties the null syscall on m7i (80 / 80); Ichor keeps the rest. Locally
 a 2 MiB fault is ~80% clearing, ~25 us per-page charging and bookkeeping;
 4 KiB-piece clearing was slower. The same round compared what each kernel
-mitigates (`docs/reports/mitigations-vs-linux.md`): Ichor lacks ITS on n2
-(Ice Lake), TSA's VERW on Milan, STIBP on Milan and Rome, speculative
-store bypass control, and an MMIO-stale-data check; and it runs VERW on
-AWS's m7i needlessly (TAA taken from `TAA_NO` alone; Linux also wants
-TSX). Not fixed yet.
+mitigates (`docs/reports/mitigations-vs-linux.md`). Ichor lacked:
+
+- ITS on n2 (Ice Lake);
+- TSA's VERW on Milan;
+- STIBP on Milan and Rome;
+- speculative store bypass control;
+- an MMIO-stale-data check.
+
+It also ran VERW on AWS's m7i needlessly, taking TAA from `TAA_NO` alone
+where Linux also wants TSX.
+
+All of these were fixed the same day (ADR-0004's second 2026-11-27
+amendment):
+
+- Detection follows Linux's tests.
+- Both thunks start at byte 32 of a cache line on every CPU (ITS).
+- TSA uses VERW, where `VERW_CLEAR` says it clears.
+- STIBP stays on where cores run two threads without eIBRS or AutoIBRS
+  (`force_stibp` for tests).
+- `PR_GET/SET_SPECULATION_CTRL` controls per-thread SSBD, through
+  `UserContext::set_ssbd` and the `Ssb` state in `LinuxProcess`.
+  Debian's perl checks it (`SPEC_SCRIPT`), and so does `ssbdtest` where
+  the CPU can disable it.
+- MMIO stale data is logged; no cell has MMIO, so it calls for no VERW.
+
+Round 19 (`docs/benchmarks.md`) measured what they cost:
+
+- Milan's null syscall rose 93 → 317 ns with VERW; Linux 7.3 takes 342.
+- STIBP costs nothing measurable on Rome.
+- On m7i the null syscall fell 80 → 72 ns, VERW off.
+- n2 and c3 now tie Linux on the null syscall (95 and 86 ns).
+
+`ichor_clear_bhb`'s `ret`s stay where they were: each is predicted from
+the return stack, and moving them behind jumps cost 5 ns.
 
 Frame budget: ADR-0005 sets the milestone 3 ceiling at 8,500 lines / 380
 sites; ADR-0007 raises it to 9,500 / 420 for milestone 4 (TLB shootdown,
-atomic user ops for futexes, PCID). `audit.toml` is at step 22 (8,100 / 320,
-ADR-0004's 2026-11-27 amendment); frame is at 8,056 / 316 (A5 added
+atomic user ops for futexes, PCID). `audit.toml` is at step 23 (8,350 / 325,
+ADR-0004's second 2026-11-27 amendment); frame is at 8,307 / 319 (A5 added
 RDSEED/RDRAND and UEFI GetTime; B added XSAVE; C the frames tree and
 request tracking; M6 reading `\ichor\roots.pem`, later
 `\ichor\suffixes.dat` too; ADR-0011 the checked user
@@ -892,7 +921,8 @@ task's CPU time, ADR-0021; user registers saved only when they must be,
 ADR-0008's 2026-11-26 amendment; protection keys, ADR-0022; AMX behind
 XFD and per-thread area sizes, ADR-0023; retpolines, the untraining stub
 and the entry code at its image address, mapped in shadow roots,
-ADR-0004's 2026-11-27 amendment). Growth past the step
+ADR-0004's 2026-11-27 amendment; ITS, TSA, STIBP, SSBD and Linux's
+vulnerability tests, its second amendment that day). Growth past the step
 needs an ADR and a new audit step.
 `services/rt` has its own budget (`services/rt/audit.toml`: 500 / 40; at
 417 / 30).

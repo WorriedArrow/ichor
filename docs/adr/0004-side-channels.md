@@ -445,9 +445,11 @@ the same CPU the same way.
   `-Zretpoline-external-thunk`; `__x86_return_thunk`,
   `-Zfunction-return=thunk-extern`). Both thunks now start at byte 32 of a
   cache line on every CPU, so placing them costs nothing.
-  - `ichor_clear_bhb`'s two `ret`s are placed the same way. Each is now
-    reached by a direct jump, one more taken branch of the kernel's own in
-    the history.
+  - `ichor_clear_bhb`'s two `ret`s stay where they are. Each returns to
+    the `call` just before it, so the return stack predicts it; ITS
+    concerns only the fallback predictor, which an underflow would use.
+    Moving them behind direct jumps was tried and cost the n2 about 5 ns
+    a system call (round 19).
   - The stack probe of `compiler_builtins` is assembly that never reaches
     the thunks. Its `ret` is patched to a jump to the return thunk, as the
     safe-RET install already does on AMD (`rethunk::install_its`), where
@@ -505,10 +507,16 @@ the same CPU the same way.
 - The boot log names each: `its`, `tsa`, `mmio`, `ssb`, `stibp`, `ssbd`
   and `smt` in the `cpu0 speculation` line, and indirect target selection,
   STIBP and speculative store bypass at the end of the `mitigations` line.
-- Cost: nothing on CPUs none of these apply to. On the affected ones:
-  VERW on Milan, STIBP on Rome and Milan, the patched stack probe on Ice
-  Lake. GCP figures: `docs/benchmarks.md`.
-- Frame grows past audit step 22 (to 8,317 / 319); step 23 (8,350 / 325).
+- Cost (round 19, `docs/benchmarks.md`): nothing on CPUs none of these
+  apply to.
+  - Milan, TSA's VERW: the null system call 93 → 317 ns, against Linux
+    7.3's 342.
+  - Rome, STIBP: nothing measurable.
+  - n2, ITS: within the spread between hosts (93 → 95 ns).
+  - AWS m7i: 80 → 72 ns, VERW being off there now.
+  - Every machine chose what this amendment says it should, and
+    `ssbdtest` passed on all five.
+- Frame grows past audit step 22 (to 8,307 / 319); step 23 (8,350 / 325).
 
 ## Consequences
 

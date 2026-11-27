@@ -565,6 +565,59 @@ Reading it:
   pull 0.47 s on AWS, 0.86-0.90 s on n2 and Rome, and 3-4 s on c3 and
   Milan this time.
 
+## Round 19 (2026-11-27): the mitigation gaps closed
+
+Ichor alone, after ADR-0004's second 2026-11-27 amendment, which closed
+the gaps round 18 found: aligned ITS thunks, TSA's VERW, STIBP, SSBD by
+prctl, and TAA tested as Linux tests it. Linux 7.3's figures are round
+18's, from the same machine types the same day. n2, Milan and Rome are
+from a second run (19b) after two fixes:
+
+- The kernel's IBRS self-check took STIBP in `IA32_SPEC_CTRL` for IBRS
+  and failed the boot's end on Milan and Rome. The benchmarks had run by
+  then.
+- `ichor_clear_bhb`'s `ret`s had been moved behind direct jumps, which
+  cost the n2 about 5 ns a system call (100 against 95). They are back
+  where they were (ADR-0004).
+
+c3 and m7i are from the first run; neither change touches their path.
+Medians of five rounds, Ichor / Linux 7.3.
+
+| Benchmark | n2 | c3 | Milan | Rome | AWS m7i |
+|---|---|---|---|---|---|
+| null syscall | 95 / 95 ns | 86 / 86 ns | **317** / 342 ns | **101** / 123 ns | **72** / 80 ns |
+| pipe round trip | **3.45** / 8.48 us | **3.80** / 8.18 us | **4.71** / 15.6 us | **3.72** / 13.3 us | **3.13** / 11.2 us |
+| page fault | **542** / 660 ns | 558 / **363** ns | 448 / **247** ns | 338 / **325** ns | 530 / **350** ns |
+| fork + wait | **10** / 45 us | **11** / 39 us | **12** / 74 us | **11** / 61 us | **10** / 36 us |
+| fork + exec + wait | **54** / 133 us | **54** / 98 us | **60** / 218 us | **54** / 210 us | **45** / 89 us |
+
+Container start from a native caller: 115, 93, 142, 127 and 70 us; through
+the gRPC API 0.60, 0.54, 0.57 and 0.66 ms (n2, c3, Milan, Rome).
+
+Reading it:
+
+- **What the mitigations cost.**
+  - Milan, TSA's VERW: the null system call 93 → 317 ns, the pipe round
+    trip 3.75 → 4.71 us, and fork + exec 55 → 60 us. Linux pays the same
+    VERW, and Ichor stays ahead of it.
+  - Rome, STIBP always on: nothing measurable (null system call 104 →
+    101 ns, pipe 3.70 → 3.72 us, fork + exec 54 → 54 us).
+  - n2, the aligned ITS thunks: 93 → 95 ns, within the spread between
+    hosts.
+  - AWS m7i: VERW is off now that TAA is tested as Linux tests it, so the
+    null system call fell 80 → 72 ns. Round 18's tie with Linux (80 ns)
+    is now a lead.
+- **Two ties**, n2 and c3's null system call, where round 18 had Ichor 2-3
+  ns ahead. On c3 nothing on that path changed, and the spread between
+  hosts is larger than that.
+- **Page faults move with the host.** c3 went 407 → 558 ns and Milan
+  352 → 448 ns, between runs that changed nothing on their path. Linux
+  still leads on c3, Milan, Rome (by 4%) and m7i, as in round 18.
+- The `ssbdtest` self-test passed on all five machines. A thread
+  disables speculative store bypass by prctl; its forked child keeps it;
+  the two then run side by side with different settings, so CPUs switch
+  SSBD between them.
+
 ## Container start from the caller's side
 
 Linux's container starts above are timed by the caller: a shell starts

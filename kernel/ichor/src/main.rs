@@ -251,7 +251,7 @@ fn kmain(info: BootInfo) -> ! {
                 println!("ichor: FAILED: the kernel runs without IBRS");
                 shutdown(ExitStatus::Failure)
             }
-            None => "not enumerated",
+            None => "not used",
         }
     );
 
