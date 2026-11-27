@@ -7,8 +7,8 @@
 //! timer belongs to its process, is not inherited by `fork`, and is dropped
 //! when the process goes away (POSIX ones at `execve` too).
 //!
-//! Partial: CPU time is user time only, so `ITIMER_PROF` counts as
-//! `ITIMER_VIRTUAL` does.
+//! Partial: CPU time is user and system time together (the task's time on
+//! a CPU, ADR-0021), so `ITIMER_VIRTUAL` counts as `ITIMER_PROF` does.
 
 use alloc::collections::BTreeMap;
 use alloc::sync::Weak;
@@ -112,9 +112,9 @@ fn time_on(p: &LinuxProcess, clock: Clock) -> Duration {
     match clock {
         Clock::Mono | Clock::Real => now(),
         Clock::Process => Duration::from_nanos(p.group.cpu_ns()),
-        Clock::Thread(tid) => Duration::from_nanos(
-            proc::find(p.entry.cell, tid).map_or(0, |e| e.cpu_ns.load(Ordering::Relaxed)),
-        ),
+        Clock::Thread(tid) => {
+            Duration::from_nanos(proc::find(p.entry.cell, tid).map_or(0, |e| e.cpu_ns()))
+        }
     }
 }
 
@@ -341,7 +341,7 @@ pub(crate) fn check_cpu(p: &LinuxProcess) {
                 Clock::Thread(tid) => threads
                     .iter()
                     .find(|e| e.pid == tid)
-                    .map_or(0, |e| e.cpu_ns.load(Ordering::Relaxed)),
+                    .map_or(0, |e| e.cpu_ns()),
                 _ => continue,
             };
             if let Some(n) = x.expire(Duration::from_nanos(t)) {

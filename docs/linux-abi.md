@@ -100,9 +100,9 @@ stale. Do not edit by hand.
 | 95 | `umask` | implemented |  |
 | 96 | `gettimeofday` | implemented | firmware clock at boot plus monotonic time (no NTP) |
 | 97 | `getrlimit` | implemented |  |
-| 98 | `getrusage` | partial | user CPU time only (system time and children are zero); maxrss is the current rss |
+| 98 | `getrusage` | partial | user and system CPU time together as user time (system time and children are zero); maxrss is the current rss |
 | 99 | `sysinfo` | partial | the cell's memory; no load averages or swap |
-| 100 | `times` | partial | user CPU time only (system and children's times are zero) |
+| 100 | `times` | partial | user and system CPU time together as user time (system and children's times are zero) |
 | 102 | `getuid` | implemented |  |
 | 104 | `getgid` | implemented |  |
 | 105 | `setuid` | partial | per-process credentials (libc's semantics) |

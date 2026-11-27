@@ -41,5 +41,7 @@
 # write protection): 7,450 / 310.
 # Step 17 (ADR-0020: 2 MiB pages for anonymous memory, split on partial
 # changes): 7,650 / 310.
-max_code_lines = 7650
+# Step 18 (ADR-0021: each task's time on a CPU, kept at context switches):
+# 7,700 / 310.
+max_code_lines = 7700
 max_unsafe_sites = 310

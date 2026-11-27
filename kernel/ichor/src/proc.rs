@@ -219,14 +219,28 @@ pub(crate) struct ProcEntry {
     signals: WaitQueue,
     /// The process, for a first entry (`/proc/<pid>`).
     process: SpinLock<Weak<Group>>,
-    /// CPU time this thread has spent in user code, in nanoseconds (the
-    /// time inside `UserMode::execute`; kernel time is not counted yet).
-    pub(crate) cpu_ns: AtomicU64,
+    /// Its task's CPU time when the task began running the thread (ns).
+    cpu_base: AtomicU64,
+    /// The thread's CPU time once it no longer runs (ns).
+    cpu_done: AtomicU64,
     /// What the entry costs the cell, until it is reaped.
     _kept: Reserved,
 }
 
 impl ProcEntry {
+    /// The thread's CPU time in nanoseconds, user and system time together:
+    /// its task's time on a CPU since it began running the thread
+    /// (ADR-0021).
+    pub(crate) fn cpu_ns(&self) -> u64 {
+        match &*self.task.lock() {
+            Some(t) => {
+                let ns = u64::try_from(t.cpu_time().as_nanos()).unwrap_or(u64::MAX);
+                ns.saturating_sub(self.cpu_base.load(Ordering::Relaxed))
+            }
+            None => self.cpu_done.load(Ordering::Relaxed),
+        }
+    }
+
     pub(crate) fn ppid(&self) -> u64 {
         self.ppid.load(Ordering::Acquire)
     }
@@ -472,7 +486,8 @@ pub(crate) fn register(
         task: SpinLock::new(None),
         signals: WaitQueue::new(),
         process: SpinLock::new(Weak::new()),
-        cpu_ns: AtomicU64::new(0),
+        cpu_base: AtomicU64::new(0),
+        cpu_done: AtomicU64::new(0),
         _kept: kept,
     });
     TABLE.lock().insert(pid, e.clone());
@@ -886,6 +901,10 @@ pub(crate) fn take_over_leader(e: &Arc<ProcEntry>, leader: &Arc<ProcEntry>) -> A
     while let Some((sig, info)) = e.pending.take(u64::MAX) {
         leader.pending.add(sig, info);
     }
+    // The task comes with its CPU time (ADR-0021).
+    leader
+        .cpu_base
+        .store(e.cpu_base.load(Ordering::Relaxed), Ordering::Relaxed);
     *leader.task.lock() = e.task.lock().take();
     t.remove(&e.pid);
     leader.clone()
@@ -1045,19 +1064,19 @@ pub(crate) fn run(mut p: LinuxProcess, mut ctx: UserContext) -> (u32, u32) {
     // Separates this cell's user code from other cells' on each CPU
     // (ADR-0004 §2).
     frame::task::set_current_domain(p.cell.id());
-    *p.entry.task.lock() = Some(frame::task::current());
+    let me = frame::task::current();
+    // CPU time counts from here (ADR-0021): the system call path reads no
+    // clock.
+    let base = u64::try_from(me.cpu_time().as_nanos()).unwrap_or(u64::MAX);
+    p.entry.cpu_base.store(base, Ordering::Relaxed);
+    *p.entry.task.lock() = Some(me);
     signal::sync(&p);
     let mut syscalls = 0u32;
     let status = loop {
         let mut restart = None;
-        let entered = frame::time::now();
         // Not into user code with a signal to act on: one posted from here
         // on interrupts it (`wake`).
         let event = UserMode::new(&mut ctx).execute_unless(|| interrupted(&p.entry));
-        let ran = frame::time::now().saturating_sub(entered);
-        p.entry
-            .cpu_ns
-            .fetch_add(ran.as_nanos() as u64, Ordering::Relaxed);
         crate::itimer::check_cpu(&p);
         match event {
             UserEvent::Syscall => {
@@ -1135,6 +1154,8 @@ pub(crate) fn run(mut p: LinuxProcess, mut ctx: UserContext) -> (u32, u32) {
     frame::mm::activate_kernel_space();
     let entry = p.entry.clone();
     let group = p.group.clone();
+    let cpu = entry.cpu_ns();
+    entry.cpu_done.store(cpu, Ordering::Relaxed);
     *entry.task.lock() = None;
     let last = group.thread_exited(&entry, status);
     if last.is_none() {

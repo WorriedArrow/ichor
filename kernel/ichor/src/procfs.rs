@@ -503,8 +503,9 @@ fn cpu_list() -> String {
     }
 }
 
-/// `/proc/<pid>/stat`. User CPU time, start time, size and resident pages
-/// are real; what is not counted is zero.
+/// `/proc/<pid>/stat`. CPU time (user and system together, as user time),
+/// start time, size and resident pages are real; what is not counted is
+/// zero.
 fn stat_process(g: &Group, t: &ProcEntry) -> Vec<u8> {
     let (pgid, sid) = g.leader.group();
     let (vsize, rss) = {

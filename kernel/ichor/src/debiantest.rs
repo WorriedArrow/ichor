@@ -745,7 +745,22 @@ $n = 0;
 select(undef, undef, undef, 0.6);
 $n == 0 or fail("disarmed timer fired");
 syscall(38, 3, $it, $zero) == -1 && $!{EINVAL} or fail("a fourth interval timer accepted");
-print "debian: alarm and setitimer deliver SIGALRM, getitimer reads back\n";
+# CPU time (CLOCK_THREAD_CPUTIME_ID) counts computing, not sleeping.
+sub cputime {
+    my $t = "\0" x 16;
+    syscall(228, 3, $t) == 0 or fail("clock_gettime: $!");
+    my ($s, $ns) = unpack("q2", $t);
+    $s * 1_000_000_000 + $ns
+}
+my $c0 = cputime();
+select(undef, undef, undef, 0.2);
+my $c1 = cputime();
+$c1 - $c0 < 50_000_000 or fail("200 ms asleep took " . ($c1 - $c0) . " ns of CPU time");
+my $x = 0;
+$x += $_ for 1 .. 200_000;
+my $c2 = cputime();
+$c2 > $c1 or fail("computing took no CPU time");
+print "debian: alarm and setitimer deliver SIGALRM, getitimer reads back, CPU time skips sleep\n";
 "#;
 
 /// The server cell of the cross-cell run: `ME PEER PORT`. Accepts one

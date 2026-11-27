@@ -73,9 +73,71 @@ pub struct Task {
     /// Security domain (the kernel's cell id; 0: none), for cross-domain
     /// predictor barriers (ADR-0004 §2).
     domain: AtomicU64,
+    /// Its time on a CPU (ADR-0021).
+    ran: RunTime,
+}
+
+/// A task's time on a CPU, kept at context switches (ADR-0021). Only the
+/// CPU switching the task out or in writes it, and those never overlap;
+/// the sequence counter keeps readers from seeing a switch halfway.
+struct RunTime {
+    /// Odd while a CPU updates the other two.
+    seq: AtomicU32,
+    /// Nanoseconds on a CPU before its current run.
+    total: AtomicU64,
+    /// When its current run began (ns since boot); 0 while not running.
+    since: AtomicU64,
+}
+
+impl RunTime {
+    fn new(since: u64) -> Self {
+        RunTime {
+            seq: AtomicU32::new(0),
+            total: AtomicU64::new(0),
+            since: AtomicU64::new(since),
+        }
+    }
+
+    /// The task is switched in (`start`) or out at `now`.
+    fn switch(&self, now: u64, start: bool) {
+        self.seq.fetch_add(1, Ordering::AcqRel);
+        let since = self.since.load(Ordering::Relaxed);
+        if since != 0 {
+            let total = self.total.load(Ordering::Relaxed);
+            self.total
+                .store(total + now.saturating_sub(since), Ordering::Relaxed);
+        }
+        let since = if start { now.max(1) } else { 0 };
+        self.since.store(since, Ordering::Relaxed);
+        self.seq.fetch_add(1, Ordering::Release);
+    }
 }
 
 impl Task {
+    /// How long the task has run on a CPU, its current run included. Never
+    /// goes backward.
+    pub fn cpu_time(&self) -> Duration {
+        let r = &self.ran;
+        loop {
+            // The time first: a run that ends after it counts only up to it,
+            // so a later read never says less.
+            let now = arch::apic::now_ns();
+            let s = r.seq.load(Ordering::Acquire);
+            let total = r.total.load(Ordering::Relaxed);
+            let since = r.since.load(Ordering::Relaxed);
+            core::sync::atomic::fence(Ordering::Acquire);
+            if s & 1 == 0 && r.seq.load(Ordering::Relaxed) == s {
+                let running = if since == 0 {
+                    0
+                } else {
+                    now.saturating_sub(since)
+                };
+                return Duration::from_nanos(total + running);
+            }
+            core::hint::spin_loop();
+        }
+    }
+
     /// Unique, never reused task ID.
     pub fn id(&self) -> u64 {
         self.id
@@ -315,6 +377,7 @@ impl TaskOptions {
             data: self.data,
             vm_root: AtomicU64::new(0),
             domain: AtomicU64::new(0),
+            ran: RunTime::new(0),
         }))
     }
 
@@ -355,6 +418,7 @@ fn adopt(is_idle: bool) -> Arc<Task> {
         data: Box::new(()),
         vm_root: AtomicU64::new(0),
         domain: AtomicU64::new(0),
+        ran: RunTime::new(arch::apic::now_ns().max(1)),
     })
 }
 
@@ -582,6 +646,9 @@ fn schedule_inner(why: Enqueue, from_idle: bool) {
     let next_domain = next.domain.load(Ordering::Relaxed);
     let next_is_idle = next.is_idle;
     let requeue = (runnable && !cur.is_idle).then_some(why);
+    let now = arch::apic::now_ns();
+    cur.ran.switch(now, false);
+    next.ran.switch(now, true);
     {
         let g = IrqGuard::new();
         let s = SCHED.get(&g);

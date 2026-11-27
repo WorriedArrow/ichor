@@ -117,9 +117,9 @@ mod nr {
     pub(super) const FCHOWN: u64 = 93;
     pub(super) const LCHOWN: u64 = 94;
     pub(super) const UMASK: u64 = 95;
-    pub(super) const GETRUSAGE: u64 = 98; // partial: user CPU time only (system time and children are zero); maxrss is the current rss
+    pub(super) const GETRUSAGE: u64 = 98; // partial: user and system CPU time together as user time (system time and children are zero); maxrss is the current rss
     pub(super) const SYSINFO: u64 = 99; // partial: the cell's memory; no load averages or swap
-    pub(super) const TIMES: u64 = 100; // partial: user CPU time only (system and children's times are zero)
+    pub(super) const TIMES: u64 = 100; // partial: user and system CPU time together as user time (system and children's times are zero)
     pub(super) const GETTIMEOFDAY: u64 = 96; // firmware clock at boot plus monotonic time (no NTP)
     pub(super) const GETRLIMIT: u64 = 97;
     pub(super) const SETRLIMIT: u64 = 160; // partial: NOFILE and STACK enforced, others stored
@@ -1401,9 +1401,7 @@ fn clock_gettime(p: &mut LinuxProcess, clock: u64, tp: u64) -> Result<u64, i64> 
         REALTIME | REALTIME_COARSE => crate::vfs::wall_clock(),
         MONOTONIC | MONOTONIC_RAW | MONOTONIC_COARSE | BOOTTIME => frame::time::now(),
         PROCESS_CPUTIME => core::time::Duration::from_nanos(p.group.cpu_ns()),
-        THREAD_CPUTIME => core::time::Duration::from_nanos(
-            p.entry.cpu_ns.load(core::sync::atomic::Ordering::Relaxed),
-        ),
+        THREAD_CPUTIME => core::time::Duration::from_nanos(p.entry.cpu_ns()),
         // A CPU-time clock id for a pid or tid (clock_getcpuclockid,
         // pthread_getcpuclockid): `~id << 3 | type`, bit 2 for a thread.
         // The caller's own process and threads are answered.
@@ -1419,8 +1417,7 @@ fn clock_gettime(p: &mut LinuxProcess, clock: u64, tp: u64) -> Result<u64, i64> 
                     .iter()
                     .find(|e| e.pid == id || (id == 0 && e.pid == p.entry.pid))
                     .ok_or(EINVAL)?
-                    .cpu_ns
-                    .load(core::sync::atomic::Ordering::Relaxed)
+                    .cpu_ns()
             } else if id == 0 || id == p.group.tgid {
                 p.group.cpu_ns()
             } else {
@@ -1668,8 +1665,9 @@ fn sysinfo(p: &mut LinuxProcess, buf: u64) -> Result<u64, i64> {
     Ok(0)
 }
 
-/// `getrusage(who, usage)`: no CPU-time accounting yet, so times are zero;
-/// `ru_maxrss` is the current resident size (an under-estimate of the peak).
+/// `getrusage(who, usage)`: the CPU time, user and system together, as
+/// `ru_utime` (ADR-0021; `ru_stime` is zero); `ru_maxrss` is the current
+/// resident size (an under-estimate of the peak).
 fn getrusage(p: &mut LinuxProcess, who: i64, buf: u64) -> Result<u64, i64> {
     const RUSAGE_SELF: i64 = 0;
     const RUSAGE_CHILDREN: i64 = -1;
@@ -1677,12 +1675,12 @@ fn getrusage(p: &mut LinuxProcess, who: i64, buf: u64) -> Result<u64, i64> {
     let mut b = [0u8; 144];
     match who {
         RUSAGE_SELF | RUSAGE_THREAD => {
-            // ru_utime: user CPU time (a timeval); system time is not
-            // accounted yet.
+            // ru_utime (a timeval): all of the CPU time; there is no
+            // split to give.
             let ns = if who == RUSAGE_SELF {
                 p.group.cpu_ns()
             } else {
-                p.entry.cpu_ns.load(core::sync::atomic::Ordering::Relaxed)
+                p.entry.cpu_ns()
             };
             b[0..8].copy_from_slice(&(ns / 1_000_000_000).to_le_bytes());
             b[8..16].copy_from_slice(&((ns % 1_000_000_000) / 1000).to_le_bytes());
@@ -1698,8 +1696,9 @@ fn getrusage(p: &mut LinuxProcess, who: i64, buf: u64) -> Result<u64, i64> {
     Ok(0)
 }
 
-/// `times(buf)`: the process's user CPU time in clock ticks (`USER_HZ`,
-/// 100/s); system and children's times are not accounted yet (zero).
+/// `times(buf)`: the process's CPU time, user and system together
+/// (ADR-0021), as user time in clock ticks (`USER_HZ`, 100/s); system and
+/// children's times are zero.
 /// Returns clock ticks since boot.
 fn times(p: &mut LinuxProcess, buf: u64) -> Result<u64, i64> {
     let mut t = [0u8; 32];

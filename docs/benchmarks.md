@@ -287,6 +287,12 @@ as in that section's 160):
 | fork + exec + wait | 114 us | 75-82 us |
 | container start (in the kernel) | 330-410 us | 187 us |
 
+Then CPU time from the scheduler (ADR-0021): the clock read once per
+context switch instead of twice per return from ring 3. Null syscall
+160-166 → 137-148 ns in the same setup (the TSC clock; under kvmclock each
+read costs more), pipe round trip unchanged (2.72-2.86 us against
+2.83-2.89).
+
 ## Google Cloud, third round (2026-11-26): 2 MiB pages, THP checked
 
 After `c6e5b77` (ADR-0020) and ADR-0008's 2026-11-25 amendment (`sysretq`,
