@@ -716,6 +716,131 @@ Reading it:
   pipes and fork, and by 1.7x on fork + exec.
 - Container start from a native caller: 79 us.
 
+## Round 22 (2026-11-28): boot time, directly on a VM and under Firecracker
+
+How long each kernel takes from power-on until it can run a container.
+
+- **Ichor:** a production boot (`no_selftests control=50051`, ADR-0024). It
+  is ready when the control plane serves its API.
+- **Linux:** Debian 13 on trixie-backports' `7.3.4+deb13-cloud-amd64`, with
+  Debian's containerd. It is ready when containerd answers `ctr version`,
+  and the table also gives when containerd itself was up. A unit after
+  `containerd.service` reads the TSC and `CLOCK_MONOTONIC` once `ctr`
+  answers.
+
+One Debian image served every Linux boot, built once on GCE from
+`debian-13`: the kernel, containerd, and the two measuring units added.
+Both kernels write 123 to port 0x3F0 when ready (Firecracker's boot timer),
+but Firecracker 1.18 logged it for neither, so its own figure is missing.
+
+The common clock is the TSC. A vCPU's TSC starts at 0 when the VMM makes
+the vCPU, so the TSC at ready is the time since the VM started, firmware
+included. Ichor logs its TSC at entry and its time from entry to ready.
+Linux's unit logs the TSC at ready.
+
+### Directly on GCP
+
+n2-standard-2 (Ice Lake, us-central1-a), pd-balanced boot disk,
+virtio-net, no Secure Boot; the same for both. Each machine was booted
+once, then reset five times (`gcloud compute instances reset`). Medians of
+the five resets, ranges in brackets:
+
+| | Ichor | Debian 13 + Linux 7.3 |
+|---|---|---|
+| VM start → firmware hands over | 1,469 ms (1,453-1,603) | (included below) |
+| VM start → the kernel's clock starts | | 9,066 ms (9,009-9,194) |
+| kernel → ready for containers | **153 ms** (151-155) | 4,689 ms to containerd up (4,290-5,081), 4,959 ms to `ctr` answering |
+| **VM start → ready** | **1,623 ms** (1,608-1,756) | 13,879 ms to containerd up (13,299-14,201), 14,154 ms to `ctr` (13,580-14,535) |
+| first boot of a new VM | 2,268 ms | 15,046 ms |
+
+- Both machines run GCP's UEFI firmware, about 1.5 s by Ichor's TSC at
+  entry. On the Debian side, the rest of the 9.1 s before the kernel's
+  clock starts is spent loading:
+  - firmware into shim, then into GRUB (`GRUB_TIMEOUT=0` in the image, so
+    there is no menu wait);
+  - a 14 MB kernel and a 21 MB initrd, read from the persistent disk
+    through the firmware's driver;
+  - decompression.
+- Linux's own figure starts at its clock (`systemd-analyze`: about 1.3 s of
+  kernel, then systemd until containerd).
+- Ichor's 153 ms breaks down as follows:
+  - **0 to 67 ms:** frame. This includes 27 ms for ExitBootServices and the
+    firmware clock, 18 ms to set up 8 GB of page metadata, and 18 ms to
+    scan PCI bus 0 through port I/O.
+  - **About 15 ms:** the second CPU and the scheduler.
+  - **About 60 ms:** DHCP and ARP to GCP's gateway, plus the 50 ms the ping
+    gets. GCP's gateway never answers ping, so those 50 ms are idle.
+  - **About 9 ms:** the control plane, loading the CA roots and starting
+    to listen.
+- Ichor's first set of boots here waited the full 2 s for that ping,
+  2,100 ms from entry to ready. That set was left out, and `88cb18c`
+  limited the wait to 50 ms past ARP. The table is the set after the
+  change.
+
+### Under Firecracker on a nested-virtualization VM
+
+The host:
+
+- an n2-standard-4 (Ice Lake) with `--enable-nested-virtualization`, booted
+  from the same Debian image;
+- Firecracker v1.18.0 (release binary, checked by SHA-256), `--enable-pci`;
+- a tap with dnsmasq for DHCP.
+
+Each guest got 2 vCPUs, 2,048 MiB and one virtio-net. The guests:
+
+- **Ichor:** `cargo xtask pvh-image` (ADR-0025): the kernel as a PVH ELF,
+  the CA roots and suffix rules as its initrd, command line
+  `no_selftests control=50051 boot_timer`.
+- **Debian:**
+  - the image's own kernel and initrd, the bzImage booted directly;
+  - its disk was a second persistent disk made from the same image, as
+    virtio-blk;
+  - its command line was the image's own on GCE (`console=ttyS0,115200
+    earlyprintk=...`), plus `reboot=k panic=1`;
+  - a second set adds `quiet`, Linux's lightest console setting.
+
+Ichor was stopped by killing the VMM. Debian was stopped by Ctrl-Alt-Del,
+a clean shutdown, so each boot found a clean file system.
+
+| | Ichor | Debian 13 + Linux 7.3 | Debian, `quiet` |
+|---|---|---|---|
+| **vCPU made → ready** (the guest's TSC) | **36.7 ms** (33.9-42.9) | 5,808 ms to containerd up, 5,884 ms to `ctr` (5,810-6,061) | 4,455 ms to `ctr` (2,912-4,760) |
+| kernel → ready | 33.0 ms (30.4-39.3) | 5,462 ms (`CLOCK_MONOTONIC`) | 4,222 ms |
+| VMM launched → ready line on the host's serial | 108 ms (94-124) | 5,906 ms (5,838-6,086) | 4,499 ms (2,950-4,811) |
+| boots | 10 | 6 (`ctr`), 4 (containerd up) | 6 |
+
+- **From the vCPU to ready, Ichor takes 37 ms and Linux 5.9 s, 160 times
+  as long.** With `quiet`, Linux takes 4.5 s, 120 times as long. Ichor's
+  33 ms from entry:
+  - **About 10.5 ms:** frame. The page metadata for 2 GiB takes about
+    4.3 ms, and PCI about 5 ms (each probe is a nested exit).
+  - **The other 22 ms:** the second CPU, the scheduler, the network (DHCP
+    from dnsmasq, then ARP; the host answers the ping at once), and the
+    control plane.
+- **Firecracker had the vCPUs running 12 ms after launch**, by its own log.
+  So Ichor's ready line reached the host about 60 ms after the TSC says it
+  was ready, and Debian's about 10 ms after. Ichor's console task writes
+  the 3 KB boot log behind the boot (ADR-0024), one nested VM exit a byte,
+  and the ready line is its last. The TSC column is the like-for-like one.
+- Debian rounds 7-10 are left out. After round 6, the `quiet` guest's
+  shutdown did not finish within 60 s, and the script killed the VMM.
+  Every later Debian boot found its root read-only, and containerd could
+  not start. The rounds before that are unaffected (first round left out
+  too).
+
+### Locally, OpenVMM (ADR-0024's starting point)
+
+Before this round's changes, a production boot under OpenVMM (2 vCPUs)
+was ready 326 ms after frame's entry:
+
+- 144 ms scanning all 256 PCI buses;
+- about 60 ms of console writes, one VM exit a byte;
+- 10.4 ms of MP Specification delays per further CPU;
+- 20 ms of the timer test.
+
+Without them it is ready in 56-90 ms. Most of the remainder is VMBus's
+network bring-up, which waits on the host's channel offers.
+
 ## Container start from the caller's side
 
 Linux's container starts above are timed by the caller: a shell starts

@@ -66,7 +66,19 @@ boot [done: VERW, IBPB, and page-table isolation (ADR-0004's second
   with the PVH note, and frame's 32-bit stub (`arch::pvh`) reaches
   `boot::pvh::pvh_main`, which fills the same boot state as `efi_main`
   (files from the initrd, `bootfiles.img`). No wall clock under PVH yet
-  (kvmclock's is owed). Test: `a_pvh_loader_boots_the_kernel`.
+  (kvmclock's is owed). Test: `a_pvh_loader_boots_the_kernel`. Round 22
+  (`docs/benchmarks.md`), against Debian 13 + Linux 7.3 with containerd,
+  ready = the control plane serving / containerd answering:
+  - **GCP n2-standard-2, booted directly:** VM start to ready 1.62 s
+    against 14.2 s, of which the kernel's part is 153 ms against 4.7-5.0 s.
+    The firmware is 1.47 s for both, and Debian spends 9.1 s before its
+    kernel's clock starts.
+  - **Firecracker 1.18 on a nested n2:** vCPU to ready 37 ms against
+    5.9 s (4.5 s with `quiet`).
+
+  Firecracker starts PVH guests with `%esp` 0, so the stub loads a stack
+  pointer xtask writes into its first instruction. GCP's gateway never
+  answers ping, so the uplink gives it 50 ms past ARP, not 2 s.
 
 - Cell access-control suite (merged 2026-11-23, WorriedArrow/ichor#4;
   `docs/reports/cell-access-tests.md`): `cell_access` runs
