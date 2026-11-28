@@ -120,10 +120,10 @@ enum Kind {
         /// Already put in the parent's backlog.
         queued: bool,
     },
-    /// A UDP socket: received datagrams with their sources, and the
-    /// peer `connect` fixed, if any.
+    /// A UDP socket: received datagrams with their sources and the
+    /// addresses they were sent to, and the peer `connect` fixed, if any.
     Udp {
-        rx: VecDeque<(Addr, Vec<u8>)>,
+        rx: VecDeque<(Addr, Addr, Vec<u8>)>,
         bytes: usize,
         peer: Option<Addr>,
     },
@@ -688,7 +688,7 @@ impl Inner {
             && !starved
         {
             *bytes += d.payload.len();
-            rx.push_back((from, d.payload.to_vec()));
+            rx.push_back((from, (dst, d.dst_port), d.payload.to_vec()));
             self.touched.insert(id);
         }
     }
@@ -1356,7 +1356,16 @@ impl Stack {
     pub(crate) fn readable(&self, id: u64) -> usize {
         match self.inner.lock().socks.get(&id).map(|s| &s.kind) {
             Some(Kind::Conn { tcp, .. }) => tcp.readable(),
-            Some(Kind::Udp { rx, .. }) => rx.front().map_or(0, |(_, d)| d.len()),
+            Some(Kind::Udp { rx, .. }) => rx.front().map_or(0, |(_, _, d)| d.len()),
+            _ => 0,
+        }
+    }
+
+    /// `SIOCOUTQ`: a connection's bytes written and not yet acknowledged.
+    /// Datagrams leave at once, so a UDP socket has none.
+    pub(crate) fn unsent(&self, id: u64) -> usize {
+        match self.inner.lock().socks.get(&id).map(|s| &s.kind) {
+            Some(Kind::Conn { tcp, .. }) => tcp.unacked(),
             _ => 0,
         }
     }
@@ -1426,6 +1435,16 @@ impl Stack {
     /// Takes the next received datagram and its source (a copy, if `peek`):
     /// `Ok(None)` when none is queued.
     pub(crate) fn recv_from(&self, id: u64, peek: bool) -> Result<Option<(Addr, Vec<u8>)>, i64> {
+        Ok(self.recv_from_to(id, peek)?.map(|(from, _, d)| (from, d)))
+    }
+
+    /// [`Stack::recv_from`], with the address the datagram was sent to
+    /// (`IP_ORIGDSTADDR`).
+    pub(crate) fn recv_from_to(
+        &self,
+        id: u64,
+        peek: bool,
+    ) -> Result<Option<(Addr, Addr, Vec<u8>)>, i64> {
         let mut i = self.inner.lock();
         let s = i.sock(id)?;
         if let Some(e) = s.error.take() {
@@ -1439,15 +1458,18 @@ impl Stack {
             return Ok(Some(d.clone()));
         }
         match rx.pop_front() {
-            Some((from, d)) => {
+            Some((from, to, d)) => {
                 *bytes -= d.len();
                 // What the queue held goes back to the cell.
                 i.touched.insert(id);
                 let _ = i.take_touched();
-                Ok(Some((from, d)))
+                Ok(Some((from, to, d)))
             }
             // After shutdown(SHUT_RD) reads return 0 at once.
-            None if shut => Ok(Some(((Ipv4Addr::UNSPECIFIED, 0), Vec::new()))),
+            None if shut => {
+                let none = (Ipv4Addr::UNSPECIFIED, 0);
+                Ok(Some((none, none, Vec::new())))
+            }
             None => Ok(None),
         }
     }

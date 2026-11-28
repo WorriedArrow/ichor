@@ -66,6 +66,7 @@ pub(super) const SUPPORTED: &[u8] = &[
     abi::OP_LINKAT,
     abi::OP_MSG_RING,
     abi::OP_SOCKET,
+    abi::OP_URING_CMD,
 ];
 
 /// Every SQE flag there is.
@@ -129,6 +130,7 @@ pub(super) fn on_file(op: u8) -> bool {
             | abi::OP_TEE
             | abi::OP_SHUTDOWN
             | abi::OP_MSG_RING
+            | abi::OP_URING_CMD
     )
 }
 
@@ -407,6 +409,12 @@ pub(super) fn check(s: &Sqe, l: &Layout) -> Result<(), i64> {
             )
         }
         abi::OP_SOCKET => zero(&[s.addr, flags, buf]),
+        // Linux's `io_uring_cmd_prep`: `__pad1` (the high half of `off`)
+        // zero, and no flag but FIXED.
+        abi::OP_URING_CMD => {
+            zero(&[s.off >> 32])?;
+            only(s.op_flags, abi::URING_CMD_FIXED)
+        }
         abi::OP_TEE => zero(&[s.addr, s.off]),
         _ => Ok(()),
     }
@@ -1017,6 +1025,22 @@ fn other(ring: &Ring, p: &mut LinuxProcess, s: &Sqe) -> Result<u64, i64> {
         abi::OP_FADVISE => call(p, nr::FADVISE64, [LENT, s.off, len, flags, 0, 0]),
         abi::OP_MADVISE => call(p, nr::MADVISE, [s.addr, len, flags, 0, 0, 0]),
         abi::OP_SHUTDOWN => call(p, nr::SHUTDOWN, [LENT, len, 0, 0, 0, 0]),
+        // Linux's `io_uring_cmd_sock`: what the protocol's ioctl answers
+        // (TCP and UDP here); other files and sockets have no commands.
+        abi::OP_URING_CMD => {
+            let Some(Fd::Object(o)) = p.fd(LENT) else {
+                return Err(EOPNOTSUPP);
+            };
+            if o.obj.socket().is_none() {
+                return Err(EOPNOTSUPP);
+            }
+            let n = match s.off as u32 {
+                abi::SOCKET_URING_OP_SIOCINQ => o.obj.readable(),
+                abi::SOCKET_URING_OP_SIOCOUTQ => o.obj.unsent(),
+                _ => None,
+            };
+            n.map(|n| n.min(i32::MAX as usize) as u64).ok_or(EOPNOTSUPP)
+        }
         abi::OP_OPENAT => {
             let fd = call(p, nr::OPENAT, [dir, s.addr, flags, len, 0, 0])?;
             direct(ring, p, s, fd)

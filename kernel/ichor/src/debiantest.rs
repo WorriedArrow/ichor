@@ -234,6 +234,33 @@ unpack("i", getsockopt($u3, SOL_SOCKET, SO_ERROR)) == 0 or fail("an unconnected 
 setsockopt($u3, 0, 11, 1) or fail("IP_RECVERR: $!");
 defined(recv($u3, $m, 100, 0x2000)) and fail("an error in the error queue");
 $!{EAGAIN} or fail("the error queue: $!");
+# IP_RECVORIGDSTADDR: recvmsg tells where each datagram was sent, as an
+# IP_ORIGDSTADDR control message.
+my $od = udp();
+bind($od, pack_sockaddr_in(0, INADDR_ANY)) or fail("udp bind to any: $!");
+my ($odp) = unpack_sockaddr_in(getsockname($od));
+setsockopt($od, 0, 20, 1) or fail("IP_RECVORIGDSTADDR: $!");
+send($u3, "where", 0, pack_sockaddr_in($odp, $lo)) == 5 or fail("udp send 5: $!");
+my ($obuf, $octl, $oname) = ("\0" x 16, "\0" x 64, "\0" x 16);
+my $oiov = pack("P16 Q", $obuf, 16);
+my $omsg = pack("P16 L x4 P16 Q P64 Q i x4", $oname, 16, $oiov, 1, $octl, 64, 0);
+syscall(47, fileno($od), $omsg, 0) == 5 or fail("recvmsg: $!");
+my ($clen) = unpack("x40 Q", $omsg);
+my ($cl, $lvl, $ty, $fam, $dport, $daddr) = unpack("Q i i S n a4", $octl);
+$clen == 32 && $cl == 32 && $lvl == 0 && $ty == 20 && $fam == AF_INET && $dport == $odp
+    && $daddr eq $lo or fail("IP_ORIGDSTADDR: $clen $cl $lvl $ty $fam $dport " . inet_ntoa($daddr));
+# SIOCINQ and SIOCOUTQ: what was written is in one queue or the other.
+my $ls = tcp();
+bind($ls, pack_sockaddr_in(0, $lo)) && listen($ls, 1) or fail("tcp listen: $!");
+my $tc = tcp();
+connect($tc, getsockname($ls)) or fail("tcp connect: $!");
+accept(my $ta, $ls) or fail("accept: $!");
+syswrite($tc, "hello") == 5 or fail("tcp write: $!");
+select(undef, undef, undef, 0.05);
+my ($inq, $outq) = ("\0" x 4, "\0" x 4);
+ioctl($ta, 0x541b, $inq) && ioctl($tc, 0x5411, $outq) or fail("SIOCINQ/SIOCOUTQ: $!");
+unpack("i", $inq) + unpack("i", $outq) == 5
+    or fail("SIOCINQ " . unpack("i", $inq) . " + SIOCOUTQ " . unpack("i", $outq));
 # glibc's resolver, asking a name server here: one that knows one address.
 open(my $rc, ">", "/etc/resolv.conf") or fail("resolv.conf: $!");
 print $rc "nameserver 127.0.0.1\n";

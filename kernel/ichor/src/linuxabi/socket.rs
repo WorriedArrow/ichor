@@ -75,6 +75,10 @@ const IP_MTU_DISCOVER: u64 = 10;
 /// gives up if it may not set this.)
 const IP_RECVERR: u64 = 11;
 const IP_FREEBIND: u64 = 15;
+/// The address each datagram was sent to, as an `IP_ORIGDSTADDR` control
+/// message (the same number).
+const IP_RECVORIGDSTADDR: u64 = 20;
+const IP_ORIGDSTADDR: u64 = IP_RECVORIGDSTADDR;
 const IP_BIND_ADDRESS_NO_PORT: u64 = 24;
 const IP_MULTICAST_IF: u64 = 32;
 const IP_MULTICAST_TTL: u64 = 33;
@@ -98,6 +102,7 @@ const TCP_USER_TIMEOUT: u64 = 18;
 const TCP_FASTOPEN: u64 = 23;
 
 const MSG_PEEK: u64 = 0x2;
+const MSG_CTRUNC: u64 = 0x8;
 const MSG_DONTWAIT: u64 = 0x40;
 const MSG_WAITALL: u64 = 0x100;
 const MSG_ERRQUEUE: u64 = 0x2000;
@@ -148,16 +153,25 @@ impl Socket {
         }
     }
 
-    /// Receives one datagram (blocking as asked): its source and bytes.
+    /// Receives one datagram (blocking as asked): its source, the address
+    /// it was sent to, and its bytes.
     fn recv_datagram(
         &self,
         nonblock: bool,
         peek: bool,
         interrupted: &dyn Fn() -> bool,
-    ) -> Result<(Addr, Vec<u8>), i64> {
+    ) -> Result<(Addr, Addr, Vec<u8>), i64> {
         block_recv(self, nonblock, interrupted, || {
-            self.stack.recv_from(self.id, peek).transpose()
+            self.stack.recv_from_to(self.id, peek).transpose()
         })
+    }
+
+    /// Whether an int option was set to something other than 0.
+    fn flag(&self, level: u64, name: u64) -> bool {
+        self.opts
+            .lock()
+            .iter()
+            .any(|(k, v)| *k == (level, name) && v.iter().any(|&b| b != 0))
     }
 
     /// Receives some of a stream (blocking as asked): up to `max` bytes,
@@ -293,7 +307,7 @@ impl Object for Socket {
         interrupted: &dyn Fn() -> bool,
     ) -> Result<Vec<u8>, i64> {
         if self.dgram {
-            let (_, mut d) = self.recv_datagram(nonblock, false, interrupted)?;
+            let (_, _, mut d) = self.recv_datagram(nonblock, false, interrupted)?;
             d.truncate(max);
             return Ok(d);
         }
@@ -352,6 +366,10 @@ impl Object for Socket {
 
     fn readable(&self) -> Option<usize> {
         Some(self.stack.readable(self.id))
+    }
+
+    fn unsent(&self) -> Option<usize> {
+        Some(self.stack.unsent(self.id))
     }
 }
 
@@ -648,6 +666,7 @@ fn known_option(s: &Socket, level: u64, name: u64) -> bool {
                 | IP_MTU_DISCOVER
                 | IP_RECVERR
                 | IP_FREEBIND
+                | IP_RECVORIGDSTADDR
                 | IP_BIND_ADDRESS_NO_PORT
                 | IP_MULTICAST_IF
                 | IP_MULTICAST_TTL
@@ -918,6 +937,9 @@ struct Received {
     from: Option<Vec<u8>>,
     /// A datagram's full length (more than `data` when truncated).
     full: usize,
+    /// Where a UDP datagram was sent, if its socket asked to be told
+    /// (`IP_RECVORIGDSTADDR`).
+    to: Option<Addr>,
 }
 
 fn recv_bytes(p: &mut LinuxProcess, fd: u64, max: usize, flags: u64) -> Result<Received, i64> {
@@ -933,6 +955,7 @@ fn recv_bytes(p: &mut LinuxProcess, fd: u64, max: usize, flags: u64) -> Result<R
             data,
             from: Some(netlink::sockaddr(0).to_vec()),
             full,
+            to: None,
         });
     }
     let (o, nonblock) = sock_of(p, fd)?;
@@ -943,13 +966,14 @@ fn recv_bytes(p: &mut LinuxProcess, fd: u64, max: usize, flags: u64) -> Result<R
     }
     let nonblock = nonblock || flags & MSG_DONTWAIT != 0;
     if s.dgram {
-        let (from, mut data) = s.recv_datagram(nonblock, peek, &interrupted)?;
+        let (from, to, mut data) = s.recv_datagram(nonblock, peek, &interrupted)?;
         let full = data.len();
         data.truncate(max);
         return Ok(Received {
             data,
             from: Some(sockaddr(from).to_vec()),
             full,
+            to: s.flag(IPPROTO_IP, IP_RECVORIGDSTADDR).then_some(to),
         });
     }
     let mut data = s.recv_stream(max, nonblock, peek, &interrupted)?;
@@ -964,6 +988,7 @@ fn recv_bytes(p: &mut LinuxProcess, fd: u64, max: usize, flags: u64) -> Result<R
         full: data.len(),
         data,
         from: None,
+        to: None,
     })
 }
 
@@ -1055,8 +1080,9 @@ pub(super) fn recvmsg(p: &mut LinuxProcess, fd: u64, msg: u64, flags: u64) -> Re
     let total: usize = h.iov.iter().map(|&(_, l)| l).sum();
     let r = recv_bytes(p, fd, total, flags)?;
     scatter(p, &h.iov, &r.data)?;
-    // A datagram's source goes to msg_name (msg_namelen is in-out); no
-    // control messages; MSG_TRUNC if the datagram was cut.
+    // A datagram's source goes to msg_name (msg_namelen is in-out); the
+    // address it was sent to as a control message if asked for
+    // (IP_RECVORIGDSTADDR); MSG_TRUNC if the datagram was cut.
     match &r.from {
         Some(f) if h.name != 0 => write_sockaddr(p, h.name, msg + 8, f)?,
         _ => {
@@ -1069,7 +1095,21 @@ pub(super) fn recvmsg(p: &mut LinuxProcess, fd: u64, msg: u64, flags: u64) -> Re
     if r.full > r.data.len() {
         mflags |= MSG_TRUNC;
     }
-    if p.copy_to_user(msg + 40, &[0u8; 8]) != 8
+    let mut ctl = Vec::new();
+    if let Some(to) = r.to {
+        // struct cmsghdr { u64 len; int level, type; }, then a
+        // sockaddr_in: Linux's put_cmsg, which drops one with no room.
+        if h.controllen >= 32 {
+            ctl.extend_from_slice(&32u64.to_le_bytes());
+            ctl.extend_from_slice(&(IPPROTO_IP as i32).to_le_bytes());
+            ctl.extend_from_slice(&(IP_ORIGDSTADDR as i32).to_le_bytes());
+            ctl.extend_from_slice(&sockaddr(to));
+        } else {
+            mflags |= MSG_CTRUNC;
+        }
+    }
+    if (!ctl.is_empty() && p.copy_to_user(h.control, &ctl) != ctl.len())
+        || p.copy_to_user(msg + 40, &(ctl.len() as u64).to_le_bytes()) != 8
         || p.copy_to_user(msg + 48, &(mflags as u32).to_le_bytes()) != 4
     {
         return Err(EFAULT);

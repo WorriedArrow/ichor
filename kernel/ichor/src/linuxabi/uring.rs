@@ -597,6 +597,9 @@ pub(crate) struct Ring {
     /// `IORING_REGISTER_IOWQ_MAX_WORKERS`: what the program asked for (no
     /// operation waits in a worker here, so nothing uses that many).
     max_workers: SpinLock<[u32; 2]>,
+    /// `IORING_REGISTER_IOWQ_AFF`: the CPUs its workers may run on, recorded
+    /// as `sched_setaffinity`'s mask is, not applied (partial; None: all).
+    pub(super) worker_cpus: SpinLock<Option<u64>>,
     /// This ring, for the worker (which must not keep it alive).
     me: Weak<Ring>,
 }
@@ -1826,6 +1829,7 @@ pub(super) fn setup(p: &mut LinuxProcess, entries: u64, params: u64) -> Result<u
         issuer: AtomicU64::new(issuer),
         limits: SpinLock::new(None),
         max_workers: SpinLock::new([4 * frame::cpu::online_count() as u32, 1024]),
+        worker_cpus: SpinLock::new(None),
         me: me.clone(),
     });
     let fd = p

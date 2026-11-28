@@ -1014,6 +1014,35 @@ pub(in super::super) fn register(
             ring.enabled.store(true, Ordering::Release);
             Ok(0)
         }
+        abi::REGISTER_IOWQ_AFF => {
+            // Linux's `io_register_iowq_aff`: `n` bytes of a CPU mask,
+            // which must name an online CPU and no CPU beyond the possible.
+            none(arg != 0 && n != 0)?;
+            let take = usize::try_from(n).unwrap_or(usize::MAX).min(128);
+            let mut b = [0u8; 128];
+            if p.copy_from_user(arg, &mut b[..take]) != take {
+                return Err(EFAULT);
+            }
+            let cpus = frame::cpu::online_count().min(64);
+            let online = if cpus == 64 {
+                u64::MAX
+            } else {
+                (1u64 << cpus) - 1
+            };
+            let mut low = [0u8; 8];
+            low.copy_from_slice(&b[..8]);
+            let mask = u64::from_le_bytes(low);
+            if mask & !online != 0 || b[8..take.max(8)].iter().any(|&x| x != 0) || mask == 0 {
+                return Err(EINVAL);
+            }
+            *ring.worker_cpus.lock() = (mask != online).then_some(mask);
+            Ok(0)
+        }
+        abi::UNREGISTER_IOWQ_AFF => {
+            none(arg == 0 && n == 0)?;
+            *ring.worker_cpus.lock() = None;
+            Ok(0)
+        }
         abi::REGISTER_IOWQ_MAX_WORKERS => {
             none(arg != 0 && n == 2)?;
             let b: [u8; 8] = get(p, arg)?;

@@ -672,7 +672,7 @@ fn uring_program() -> Vec<u8> {
     sqe(&mut a, 10, write, fixed, 0, 0, Some((Reg::Rbx, 0)), 7, 11);
     enter(&mut a, 1, 1, 0);
     cqe(&mut a, 23, 10, 11, -14);
-    // 14: the probe: last op SOCKET (45), 46 ops listed.
+    // 14: the probe: last op URING_CMD (46), 47 ops listed.
     a.mov_imm(Reg::Rdi, 5);
     a.mov_imm(Reg::Rsi, u64::from(abi::REGISTER_PROBE));
     a.mov(Reg::Rdx, Reg::Rbp);
@@ -681,7 +681,7 @@ fn uring_program() -> Vec<u8> {
     a.sys(sys::IO_URING_REGISTER);
     expect(&mut a, 14, 0);
     a.load(Reg::Rax, Reg::Rbp, 1024);
-    expect(&mut a, 14, 45 | (46 << 8));
+    expect(&mut a, 14, 46 | (47 << 8));
     a.mov_imm(Reg::R15, 0);
     a.bind(bad);
     a.mov(Reg::Rdi, Reg::R15);

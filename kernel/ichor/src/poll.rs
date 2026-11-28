@@ -150,6 +150,11 @@ pub(crate) trait Object: Send + Sync + Debug {
     fn readable(&self) -> Option<usize> {
         None
     }
+    /// Bytes written and not yet taken by the other end (`SIOCOUTQ`);
+    /// `None` if that is not something to ask of it.
+    fn unsent(&self) -> Option<usize> {
+        None
+    }
     /// This object as an eventfd.
     fn eventfd(&self) -> Option<&EventFd> {
         None

@@ -442,6 +442,12 @@ impl Tcp {
         }
     }
 
+    /// Bytes written and not yet acknowledged, sent or not (Linux's
+    /// `SIOCOUTQ`: `write_seq - snd_una`).
+    pub fn unacked(&self) -> usize {
+        self.send_buf.len()
+    }
+
     /// Bytes the connection holds in memory: received, out of order, and
     /// sent but not yet acknowledged or not yet sent.
     pub fn buffered(&self) -> usize {

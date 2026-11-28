@@ -158,7 +158,8 @@ boot [done: VERW, IBPB, and page-table isolation (ADR-0004's second
   (`nudge` tells the program); SQPOLL rings always say NEED_WAKEUP.
   `runtest::uring_program` and `uring_worker_program` check it on every
   boot; `cargo xtask workloads uring` runs liburing 2.5's tests. Not yet:
-  personalities, URING_CMD, zero-copy sends, NO_MMAP, xattr operations.
+  personalities, URING_CMD beyond sockets' SIOCINQ/SIOCOUTQ, zero-copy
+  sends, NO_MMAP, xattr operations.
   While a thread is in `io_uring_enter` (`State::entering`), it alone
   starts what is ready, as Linux's submitter does: the ring's worker (or
   another thread's task work) used to take a just-submitted SQE now and
@@ -276,7 +277,17 @@ boot [done: VERW, IBPB, and page-table isolation (ADR-0004's second
   `IP_RECVORIGDSTADDR`, URING_CMD on sockets, and Linux's own worker
   threads). It found the `execve` race (`/proc/<pid>/cmdline` read
   the old arguments' address in the new memory) and that a TCP socket whose
-  connect was refused could not connect again.
+  connect was refused could not connect again. Since 2026-11-28:
+  `IP_RECVORIGDSTADDR` (UDP queues keep each datagram's destination,
+  `Stack::recv_from_to`), `IORING_OP_URING_CMD` on TCP and UDP sockets
+  (SIOCINQ, SIOCOUTQ; `ioctl` has SIOCOUTQ too, `Object::unsent`), and
+  `IORING_REGISTER_IOWQ_AFF` (recorded, as `sched_setaffinity`'s mask is).
+  Left: `send-zerocopy` (IPv6) and `read-write`, whose `test_write_efbig`
+  restores a hard RLIMIT_FSIZE it lowered, which needs CAP_SYS_RESOURCE
+  (outside the cell bounding set, as in Docker's default).
+  `socket-io-cmd` and `wq-aff` skip, as they would in a Docker container:
+  raw sockets need CAP_NET_RAW, and there are no `iou-wrk` threads to
+  find.
 - A pull that does not fit in memory fails, and the control plane lives
   on: `rt::memory_available` (`MEM_AVAILABLE`) is asked before large work,
   through `layer::Room` (`gunzip_within`, `add_tar_within`, `into_image`).

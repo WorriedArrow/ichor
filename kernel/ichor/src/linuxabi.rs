@@ -847,6 +847,8 @@ fn ioctl(p: &mut LinuxProcess, fd: u64, request: u64, arg: u64) -> Result<u64, i
     const FIOCLEX: u64 = 0x5451;
     const FIONBIO: u64 = 0x5421;
     const FIONREAD: u64 = 0x541b;
+    /// `SIOCOUTQ` (a tty's `TIOCOUTQ`, answered above for ttys).
+    const SIOCOUTQ: u64 = 0x5411;
     const FIOASYNC: u64 = 0x5452;
     let desc = p.desc(fd).ok_or(EBADF)?;
     if request == FIOASYNC {
@@ -884,6 +886,17 @@ fn ioctl(p: &mut LinuxProcess, fd: u64, request: u64, arg: u64) -> Result<u64, i
                 usize::try_from(s.size.saturating_sub(f.offset)).unwrap_or(usize::MAX)
             }
             Fd::Console | Fd::Dev(_) => return Err(ENOTTY),
+        };
+        let n = u32::try_from(n).unwrap_or(i32::MAX as u32);
+        if p.copy_to_user(arg, &n.to_le_bytes()) != 4 {
+            return Err(EFAULT);
+        }
+        return Ok(0);
+    }
+    if request == SIOCOUTQ {
+        let n = match &*desc.state() {
+            Fd::Object(o) => o.obj.unsent().ok_or(ENOTTY)?,
+            _ => return Err(ENOTTY),
         };
         let n = u32::try_from(n).unwrap_or(i32::MAX as u32);
         if p.copy_to_user(arg, &n.to_le_bytes()) != 4 {

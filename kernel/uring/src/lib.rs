@@ -111,6 +111,13 @@ pub mod abi {
     pub const OP_LINKAT: u8 = 39;
     pub const OP_MSG_RING: u8 = 40;
     pub const OP_SOCKET: u8 = 45;
+    /// A command to the file's driver; `off`'s low half is `cmd_op`.
+    pub const OP_URING_CMD: u8 = 46;
+    /// `uring_cmd_flags`: the command's buffer is a registered one.
+    pub const URING_CMD_FIXED: u32 = 1 << 0;
+    /// `SOCKET_URING_OP_*`: what a socket is asked.
+    pub const SOCKET_URING_OP_SIOCINQ: u32 = 0;
+    pub const SOCKET_URING_OP_SIOCOUTQ: u32 = 1;
 
     /// What opcodes' flags (`Sqe::op_flags`) ask for.
     pub const FSYNC_DATASYNC: u32 = 1 << 0;
@@ -165,6 +172,8 @@ pub mod abi {
     pub const REGISTER_FILES_UPDATE2: u32 = 14;
     pub const REGISTER_BUFFERS2: u32 = 15;
     pub const REGISTER_BUFFERS_UPDATE: u32 = 16;
+    pub const REGISTER_IOWQ_AFF: u32 = 17;
+    pub const UNREGISTER_IOWQ_AFF: u32 = 18;
     pub const REGISTER_IOWQ_MAX_WORKERS: u32 = 19;
     pub const REGISTER_RING_FDS: u32 = 20;
     pub const UNREGISTER_RING_FDS: u32 = 21;
