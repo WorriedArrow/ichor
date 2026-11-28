@@ -20,6 +20,7 @@ pub mod inflate;
 pub mod limbo;
 pub mod linux_abi;
 pub mod linuxref;
+pub mod openvmm;
 pub mod pvh;
 pub mod qemu;
 pub mod rootfs;

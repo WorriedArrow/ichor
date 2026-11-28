@@ -48,17 +48,28 @@ pub struct Suite {
     pub parse: fn(&str) -> Score,
 }
 
-/// CPython 3.12.16: `python:3.12-slim-bookworm` strips `Lib/test`, so the
+/// CPython 3.12.16 on `python:3.12.16-bookworm`, the full image: the slim
+/// one has no `gcc` or `ld`, and `test_ctypes` finds libraries through them
+/// (it fails there on Linux too). The image strips `Lib/test`, so the
 /// matching source release supplies it.
 pub const PYTHON: Suite = Suite {
     name: "python",
-    image: "docker.io/library/python@sha256:935c3c5b12357a7e10caa9c1e6ca5692344d97cf229832ef584be2cec9fc03df",
-    layers: &[LayerPin {
-        url: "https://www.python.org/ftp/python/3.12.16/Python-3.12.16.tgz",
-        sha256: "sha256:710c3e75dac8b2f258d9cd0f76e5c4c2e9175fac9e249c98901552f7cf33b7dd",
-        from: "Python-3.12.16/Lib/test/",
-        to: "/usr/local/lib/python3.12/test/",
-    }],
+    image: "docker.io/library/python@sha256:5f0cc9bc924d72614831d2b1575de5d7c4114609a0d42ca60dfc2f0abca10dd6",
+    layers: &[
+        LayerPin {
+            url: "https://www.python.org/ftp/python/3.12.16/Python-3.12.16.tgz",
+            sha256: "sha256:710c3e75dac8b2f258d9cd0f76e5c4c2e9175fac9e249c98901552f7cf33b7dd",
+            from: "Python-3.12.16/Lib/test/",
+            to: "/usr/local/lib/python3.12/test/",
+        },
+        // (Stripped too; `test_idle` imports it.)
+        LayerPin {
+            url: "https://www.python.org/ftp/python/3.12.16/Python-3.12.16.tgz",
+            sha256: "sha256:710c3e75dac8b2f258d9cd0f76e5c4c2e9175fac9e249c98901552f7cf33b7dd",
+            from: "Python-3.12.16/Lib/idlelib/idle_test/",
+            to: "/usr/local/lib/python3.12/idlelib/idle_test/",
+        },
+    ],
     // No `-u`: regrtest enables no optional resources (network, cpu-heavy,
     // largefile, ...) by default, which is what a sealed cell can offer.
     // `-j0` (ADR-0013): each module in a worker process, so a module that
@@ -576,6 +587,7 @@ pub fn run(
     argv: Vec<String>,
     follow: Option<std::path::PathBuf>,
     kernel: std::path::PathBuf,
+    openvmm: bool,
     cfg_tweak: impl FnOnce(&mut RunConfig),
 ) -> Result<(String, u32)> {
     let port = std::net::TcpListener::bind("127.0.0.1:0")
@@ -641,7 +653,14 @@ pub fn run(
         }
         Ok((String::from_utf8_lossy(&out).into_owned(), status))
     });
-    let outcome = qemu::run(&cfg)?;
+    let outcome = if openvmm {
+        // OpenVMM (hardware virtualization on Windows): a production boot
+        // straight to the control plane; the VM stops with the client.
+        cfg.cmdline = format!("no_selftests {}", cfg.cmdline);
+        crate::openvmm::run(&cfg, (port, 50051), || client.is_finished())?
+    } else {
+        qemu::run(&cfg)?
+    };
     // The whole guest log, for traces (`--cmdline trace_errors`) and
     // post-mortems.
     let log = crate::workspace_root()

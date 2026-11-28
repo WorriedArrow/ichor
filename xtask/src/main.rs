@@ -543,12 +543,19 @@ fn cmd_workloads(args: &[String]) -> Result<()> {
     let (mut image, mut memory) = (None, None);
     let mut follow = None;
     let mut extra = String::new();
+    let mut openvmm = false;
     while let Some(a) = it.next() {
         match a.as_str() {
             "--tests" => tests = Some(it.next().ok_or("--tests needs a value")?.clone()),
             "--cmd" => cmd = Some(it.next().ok_or("--cmd needs a value")?.clone()),
             "--follow" => follow = Some(it.next().ok_or("--follow needs a value")?.into()),
             "--accel" => accel = Some(it.next().ok_or("--accel needs a value")?.clone()),
+            // `--vmm openvmm`: hardware virtualization on Windows (OpenVMM).
+            "--vmm" => match it.next().map(String::as_str) {
+                Some("openvmm") => openvmm = true,
+                Some("qemu") => openvmm = false,
+                _ => return Err("--vmm is qemu or openvmm".into()),
+            },
             // For exploring on a machine too small for the suite's own.
             "--image" => image = Some(it.next().ok_or("--image needs a value")?.clone()),
             "--memory" => {
@@ -601,7 +608,7 @@ fn cmd_workloads(args: &[String]) -> Result<()> {
         None => Accel::Auto,
     };
     let started = std::time::Instant::now();
-    let (out, status) = workloads::run(suite, argv, follow, kernel, |c| {
+    let (out, status) = workloads::run(suite, argv, follow, kernel, openvmm, |c| {
         c.accel = accel;
         if !extra.is_empty() {
             c.cmdline = format!("{} {extra}", c.cmdline);
@@ -642,7 +649,11 @@ fn cmd_workloads(args: &[String]) -> Result<()> {
         .map_or(0, |(_, f)| f);
     let doc_path = root.join("docs").join("workloads.md");
     let old = std::fs::read_to_string(&doc_path).unwrap_or_default();
-    let machine = format!("{:?}", accel.resolve()).to_lowercase();
+    let machine = if openvmm {
+        "openvmm, Windows' hypervisor platform".to_string()
+    } else {
+        format!("{:?}", accel.resolve()).to_lowercase()
+    };
     let secs = started.elapsed().as_secs();
     let section = workloads::section(suite, &s, secs, &machine, floor);
     std::fs::write(&doc_path, workloads::merge_doc(&old, suite.name, &section))

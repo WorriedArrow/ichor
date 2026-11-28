@@ -75,7 +75,7 @@ stale. Do not edit by hand.
 | 62 | `kill` | implemented |  |
 | 63 | `uname` | implemented |  |
 | 67 | `shmdt` | implemented |  |
-| 72 | `fcntl` | partial | F_SETOWN/F_GETOWN and O_ASYNC on AF_UNIX sockets only; no F_*SIG/leases/seals |
+| 72 | `fcntl` | partial | F_SETOWN/F_GETOWN and O_ASYNC on AF_UNIX sockets only; F_NOTIFY (dnotify) always signals SIGIO; no F_*SIG/leases/seals |
 | 73 | `flock` | implemented |  |
 | 74 | `fsync` | partial | the upper layer is memory |
 | 75 | `fdatasync` | partial | the upper layer is memory |

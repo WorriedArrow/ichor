@@ -94,7 +94,7 @@ mod nr {
     pub(super) const WAIT4: u64 = 61; // partial: rusage is all zero (no accounting yet)
     pub(super) const KILL: u64 = 62;
     pub(super) const UNAME: u64 = 63;
-    pub(super) const FCNTL: u64 = 72; // partial: F_SETOWN/F_GETOWN and O_ASYNC on AF_UNIX sockets only; no F_*SIG/leases/seals
+    pub(super) const FCNTL: u64 = 72; // partial: F_SETOWN/F_GETOWN and O_ASYNC on AF_UNIX sockets only; F_NOTIFY (dnotify) always signals SIGIO; no F_*SIG/leases/seals
     pub(super) const FLOCK: u64 = 73;
     pub(super) const FSYNC: u64 = 74; // partial: the upper layer is memory
     pub(super) const FDATASYNC: u64 = 75; // partial: the upper layer is memory
@@ -939,6 +939,7 @@ fn fcntl(p: &mut LinuxProcess, fd: u64, cmd: u64, arg: u64) -> Result<u64, i64> 
     const F_GETPIPE_SZ: u64 = 1032;
     const F_SETOWN: u64 = 8;
     const F_GETOWN: u64 = 9;
+    const F_NOTIFY: u64 = 1026;
     const FD_CLOEXEC: u64 = 1;
     const O_RDWR: u64 = 2;
     const O_APPEND: u64 = 0o2000;
@@ -1012,6 +1013,7 @@ fn fcntl(p: &mut LinuxProcess, fd: u64, cmd: u64, arg: u64) -> Result<u64, i64> 
         F_GETLK | F_SETLK | F_SETLKW | F_OFD_GETLK | F_OFD_SETLK | F_OFD_SETLKW => {
             fs::record_lock(p, &desc, cmd, arg)
         }
+        F_NOTIFY => inotify::dnotify_set(p, &desc, arg),
         // Pipe capacity: Linux answers EBADF for anything but a pipe.
         F_SETPIPE_SZ | F_GETPIPE_SZ => match &*desc.state() {
             Fd::Pipe(e) if cmd == F_GETPIPE_SZ => Ok(e.pipe.capacity() as u64),

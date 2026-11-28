@@ -7,17 +7,12 @@ suite's own unit), passed / run. Floors are in `workloads.toml`.
 
 ## python
 
-- Image: `docker.io/library/python@sha256:935c3c5b12357a7e10caa9c1e6ca5692344d97cf229832ef584be2cec9fc03df`
+- Image: `docker.io/library/python@sha256:5f0cc9bc924d72614831d2b1575de5d7c4114609a0d42ca60dfc2f0abca10dd6`
 - Layer: `https://www.python.org/ftp/python/3.12.16/Python-3.12.16.tgz` (sha256:710c3e75dac8b2f258d9cd0f76e5c4c2e9175fac9e249c98901552f7cf33b7dd), `Python-3.12.16/Lib/test/` at `/usr/local/lib/python3.12/test/`
+- Layer: `https://www.python.org/ftp/python/3.12.16/Python-3.12.16.tgz` (sha256:710c3e75dac8b2f258d9cd0f76e5c4c2e9175fac9e249c98901552f7cf33b7dd), `Python-3.12.16/Lib/idlelib/idle_test/` at `/usr/local/lib/python3.12/idlelib/idle_test/`
 - Command: `python3 -m test -j0 --timeout 600`
-- Result: 454 of 457 modules passed (99.3%), 35 skipped; floor 88.0%
-- Run time: 31 min (tcg, 4 vCPUs, the cell given 3 GiB)
-
-Failed:
-
-- `test.test_multiprocessing_spawn.test_processes`
-- `test_ctypes`
-- `test_fcntl`
+- Result: 461 of 461 modules passed (100.0%), 31 skipped; floor 97.0%
+- Run time: 4 min (openvmm, Windows' hypervisor platform, 4 vCPUs, the cell given 3 GiB)
 
 ## go
 

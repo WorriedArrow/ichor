@@ -560,6 +560,27 @@ while (length $buf) {
 $seen eq "100f 20f 2f 8f 40f 80g 4g 200g 40000400 8000 " or fail("inotify saw $seen");
 $cookies =~ /^([1-9]\d*) \1 $/ or fail("move cookies $cookies");
 !defined(sysread($inh, $buf, 8192)) && $!{EAGAIN} or fail("inotify has more to say");
+# dnotify: F_NOTIFY (1026) on a directory signals SIGIO, each time with
+# DN_MULTISHOT, once without, never after the descriptor closes.
+my $dn = "/tmp/ichor-dnotified";
+mkdir $dn or fail("mkdir: $!");
+my $io = 0;
+local $SIG{IO} = sub { $io++ };
+sysopen(my $dh, $dn, O_RDONLY) or fail("open dir: $!");
+fcntl($dh, 1026, 0x80000004) or fail("F_NOTIFY: $!"); # DN_CREATE | DN_MULTISHOT
+open(my $c1, ">", "$dn/a") or fail("create: $!"); close $c1;
+open(my $c2, ">", "$dn/b") or fail("create: $!"); close $c2;
+$io == 2 or fail("multishot dnotify signalled $io times");
+fcntl($dh, 1026, 0x8) or fail("F_NOTIFY: $!"); # DN_DELETE, once
+unlink "$dn/a"; unlink "$dn/b";
+$io == 3 or fail("one-shot dnotify signalled " . ($io - 2) . " times");
+fcntl($dh, 1026, 0x80000004) or fail("F_NOTIFY: $!");
+close $dh;
+open(my $c3, ">", "$dn/c") or fail("create: $!"); close $c3;
+$io == 3 or fail("dnotify outlived its descriptor");
+open(my $nd, "<", "/etc/hostname") or fail("open: $!");
+!fcntl($nd, 1026, 0x4) && $!{ENOTDIR} or fail("F_NOTIFY on a file: $!");
+unlink "$dn/c"; rmdir $dn;
 readlink("/proc/self/fd/" . fileno $f) eq $p or fail("/proc/self/fd names " . readlink("/proc/self/fd/" . fileno $f));
 system("/usr/bin/perl", "-e", 'system("/proc/self/exe", "-e", "exit 3"); exit($? >> 8)');
 $? >> 8 == 3 or fail("/proc/self/exe ran with status $?");
@@ -639,7 +660,7 @@ my $ino = (stat("/usr/bin/cat"))[1];
 (grep { / \[stack\]$/ } @maps) == 1 && (grep { / \[heap\]$/ } @maps) == 1 or fail("no stack or heap: @maps");
 system("/bin/sh", "-c", '[ $# = 20000 ] && [ ${#1} = 100000 ]', "sh", "x" x 100000, ("y") x 19999) == 0 or fail("20000 arguments: $?");
 system("/bin/true", "x" x 140000) != 0 && $!{E2BIG} or fail("an argument over 128 KiB: $!");
-print "debian: moves: splice, tee, copy_file_range, MSG_PEEK, timeouts, netlink, inotify and shared memory work\n";
+print "debian: moves: splice, tee, copy_file_range, MSG_PEEK, timeouts, netlink, inotify, dnotify and shared memory work\n";
 "#;
 
 /// `AF_UNIX`: a socketpair with credentials and end of file; a stream
