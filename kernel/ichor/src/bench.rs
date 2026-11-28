@@ -31,8 +31,9 @@ use crate::runtest::{fail, run_linux};
 use crate::vfs::Vfs;
 use testprog::bench;
 
-/// Pages a benchmark cell may use (64 MiB).
-const CELL_PAGES: u64 = 16384;
+/// Pages a benchmark cell may use (96 MiB: the page-fault program's 64 MiB
+/// and the rest of the process).
+const CELL_PAGES: u64 = 24576;
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
 
@@ -107,7 +108,10 @@ pub(crate) fn run(m: &Mounted, vfs: &Arc<Vfs>, busybox: &[u8]) {
     let rows: [Row<'_>; 5] = [
         ("null syscall", &bench::null_syscall, 1000, 201_000),
         ("pipe round trip", &bench::pipe_round_trip, 100, 10_100),
-        ("page fault", &bench::page_fault, 16, 4112),
+        // 64 MiB, the size Linux runs (`testprog::bench`'s table): 32
+        // aligned blocks. The program's own line times the touch alone,
+        // this row the process's exit too.
+        ("page fault", &bench::page_fault, 16, 16384),
         ("fork + wait", &bench::fork_wait, 4, 204),
         ("fork + exec + wait", &bench::fork_exec_wait, 4, 104),
     ];

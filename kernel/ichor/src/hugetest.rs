@@ -96,6 +96,19 @@ pub(crate) fn run() {
         fail("a sequential touch did not map 2 MiB pages");
     }
     check(&mut mm, start, "the bytes written", |at| Some(byte(at)));
+    // Each page counts once, from its first holder to its last; a 2 MiB
+    // page's are charged together and released as they go.
+    let full = LEN / PAGE_SIZE;
+    let charged = |want: u64, what: &str| {
+        if account.used() != want {
+            println!(
+                "ichor: hugetest: {} pages charged, {want} expected",
+                account.used()
+            );
+            fail(what);
+        }
+    };
+    charged(full, "the charge for a sequential touch");
 
     // One page of block 1 read-only: the rest of the block stays as it was.
     let b1 = start + HUGE_PAGE_SIZE;
@@ -126,6 +139,8 @@ pub(crate) fn run() {
         "the bytes after mprotect and munmap",
         unchanged,
     );
+    let holed = full - CHUNK / PAGE_SIZE;
+    charged(holed, "the charge after munmap of part of a 2 MiB page");
 
     // Copy-on-write across fork, both ways.
     let mut child = mm.fork().unwrap_or_else(|| fail("fork"));
@@ -150,13 +165,22 @@ pub(crate) fn run() {
         "the parent's bytes after writes",
         written(ours, 0x5a),
     );
+    charged(holed + 2, "the charge after a write on each side of fork");
+    // The child's copy goes, and so does the original of the parent's,
+    // which only the child still held.
     drop(child);
+    charged(holed, "the charge after the forked child went");
 
     // MADV_DONTNEED on block 3 leaves zeros.
     let b3 = 3 * HUGE_PAGE_SIZE;
     if mm.madvise(start + b3, HUGE_PAGE_SIZE, DONTNEED).is_err() {
         fail("MADV_DONTNEED");
     }
+    // (Before reading it back, which faults a fresh block in.)
+    charged(
+        holed - HUGE_PAGE_SIZE / PAGE_SIZE,
+        "the charge after MADV_DONTNEED of a 2 MiB page",
+    );
     check(&mut mm, start, "the bytes after MADV_DONTNEED", |at| {
         if at >= b3 {
             Some(0)
@@ -169,6 +193,6 @@ pub(crate) fn run() {
         fail("pages still charged after the address spaces went");
     }
     println!(
-        "ichor: hugetest: a sequential touch mapped 2 MiB pages; mprotect, munmap, fork and MADV_DONTNEED split them, every byte kept"
+        "ichor: hugetest: a sequential touch mapped 2 MiB pages; mprotect, munmap, fork and MADV_DONTNEED split them, every byte kept, every page charged once"
     );
 }

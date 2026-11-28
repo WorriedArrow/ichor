@@ -85,6 +85,39 @@ impl<V> PageMap<V> {
         old
     }
 
+    /// Puts `values` at consecutive pages from `start`, dropping what was
+    /// there: one chunk lookup per chunk, not per page.
+    pub fn extend(&mut self, start: u64, values: impl IntoIterator<Item = V>) {
+        let mut values = values.into_iter().peekable();
+        let mut va = start;
+        while values.peek().is_some() {
+            let (base, mut slot) = split(va);
+            let c = self.chunks.entry(base).or_insert_with(|| {
+                Box::new(Chunk {
+                    slots: [const { None }; SPAN],
+                    used: 0,
+                })
+            });
+            while slot < SPAN
+                && let Some(v) = values.next()
+            {
+                if c.slots[slot].replace(v).is_none() {
+                    c.used += 1;
+                    self.len += 1;
+                }
+                slot += 1;
+                va += PAGE;
+            }
+        }
+    }
+
+    /// Every value, by address, the map consumed.
+    pub fn into_values(self) -> impl Iterator<Item = V> {
+        self.chunks
+            .into_values()
+            .flat_map(|c| c.slots.into_iter().flatten())
+    }
+
     pub fn remove(&mut self, va: &u64) -> Option<V> {
         let (base, slot) = split(*va);
         let c = self.chunks.get_mut(&base)?;
@@ -193,6 +226,23 @@ mod tests {
             m.remove(&k);
         }
         assert!(m.is_empty() && m.chunks.is_empty());
+        // A run straddling chunks, over values already there.
+        let mut model = BTreeMap::new();
+        for va in [PAGE * 3, PAGE * 70] {
+            m.insert(va, 1);
+            model.insert(va, 1);
+        }
+        let start = PAGE * 2;
+        m.extend(start, 100..300u64);
+        for (i, v) in (100..300u64).enumerate() {
+            model.insert(start + i as u64 * PAGE, v);
+        }
+        assert_eq!(m.len(), model.len());
+        let all: Vec<_> = m.iter().map(|(k, &v)| (k, v)).collect();
+        let want: Vec<_> = model.iter().map(|(&k, &v)| (k, v)).collect();
+        assert_eq!(all, want);
+        let values: Vec<u64> = m.into_values().collect();
+        assert_eq!(values, model.values().copied().collect::<Vec<_>>());
         let mut s = PageSet::new();
         assert!(s.insert(PAGE) && !s.insert(PAGE) && s.contains(&PAGE));
         assert!(s.remove(&PAGE) && !s.remove(&PAGE) && !s.contains(&PAGE));

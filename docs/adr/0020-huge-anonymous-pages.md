@@ -99,3 +99,39 @@ fault-around page costs about 220 ns of allocation and zeroing plus about
   nothing), collapsing 4 KiB pages into 2 MiB ones later (khugepaged), 2 MiB
   pages in a child after `fork`, file and shared memory, 1 GiB pages, and
   `AnonHugePages` in `/proc/meminfo`.
+
+## Amendment (2026-11-27): one charge a 2 MiB page
+
+Debian 13's Linux 7.3 took the page-fault row back on four machines in
+benchmark round 18. Timed locally (OpenVMM, Zen 3, temporary counters in
+`Mm::fault_huge`), a 2 MiB fault spent about 87 us clearing, 1.8 us
+mapping, 10.5 us making the 512 charged pages (`page::charged_all`: an
+`Arc<Charged>` from the heap and a clone of the account's `Arc` each) and
+8 us entering them in the `Mm` one by one; the process's exit then took
+26-40 ns a page (a heap free, the account's chain released and a buddy
+free each).
+
+- **A block is charged once.** `page::Block` holds the account's charge for
+  the 512 pages and, for each page, how many address spaces hold it
+  (`fork` shares them). The `Mm`'s entries are `page::Resident`: a page
+  charged on its own (`Page`, as before) or a page of a block (`InBlock`:
+  its own `UFrame` and a hold on the block). Each page still counts until
+  its last holder lets it go, as before: what has gone is released by
+  `Block::settle`, which `munmap`, `MADV_DONTNEED` and `MADV_FREE`
+  (`free_range`), a copy-on-write copy, and an address space's end call
+  (`page::Settle`, one block at a time in address order), and the rest when
+  the block goes. Between those points a page whose last holder went (a
+  process that ended while another still shares the block) may stay
+  charged: never less than what is held.
+- **Entered a chunk at a time**: `PageMap::extend` looks up each 64-page
+  chunk once, not each page.
+- Frame does not change. Clearing the block a 256 KiB piece at a time from
+  its end, so its start, where a sequential touch goes on, stayed in the
+  caches, was tried and was slower here (120-150 us a block against 84-86).
+
+Locally: making the entries 0.2 us a block, entering them 3.2 us, the
+exit 10-12 ns a page; the page-fault program's own timing over 16 MiB 184-188
+ns a 4 KiB page against 221-226 ns before, and 187-194 ns over the 64 MiB
+the benchmark now touches (Linux's size). `hugetest` checks the charge after
+each step (sequential touch, partial `munmap`, writes on both sides of
+`fork`, the child's end, `MADV_DONTNEED`).

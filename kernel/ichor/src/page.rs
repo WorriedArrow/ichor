@@ -4,6 +4,8 @@
 //! maps the file's own page.
 
 use alloc::sync::Arc;
+use core::sync::atomic::AtomicU32;
+use core::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed};
 
 use cell::Account;
 use frame::mm::UFrame;
@@ -45,20 +47,165 @@ pub(crate) fn charged(account: &Arc<Account>, frame: UFrame) -> Option<Page> {
     }))
 }
 
-/// Charges `account` for every frame of `frames` at once, or `None` (and
-/// nothing charged) if it cannot pay for all of them.
-pub(crate) fn charged_all(
-    account: &Arc<Account>,
-    frames: alloc::vec::Vec<UFrame>,
-) -> Option<alloc::vec::Vec<Page>> {
-    account.charge(frames.len() as u64).ok()?;
-    let page = |frame| {
-        Arc::new(Charged {
-            frame,
-            account: Some(account.clone()),
-        })
-    };
-    Some(frames.into_iter().map(page).collect())
+/// Pages in a 2 MiB block.
+const BLOCK_PAGES: usize = 512;
+
+/// The charge of one 2 MiB block of anonymous memory (ADR-0020), paid once
+/// for its 512 pages: entries made one by one cost a heap object and the
+/// account's chain each, for each page, on the way in and out. Each page
+/// still counts until its last holder lets go, as a [`Charged`] page does;
+/// what has gone is released by [`Block::settle`], and the rest when the
+/// block goes.
+#[derive(Debug)]
+pub(crate) struct Block {
+    account: Arc<Account>,
+    /// Each page's holders (address spaces sharing it after `fork`).
+    holders: [AtomicU32; BLOCK_PAGES],
+    /// Pages with a holder.
+    live: AtomicU32,
+    /// Pages the account pays for: `live`, or more until settled.
+    charged: AtomicU32,
+}
+
+impl Block {
+    /// Charges `account` for `frames`, a 2 MiB block in address order, and
+    /// gives one entry per page; `None` (and nothing charged) if the
+    /// account cannot pay for them all.
+    pub(crate) fn charge(
+        account: &Arc<Account>,
+        frames: alloc::vec::Vec<UFrame>,
+    ) -> Option<impl Iterator<Item = Resident>> {
+        let n = u32::try_from(frames.len())
+            .ok()
+            .filter(|&n| n as usize <= BLOCK_PAGES)?;
+        account.charge(u64::from(n)).ok()?;
+        let block = Arc::new(Block {
+            account: account.clone(),
+            holders: [const { AtomicU32::new(1) }; BLOCK_PAGES],
+            live: AtomicU32::new(n),
+            charged: AtomicU32::new(n),
+        });
+        Some(frames.into_iter().zip(0u16..).map(move |(frame, index)| {
+            Resident::Block(InBlock {
+                frame,
+                block: block.clone(),
+                index,
+            })
+        }))
+    }
+
+    /// Releases the charge of the pages that lost their last holder.
+    pub(crate) fn settle(&self) {
+        let mut charged = self.charged.load(Acquire);
+        loop {
+            // `live` only falls: a page without holders gets none again.
+            let live = self.live.load(Acquire);
+            if live >= charged {
+                return;
+            }
+            match self
+                .charged
+                .compare_exchange(charged, live, AcqRel, Acquire)
+            {
+                Ok(_) => {
+                    self.account.release(u64::from(charged - live));
+                    return;
+                }
+                Err(now) => charged = now,
+            }
+        }
+    }
+}
+
+impl Drop for Block {
+    fn drop(&mut self) {
+        self.account.release(u64::from(*self.charged.get_mut()));
+    }
+}
+
+/// One page of a [`Block`]: its own frame (freed when its last handle and
+/// mapping go), and a hold on the block's charge.
+#[derive(Debug)]
+pub(crate) struct InBlock {
+    frame: UFrame,
+    block: Arc<Block>,
+    index: u16,
+}
+
+impl InBlock {
+    fn holders(&self) -> Option<&AtomicU32> {
+        self.block.holders.get(usize::from(self.index))
+    }
+}
+
+impl Clone for InBlock {
+    fn clone(&self) -> InBlock {
+        if let Some(h) = self.holders() {
+            h.fetch_add(1, Relaxed);
+        }
+        InBlock {
+            frame: self.frame.clone(),
+            block: self.block.clone(),
+            index: self.index,
+        }
+    }
+}
+
+impl Drop for InBlock {
+    fn drop(&mut self) {
+        if self.holders().is_some_and(|h| h.fetch_sub(1, AcqRel) == 1) {
+            self.block.live.fetch_sub(1, AcqRel);
+        }
+    }
+}
+
+/// A page an address space holds: one charged on its own, or one of a
+/// 2 MiB block's.
+#[derive(Clone, Debug)]
+pub(crate) enum Resident {
+    Page(Page),
+    Block(InBlock),
+}
+
+impl core::ops::Deref for Resident {
+    type Target = UFrame;
+    fn deref(&self) -> &UFrame {
+        match self {
+            Resident::Page(p) => p,
+            Resident::Block(b) => &b.frame,
+        }
+    }
+}
+
+/// Settles the blocks whose entries are dropped through it, in address
+/// order (so one block at a time): each when the next begins, and the last
+/// when it goes.
+#[derive(Default)]
+pub(crate) struct Settle(Option<Arc<Block>>);
+
+impl Settle {
+    /// Drops `old`, an entry taken out of an address space.
+    pub(crate) fn drop_entry(&mut self, old: Option<Resident>) {
+        let Some(Resident::Block(e)) = &old else {
+            return;
+        };
+        if self.0.as_ref().is_some_and(|b| Arc::ptr_eq(b, &e.block)) {
+            return;
+        }
+        let done = self.0.replace(e.block.clone());
+        drop(old);
+        if let Some(b) = done {
+            b.settle();
+        }
+    }
+}
+
+impl Drop for Settle {
+    fn drop(&mut self) {
+        if let Some(b) = self.0.take() {
+            b.settle();
+        }
+    }
 }
 
 /// Where a root's written files get their pages: the owning cell's account

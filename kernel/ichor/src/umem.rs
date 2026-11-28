@@ -47,7 +47,7 @@ use cell::Account;
 
 use crate::file::File;
 use crate::linuxabi::shm::Attached;
-use crate::page::{Page, charged, charged_all};
+use crate::page::{Block, Page, Resident, Settle, charged};
 use frame::mm::{PAGE_SIZE, UFrame, UserProt, VmSpace};
 use vma::{PageMap, PageSet, Prot, Region, RegionMap};
 
@@ -206,7 +206,7 @@ pub(crate) struct Mm {
     account: Arc<Account>,
     regions: RegionMap<Backing>,
     /// Every page the process holds, mapped or not (`PROT_NONE`).
-    pages: PageMap<Page>,
+    pages: PageMap<Resident>,
     /// Pages possibly shared with another process after `fork`: mapped
     /// read-only, copied on the first write.
     cow: PageSet,
@@ -219,6 +219,17 @@ pub(crate) struct Mm {
     /// Protection keys allocated (`pkey_alloc`), a bit each; key 0 from
     /// the start, as on Linux.
     pkeys: u16,
+}
+
+impl Drop for Mm {
+    fn drop(&mut self) {
+        // A block another process still shares releases what this one alone
+        // held (the pages the other side of a `fork` had copied).
+        let mut settle = Settle::default();
+        for r in core::mem::take(&mut self.pages).into_values() {
+            settle.drop_entry(Some(r));
+        }
+    }
 }
 
 impl Mm {
@@ -401,7 +412,7 @@ impl Mm {
         let Some(page) = charged(&self.account, frame.clone()) else {
             return false;
         };
-        self.pages.insert(va, page);
+        self.pages.insert(va, Resident::Page(page));
         self.cow.insert(va);
         let p = self.mapped_prot(va, prot);
         !prot.accessible() || self.space.map(va, &frame, p).is_ok()
@@ -425,7 +436,9 @@ impl Mm {
         if self.space.map(va, &copy, user_prot(prot)).is_err() {
             return false;
         }
-        self.pages.insert(va, copy);
+        let mut settle = Settle::default();
+        settle.drop_entry(self.pages.insert(va, Resident::Page(copy)));
+        settle.drop_entry(Some(shared));
         self.cow.remove(&va);
         true
     }
@@ -546,7 +559,7 @@ impl Mm {
     /// map it.
     pub(crate) fn frame(&mut self, va: u64) -> Option<UFrame> {
         if let Some(f) = self.pages.get(&va) {
-            return Some((***f).clone());
+            return Some((**f).clone());
         }
         let map = self.file_at(va);
         // A cache page needs no fresh frame (or zeroing one to throw away).
@@ -554,8 +567,8 @@ impl Mm {
             && let Some(cached) = m.file.cached_page(m.at(va) / PAGE_SIZE)
         {
             // Shared with the cache: read-only until written.
-            self.pages
-                .insert(va, charged(&self.account, cached.clone())?);
+            let page = charged(&self.account, cached.clone())?;
+            self.pages.insert(va, Resident::Page(page));
             self.cow.insert(va);
             return Some(cached);
         }
@@ -566,7 +579,7 @@ impl Mm {
             page.writer().write(&buf[..n]);
         }
         let f = (**page).clone();
-        self.pages.insert(va, page);
+        self.pages.insert(va, Resident::Page(page));
         Some(f)
     }
 
@@ -593,7 +606,7 @@ impl Mm {
                 self.space.unmap(va);
                 self.cow.remove(&va);
                 let mapped = self.space.map(va, &page, user_prot(prot)).is_ok();
-                self.pages.insert(va, page);
+                Settle::default().drop_entry(self.pages.insert(va, Resident::Page(page)));
                 mapped
             }
             // Nobody has written this file: the image's page will do, until
@@ -708,14 +721,12 @@ impl Mm {
         let mapped = self.space.map_huge(block, &frames, user_prot(region.prot));
         let Some(pages) = mapped
             .ok()
-            .and_then(|()| charged_all(&self.account, frames))
+            .and_then(|()| Block::charge(&self.account, frames))
         else {
             self.space.unmap_range(block, end);
             return false;
         };
-        for (va, page) in (block..end).step_by(PAGE_SIZE as usize).zip(pages) {
-            self.pages.insert(va, page);
-        }
+        self.pages.extend(block, pages);
         self.next_anon = end;
         true
     }
@@ -750,7 +761,7 @@ impl Mm {
             if self.space.map(at, &page, prot).is_err() {
                 break;
             }
-            self.pages.insert(at, page);
+            self.pages.insert(at, Resident::Page(page));
             at += PAGE_SIZE;
         }
         self.next_anon = at;
@@ -811,9 +822,10 @@ impl Mm {
             if vas.is_empty() {
                 return;
             }
+            // The charge goes with the page's last holder.
+            let mut settle = Settle::default();
             for va in vas {
-                // The charge goes with the page's last holder.
-                self.pages.remove(&va);
+                settle.drop_entry(self.pages.remove(&va));
                 self.cow.remove(&va);
             }
         }
@@ -911,7 +923,7 @@ impl Mm {
         let user = Prot::from_linux(prot).ok_or(EINVAL)?;
         for (i, page) in pages.iter().enumerate() {
             let va = start + i as u64 * PAGE_SIZE;
-            self.pages.insert(va, page.clone());
+            self.pages.insert(va, Resident::Page(page.clone()));
             if user.accessible() && self.space.map(va, page, user_prot(user)).is_err() {
                 let _ = self.munmap(start, len);
                 return Err(ENOMEM);
