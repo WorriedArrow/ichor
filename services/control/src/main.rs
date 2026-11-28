@@ -620,8 +620,30 @@ impl Control {
                 } else {
                     req.memory_bytes
                 };
-                let made = rt::cell_create(&self.cell, &image.handle, bytes.div_ceil(4096))
-                    .and_then(|h| rt::cell_addr(&h).map(|a| (h, a)));
+                // Every value the kernel knows is a number.
+                let mut sysctls = Vec::new();
+                for (name, value) in &req.sysctls {
+                    let Ok(v) = value.trim().parse::<u64>() else {
+                        let m = format!("sysctl {name}: {value:?} is not a number");
+                        return self.fail(conn, stream, status::INVALID_ARGUMENT, &m);
+                    };
+                    sysctls.push((name.as_str(), v));
+                }
+                let made = match rt::cell_create(&self.cell, &image.handle, bytes.div_ceil(4096)) {
+                    Ok(h) => {
+                        // Set before anything runs in it; a cell refused one
+                        // is freed with its handle.
+                        if let Some((name, v)) = sysctls
+                            .iter()
+                            .find(|&&(name, v)| rt::cell_sysctl(&h, name, v).is_err())
+                        {
+                            let m = format!("sysctl {name}={v}: unknown, or out of range");
+                            return self.fail(conn, stream, status::INVALID_ARGUMENT, &m);
+                        }
+                        rt::cell_addr(&h).map(|a| (h, a))
+                    }
+                    Err(e) => Err(e),
+                };
                 match made {
                     Ok((h, a)) => {
                         let id = self.next_cell.to_string();

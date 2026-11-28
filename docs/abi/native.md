@@ -104,6 +104,7 @@ moves at most 256 KiB (`LOG`, `RANDOM`, the socket calls, `PROCESS_READ`).
 | 28 | `CELL_SIGNAL` | container, signal (1-64) | how many processes it was posted to (every live process of the cell); needs WRITE |
 | 29 | `CELL_INSPECT` | container, buffer (40 bytes) | 40; writes a `CellInfo`: pages used and limit, live processes, threads, switch address; needs INSPECT |
 | 30 | `MEM_AVAILABLE` | none | bytes of memory the cell may still use (`MEM_MAP` takes none; touching a page past this ends the process) |
+| 31 | `CELL_SYSCTL` | container, name buffer (≤ 256 bytes), value | 0; sets one of the cell's kernel parameters, named as in `/proc/sys` with dots; needs WRITE. Known: `net.ipv4.ip_unprivileged_port_start` (0-65536, default 0): binding a TCP or UDP port below it needs CAP_NET_BIND_SERVICE. Anything else is `Invalid` |
 
 ### `OBJECT_WAIT` items
 

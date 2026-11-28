@@ -209,6 +209,11 @@ const LINGER: Duration = Duration::from_secs(60);
 pub(crate) struct Stack {
     pub(crate) cell: u64,
     addr: Option<Ipv4Addr>,
+    /// `net.ipv4.ip_unprivileged_port_start`: binding a port below it
+    /// needs CAP_NET_BIND_SERVICE. 0 by default, as Docker and containerd
+    /// set it (a cell's ports are its own); the control plane may set
+    /// another for a cell (`CreateCell`'s sysctls).
+    unprivileged_ports: core::sync::atomic::AtomicU32,
     inner: SpinLock<Inner>,
 }
 
@@ -243,6 +248,7 @@ pub(crate) fn stack_for(c: &crate::kcell::Cell) -> Arc<Stack> {
                     Stack {
                         cell,
                         addr,
+                        unprivileged_ports: core::sync::atomic::AtomicU32::new(0),
                         inner: SpinLock::new(Inner {
                             addr,
                             account: Some(c.account().clone()),
@@ -1023,6 +1029,26 @@ impl Stack {
             .socks
             .get(&id)
             .is_some_and(|s| s.reuse_addr)
+    }
+
+    /// `net.ipv4.ip_unprivileged_port_start`.
+    pub(crate) fn unprivileged_ports(&self) -> u32 {
+        self.unprivileged_ports.load(Ordering::Relaxed)
+    }
+
+    /// Sets `net.ipv4.ip_unprivileged_port_start` (0 to 65536).
+    pub(crate) fn set_unprivileged_ports(&self, start: u32) -> Result<(), i64> {
+        if start > 65536 {
+            return Err(EINVAL);
+        }
+        self.unprivileged_ports.store(start, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Whether binding `port` needs CAP_NET_BIND_SERVICE (Linux's
+    /// `inet_port_requires_bind_service`).
+    pub(crate) fn needs_bind_service(&self, port: u16) -> bool {
+        port != 0 && u32::from(port) < self.unprivileged_ports()
     }
 
     pub(crate) fn bind(&self, id: u64, mut addr: Addr) -> Result<(), i64> {

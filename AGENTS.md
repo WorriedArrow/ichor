@@ -246,6 +246,15 @@ boot [done: VERW, IBPB, and page-table isolation (ADR-0004's second
   under TCG). The six: four CPU-profiler tests (V8 samples every 100 us,
   which TCG cannot keep up with), `net-boundsocket` (wants port 1 refused;
   any user may bind any port in a cell, as in Docker), and `watch-mode`.
+  Under OpenVMM (2026-11-28, 7 min) the profiler tests and `watch-mode`
+  pass. For `net-boundsocket`, cells have their own sysctls now:
+  `CreateCell`'s `sysctls` map (OCI's `linux.sysctl`, a pod's), set by
+  native `CELL_SYSCTL` before anything runs. The one known name is
+  `net.ipv4.ip_unprivileged_port_start`: per stack, default 0 as in
+  Docker and containerd, ports below it need CAP_NET_BIND_SERVICE to
+  bind, and `/proc` shows it read-only. The Node suite asks for 1024
+  (`Suite::sysctls`), Linux's own default, which its tests assume.
+  Debian's perl checks both values (`PORTS_SCRIPT`).
 - M7 JVM (fifth suite): `cargo xtask workloads jvm` (jtreg, OpenJDK 21's
   tier 1). On KVM (`workloads.yml`): 2283 of 2376 (2026-11-22, 34 min).
   Of the 93, by their names: about 50 need native test libraries, which are
@@ -1003,7 +1012,7 @@ ADR-0004's 2026-11-27 amendment; ITS, TSA, STIBP, SSBD and Linux's
 vulnerability tests, its second amendment that day). Growth past the step
 needs an ADR and a new audit step.
 `services/rt` has its own budget (`services/rt/audit.toml`: 500 / 40; at
-417 / 30).
+427 / 31).
 
 Milestone 8 (done 2026-11-23, bare metal deferred until hardware): `cargo xtask disk-image` writes a single
 bootable GPT disk (FAT32 ESP with `\EFI\BOOT\BOOTX64.EFI` and

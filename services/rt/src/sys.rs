@@ -350,6 +350,19 @@ pub fn cell_inspect(cell: &Handle) -> Result<ichor_abi::CellInfo> {
     Ok(ichor_abi::CellInfo::from_bytes(&b))
 }
 
+/// Sets kernel parameter `name` (as in `/proc/sys`, with dots) of `cell`.
+pub fn cell_sysctl(cell: &Handle, name: &str, value: u64) -> Result<()> {
+    let n = name.as_bytes();
+    // SAFETY: the kernel reads `n.len()` bytes at `n`.
+    decode(unsafe {
+        syscall(
+            sys::CELL_SYSCTL,
+            [cell.0, n.as_ptr() as u64, n.len() as u64, value, 0],
+        )
+    })
+    .map(|_| ())
+}
+
 /// The address the switch gave a cell.
 pub fn cell_addr(cell: &Handle) -> Result<[u8; 4]> {
     call(sys::CELL_ADDR, [cell.0, 0, 0, 0, 0]).map(|a| (a as u32).to_be_bytes())

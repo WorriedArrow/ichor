@@ -44,6 +44,9 @@ pub struct Suite {
     /// The machine's memory, and the cell's.
     pub memory_mib: u32,
     pub cell_bytes: u64,
+    /// The cell's sysctls (`CreateCell`'s), where the suite assumes
+    /// another value than a container's.
+    pub sysctls: &'static [(&'static str, &'static str)],
     /// Reads the score out of the suite's output.
     pub parse: fn(&str) -> Score,
 }
@@ -81,6 +84,7 @@ pub const PYTHON: Suite = Suite {
     unit: "modules",
     memory_mib: 6144,
     cell_bytes: 3 << 30,
+    sysctls: &[],
     parse: parse_python,
 };
 
@@ -98,6 +102,7 @@ pub const GO: Suite = Suite {
     unit: "packages",
     memory_mib: 12 * 1024,
     cell_bytes: 6 << 30,
+    sysctls: &[],
     parse: parse_go,
 };
 
@@ -137,6 +142,7 @@ pub const POSTGRES: Suite = Suite {
     unit: "tests",
     memory_mib: 10 * 1024,
     cell_bytes: 5 << 30,
+    sysctls: &[],
     parse: parse_tap,
 };
 
@@ -193,6 +199,9 @@ pub const NODE: Suite = Suite {
     unit: "tests",
     memory_mib: 10 * 1024,
     cell_bytes: 4 << 30,
+    // Its tests assume Linux's own default (`test-net-boundsocket` wants
+    // port 1 refused to a user), not a container runtime's 0.
+    sysctls: &[("net.ipv4.ip_unprivileged_port_start", "1024")],
     parse: parse_node,
 };
 
@@ -248,6 +257,7 @@ pub const JVM: Suite = Suite {
     unit: "tests",
     memory_mib: 10 * 1024,
     cell_bytes: 5 << 30,
+    sysctls: &[],
     parse: parse_jtreg,
 };
 
@@ -283,6 +293,7 @@ pub const URING: Suite = Suite {
     unit: "tests",
     memory_mib: 8192,
     cell_bytes: 3 << 30,
+    sysctls: &[],
     parse: parse_node,
 };
 
@@ -477,6 +488,9 @@ pub fn section(suite: &Suite, s: &Score, secs: u64, machine: &str, floor: u32) -
         "- Command: `{}`\n",
         [suite.argv, suite.all].concat().join(" ")
     );
+    for (k, v) in suite.sysctls {
+        out += &format!("- Sysctl: `{k}={v}`\n");
+    }
     out += &format!(
         "- Result: {} of {} {} passed ({}.{}%), {} skipped; floor {}.{}%\n",
         s.passed.len(),
@@ -624,7 +638,7 @@ pub fn run(
             pulled.image_id,
             pulled.size >> 20
         );
-        let cell = s.create_cell(&pulled.image_id, suite.cell_bytes)?;
+        let cell = s.create_cell_with(&pulled.image_id, suite.cell_bytes, suite.sysctls)?;
         let a: Vec<&str> = argv.iter().map(String::as_str).collect();
         eprintln!("workloads: cell {} runs {a:?}", cell.cell_id);
         // The output also goes to a file as it comes, so a run that fails

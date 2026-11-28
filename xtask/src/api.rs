@@ -274,9 +274,20 @@ impl Session {
         image_id: &str,
         memory_bytes: u64,
     ) -> Result<control::CreateCellResponse> {
+        self.create_cell_with(image_id, memory_bytes, &[])
+    }
+
+    /// `CreateCell` with sysctls (name, value).
+    pub fn create_cell_with(
+        &mut self,
+        image_id: &str,
+        memory_bytes: u64,
+        sysctls: &[(&str, &str)],
+    ) -> Result<control::CreateCellResponse> {
         let req = control::CreateCellRequest {
             image_id: image_id.into(),
             memory_bytes,
+            sysctls: sysctls.iter().map(|&(k, v)| (k.into(), v.into())).collect(),
         };
         let (m, code, msg) =
             self.call(control::CREATE_CELL, &req.encode(), Duration::from_secs(60))?;

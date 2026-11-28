@@ -843,6 +843,37 @@ print "debian: speculation control answers as Linux does (store bypass $mode)\n"
 /// The server cell of the cross-cell run: `ME PEER PORT`. Accepts one
 /// connection on `PORT`, checks both ends' addresses, reads to EOF and
 /// answers with the peer's address and the byte count.
+/// Privileged ports against the cell's `ip_unprivileged_port_start`
+/// (`ARGV[0]`, what the kernel set): root binds any, a user only from it up.
+const PORTS_SCRIPT: &str = r#"use strict; use warnings; use Socket; use POSIX; use Errno;
+my $start = $ARGV[0];
+sub fail { print "debian: ports FAILED: @_\n"; exit 1 }
+sub try_bind {
+    my ($port, $type) = @_;
+    socket(my $s, AF_INET, $type, 0) or fail("socket: $!");
+    return "ok" if bind($s, pack_sockaddr_in($port, inet_aton("127.0.0.1")));
+    return $!{EACCES} ? "EACCES" : "$!";
+}
+open(my $f, "<", "/proc/sys/net/ipv4/ip_unprivileged_port_start") or fail("open: $!");
+my $v = <$f>;
+chomp $v;
+$v eq $start or fail("the sysctl reads $v, not $start");
+try_bind(1, SOCK_STREAM) eq "ok" or fail("root could not bind port 1");
+POSIX::setuid(65534);
+$> == 65534 or fail("setuid: $!");
+if ($start > 1) {
+    my $r;
+    ($r = try_bind(1, SOCK_STREAM)) eq "EACCES" or fail("a user's bind of TCP port 1: $r");
+    ($r = try_bind($start - 1, SOCK_DGRAM)) eq "EACCES"
+        or fail("a user's bind of UDP port " . ($start - 1) . ": $r");
+} else {
+    try_bind(2, SOCK_STREAM) eq "ok" or fail("a user could not bind port 2");
+}
+try_bind($start, SOCK_STREAM) eq "ok" or fail("a user could not bind port $start");
+try_bind(0, SOCK_DGRAM) eq "ok" or fail("a user could not bind an ephemeral port");
+print "debian: ports: below ip_unprivileged_port_start ($start) needs CAP_NET_BIND_SERVICE\n";
+"#;
+
 const CELL_SERVER: &str = r#"use strict; use warnings; use Socket;
 sub fail { print "debian: cells FAILED (server): @_\n"; exit 1 }
 my ($me, $peer, $port) = @ARGV;
@@ -1140,6 +1171,18 @@ fn cell_addr(cell: &Cell) -> String {
 fn network(vfs: &Arc<Vfs>, system: &System) {
     let new_cell =
         || Cell::new(&system.root_account, CELL_PAGES).unwrap_or_else(|| fail("no debian cell"));
+    // A container runtime's default (0), and Linux's own (1024), as the
+    // control plane sets it for a cell (`CreateCell`'s sysctls).
+    for start in [0, 1024] {
+        let cell = new_cell();
+        if crate::netstack::stack_for(&cell)
+            .set_unprivileged_ports(start)
+            .is_err()
+            || perl(vfs, cell, PORTS_SCRIPT, &[alloc::format!("{start}")]) != 0
+        {
+            fail("debian: privileged ports");
+        }
+    }
     let (server, client) = (new_cell(), new_cell());
     let (sa, ca) = (cell_addr(&server), cell_addr(&client));
     let port = String::from("7000");

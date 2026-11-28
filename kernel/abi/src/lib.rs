@@ -108,7 +108,15 @@ pub mod sys {
     /// and of the machine. Touching a mapped page past it ends the process
     /// (`MEM_MAP` itself takes nothing), so ask before large work.
     pub const MEM_AVAILABLE: u64 = 30;
+    /// Set kernel parameter `arg1`/`arg2` (its name: pointer, length at
+    /// most [`super::SYSCTL_NAME_MAX`]) of cell `arg0` (a container handle
+    /// with WRITE) to `arg3`; returns 0. An unknown name or a value out of
+    /// range is `Invalid`. Names as in `/proc/sys`, with dots.
+    pub const CELL_SYSCTL: u64 = 31;
 }
+
+/// The longest name [`sys::CELL_SYSCTL`] takes.
+pub const SYSCTL_NAME_MAX: usize = 256;
 
 /// [`sys::CLOCK`] clocks.
 pub const CLOCK_MONOTONIC: u64 = 0;

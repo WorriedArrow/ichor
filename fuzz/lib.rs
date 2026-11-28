@@ -514,6 +514,7 @@ fn proto_seeds() -> Vec<Vec<u8>> {
         CreateCellRequest {
             image_id: "x".into(),
             memory_bytes: 64 << 20,
+            sysctls: vec![("net.ipv4.ip_unprivileged_port_start".into(), "1024".into())],
         }
         .encode(),
     ]

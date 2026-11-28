@@ -26,6 +26,7 @@ use crate::signal;
 
 const EINTR: i64 = 4;
 const EAGAIN: i64 = 11;
+const EACCES: i64 = 13;
 const EBADF: i64 = 9;
 const EDOM: i64 = 33;
 const EINVAL: i64 = 22;
@@ -480,6 +481,9 @@ pub(super) fn bind(p: &mut LinuxProcess, fd: u64, addr: u64, len: u64) -> Result
     let (o, _) = sock_of(p, fd)?;
     let a = read_addr(p, addr, len)?;
     let s = o.socket().ok_or(ENOTSOCK)?;
+    if s.stack.needs_bind_service(a.1) && !p.group.creds().has(crate::cred::cap::NET_BIND_SERVICE) {
+        return Err(EACCES);
+    }
     s.stack.bind(s.id(), a).map(|()| 0)
 }
 

@@ -125,6 +125,7 @@ impl Api {
         let req = control::CreateCellRequest {
             image_id: image_id.to_string(),
             memory_bytes: 64 << 20,
+            sysctls: Vec::new(),
         };
         let m = self.ok(control::CREATE_CELL, &req.encode())?;
         let cell = control::CreateCellResponse::decode(m.first().ok_or("api-bench: no cell")?)

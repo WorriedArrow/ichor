@@ -56,10 +56,28 @@ fn pull_and_run(
         pulled.size / 1024,
         t0.elapsed()
     );
-    let req = control::CreateCellRequest {
+    // A sysctl the kernel does not know, or a value it cannot take, is
+    // refused; the cell gets the one it can.
+    let sysctl = |k: &str, v: &str| control::CreateCellRequest {
         image_id: pulled.image_id.clone(),
         memory_bytes: 64 << 20,
+        sysctls: vec![(k.into(), v.into())],
     };
+    for bad in [
+        sysctl("kernel.ichor_nonsense", "1"),
+        sysctl("net.ipv4.ip_unprivileged_port_start", "65537"),
+        sysctl("net.ipv4.ip_unprivileged_port_start", "low"),
+    ] {
+        let (_, code, msg) =
+            s.call(control::CREATE_CELL, &bad.encode(), Duration::from_secs(60))?;
+        if code != 3 {
+            return Err(format!(
+                "CreateCell {:?}: {code} ({msg}), not INVALID_ARGUMENT",
+                bad.sysctls
+            ));
+        }
+    }
+    let req = sysctl("net.ipv4.ip_unprivileged_port_start", "1024");
     let (m, code, msg) = s.call(control::CREATE_CELL, &req.encode(), Duration::from_secs(60))?;
     if code != 0 {
         return Err(format!("CreateCell failed ({code}): {msg}"));
@@ -281,6 +299,7 @@ fn session(port: u16, layer_port: u16) -> Result<(Ran, Ran), String> {
             "-c",
             "cat /etc/alpine-release; echo \"$((6 * 7)) from $(uname -s)\"; ls /bin/busybox; cat /opt/extra/greeting; \
              cat /opt/again/greeting; head -1 /etc/hosts; cat /etc/hostname /etc/resolv.conf; \
+             echo \"unprivileged ports from $(cat /proc/sys/net/ipv4/ip_unprivileged_port_start)\"; \
              nslookup registry-1.docker.io >/dev/null 2>&1 && echo a name was found; exit 3",
         ],
     )?;
@@ -587,7 +606,7 @@ fn the_control_plane_pulls_and_runs_an_image_from_docker_hub() {
         text,
         "3.20.3\n42 from Linux\n/bin/busybox\nhello from an extra layer\n\
          hello from an extra layer\n127.0.0.1\tlocalhost\nichor\n\
-         nameserver 10.0.2.3\na name was found\n"
+         nameserver 10.0.2.3\nunprivileged ports from 1024\na name was found\n"
     );
     assert_eq!(exit, 3 << 8);
     // Once refused (and again, its first answer having been cut short),

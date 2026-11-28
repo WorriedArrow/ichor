@@ -255,14 +255,19 @@ impl PullImageResponse {
 pub struct CreateCellRequest {
     pub image_id: String,
     pub memory_bytes: u64,
+    /// `map<string, string> sysctls`: (name, value), in the order sent.
+    pub sysctls: Vec<(String, String)>,
 }
 
 impl CreateCellRequest {
     pub fn encode(&self) -> Vec<u8> {
-        Writer::new()
-            .string(1, &self.image_id)
-            .varint(2, self.memory_bytes)
-            .finish()
+        let mut w = Writer::new();
+        w.string(1, &self.image_id).varint(2, self.memory_bytes);
+        for (k, v) in &self.sysctls {
+            // A map entry is a message: key 1, value 2.
+            w.bytes(3, &Writer::new().string(1, k).string(2, v).finish());
+        }
+        w.finish()
     }
 
     pub fn decode(b: &[u8]) -> Result<Self, Error> {
@@ -271,6 +276,18 @@ impl CreateCellRequest {
             match f {
                 1 => m.image_id = v.as_string()?,
                 2 => m.memory_bytes = v.as_u64()?,
+                3 => {
+                    let (mut key, mut value) = (String::new(), String::new());
+                    each(v.as_bytes()?, |f, v| {
+                        match f {
+                            1 => key = v.as_string()?,
+                            2 => value = v.as_string()?,
+                            _ => {}
+                        }
+                        Ok(())
+                    })?;
+                    m.sysctls.push((key, value));
+                }
                 _ => {}
             }
             Ok(())
@@ -428,8 +445,30 @@ mod tests {
         let c = CreateCellRequest {
             image_id: "x".into(),
             memory_bytes: 0,
+            sysctls: Vec::new(),
         };
         assert_eq!(c.encode(), Writer::new().string(1, "x").finish());
+        assert_eq!(CreateCellRequest::decode(&c.encode()), Ok(c));
+        let c = CreateCellRequest {
+            image_id: "x".into(),
+            memory_bytes: 4096,
+            sysctls: vec![
+                ("net.ipv4.ip_unprivileged_port_start".into(), "1024".into()),
+                ("a".into(), String::new()),
+            ],
+        };
+        // As protoc writes it: each entry a message of key 1, value 2.
+        let mut want = Writer::new();
+        want.string(1, "x").varint(2, 4096);
+        want.bytes(
+            3,
+            &Writer::new()
+                .string(1, "net.ipv4.ip_unprivileged_port_start")
+                .string(2, "1024")
+                .finish(),
+        );
+        want.bytes(3, &Writer::new().string(1, "a").finish());
+        assert_eq!(c.encode(), want.finish());
         assert_eq!(CreateCellRequest::decode(&c.encode()), Ok(c));
     }
 }

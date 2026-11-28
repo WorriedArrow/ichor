@@ -378,6 +378,24 @@ pub(crate) fn call(cell: &Arc<Cell>, mm: &mut Mm, nr: u64, a: [u64; 6]) -> Resul
                 .ok_or(Error::Invalid)?;
             Ok(crate::proc::signal_cell(c.cell.id(), sig))
         }
+        sys::CELL_SYSCTL => {
+            let c = container(cell, a[0], rights::WRITE)?;
+            let len = usize::try_from(a[2])
+                .ok()
+                .filter(|&l| l <= ichor_abi::SYSCTL_NAME_MAX)
+                .ok_or(Error::Invalid)?;
+            let name = read_user(mm, a[1], len)?;
+            match name.as_slice() {
+                b"net.ipv4.ip_unprivileged_port_start" => {
+                    let start = u32::try_from(a[3]).map_err(|_| Error::Invalid)?;
+                    crate::netstack::stack_for(&c.cell)
+                        .set_unprivileged_ports(start)
+                        .map_err(errno)?;
+                    Ok(0)
+                }
+                _ => Err(Error::Invalid),
+            }
+        }
         sys::CELL_INSPECT => {
             let c = container(cell, a[0], Rights::INSPECT)?;
             let (threads, processes, _) = crate::proc::census(c.cell.id());

@@ -154,10 +154,17 @@ pub(crate) fn lookup(p: &LinuxProcess, path: &str, follow_last: bool) -> Option<
         )),
         ["sys"] => Ok(dir(&[("kernel", DT_DIR), ("net", DT_DIR)])),
         ["sys", "net"] => Ok(dir(&[("core", DT_DIR), ("ipv4", DT_DIR)])),
-        // Any user may bind any port, as in Docker's containers: a cell's
-        // ports are its own.
+        // The cell's own: 0 unless the control plane set another, as Docker
+        // and containerd do (a cell's ports are its own). Read-only, as
+        // /proc/sys is in a container.
         ["sys", "net", "ipv4"] => Ok(dir(&[("ip_unprivileged_port_start", DT_REG)])),
-        ["sys", "net", "ipv4", "ip_unprivileged_port_start"] => Ok(Node::File(b"0\n".to_vec())),
+        ["sys", "net", "ipv4", "ip_unprivileged_port_start"] => Ok(Node::File(
+            format!(
+                "{}\n",
+                crate::netstack::stack_for(&p.cell).unprivileged_ports()
+            )
+            .into_bytes(),
+        )),
         ["sys", "net", "core"] => Ok(dir(&[("somaxconn", DT_REG)])),
         // `listen` clamps backlogs to this (redis checks it).
         ["sys", "net", "core", "somaxconn"] => Ok(Node::File(b"4096\n".to_vec())),
