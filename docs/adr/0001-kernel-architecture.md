@@ -23,7 +23,8 @@ ATC'25). Its trusted crate is OSTD. We studied OSTD 0.19.0 (main @ a0de225,
 2026-11-13), its soundness book, the 2026 audit issues (asterinas#3920 and
 children), and Theseus (OSDI'20). The decisions below borrow their ideas. **No
 code is copied.** Asterinas is MPL-2.0 (file-level copyleft), and Ichor is
-MIT/Apache-2.0. Any file ever vendored from Asterinas must keep its MPL-2.0
+FSL-1.1-ALv2 (`LICENSE.md`; MIT/Apache-2.0 until 2026-11-28). Any file ever
+vendored from Asterinas must keep its MPL-2.0
 header and live in its own file. The default is to re-implement from the
 published invariants.
 

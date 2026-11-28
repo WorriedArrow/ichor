@@ -1259,8 +1259,10 @@ vfs,block,net,linux-abi,native-abi}`, `kernel/drivers/*`, `abi/`, `services/`.
 - Commit in small steps that build and pass `cargo xtask lint` and
   `cargo xtask test`. Commit messages say what changed and why. A tracked
   benchmark regression needs a justification in the message.
-- Code is MIT OR Apache-2.0. Never copy Asterinas code (MPL-2.0) into
-  differently licensed files. Re-implement from its documented invariants.
+- Code is FSL-1.1-ALv2 (`LICENSE.md`): each release becomes Apache 2.0 two
+  years after it is made available. Never copy Asterinas code (MPL-2.0)
+  into differently licensed files. Re-implement from its documented
+  invariants.
 
 ## Toolchain
 
@@ -1299,7 +1301,8 @@ codegen.
 
 Settled by the owner:
 
-- License: MIT OR Apache-2.0 (confirmed 2026-11-14).
+- License: FSL-1.1-ALv2, licensor Tundras, every crate (2026-11-28;
+  MIT OR Apache-2.0 before).
 
 The brief cannot decide these, so ask the owner:
 
