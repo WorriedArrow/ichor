@@ -25,6 +25,11 @@ pub(crate) fn record_entry() {
     ENTRY_TSC.store(crate::arch::regs::rdtsc(), Ordering::Relaxed);
 }
 
+/// Records the TSC a PVH entry read before it had a stack for Rust.
+pub(crate) fn set_entry(tsc: u64) {
+    ENTRY_TSC.store(tsc, Ordering::Relaxed);
+}
+
 /// Time since the firmware (or a PVH loader) entered frame, by the TSC.
 pub fn since_entry() -> Duration {
     let ticks = crate::arch::regs::rdtsc().wrapping_sub(ENTRY_TSC.load(Ordering::Relaxed));

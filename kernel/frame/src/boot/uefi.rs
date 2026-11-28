@@ -697,5 +697,5 @@ extern "efiapi" fn efi_main(image: Handle, system_table: *const SystemTable) -> 
         fatal("firmware memory descriptor size too small", desc_size);
     }
     state.region_count = convert_memory_map(&map[..map_len], desc_size, &mut state.regions);
-    super::start(state)
+    super::start(state, u64::MAX)
 }

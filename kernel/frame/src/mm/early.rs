@@ -25,13 +25,15 @@ impl EarlyAlloc {
         hi: 0,
     };
 
-    pub(crate) fn new(regions: &[MemoryRegion]) -> Option<Self> {
+    /// Takes the largest usable region between 1 MiB and `limit` (the end
+    /// of what the current page tables identity-map).
+    pub(crate) fn new(regions: &[MemoryRegion], limit: u64) -> Option<Self> {
         let r = regions
             .iter()
             .filter(|r| r.kind == MemoryKind::Usable)
             .map(|r| {
                 let lo = align_up(r.base.as_u64().max(ONE_MIB), PAGE_SIZE);
-                let hi = align_down(r.end().as_u64(), PAGE_SIZE);
+                let hi = align_down(r.end().as_u64().min(limit), PAGE_SIZE);
                 (lo, hi.max(lo))
             })
             .max_by_key(|&(lo, hi)| hi - lo)?;

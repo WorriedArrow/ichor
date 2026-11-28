@@ -24,7 +24,69 @@
 //! official static busybox: echo, ls, cat, and a shell that forks, execs
 //! and waits.
 
-use ichor_tests::{Exit, boot, boot_disk, boot_disk_with};
+use ichor_tests::{Exit, boot, boot_disk, boot_disk_with, boot_with};
+
+/// A production boot (`no_selftests`, ADR-0024): no self-test runs, every
+/// phase is timed from frame's entry, and `ready` comes when the control
+/// plane serves its API.
+#[test]
+fn a_production_boot_times_its_way_to_the_control_plane() {
+    let cmdline = "no_selftests control=50051 control_exit_after=1";
+    let out = boot("production", cmdline, 2);
+    out.assert_exit(Exit::Success);
+    out.assert_in_order(&[
+        "ichor: frame: entered from UEFI",
+        "ichor: frame: boot steps (ms after entry): files ",
+        "ichor: boot: kernel at ",
+        "ichor: boot: TSC at frame's entry ",
+        "ichor: smp: 2 CPUs online",
+        "ichor: boot: every CPU online at ",
+        "ichor: boot: scheduler at ",
+        "ichor: boot: network at ",
+        "ichor: cell 1: control: serving ichor.v1.Control on 127.0.0.1:50051",
+        "ichor: boot: ready (the control plane serves its API) at ",
+        "ichor: control: exited with Some(0)",
+    ]);
+    assert!(
+        !out.serial.contains("ichor: blk:") && !out.serial.contains("self-tests at"),
+        "a production boot ran self-tests; serial log:\n{}",
+        out.serial
+    );
+}
+
+/// A PVH loader's boot (ADR-0025), as Firecracker starts Ichor: QEMU's
+/// `-kernel` with the kernel laid out as an ELF and the boot files (CA
+/// roots, suffix rules) as its initrd, no UEFI and no disks. Both CPUs come
+/// up from the loader's ACPI tables, and the control plane serves.
+#[test]
+fn a_pvh_loader_boots_the_kernel() {
+    let out = boot_with(
+        "pvh",
+        "no_selftests control=50051 control_exit_after=1",
+        2,
+        |c| c.pvh = true,
+    );
+    out.assert_exit(Exit::Success);
+    out.assert_in_order(&[
+        "ichor: frame: entered by a PVH loader",
+        "ichor: frame: PVH start info v1: ",
+        "1 modules, RSDP found",
+        "ichor: frame: running in the higher half",
+        "ichor: kernel 0.0.0 on PVH loader",
+        "ichor: smp: 2 CPUs online",
+        "ichor: net: DHCP lease 10.0.2.15/24",
+        "ichor: control: starting (",
+        "ichor: cell 1: control: serving ichor.v1.Control on 127.0.0.1:50051 (",
+        "ichor: boot: ready (the control plane serves its API) at ",
+        "ichor: control: exited with Some(0)",
+    ]);
+    // The CA roots came through the module.
+    assert!(
+        !out.serial.contains("50051 (0 roots"),
+        "no CA roots from the boot files; serial log:\n{}",
+        out.serial
+    );
+}
 
 const BOOT_MARKERS: &[&str] = &[
     "ichor: frame: entered from UEFI",

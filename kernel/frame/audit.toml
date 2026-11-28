@@ -59,5 +59,7 @@
 # Step 24 (ADR-0024: boot timed from frame's entry, Firecracker's boot-timer
 # port, PCI enumeration through bridges, only the console task writing to
 # the port, APs started without the MP Specification's delays): 8,450 / 325.
-max_code_lines = 8450
-max_unsafe_sites = 325
+# Step 25 (ADR-0025: the PVH entry, a 32-bit stub and the start info read
+# into the boot state): 8,800 / 330.
+max_code_lines = 8800
+max_unsafe_sites = 330

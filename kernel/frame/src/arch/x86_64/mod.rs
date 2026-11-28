@@ -7,6 +7,7 @@ pub(crate) mod entry;
 pub(crate) mod io;
 pub mod paging;
 pub(crate) mod pci;
+pub(crate) mod pvh;
 pub(crate) mod qemu;
 pub(crate) mod regs;
 pub(crate) mod rethunk;

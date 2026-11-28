@@ -254,6 +254,10 @@ pub struct RunConfig {
     /// Press the ACPI power button (QEMU's `system_powerdown`) once this
     /// text is on the serial console, as a cloud's "stop" does.
     pub power_button_after: Option<String>,
+    /// Boot as a PVH loader would (ADR-0025): QEMU's `-kernel` with the
+    /// kernel laid out as an ELF (`pvh::elf`), the boot files as `-initrd`
+    /// and the command line as `-append`; no UEFI, no disks.
+    pub pvh: bool,
 }
 
 impl RunConfig {
@@ -325,6 +329,7 @@ impl RunConfig {
             api_token: None,
             api_tls: None,
             power_button_after: None,
+            pvh: false,
         }
     }
 }
@@ -548,6 +553,9 @@ pub fn debian_image_path() -> Result<std::path::PathBuf> {
 /// Builds the QEMU command line for a run.
 pub fn command(cfg: &RunConfig) -> Result<Command> {
     let qemu = find_qemu()?;
+    if cfg.pvh {
+        return pvh_command(cfg, &qemu);
+    }
     let fw = find_firmware(&qemu)?;
     if let Some(img) = &cfg.disk_image {
         return disk_command(cfg, &qemu, &fw, img);
@@ -674,6 +682,41 @@ fn disk_command(cfg: &RunConfig, qemu: &Path, fw: &Firmware, img: &Path) -> Resu
                 cfg.disk_nvme_props
             ),
         })
+        .args(["-device", "virtio-rng-pci,disable-legacy=on"])
+        .args(cfg.net_args())
+        .args(&cfg.extra_args);
+    Ok(cmd)
+}
+
+/// QEMU as a PVH loader: SeaBIOS's PVH option ROM starts the ELF that
+/// `pvh::elf` makes of the kernel, with the boot files as its module.
+fn pvh_command(cfg: &RunConfig, qemu: &Path) -> Result<Command> {
+    let dir = workspace_root().join("target").join("qemu").join(&cfg.name);
+    fs::create_dir_all(&dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
+    let efi =
+        fs::read(&cfg.kernel).map_err(|e| format!("reading {}: {e}", cfg.kernel.display()))?;
+    let (elf, files) = (dir.join("ichor.elf"), dir.join("bootfiles.img"));
+    fs::write(&elf, crate::pvh::elf(&efi)?)
+        .map_err(|e| format!("writing {}: {e}", elf.display()))?;
+    let token = cfg.api_token.as_deref().map(str::as_bytes);
+    let tls = cfg.api_tls.as_deref().map(str::as_bytes);
+    fs::write(&files, crate::pvh::boot_files(token, tls)?)
+        .map_err(|e| format!("writing {}: {e}", files.display()))?;
+    let accel = cfg.accel.resolve();
+    let mut cmd = Command::new(qemu);
+    cmd.args(["-machine", &cfg.machine(), "-accel", accel.qemu_name()])
+        .args(["-cpu", &cfg.cpu_arg(accel)])
+        .args(["-smp", &cfg.smp_arg()])
+        .args(["-m", &format!("{}M", cfg.memory_mib)])
+        .args(["-nodefaults", "-no-user-config", "-no-reboot"])
+        .args(["-display", "none", "-serial", "stdio"])
+        .args(["-device", "isa-debug-exit,iobase=0xf4,iosize=0x04"])
+        .arg("-kernel")
+        .arg(&elf)
+        .arg("-initrd")
+        .arg(&files)
+        .arg("-append")
+        .arg(&cfg.cmdline)
         .args(["-device", "virtio-rng-pci,disable-legacy=on"])
         .args(cfg.net_args())
         .args(&cfg.extra_args);

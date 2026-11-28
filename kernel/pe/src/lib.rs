@@ -73,6 +73,11 @@ pub struct Section {
     pub virtual_address: u32,
     /// Size of the section in memory.
     pub virtual_size: u32,
+    /// Bytes of the section in the file (the rest of `virtual_size` is
+    /// zeros).
+    pub raw_size: u32,
+    /// Where those bytes start in the file.
+    pub raw_offset: u32,
     /// `IMAGE_SCN_*` flags.
     pub characteristics: u32,
 }
@@ -180,6 +185,8 @@ pub fn parse_headers(b: &[u8]) -> Result<Headers, Error> {
         s.name.copy_from_slice(name);
         s.virtual_size = u32_at(b, at + 8)?;
         s.virtual_address = u32_at(b, at + 12)?;
+        s.raw_size = u32_at(b, at + 16)?;
+        s.raw_offset = u32_at(b, at + 20)?;
         s.characteristics = u32_at(b, at + 36)?;
     }
     Ok(Headers {

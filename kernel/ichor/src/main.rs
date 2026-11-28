@@ -124,14 +124,22 @@ pub(crate) fn boot_ready() {
 fn kmain(info: BootInfo) -> ! {
     boot_phase("kernel");
     let (major, minor) = info.uefi_revision();
-    println!(
-        "ichor: kernel {} on {} (firmware rev {:#x}, UEFI {}.{})",
-        env!("CARGO_PKG_VERSION"),
-        info.firmware_vendor(),
-        info.firmware_revision(),
-        major,
-        minor / 10,
-    );
+    if major == 0 {
+        println!(
+            "ichor: kernel {} on {} (no UEFI)",
+            env!("CARGO_PKG_VERSION"),
+            info.firmware_vendor(),
+        );
+    } else {
+        println!(
+            "ichor: kernel {} on {} (firmware rev {:#x}, UEFI {}.{})",
+            env!("CARGO_PKG_VERSION"),
+            info.firmware_vendor(),
+            info.firmware_revision(),
+            major,
+            minor / 10,
+        );
+    }
     println!("ichor: cmdline: {:?}", info.cmdline());
     let cmdline = cmdline::Cmdline::new(info.cmdline());
     let tsc = frame::time::tsc_at_entry();

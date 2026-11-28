@@ -355,6 +355,7 @@ dependencies = [
  "ichor-image",
  "ichor-layer",
  "ichor-oci",
+ "ichor-pe",
  "ichor-testprog",
  "ichor-tls",
  "ichor-x509",

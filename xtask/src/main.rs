@@ -36,6 +36,10 @@ Commands:
                --azure target/ichor-azure.vhd;
                --api-token-file F puts the control plane's API token on it,
                --api-tls-file F its TLS certificate and Ed25519 key (PEM)
+  pvh-image    Write target/pvh/ichor.elf (the kernel for a PVH loader such as
+               Firecracker) and target/pvh/bootfiles.img (its initrd: CA roots,
+               suffix rules, --api-token-file, --api-tls-file); the command
+               line is the loader's
   root-image TAR... OUT
                Convert root file system tarballs (.tar or .tar.gz, applied in
                order, OCI whiteouts honored) into an Ichor image at OUT: a
@@ -350,6 +354,41 @@ fn cmd_disk_image(o: &Opts, args: &[String]) -> Result<()> {
         std::fs::write(&path, &vhd).map_err(|e| format!("writing {}: {e}", path.display()))?;
         println!("{}: upload as a page blob (docs/cloud.md)", path.display());
     }
+    Ok(())
+}
+
+/// `cargo xtask pvh-image`: the kernel as an ELF a PVH loader starts
+/// (Firecracker, Cloud Hypervisor; ADR-0025), and the boot files module
+/// (its initrd), in `target/pvh/`. The command line goes to the loader
+/// (Firecracker's `boot_args`), so it is only printed.
+fn cmd_pvh_image(o: &Opts) -> Result<()> {
+    let kernel = build::kernel(o.profile)?;
+    let efi = std::fs::read(&kernel).map_err(|e| format!("reading {}: {e}", kernel.display()))?;
+    let read = |p: &Option<std::path::PathBuf>| match p {
+        Some(p) => std::fs::read(p)
+            .map(Some)
+            .map_err(|e| format!("reading {}: {e}", p.display())),
+        None => Ok(None),
+    };
+    let token = read(&o.api_token_file)?;
+    let tls = read(&o.api_tls_file)?;
+    let dir = xtask::workspace_root().join("target").join("pvh");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
+    let write = |name: &str, bytes: &[u8]| {
+        let path = dir.join(name);
+        std::fs::write(&path, bytes).map_err(|e| format!("writing {}: {e}", path.display()))?;
+        println!("{} ({} KiB)", path.display(), bytes.len() >> 10);
+        Ok::<_, String>(())
+    };
+    write("ichor.elf", &xtask::pvh::elf(&efi)?)?;
+    write(
+        "bootfiles.img",
+        &xtask::pvh::boot_files(token.as_deref(), tls.as_deref())?,
+    )?;
+    println!(
+        "boot with the ELF as the kernel and bootfiles.img as the initrd; command line {:?}",
+        o.cmdline
+    );
     Ok(())
 }
 
@@ -717,6 +756,7 @@ fn main() -> ExitCode {
         "fuzz" => cmd_fuzz(rest),
         "workloads" => cmd_workloads(rest),
         "disk-image" => cmd_disk_image(&o, rest),
+        "pvh-image" => cmd_pvh_image(&o),
         "api" => cmd_api(rest),
         "root-image" => cmd_root_image(rest),
         "help" | "--help" | "-h" => {

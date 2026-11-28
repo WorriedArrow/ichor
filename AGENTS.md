@@ -53,6 +53,21 @@ tests/control.rs serves one from the host and refuses a wrong digest]; (6) ADR-0
 boot [done: VERW, IBPB, and page-table isolation (ADR-0004's second
 2026-11-16 amendment)].
 
+- Boot time (2026-11-28, ADR-0024 and ADR-0025): boots are timed from
+  frame's entry (`ichor: frame: boot steps`, `ichor: boot: PHASE at T ms`,
+  `ready` when the control plane serves; `boot_timer` tells Firecracker's
+  boot timer). `no_selftests` is a production boot. Four waits left the
+  boot path: the 256-bus PCI scan (now bridges from bus 0), writers paying
+  a VM exit per console byte (only the console task writes the port now),
+  the MP Specification's INIT/STARTUP delays, and the timer test's ticks.
+  Under OpenVMM a production boot is ready in 56-90 ms, from 326. Ichor
+  also boots without firmware, by PVH (Firecracker, Cloud Hypervisor, QEMU
+  `-kernel`): `cargo xtask pvh-image` lays the PE out at 16 MiB in an ELF
+  with the PVH note, and frame's 32-bit stub (`arch::pvh`) reaches
+  `boot::pvh::pvh_main`, which fills the same boot state as `efi_main`
+  (files from the initrd, `bootfiles.img`). No wall clock under PVH yet
+  (kvmclock's is owed). Test: `a_pvh_loader_boots_the_kernel`.
+
 - Cell access-control suite (merged 2026-11-23, WorriedArrow/ichor#4;
   `docs/reports/cell-access-tests.md`): `cell_access` runs
   `kernel/ichor/src/cellaccess.rs`, two cells with their own roots, a helper
@@ -1054,6 +1069,7 @@ cargo xtask frame-audit    # frame's and services/rt's line and unsafe-site coun
 cargo xtask run --cmdline "qemu_debug_exit bench" --smp 4 --release   # benchmarks (use KVM for real numbers)
 cargo xtask bench --accel kvm --smp 4   # Ichor vs Linux, same machine and programs (Markdown table)
 cargo xtask disk-image     # target/ichor-disk.img: bootable GPT disk (ESP + Ichor root) for clouds/bare metal
+cargo xtask pvh-image --release --cmdline "..."   # target/pvh/ichor.elf + bootfiles.img: kernel and initrd for Firecracker (PVH, ADR-0025)
 cargo xtask api HOST:50051 --name NAME --ca ca.pem --token-file F IMAGE -- CMD   # pull and run on a running machine (docs/cloud.md)
 cargo xtask root-image ROOT.tar[.gz]... OUT.img   # root file system tarballs into an Ichor image (autorun's second disk; docs/syzkaller.md)
 cargo xtask fuzz [TARGET] --iterations N   # mutation-fuzz the parsers (failing inputs: target/fuzz/)

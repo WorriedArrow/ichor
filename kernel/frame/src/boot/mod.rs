@@ -19,6 +19,7 @@
 //! After step 4 no firmware code runs again: Ichor never calls UEFI runtime
 //! services.
 
+pub(crate) mod pvh;
 mod uefi;
 
 use core::cell::UnsafeCell;
@@ -186,12 +187,16 @@ pub(crate) fn fatal(what: &str) -> ! {
 }
 
 /// Firmware phase, after boot services are gone: build the kernel address
-/// space and switch to it.
-fn start(state: &'static mut BootState) -> ! {
+/// space and switch to it. `identity` is how much of physical memory the
+/// current page tables identity-map (all of it under UEFI; 4 GiB after the
+/// PVH stub).
+fn start(state: &'static mut BootState, identity: u64) -> ! {
+    // Referenced so the linker keeps the PVH stub in every image.
+    core::hint::black_box(arch::pvh::header());
     if !arch::cpu::enable_nx() {
         fatal("CPU lacks no-execute support");
     }
-    let Some(mut early) = EarlyAlloc::new(state.regions()) else {
+    let Some(mut early) = EarlyAlloc::new(state.regions(), identity) else {
         fatal("no usable memory above 1 MiB");
     };
     let plan = match mm::kspace::build(state.regions(), state.kernel_image, &mut early) {
