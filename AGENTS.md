@@ -920,8 +920,13 @@ Page faults (round 20, 2026-11-27; ADR-0020's 2026-11-27 amendment):
   `ichor: bench: page fault` row includes the exit; through round 19 that
   row, at 16 MiB, was what the tables compared.
 - Against Linux 7.3 the touch alone takes 395 / 660 ns on n2, 361 / 363
-  on c3, 231 / 247 on Milan and 272 / 325 on Rome. The m7i drew a host
-  20-30% slow on every row (443 / 350, unsettled).
+  on c3, 231 / 247 on Milan and 272 / 325 on Rome. Round 20's m7i drew a
+  host 20-30% slow on every row (443 / 350).
+- Round 21 ran both kernels on one m7i host, Ichor after Linux through
+  `create-replace-root-volume-task` (`docs/benchmarks.md` has what that
+  needs: a UEFI copy of Debian's AMI, SR-IOV on Ichor's). Linux keeps the
+  page fault by 2% (355 / 362 ns), and the null syscall ties (76 / 76).
+  Ichor leads pipes and fork by 3x, and fork + exec 49 / 83 us.
 - Clearing a block backward in 256 KiB pieces, to leave its start in
   cache, was slower locally and was dropped.
 

@@ -665,13 +665,56 @@ Reading it:
 - **The m7i drew a slow host.** Every row is 20-30% slower than in round 19
   on the same instance type: null syscall 90 against 72 ns, pipe 3.91
   against 3.13 us, fork + exec 58 against 45 us. Its page fault, 443
-  against Linux's 350 ns from another host, says little either way. Only
-  Ichor and Linux on one host, one after the other, would settle it.
+  against Linux's 350 ns from another host, says little either way. Round
+  21 ran both on one host.
 - **The exit.** With it, the page-fault row is 46-86 ns a page above the
   touch alone. Freeing a page now costs 10-12 ns, against 26-40 locally
   before. The rest is not broken down here; it includes unmapping, and
   the buddy allocator taking its lock once for each 4 KiB page freed.
 - **The other rows** are within each machine's spread of round 19.
+
+## Round 21 (2026-11-28): Ichor and Linux 7.3 on one m7i host
+
+Round 20's m7i drew a slow host, so this round runs both kernels on one
+host, one after the other. One m7i-flex.large (us-east-2c) booted Debian
+13 and moved to trixie-backports' `7.3.4+deb13-cloud-amd64` (THP
+`[always]`). It ran the benchmark programs five rounds (`linuxpf.sh`: round
+18's script without the container runtimes). Then
+`create-replace-root-volume-task` put Ichor's round-20 image on its root.
+AWS keeps the instance on the same physical host for that, and the task
+took 20 s. Ichor ran the same programs, five rounds.
+
+What it took:
+
+- Debian's AMI declares no boot mode, so an m7i boots it as legacy BIOS,
+  and a UEFI root cannot replace a BIOS one. A copy of Debian's AMI
+  (`copy-image`), registered again from the copy's snapshot with
+  `--boot-mode uefi`, booted Debian under UEFI.
+- The instance took SR-IOV (`simple`) from Debian's AMI, and a replacement
+  may not remove it. So Ichor's snapshot was registered again with
+  `--sriov-net-support simple`. Ichor drives the ENA itself, so the flag
+  changes nothing for it.
+
+Medians of five rounds, the programs' own timings (the range after it):
+
+| Benchmark | Ichor | Linux 7.3 |
+|---|---|---|
+| null syscall | 76 ns (73-77) | 76 ns (76-77) |
+| pipe round trip | **3.26** us | 10.9 us (10.2-11.4) |
+| page fault (64 MiB, the touch alone) | 362 ns (360-373) | **355** ns (350-358) |
+| fork + wait | **11** us | 33.4 us |
+| fork + exec + wait | **49** us (43-52) | 83 us (80-84) |
+
+Linux took 32 huge-page faults a run (`thp_fault_alloc` 9 → 169 over the
+five), so its page fault is the 2 MiB fault, as Ichor's is.
+
+Reading it:
+
+- **The page fault is Linux's by 2%** on this host (362 against 355 ns).
+  Round 20's 443 against 350 was the slow host, not the kernel.
+- **The null system call ties** (76 / 76 ns). Ichor is ahead by 3x on
+  pipes and fork, and by 1.7x on fork + exec.
+- Container start from a native caller: 79 us.
 
 ## Container start from the caller's side
 
