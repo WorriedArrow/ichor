@@ -30,7 +30,7 @@ use net::link::Link;
 use net::nat::{self, Nat};
 use net::switch::{PortId, Switch, Verdict};
 use net::tcp;
-use net::wire::{PROTO_TCP, PROTO_UDP};
+use net::wire::{PROTO_ICMP, PROTO_TCP, PROTO_UDP, UNREACHABLE_NEEDS_FRAG, Unreachable};
 
 use crate::netstack::Stack;
 
@@ -441,6 +441,49 @@ fn tcp_refusal(p: &Packet) -> Option<Vec<u8>> {
     ))
 }
 
+/// ICMP "fragmentation needed" about a TCP packet a cell sent out (RFC
+/// 1191): the path beyond the uplink carries less than the uplink's own MTU
+/// (Firecracker's tap on GCP: 1500 against GCP's 1460), and the path
+/// dropped it. Later SYNs crossing the uplink are clamped to the path's MTU,
+/// and the error goes to the cell, translated back to its address and port,
+/// so its connection resends in segments that fit. Other ICMP is dropped.
+fn frag_needed(u: &mut Uplink, p: &Packet, t: Duration) -> Option<(PortId, Packet)> {
+    let e = Unreachable::parse(&p.payload)?;
+    if e.code != UNREACHABLE_NEEDS_FRAG || e.protocol != PROTO_TCP || e.mtu < 68 {
+        return None;
+    }
+    let port = |at: usize| u16::from_be_bytes([e.head[at], e.head[at + 1]]);
+    if e.mtu - 40 < u.mss {
+        println!(
+            "ichor: net: the path to {} carries {} bytes: SYNs across the uplink now ask for {} (was {})",
+            e.dst,
+            e.mtu,
+            e.mtu - 40,
+            u.mss
+        );
+        u.mss = e.mtu - 40;
+    }
+    let inside = u.nat.lookup(PROTO_TCP, (e.dst, port(2)), port(0), t)?;
+    let mut head = e.head;
+    head[..2].copy_from_slice(&inside.1.to_be_bytes());
+    let id = with_table(|tb| tb.switch.port_of(inside.0))?;
+    let payload = Unreachable {
+        src: inside.0,
+        head,
+        ..e
+    }
+    .emit();
+    Some((
+        id,
+        Packet {
+            src: p.src,
+            dst: inside.0,
+            protocol: PROTO_ICMP,
+            payload,
+        },
+    ))
+}
+
 /// Sends a packet of `from`'s cell out of the uplink, translated.
 fn uplink_out(from: PortId, mut p: Packet) {
     let mut u = UPLINK.lock();
@@ -520,6 +563,12 @@ pub(crate) fn poll_uplink() -> bool {
             if let Some(w) = &mut u.watch
                 && w.take(t, &p)
             {
+                continue;
+            }
+            if p.protocol == PROTO_ICMP {
+                if let Some(q) = frag_needed(u, &p, t) {
+                    inbound.push(q);
+                }
                 continue;
             }
             let Some((sp, dp)) = ports(p.protocol, &p.payload) else {

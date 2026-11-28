@@ -283,13 +283,20 @@ pub const ICMP_UNREACHABLE: u8 = 3;
 /// listens on.
 pub const UNREACHABLE_HOST: u8 = 1;
 pub const UNREACHABLE_PORT: u8 = 3;
+/// "Fragmentation needed and DF set" (RFC 1191): the packet was larger
+/// than the next hop carries, whose MTU the message gives.
+pub const UNREACHABLE_NEEDS_FRAG: u8 = 4;
 
 /// An ICMP "destination unreachable" (checksum verified), and what it
 /// quotes of the packet it is about: its addresses, its protocol and the
-/// first eight bytes of its payload (a UDP header).
+/// first eight bytes of its payload (a UDP header, or the start of a TCP
+/// one: its ports and sequence number).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Unreachable {
     pub code: u8,
+    /// The next hop's MTU, for [`UNREACHABLE_NEEDS_FRAG`] (0 otherwise, or
+    /// from a router too old to say).
+    pub mtu: u16,
     pub src: Ipv4Addr,
     pub dst: Ipv4Addr,
     pub protocol: u8,
@@ -310,6 +317,7 @@ impl Unreachable {
         }
         Some(Unreachable {
             code: *b.get(1)?,
+            mtu: be16(b, 6)?,
             src: ip(quoted, 12)?,
             dst: ip(quoted, 16)?,
             protocol: *quoted.get(9)?,
@@ -318,7 +326,8 @@ impl Unreachable {
     }
 
     pub fn emit(&self) -> Vec<u8> {
-        let mut b = alloc::vec![ICMP_UNREACHABLE, self.code, 0, 0, 0, 0, 0, 0];
+        let [hi, lo] = self.mtu.to_be_bytes();
+        let mut b = alloc::vec![ICMP_UNREACHABLE, self.code, 0, 0, 0, 0, hi, lo];
         b.extend_from_slice(&ipv4(self.src, self.dst, self.protocol, 0, &self.head));
         let c = checksum(&b);
         b[2..4].copy_from_slice(&c.to_be_bytes());
@@ -419,6 +428,7 @@ mod tests {
     fn unreachable_round_trips_and_rejects_damage() {
         let u = Unreachable {
             code: UNREACHABLE_PORT,
+            mtu: 0,
             src: A,
             dst: B,
             protocol: PROTO_UDP,
@@ -426,6 +436,15 @@ mod tests {
         };
         let b = u.emit();
         assert_eq!(Unreachable::parse(&b), Some(u));
+        // "Fragmentation needed" carries the next hop's MTU.
+        let frag = Unreachable {
+            code: UNREACHABLE_NEEDS_FRAG,
+            mtu: 1460,
+            protocol: PROTO_TCP,
+            ..u
+        };
+        assert_eq!(Unreachable::parse(&frag.emit()), Some(frag));
+        assert_eq!(&frag.emit()[6..8], &1460u16.to_be_bytes());
         for i in 0..b.len() {
             let mut bad = b.clone();
             bad[i] ^= 0x40;

@@ -245,6 +245,20 @@ impl Nat {
 
     /// A packet from `remote` outside to the uplink's `port`: the cell
     /// endpoint it goes to, or `None` (drop it).
+    /// The inside endpoint of the live mapping that `port` on the outside
+    /// has to `remote`, without touching it: for an ICMP error that quotes
+    /// a packet the mapping sent ("fragmentation needed").
+    pub fn lookup(
+        &self,
+        proto: u8,
+        remote: Endpoint,
+        port: u16,
+        now: Duration,
+    ) -> Option<Endpoint> {
+        let m = self.by_outside.get(&(proto, port, remote))?;
+        (!m.expired(now)).then_some(m.inside)
+    }
+
     pub fn inbound(
         &mut self,
         proto: u8,
@@ -450,6 +464,13 @@ mod tests {
             n.inbound(PROTO_TCP, (FAR, 443), b.1, ACK, t(1)),
             Some((CELL2, 40000))
         );
+        // An ICMP error quoting a's packet finds a's cell; no other remote.
+        assert_eq!(
+            n.lookup(PROTO_TCP, (FAR, 443), a.1, t(1)),
+            Some((CELL, 40000))
+        );
+        assert_eq!(n.lookup(PROTO_TCP, (FAR, 80), a.1, t(1)), None);
+        assert_eq!(n.lookup(PROTO_UDP, (FAR, 443), a.1, t(1)), None);
         // A different remote endpoint on that port is not let in.
         assert_eq!(n.inbound(PROTO_TCP, (FAR, 444), a.1, ACK, t(1)), None);
         assert_eq!(n.len(), 2);

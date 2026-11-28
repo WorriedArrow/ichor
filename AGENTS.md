@@ -67,9 +67,12 @@ boot [done: VERW, IBPB, and page-table isolation (ADR-0004's second
   `boot::pvh::pvh_main`, which fills the same boot state as `efi_main`
   (files from the initrd, `bootfiles.img`). Under PVH the wall clock is
   KVM's (`MSR_KVM_WALL_CLOCK_NEW`, ADR-0025's amendment; none under TCG).
-  Under Firecracker on GCP, TLS to Docker Hub verified with it. The pull
-  then stalled on the manifest request ("a call timed out"); that is not
-  diagnosed yet. Test: `a_pvh_loader_boots_the_kernel`. Round 22
+  Under Firecracker on GCP, TLS to Docker Hub verified with it, and pulls
+  and runs work (busybox in 0.9 s). They had stalled because the guest's
+  MTU was 1500 against GCP's 1460, and the uplink dropped the host's ICMP
+  "fragmentation needed". It now acts on that ICMP (ADR-0010's 2026-11-28
+  amendment, `Tcp::path_mtu`). Test: `a_pvh_loader_boots_the_kernel`.
+  Round 22
   (`docs/benchmarks.md`), against Debian 13 + Linux 7.3 with containerd,
   ready = the control plane serving / containerd answering:
   - **GCP n2-standard-2, booted directly:** VM start to ready 1.62 s

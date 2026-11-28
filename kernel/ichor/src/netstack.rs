@@ -44,7 +44,8 @@ use net::Ipv4Addr;
 use net::iface::Packet;
 use net::tcp::{self, Segment, State, Tcp};
 use net::wire::{
-    PROTO_ICMP, PROTO_TCP, PROTO_UDP, UNREACHABLE_HOST, UNREACHABLE_PORT, Udp, Unreachable,
+    PROTO_ICMP, PROTO_TCP, PROTO_UDP, UNREACHABLE_HOST, UNREACHABLE_NEEDS_FRAG, UNREACHABLE_PORT,
+    Udp, Unreachable,
 };
 
 use crate::poll::Watchers;
@@ -585,6 +586,7 @@ impl Inner {
         {
             let u = Unreachable {
                 code: UNREACHABLE_PORT,
+                mtu: 0,
                 src,
                 dst,
                 protocol: PROTO_UDP,
@@ -601,6 +603,23 @@ impl Inner {
             return;
         };
         let port = |at: usize| u16::from_be_bytes([u.head[at], u.head[at + 1]]);
+        // "Fragmentation needed" for a TCP segment we sent: its connection
+        // shrinks its segments to the path's MTU and resends (RFC 1191).
+        if u.code == UNREACHABLE_NEEDS_FRAG {
+            if u.protocol == PROTO_TCP && p.dst == u.src {
+                let (local, remote, t) = ((u.src, port(0)), (u.dst, port(2)), now());
+                for (&id, s) in &mut self.socks {
+                    if let Kind::Conn { tcp, .. } = &mut s.kind
+                        && tcp.local == local
+                        && tcp.remote == remote
+                    {
+                        tcp.path_mtu(u.mtu, t);
+                        self.touched.insert(id);
+                    }
+                }
+            }
+            return;
+        }
         let error = match u.code {
             // Only the host itself knows its ports.
             UNREACHABLE_PORT if p.src == u.dst => ECONNREFUSED,

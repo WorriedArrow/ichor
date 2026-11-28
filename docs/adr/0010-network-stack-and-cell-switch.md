@@ -162,3 +162,31 @@ the uplink refuses a cell's connection there (with a reset, so that
 programs which probe for a cloud go on at once) and drops its datagrams,
 except for DNS, which some clouds serve at the same address. A cell that
 is to have cloud credentials will be given its own.
+
+## Amendment (2026-11-28): path MTU, from ICMP "fragmentation needed"
+
+Under Firecracker on GCP, the guest's tap and DHCP server give it MTU
+1500, but GCP's network carries 1460. Every TCP segment the size of the
+peer's MSS (1460 bytes, a 1,500-byte packet) was dropped by the host.
+The host answered with ICMP "fragmentation needed" (mtu 1460), which the
+uplink dropped as untranslated ICMP. Small exchanges worked, but the first
+request with a bearer token, a full-sized segment, was resent at the same
+size until the pull timed out.
+
+- **The uplink acts on the error.** On "fragmentation needed" quoting a TCP
+  packet it sent for a cell (RFC 1191), the uplink:
+  - lowers its SYN clamp to the path's MTU minus 40, for both directions
+    and for every later connection;
+  - finds the cell through the NAT mapping (`Nat::lookup`, which does not
+    touch the mapping);
+  - delivers the error to the cell, with the quoted source rewritten to
+    the cell's address and port.
+- **The cell's stack shrinks the connection's segments**
+  (`Tcp::path_mtu`), then sends what was in flight again at once, from
+  the oldest unacknowledged byte. The congestion window stays, since this
+  is not congestion. An MTU below 68 is ignored.
+- **Other ICMP from outside is still dropped.**
+
+Seen on GCP with a guest at MTU 1500 (`docs/benchmarks.md`, round 22):
+before this, the pull stalled after the token. With dnsmasq handing out
+1460, the same pull worked. Now it works without that.

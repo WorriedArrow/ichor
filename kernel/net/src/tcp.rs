@@ -1156,6 +1156,31 @@ impl Tcp {
         self.output(now);
     }
 
+    /// The path to the peer carries at most `mtu`-byte packets (ICMP
+    /// "fragmentation needed", RFC 1191): segments shrink to fit, and what
+    /// is in flight at the old size, which the path dropped, goes again at
+    /// once. Not a sign of congestion, so the window stays. An MTU below
+    /// IPv4's minimum (68) is ignored, as is one that would not shrink them.
+    pub fn path_mtu(&mut self, mtu: u16, now: Duration) {
+        if mtu < 68 {
+            return;
+        }
+        let mss = mtu - 40;
+        if mss >= self.peer_mss {
+            return;
+        }
+        self.peer_mss = mss;
+        let open = !matches!(
+            self.state,
+            State::SynSent | State::SynReceived | State::Closed
+        );
+        if open && self.snd_nxt != self.snd_una {
+            self.rtt_probe = None;
+            self.snd_nxt = self.snd_una;
+            self.output(now);
+        }
+    }
+
     /// When [`Tcp::poll`] next has work.
     pub fn next_timer(&self) -> Option<Duration> {
         match (self.retransmit_at, self.time_wait_until) {
@@ -1288,6 +1313,32 @@ mod tests {
 
     fn pattern(n: usize, salt: u8) -> Vec<u8> {
         (0..n).map(|i| (i as u8).wrapping_mul(31) ^ salt).collect()
+    }
+
+    /// ICMP "fragmentation needed" for a path that carries 1400 bytes:
+    /// what was in flight goes again at once, from the oldest byte, in
+    /// segments that fit; a larger or impossible MTU changes nothing.
+    #[test]
+    fn a_smaller_path_mtu_resends_in_flight_data_in_smaller_segments() {
+        let t = Duration::from_secs(1);
+        let mut a = Tcp::connect(A, B, 1000, t);
+        let syn = a.transmit().unwrap();
+        let mut b = Tcp::accept(B, A, &Segment::parse(&syn, A.0, B.0).unwrap(), 5000, t);
+        let synack = b.transmit().unwrap();
+        a.on_segment(&Segment::parse(&synack, B.0, A.0).unwrap(), t);
+        while a.transmit().is_some() {}
+        assert_eq!(a.send(&pattern(6000, 7), t), 6000);
+        let size = |s: &Vec<u8>| Segment::parse(s, A.0, B.0).unwrap().payload.len();
+        let first: Vec<_> = core::iter::from_fn(|| a.transmit()).collect();
+        assert_eq!(size(&first[0]), usize::from(MSS));
+        a.path_mtu(1400, t);
+        let again: Vec<_> = core::iter::from_fn(|| a.transmit()).collect();
+        assert_eq!(Segment::parse(&again[0], A.0, B.0).unwrap().seq, 1001);
+        assert!(again.iter().all(|s| size(s) <= 1360));
+        assert_eq!(again.iter().map(size).sum::<usize>(), 6000);
+        a.path_mtu(1500, t);
+        a.path_mtu(40, t);
+        assert!(a.transmit().is_none());
     }
 
     /// Sends `a_data` from A and `b_data` from B, reading everything on
