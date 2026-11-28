@@ -22,5 +22,6 @@ node = 995
 # 2026-11-22: 2283 of 2376 tests (96.0%) on KVM with 4 vCPUs.
 jvm = 945
 
-# 2026-11-22: 150 of 156 tests (96.2%) under TCG on 4 vCPUs.
-uring = 940
+# 2026-11-28: 152 of 154 tests (98.7%) under OpenVMM on 4 vCPUs; left:
+# send-zerocopy (IPv6) and read-write (CAP_SYS_RESOURCE).
+uring = 980

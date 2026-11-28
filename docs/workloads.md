@@ -54,17 +54,13 @@ suite's own unit), passed / run. Floors are in `workloads.toml`.
 - Image: `docker.io/library/buildpack-deps@sha256:f53cd4c58cdb96a467b98696cd510a949ef4ccd7d23e07b75107de754773007a`
 - Layer: `https://brick.kernel.dk/snaps/liburing-2.5.tar.gz` (sha256:0100cfbf68943dfa869e02c99f8724c69182b09f7a90f1955e709bc914c7ebf9), `liburing-2.5/` at `/usr/src/liburing/`
 - Command: `sh -c cp -r /usr/src/liburing /root/liburing; cd /root/liburing; { ./configure && make -j4 -C src && make -j4 -C test; } >../make.log 2>&1 || { tail -40 ../make.log; exit 1; }; echo built; cd test; [ $# -gt 0 ] || set -- $(ls *.t); n=0; bad=0; for t in "$@"; do t=${t%.t}; n=$((n+1)); timeout -s INT -k 10 120 ./$t.t >/tmp/out 2>&1 </dev/null; s=$?; case $s in 0) echo "ok $n $t";; 77) echo "ok $n $t # skip";; *) echo "not ok $n $t ($s)"; tail -20 /tmp/out | sed 's/^/# /'; bad=1;; esac; done; exit $bad uring`
-- Result: 150 of 156 tests passed (96.1%), 6 skipped; floor 0.0%
-- Run time: 12 min (tcg, 4 vCPUs, the cell given 3 GiB)
+- Result: 152 of 154 tests passed (98.7%), 8 skipped; floor 94.0%
+- Run time: 3 min (openvmm, Windows' hypervisor platform, 4 vCPUs, the cell given 3 GiB)
 
 Failed:
 
 - `read-write`
-- `recv-multishot`
 - `send-zerocopy`
-- `socket-io-cmd`
-- `timeout`
-- `wq-aff`
 
 ## jvm
 
