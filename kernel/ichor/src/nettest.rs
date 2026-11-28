@@ -206,16 +206,23 @@ pub(crate) fn run() {
     }
     .emit();
     ifc.send(now(), gateway, wire::PROTO_ICMP, &req);
+    // Up to 2 s for ARP; the ping is a diagnostic, given 50 ms past the
+    // ARP answer (a gateway answers within one; GCP's never does, which
+    // held every boot there for the whole 2 s).
     let deadline = now() + Duration::from_secs(2);
     let mut pinged = false;
+    let mut resolved = None;
     while now() < deadline && !pinged {
         for p in pump(&mut *dev, &mut ifc) {
             pinged |= p.protocol == wire::PROTO_ICMP
                 && Echo::parse(&p.payload)
                     .is_some_and(|e| e.kind == wire::ICMP_ECHO_REPLY && e.ident == PING_IDENT);
         }
-        if ifc.neighbor(gateway, now()).is_some() && pinged {
-            break;
+        if ifc.neighbor(gateway, now()).is_some() {
+            let at = *resolved.get_or_insert(now());
+            if pinged || now() >= at + Duration::from_millis(50) {
+                break;
+            }
         }
         frame::task::yield_now();
     }
