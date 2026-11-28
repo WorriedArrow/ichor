@@ -181,7 +181,16 @@ boot [done: VERW, IBPB, and page-table isolation (ADR-0004's second
   Latest full run (2026-11-22): 454 of 457 modules (99.3%). The three:
   no compiler in the image (`test_ctypes`), `dnotify` (`test_fcntl`), and
   `multiprocessing_spawn.test_processes`, which takes 9 of its 10 minutes
-  under TCG and passes with a longer limit. rseq is ENOSYS.
+  under TCG and passes with a longer limit. rseq is ENOSYS. Since
+  2026-11-28: 461 of 461 under OpenVMM, on the full `python:3.12.16-bookworm`
+  image (it has a compiler) plus `idle_test`, with dnotify (`F_NOTIFY`,
+  `linuxabi/inotify.rs`: built on inotify's change recording, SIGIO to
+  the registering process, one-shot unless `DN_MULTISHOT`).
+- Workloads on OpenVMM (`cargo xtask workloads SUITE --vmm openvmm`,
+  `xtask/src/openvmm.rs`): Windows' hypervisor platform, a production boot
+  (`no_selftests`) from a disk image, the API forwarded by consomme; the
+  VM is killed when the client finishes. Minutes where TCG took hours: use
+  it locally.
 - M7 Go (second suite): `cargo xtask workloads go` runs `go test -short
   std` on the official `golang` image. Fixed on the way: `epoll_wait` held
   descriptors and a fixed interest list while asleep (an epoll instance is
@@ -206,7 +215,15 @@ boot [done: VERW, IBPB, and page-table isolation (ADR-0004's second
   `--image REF --memory MiB` on a machine too small for the suite's own).
   Latest full run (2026-11-22): 260 of 262 packages. The two: `crypto/sha1`
   (under TCG: QEMU reads 32 bytes for a 16-byte AVX2 operand) and `syscall`
-  (ptrace).
+  (ptrace). Under OpenVMM (2026-11-28, `--vmm openvmm`, 5 min) it needed:
+  `ptrace` EPERM for every request (Go skips on it); CPU-time timers
+  checked where Linux's tick would check them (after a trap that is not a
+  system call, or after a system call a tick came during:
+  `sched::tick_mark`), with PROF/VIRTUAL sent to the running thread; and
+  `clone`'s exit signal honored (`ProcEntry::exit_signal`: 0 sends none,
+  and a child with one other than SIGCHLD is waited for only with
+  `__WCLONE`/`__WALL`, as Linux's `eligible_child`). Perl's `waitpid`
+  mangles a `__WALL` status, so `SIGNAL_SCRIPT` calls wait4 itself.
 - M7 PostgreSQL (third suite): `cargo xtask workloads postgres` builds
   16.16 in `buildpack-deps` (the official image carries no `pg_regress`)
   and runs `make check`; first run 223 of 224 (the other was QEMU's FMA on

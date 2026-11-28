@@ -232,6 +232,11 @@ pub(crate) struct ProcEntry {
     cpu_base: AtomicU64,
     /// The thread's CPU time once it no longer runs (ns).
     cpu_done: AtomicU64,
+    /// The signal the parent gets when this process ends: `clone`'s low
+    /// byte (`clone3`'s `exit_signal`), SIGCHLD for `fork`; 0 for none. A
+    /// child with another is a "clone" child, waited for only with
+    /// `__WCLONE` or `__WALL`.
+    pub(crate) exit_signal: core::sync::atomic::AtomicU32,
     /// What the entry costs the cell, until it is reaped.
     _kept: Reserved,
 }
@@ -497,6 +502,7 @@ pub(crate) fn register(
         process: SpinLock::new(Weak::new()),
         cpu_base: AtomicU64::new(0),
         cpu_done: AtomicU64::new(0),
+        exit_signal: core::sync::atomic::AtomicU32::new(signal::SIGCHLD),
         _kept: kept,
     });
     TABLE.lock().insert(pid, e.clone());
@@ -1001,9 +1007,16 @@ fn exited(e: &Arc<ProcEntry>, status: u32) {
         } else {
             (CLD_KILLED, status & 0x7f)
         };
-        post_process(&t, parent, signal::SIGCHLD, Info::child(e, code, st));
+        // The child's exit signal, if it has one (Go's probe for
+        // CLONE_PIDFD clones with none, and a second SIGCHLD for one child
+        // broke os/exec's TestSIGCHLD).
+        let sig = e.exit_signal.load(Ordering::Relaxed);
+        if sig != 0 {
+            post_process(&t, parent, sig, Info::child(e, code, st));
+        }
         let parent = parent.clone();
-        if parent.shared.nocldwait.load(Ordering::Relaxed) {
+        // Only a SIGCHLD child is reaped for a parent that does not wait.
+        if sig == signal::SIGCHLD && parent.shared.nocldwait.load(Ordering::Relaxed) {
             e.ppid.store(0, Ordering::Release); // not to be waited for
         }
         parent.children.wake_all();
@@ -1026,7 +1039,15 @@ pub(crate) struct Wanted {
     pub(crate) nohang: bool,
     /// Leave what is found to be found again (`WNOWAIT`).
     pub(crate) keep: bool,
+    /// `__WCLONE`: only "clone" children (an exit signal other than
+    /// SIGCHLD), not the others; `__WALL`: both.
+    pub(crate) clone: bool,
+    pub(crate) all: bool,
 }
+
+/// `__WCLONE` and `__WALL` in `wait4`'s and `waitid`'s options.
+pub(crate) const WCLONE: u64 = 0x8000_0000;
+pub(crate) const WALL: u64 = 0x4000_0000;
 
 /// The wait status of a child that went on.
 pub(crate) const CONTINUED: u32 = 0xffff;
@@ -1075,7 +1096,11 @@ pub(crate) fn wait(
                 -1 => true,
                 p => c.group().0 == p.unsigned_abs(),
             };
-            if !leader_of_child || c.ppid() != leader.pid || !wanted {
+            // Linux's `eligible_child`: a clone child for `__WCLONE`, the
+            // others without it, any with `__WALL`.
+            let clone_child = c.exit_signal.load(Ordering::Relaxed) != signal::SIGCHLD;
+            let kind = want.all || clone_child == want.clone;
+            if !leader_of_child || c.ppid() != leader.pid || !wanted || !kind {
                 continue;
             }
             any = true;
@@ -1139,13 +1164,25 @@ pub(crate) fn run(mut p: LinuxProcess, mut ctx: UserContext) -> (u32, u32) {
         // Not into user code with a signal to act on: one posted from here
         // on interrupts it (`wake`).
         let event = UserMode::new(&mut ctx).execute_unless(|| interrupted(&p.entry));
-        crate::itimer::check_cpu(&p);
+        // CPU-time timers are looked at where Linux looks: at a tick, which
+        // ends the slice of user code it lands in (any event but a system
+        // call), or which came while a system call ran (seen as it returns).
+        // Not at every system call: a SIGPROF would then always arrive just
+        // after one, and profiles would never show user code between calls.
+        let syscall = matches!(event, UserEvent::Syscall);
+        if !syscall {
+            crate::itimer::check_cpu(&p);
+        }
         match event {
             UserEvent::Syscall => {
                 syscalls = syscalls.wrapping_add(1);
                 let nr = ctx.rax;
+                let mark = crate::sched::tick_mark();
                 if let Outcome::Exit(code) = linuxabi::dispatch(&mut p, &mut ctx) {
                     break (code as u32 & 0xff) << 8;
+                }
+                if crate::sched::tick_mark() != mark {
+                    crate::itimer::check_cpu(&p);
                 }
                 restart = signal::Restart::of(nr, ctx.rax as i64);
                 if restart.is_none() {

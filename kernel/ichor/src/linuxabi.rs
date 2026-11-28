@@ -120,6 +120,7 @@ mod nr {
     pub(super) const GETRUSAGE: u64 = 98; // partial: user and system CPU time together as user time (system time and children are zero); maxrss is the current rss
     pub(super) const SYSINFO: u64 = 99; // partial: the cell's memory; no load averages or swap
     pub(super) const TIMES: u64 = 100; // partial: user and system CPU time together as user time (system and children's times are zero)
+    pub(super) const PTRACE: u64 = 101; // partial: every request is EPERM (no tracing in a cell yet; PTRACE_TRACEME too)
     pub(super) const GETTIMEOFDAY: u64 = 96; // firmware clock at boot plus monotonic time (no NTP)
     pub(super) const GETRLIMIT: u64 = 97;
     pub(super) const SETRLIMIT: u64 = 160; // partial: NOFILE and STACK enforced, others stored
@@ -644,6 +645,8 @@ pub(crate) fn dispatch(p: &mut LinuxProcess, ctx: &mut frame::user::UserContext)
         nr::SYSINFO => sysinfo(p, a[0]),
         nr::GETRUSAGE => getrusage(p, i(a[0]), a[1]),
         nr::TIMES => times(p, a[0]),
+        // Tracing is not offered: refused, as where ptrace is not permitted.
+        nr::PTRACE => Err(EPERM),
         nr::GETTID => Ok(p.entry.pid),
         nr::GETPPID => Ok(p.entry.ppid()),
         nr::GETUID => Ok(u64::from(p.group.creds().ruid)),
@@ -1208,7 +1211,12 @@ fn clone(
         c.rsp = stack;
         (p.new_thread().ok_or(EAGAIN)?, c)
     } else {
-        proc::fork(p, ctx, stack)?
+        let (child, cctx) = proc::fork(p, ctx, stack)?;
+        child.entry.exit_signal.store(
+            (flags & CSIGNAL) as u32,
+            core::sync::atomic::Ordering::Relaxed,
+        );
+        (child, cctx)
     };
     if flags & CLONE_SETTLS != 0 {
         cctx.fs_base = tls;
@@ -1256,7 +1264,8 @@ fn wait4(
     const WNOHANG: u64 = 1;
     const WUNTRACED: u64 = 2;
     const WCONTINUED: u64 = 8;
-    /// `__WNOTHREAD`, `__WALL`, `__WCLONE`: every child is waited for here.
+    /// `__WNOTHREAD` (a thread waits for its whole process's children),
+    /// `__WALL`, `__WCLONE` (`proc::Wanted`).
     const KNOWN: u64 = WNOHANG | WUNTRACED | WCONTINUED | 0xe000_0000;
     /// `sizeof(struct rusage)` on x86-64.
     const RUSAGE_SIZE: usize = 144;
@@ -1270,6 +1279,8 @@ fn wait4(
         continued: options & WCONTINUED != 0,
         nohang: options & WNOHANG != 0,
         keep: false,
+        clone: options & proc::WCLONE != 0,
+        all: options & proc::WALL != 0,
     };
     match proc::wait(&p.group.leader, &p.entry, pid, want)? {
         None => Ok(0),
@@ -1325,6 +1336,8 @@ fn waitid(
         continued: options & WCONTINUED != 0,
         nohang: options & WNOHANG != 0 || (idtype == 3 && pidfd::nonblocking(p, id)),
         keep: options & WNOWAIT != 0,
+        clone: options & proc::WCLONE != 0,
+        all: options & proc::WALL != 0,
     };
     let found = proc::wait(&p.group.leader, &p.entry, pid, want)?;
     if found.is_none() && options & WNOHANG == 0 {

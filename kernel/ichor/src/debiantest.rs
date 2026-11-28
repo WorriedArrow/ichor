@@ -411,6 +411,24 @@ syscall(232, $outer, $evs, 4, 0) == 0 or fail("an idle nested epoll is ready");
 $pid = child(sub { select(undef, undef, undef, 0.05); syswrite($pw, "x") });
 syscall(232, $outer, $evs, 4, 5000) == 1 or fail("a nested epoll never became ready");
 waitpid($pid, 0);
+# A child cloned with no exit signal (clone's low byte 0) sends none, and
+# only __WALL (or __WCLONE) waits for it.
+my $chld = 0;
+$SIG{CHLD} = sub { $chld++ };
+pipe(my $cr, my $cw) or fail("pipe: $!");
+my $cp = syscall(56, 0, 0, 0, 0, 0);
+if ($cp == 0) { syswrite($cw, "c"); my $r = syscall(231, 7); syswrite($cw, "x$r$!"); POSIX::_exit(9) }
+$cp > 0 or fail("clone: $!");
+close $cw;
+my $said = do { local $/; <$cr> } // "";
+$said eq "c" or fail("the clone child said $said");
+select(undef, undef, undef, 0.2);
+waitpid($cp, 0) == -1 && $!{ECHILD} or fail("a clone child was waited for without __WALL");
+my $ws = pack("L", 0xdead);
+my $wr = syscall(61, $cp, $ws, 0x40000000, 0);
+my $raw = unpack("L", $ws);
+$wr == $cp && $raw == 7 << 8 or fail("__WALL gave $wr ($!), status $raw");
+$chld == 0 or fail("SIGCHLD from a child with no exit signal");
 # Children of a process that ignores SIGCHLD are not waited for.
 $SIG{CHLD} = "IGNORE";
 $pid = child(sub { });

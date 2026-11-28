@@ -152,7 +152,7 @@ my $riov = pack("QQ", $B{futex_va} + $B{futex_off}, 16);
 for ([$B{pid}, "B pid"], [$kid, "A's own child"]) {
     my ($p, $who) = @$_;
     want("pidfd_getfd($who) [ENOSYS today]", "ENOSYS", syscall(438, $pfd, 0, 0));
-    want("ptrace(PTRACE_ATTACH, $who) [ENOSYS today]", "ENOSYS", syscall(101, 16, $p, 0, 0));
+    want("ptrace(PTRACE_ATTACH, $who) [EPERM: no tracing yet]", "EPERM", syscall(101, 16, $p, 0, 0));
     want("process_vm_readv($who) [ENOSYS today]", "ENOSYS", syscall(310, $p, $liov, 1, $riov, 1, 0));
     want("process_vm_writev($who) [ENOSYS today]", "ENOSYS", syscall(311, $p, $liov, 1, $riov, 1, 0));
     want("kcmp($who, self) [ENOSYS today]", "ENOSYS", syscall(312, $p, $$ + 0, 0, 0, 0));

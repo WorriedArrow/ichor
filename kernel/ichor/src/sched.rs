@@ -48,6 +48,8 @@ struct PerCpu {
     since: AtomicU64,
     /// Group of the task picked last, or `NO_GROUP` when idle.
     group: AtomicU64,
+    /// Scheduler ticks taken on this CPU ([`tick_mark`]).
+    ticks: AtomicU64,
 }
 
 frame::cpu_local! {
@@ -55,6 +57,7 @@ frame::cpu_local! {
         rq: SpinLock::new(RunQueue::new()),
         since: AtomicU64::new(0),
         group: AtomicU64::new(NO_GROUP),
+        ticks: AtomicU64::new(0),
     };
 }
 
@@ -138,6 +141,7 @@ impl Scheduler for FairScheduler {
     }
 
     fn tick(&self, cpu: CpuId, _current: &Arc<Task>) -> bool {
+        CPUS.get_on(cpu).ticks.fetch_add(1, Relaxed);
         // Preempt only if someone else is waiting on this CPU, or a
         // CPU-time timer has to be looked at.
         let waiting = !CPUS.get_on(cpu).rq.lock().is_empty();
@@ -157,6 +161,16 @@ impl Scheduler for FairScheduler {
 }
 
 pub(crate) static SCHEDULER: FairScheduler = FairScheduler;
+
+/// This CPU and the ticks it has taken: when it changes across a system
+/// call, a tick came during it (or the task moved CPU), and CPU-time timers
+/// are looked at as the call returns, as Linux does at a tick in the kernel
+/// (`proc::run`).
+pub(crate) fn tick_mark() -> u64 {
+    let g = frame::cpu::IrqGuard::new();
+    let cpu = g.cpu();
+    (u64::from(cpu.index() as u32) << 48) | (CPUS.get_on(cpu).ticks.load(Relaxed) & ((1 << 48) - 1))
+}
 
 /// Runnable tasks queued on `cpu` (diagnostics).
 pub(crate) fn queue_len(cpu: CpuId) -> usize {

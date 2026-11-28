@@ -351,7 +351,25 @@ pub(crate) fn check_cpu(p: &LinuxProcess) {
     }
     publish(p);
     for (id, n, overrun) in fired {
-        send(p.entry.cell, p.group.tgid, id, n, overrun);
+        // `setitimer`'s CPU-time signals go to the thread that was running,
+        // unless it blocks them (Linux's `check_cpu_itimer`): profilers
+        // sample the thread that spent the time. (Go ignores a process-wide
+        // SIGPROF on a thread that has its own timer, so a spinning C thread
+        // got no samples when another thread took it.)
+        let mine = (id == VIRTUAL || id == PROF)
+            && n.sig != 0
+            && proc::blocked(&p.entry) & signal::bit(n.sig) == 0;
+        if mine {
+            let _ = proc::send_thread(
+                p.entry.cell,
+                Some(p.group.tgid),
+                p.entry.pid,
+                n.sig,
+                Info::kernel(),
+            );
+        } else {
+            send(p.entry.cell, p.group.tgid, id, n, overrun);
+        }
     }
 }
 

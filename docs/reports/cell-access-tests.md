@@ -243,9 +243,10 @@ not tested by any edit.
 
 ## ENOSYS today, needing a real check later
 
-`ptrace`, `process_vm_readv`, `process_vm_writev`, `kcmp`, `pidfd_getfd`,
-`semget`, `msgget`, `mq_open`, `reboot`, `adjtimex`, `clock_adjtime`,
+`process_vm_readv`, `process_vm_writev`, `kcmp`, `pidfd_getfd`, `semget`, `msgget`, `mq_open`, `reboot`, `adjtimex`, `clock_adjtime`,
 `chroot`, `init_module`, `iopl`, `ioperm`, `kexec_load`, `swapon`.
+`ptrace` is EPERM for every request since 2026-11-28 (no tracing yet);
+the check expects that, and needs a real one when tracing comes.
 
 ## Not tested
 
