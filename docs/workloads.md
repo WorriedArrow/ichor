@@ -27,7 +27,7 @@ suite's own unit), passed / run. Floors are in `workloads.toml`.
 - Layer: `https://ftp.postgresql.org/pub/source/v16.16/postgresql-16.16.tar.gz` (sha256:3e930f3366f675ab26e873d16201201f8e9b6d9bc13686e4465380271145ea2d), `postgresql-16.16/` at `/usr/src/postgresql/`
 - Command: `sh -c set -e; useradd -m pg; cp -r /usr/src/postgresql /home/pg/src; chown -R pg /home/pg/src; exec su pg -c 'set -e; cd ~/src; ./configure --prefix=/home/pg/inst --without-icu --without-readline --without-zlib CFLAGS=-O1 >../configure.log 2>&1 || { tail ../configure.log; exit 1; }; make -s -j4 >../make.log 2>&1 || { tail ../make.log; exit 1; }; echo built; cd src/test/regress; if [ $# -gt 0 ]; then make -s check-tests TESTS="test_setup $*"; else make -s check; fi; s=$?; cat regression.diffs 2>/dev/null | head -c 2000000; exit $s' -- "$0" "$@" postgres`
 - Result: 224 of 224 tests passed (100.0%), 0 skipped; floor 98.0%
-- Run time: 39 min
+- Run time: 3 min (openvmm, Windows' hypervisor platform, 4 vCPUs, the cell given 5 GiB)
 
 ## node
 
