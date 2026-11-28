@@ -215,7 +215,8 @@ boot [done: VERW, IBPB, and page-table isolation (ADR-0004's second
   `--image REF --memory MiB` on a machine too small for the suite's own).
   Latest full run (2026-11-22): 260 of 262 packages. The two: `crypto/sha1`
   (under TCG: QEMU reads 32 bytes for a 16-byte AVX2 operand) and `syscall`
-  (ptrace). Under OpenVMM (2026-11-28, `--vmm openvmm`, 5 min) it needed:
+  (ptrace). Under OpenVMM (2026-11-28, `--vmm openvmm`, 5 min): 262 of
+  262. It needed:
   `ptrace` EPERM for every request (Go skips on it); CPU-time timers
   checked where Linux's tick would check them (after a trap that is not a
   system call, or after a system call a tick came during:

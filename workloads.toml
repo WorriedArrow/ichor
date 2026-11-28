@@ -7,8 +7,9 @@
 # image, dnotify; 2026-11-22: 454 of 457 under TCG on the slim one).
 python = 995
 
-# 2026-11-22: 260 of 262 packages (99.2%) under TCG on 4 vCPUs.
-go = 970
+# 2026-11-28: 262 of 262 packages (100%) under OpenVMM on 4 vCPUs
+# (2026-11-22: 260 of 262 under TCG, where crypto/sha1 meets a QEMU bug).
+go = 990
 
 # 2026-11-21: 224 of 224 tests under TCG on 4 vCPUs.
 postgres = 980

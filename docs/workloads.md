@@ -18,13 +18,8 @@ suite's own unit), passed / run. Floors are in `workloads.toml`.
 
 - Image: `docker.io/library/golang@sha256:4fa7c968ba93f1635670522dbb01a2c78150443e1385746924566079f36570ea`
 - Command: `go test -short -vet=off -timeout 30m std`
-- Result: 260 of 262 packages passed (99.2%), 121 skipped; floor 94.0%
-- Run time: 78 min (tcg, 4 vCPUs, the cell given 6 GiB)
-
-Failed:
-
-- `crypto/sha1`
-- `syscall`
+- Result: 262 of 262 packages passed (100.0%), 121 skipped; floor 97.0%
+- Run time: 5 min (openvmm, Windows' hypervisor platform, 4 vCPUs, the cell given 6 GiB)
 
 ## postgres
 
