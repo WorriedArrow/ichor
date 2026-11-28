@@ -61,5 +61,7 @@
 # the port, APs started without the MP Specification's delays): 8,450 / 325.
 # Step 25 (ADR-0025: the PVH entry, a 32-bit stub and the start info read
 # into the boot state): 8,800 / 330.
-max_code_lines = 8800
+# Step 26 (ADR-0025's amendment: the wall clock from KVM's
+# MSR_KVM_WALL_CLOCK_NEW when no firmware clock was read): 8,850 / 330.
+max_code_lines = 8850
 max_unsafe_sites = 330

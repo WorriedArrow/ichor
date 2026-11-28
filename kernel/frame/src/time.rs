@@ -82,6 +82,25 @@ fn ticks_to_duration(ticks: u64) -> Duration {
     Duration::from_nanos(u64::try_from(u128::from(ticks) * 1_000_000_000 / hz).unwrap_or(u64::MAX))
 }
 
+/// Where the wall clock came from (`UEFI` unless set).
+static WALL_SOURCE: crate::sync::SpinLock<&'static str> = crate::sync::SpinLock::new("UEFI");
+
+/// Whether boot has read a wall clock yet.
+pub(crate) fn has_wall_clock() -> bool {
+    WALL_VALID.load(Ordering::Acquire)
+}
+
+/// Records where the wall clock came from, when not from UEFI.
+pub(crate) fn set_wall_clock_source(source: &'static str) {
+    *WALL_SOURCE.lock() = source;
+}
+
+/// Where the wall clock came from: `UEFI` (`GetTime` at boot) or
+/// `kvmclock` (KVM's wall clock, under a PVH loader).
+pub fn wall_clock_source() -> &'static str {
+    *WALL_SOURCE.lock()
+}
+
 /// Records the firmware clock reading (boot, before ExitBootServices).
 pub(crate) fn set_boot_wall_clock(secs: u64, nanos: u32, tsc: u64) {
     WALL_SECS.store(secs, Ordering::Relaxed);
@@ -140,15 +159,14 @@ pub fn wall_clock() -> Option<Duration> {
         return None;
     }
     // From the reading to boot, by the TSC; from boot on, the clock.
-    let hz = u128::from(tsc_hz().max(1));
-    let before = u128::from(apic::tsc_at_boot().saturating_sub(WALL_TSC.load(Ordering::Relaxed)));
+    // (Negative when the reading came after boot: kvmclock's, ADR-0025.)
+    let hz = i128::from(tsc_hz().max(1));
+    let before = i128::from(apic::tsc_at_boot()) - i128::from(WALL_TSC.load(Ordering::Relaxed));
     let before = before * 1_000_000_000 / hz;
     let t = apic::now_ns();
-    let secs = u128::from(WALL_SECS.load(Ordering::Relaxed)) * 1_000_000_000;
-    let ns = secs + u128::from(WALL_NANOS.load(Ordering::Relaxed)) + before + u128::from(t);
-    let ns = (ns as i128)
-        .saturating_add(i128::from(steering(t).0))
-        .max(0);
+    let secs = i128::from(WALL_SECS.load(Ordering::Relaxed)) * 1_000_000_000;
+    let ns = secs + i128::from(WALL_NANOS.load(Ordering::Relaxed)) + before + i128::from(t);
+    let ns = ns.saturating_add(i128::from(steering(t).0)).max(0);
     Some(Duration::from_nanos(u64::try_from(ns).unwrap_or(u64::MAX)))
 }
 

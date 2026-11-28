@@ -3,6 +3,7 @@
 - Status: Accepted
 - Date: 2026-11-28
 - Amends: ADR-0001 ("Boot", §8 frame budget)
+- Amended: 2026-11-28 (the wall clock from KVM; below)
 - Milestone: 8 (clouds)
 
 ## Context
@@ -93,3 +94,25 @@ Comparing Ichor's boot with Linux's under Firecracker
   plane cannot check certificate dates there.
 - Frame grows by about 340 lines and 2 unsafe sites (to 8,786 / 322);
   audit step 25 is 8,800 / 330.
+
+## Amendment (2026-11-28): the wall clock from KVM
+
+Without a wall clock, a PVH boot's `CLOCK_REALTIME` counted from 1970.
+That put every certificate outside its dates, so the control plane could
+pull no image under Firecracker. Firecracker has no RTC on x86_64, but it
+runs on KVM.
+
+- When kvmclock starts (ADR-0018) and boot has read no firmware clock,
+  frame writes `MSR_KVM_WALL_CLOCK_NEW` with an address in its kvmclock
+  page, past the system time. KVM writes there, synchronously, the wall
+  time at which its clock read zero (`pvclock_wall_clock`: version,
+  seconds, nanoseconds).
+- The wall time now is that plus kvmclock's nanoseconds, recorded with the
+  TSC as `GetTime`'s reading is. `wall_clock` now allows a reading taken
+  after the boot TSC, not only before it.
+- The kernel logs the source: `ichor: time: wall clock from kvmclock`.
+- UEFI boots keep `GetTime`, so nothing changes for them.
+- `a_pvh_loader_boots_the_kernel` checks the kvmclock wall clock is past
+  2026 when it runs on KVM (CI). Under TCG there is no kvmclock, and no
+  wall clock.
+- Frame: 8,821 / 323; audit step 26 is 8,850 / 330.

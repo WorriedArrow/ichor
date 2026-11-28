@@ -242,7 +242,8 @@ fn kmain(info: BootInfo) -> ! {
     }
     match frame::time::wall_clock() {
         Some(t) => println!(
-            "ichor: time: wall clock from UEFI, {} s since the epoch",
+            "ichor: time: wall clock from {}, {} s since the epoch",
+            frame::time::wall_clock_source(),
             t.as_secs()
         ),
         None => println!("ichor: time: no wall clock; CLOCK_REALTIME counts from boot"),

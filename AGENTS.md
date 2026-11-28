@@ -65,8 +65,11 @@ boot [done: VERW, IBPB, and page-table isolation (ADR-0004's second
   `-kernel`): `cargo xtask pvh-image` lays the PE out at 16 MiB in an ELF
   with the PVH note, and frame's 32-bit stub (`arch::pvh`) reaches
   `boot::pvh::pvh_main`, which fills the same boot state as `efi_main`
-  (files from the initrd, `bootfiles.img`). No wall clock under PVH yet
-  (kvmclock's is owed). Test: `a_pvh_loader_boots_the_kernel`. Round 22
+  (files from the initrd, `bootfiles.img`). Under PVH the wall clock is
+  KVM's (`MSR_KVM_WALL_CLOCK_NEW`, ADR-0025's amendment; none under TCG).
+  Under Firecracker on GCP, TLS to Docker Hub verified with it. The pull
+  then stalled on the manifest request ("a call timed out"); that is not
+  diagnosed yet. Test: `a_pvh_loader_boots_the_kernel`. Round 22
   (`docs/benchmarks.md`), against Debian 13 + Linux 7.3 with containerd,
   ready = the control plane serving / containerd answering:
   - **GCP n2-standard-2, booted directly:** VM start to ready 1.62 s

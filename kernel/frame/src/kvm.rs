@@ -17,7 +17,11 @@ use crate::dma::DmaBuf;
 use crate::sync::SpinLock;
 
 const MSR_KVM_SYSTEM_TIME_NEW: u32 = 0x4b56_4d01;
+const MSR_KVM_WALL_CLOCK_NEW: u32 = 0x4b56_4d00;
 const CLOCKSOURCE2: u32 = 1 << 3;
+/// Where in the page the host writes its wall clock (`pvclock_wall_clock`:
+/// version, seconds, nanoseconds), past the system time's 32 bytes.
+const WALL_AT: usize = 64;
 
 static PAGE: SpinLock<Option<DmaBuf>> = SpinLock::new(None);
 static ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -123,7 +127,38 @@ pub(crate) fn init() -> Option<u64> {
     }
     BOOT_NS.store(host_ns(), Ordering::Relaxed);
     ACTIVE.store(true, Ordering::Release);
+    if !crate::time::has_wall_clock() {
+        read_wall_clock(at);
+    }
     Some(hz)
+}
+
+/// The wall clock from KVM (ADR-0025's amendment), for boots that have no
+/// firmware clock to read (a PVH loader's: Firecracker has no RTC). The host
+/// writes the wall time at which its clock read 0, when the MSR is written;
+/// now is that plus the host's nanoseconds.
+fn read_wall_clock(page: u64) {
+    // SAFETY: CPUID says this KVM guest has the MSR (CLOCKSOURCE2); the host
+    // writes 12 bytes at the address, which lies in frame's kvmclock page
+    // past the system-time area, and nothing else uses it.
+    unsafe { wrmsr(MSR_KVM_WALL_CLOCK_NEW, page + WALL_AT as u64) };
+    let guard = PAGE.lock();
+    let Some(p) = &*guard else { return };
+    let v = p.read_u32(WALL_AT);
+    fence(Ordering::Acquire);
+    let (sec, nsec) = (p.read_u32(WALL_AT + 4), p.read_u32(WALL_AT + 8));
+    fence(Ordering::Acquire);
+    if v & 1 != 0 || p.read_u32(WALL_AT) != v || sec == 0 {
+        return;
+    }
+    let (host, tsc) = (host_ns(), rdtsc());
+    let ns = u128::from(sec) * 1_000_000_000 + u128::from(nsec) + u128::from(host);
+    crate::time::set_boot_wall_clock(
+        (ns / 1_000_000_000) as u64,
+        (ns % 1_000_000_000) as u32,
+        tsc,
+    );
+    crate::time::set_wall_clock_source("kvmclock");
 }
 
 /// Nanoseconds since boot by kvmclock, if it runs.

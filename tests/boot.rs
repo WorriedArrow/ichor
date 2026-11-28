@@ -86,6 +86,18 @@ fn a_pvh_loader_boots_the_kernel() {
         "no CA roots from the boot files; serial log:\n{}",
         out.serial
     );
+    // No firmware clock under PVH: on KVM (CI), kvmclock's wall clock, which
+    // is today's (after 2026-01-01); under TCG there is none.
+    if xtask::qemu::Accel::Auto.resolve() == xtask::qemu::Accel::Kvm {
+        let secs: u64 = out
+            .serial
+            .split("ichor: time: wall clock from kvmclock, ")
+            .nth(1)
+            .and_then(|s| s.split(' ').next())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| panic!("no wall clock from kvmclock; serial log:\n{}", out.serial));
+        assert!(secs > 1_767_225_600, "wall clock {secs} s is before 2026");
+    }
 }
 
 const BOOT_MARKERS: &[&str] = &[
