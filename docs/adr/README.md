@@ -29,6 +29,7 @@ brief where they conflict with it.
 | [0021](0021-cpu-time-from-the-scheduler.md) | CPU time comes from the scheduler | Accepted |
 | [0022](0022-protection-keys.md) | Protection keys for user pages | Accepted |
 | [0023](0023-amx-tile-data.md) | AMX tile data behind XFD | Accepted |
+| [0024](0024-boot-time.md) | Boot time is measured, and four waits leave the boot path | Accepted |
 
 ## Planned
 

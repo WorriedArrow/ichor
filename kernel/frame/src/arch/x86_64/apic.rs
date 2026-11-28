@@ -156,14 +156,18 @@ pub(crate) fn send_nmi_all_but_self() {
 }
 
 /// Sends INIT, then two STARTUP IPIs for the trampoline at physical page
-/// `page`, to the CPU with x2APIC ID `dest`.
+/// `page`, to the CPU with x2APIC ID `dest`. Without the MultiProcessor
+/// Specification's 10 ms after INIT and 200 us after each STARTUP, which
+/// were for external APICs: Linux waits 0 after INIT and 20 us after each
+/// STARTUP on every CPU that can run in 64-bit mode
+/// (`smp_quirk_init_udelay`), and so does frame. With them, each further
+/// CPU cost 10.4 ms of every boot.
 pub(crate) fn start_ap(dest: u32, page: u8) {
     let d = u64::from(dest) << 32;
     write(MSR_ICR, d | (0b101 << 8) | (1 << 14)); // INIT, assert
-    delay_us(10_000);
     for _ in 0..2 {
         write(MSR_ICR, d | (0b110 << 8) | u64::from(page)); // STARTUP
-        delay_us(200);
+        delay_us(20);
     }
 }
 

@@ -1104,6 +1104,10 @@ comment.
 | `force_retpoline` | retpolines for the kernel's indirect branches on any CPU (ADR-0004's 2026-11-27 amendment; tests) |
 | `force_stibp` | `IA32_SPEC_CTRL.STIBP` on every CPU where the CPU has STIBP, whatever the topology (ADR-0004's second 2026-11-27 amendment; tests) |
 | `srso=ibpb` | on CPUs SRSO or Retbleed affects, IBPB on every entry instead of safe-RET return thunks |
+| `no_selftests` | a production boot (ADR-0024): the CPUs, the scheduler, the network, then the control plane; no self-test runs and no disk is probed (so `autorun` finds none) |
+| `boot_timer` | at `ready` (the control plane serves its API), write 123 to port 0x3F0: Firecracker's boot timer (`--boot-timer`) logs its time since start |
+| `pci_scan_all` | probe all 256 PCI buses, not just those reachable from bus 0 through bridges (ADR-0024), for a second root bus only ACPI names |
+| `console_sync` | writers hand the serial port what it takes, as before ADR-0024; by default only the console task writes it (chase hangs before it runs with this) |
 | `trace_errors` | log every failing Linux syscall (pid, number, first arguments, errno) |
 | `trace_uplink` | log every TCP segment with SYN, FIN or RST crossing the uplink, either way, after NAT (`ichor: uplink:` lines: time, flags, endpoints, sequence numbers, window), and those the NAT refuses or cannot map |
 | `trace_pid=N` | log every Linux syscall of pid N with its result |

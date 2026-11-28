@@ -14,6 +14,7 @@
 //! everything (shutdown does), and a panic flushes before its report.
 
 use core::fmt::{self, Write};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::arch::early_console;
 use crate::sync::SpinLock;
@@ -107,7 +108,9 @@ pub fn _print(args: fmt::Arguments<'_>) {
     // The ring never reports an error; the only failure is a `Display` impl
     // returning `Err`, in which case the output is truncated.
     let _ = Buffered(&mut out).write_fmt(args);
-    out.send_ready();
+    if SYNC.load(Ordering::Relaxed) {
+        out.send_ready();
+    }
 }
 
 /// Writes raw bytes to the console (no UTF-8 interpretation: user programs
@@ -117,20 +120,63 @@ pub fn write_bytes(bytes: &[u8]) {
     for b in crlf(bytes.iter().copied()) {
         out.push(b);
     }
-    out.send_ready();
+    if SYNC.load(Ordering::Relaxed) {
+        out.send_ready();
+    }
+}
+
+/// Whether writers hand the port what it takes themselves (`console_sync`
+/// on the command line). By default only the console task does (ADR-0019's
+/// 2026-11-28 amendment): an emulated port takes every byte at once, one VM
+/// exit each, which the writer paid (about 20 us a byte under Hyper-V).
+static SYNC: AtomicBool = AtomicBool::new(false);
+
+/// Makes writers hand the port what it takes (`console_sync`), so that a
+/// hang before the console task runs still shows the last lines.
+pub(crate) fn set_sync() {
+    SYNC.store(true, Ordering::Relaxed);
 }
 
 /// Hands the serial port what it takes now; whether output is still
-/// waiting. The kernel's console task calls it until nothing is.
+/// waiting. The kernel's console task calls it until nothing is. The ring's
+/// lock is held only to take a FIFO-full at a time, not while the port is
+/// written (one VM exit a byte on an emulated port), so writers do not wait
+/// behind a long backlog.
 pub fn drain() -> bool {
-    let mut out = OUT.lock();
-    out.send_ready();
-    out.len > 0
+    let _port = PORT.lock();
+    loop {
+        let room = early_console::room_now().min(CHUNK);
+        let mut chunk = [0u8; CHUNK];
+        let (n, left) = {
+            let mut out = OUT.lock();
+            let n = room.min(out.len);
+            for b in &mut chunk[..n] {
+                *b = out.buf[out.start];
+                out.start = (out.start + 1) % RING;
+                out.len -= 1;
+            }
+            (n, out.len)
+        };
+        for &b in &chunk[..n] {
+            early_console::put(b);
+        }
+        if n == 0 || left == 0 {
+            return left > 0;
+        }
+    }
 }
+
+/// Most bytes [`drain`] takes from the ring at once: a 16550's FIFO.
+const CHUNK: usize = 16;
+
+/// Serializes [`drain`]'s writes to the port, so chunks leave in order.
+static PORT: SpinLock<()> = SpinLock::new(());
 
 /// Writes out everything the ring holds, waiting for the port (before the
 /// machine stops).
 pub fn flush() {
+    // The port first, as `drain` takes them: a chunk it took goes out first.
+    let _port = PORT.lock();
     OUT.lock().flush();
 }
 

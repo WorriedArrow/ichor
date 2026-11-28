@@ -94,7 +94,35 @@ fn drain_console() {
     }
 }
 
+/// Logs how long after frame's entry boot reached `what` (`ichor: boot:`
+/// lines, for boot-time measurements; `docs/benchmarks.md`).
+fn boot_phase(what: &str) {
+    let t = frame::time::since_entry();
+    println!(
+        "ichor: boot: {what} at {}.{:03} ms",
+        t.as_millis(),
+        t.as_micros() % 1000
+    );
+}
+
+static READY: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static BOOT_TIMER: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// The machine is ready for containers: the control plane serves its API.
+/// Logged once; with `boot_timer`, Firecracker's boot timer is told too.
+pub(crate) fn boot_ready() {
+    use core::sync::atomic::Ordering::Relaxed;
+    if READY.swap(true, Relaxed) {
+        return;
+    }
+    if BOOT_TIMER.load(Relaxed) {
+        frame::power::signal_boot_complete();
+    }
+    boot_phase("ready (the control plane serves its API)");
+}
+
 fn kmain(info: BootInfo) -> ! {
+    boot_phase("kernel");
     let (major, minor) = info.uefi_revision();
     println!(
         "ichor: kernel {} on {} (firmware rev {:#x}, UEFI {}.{})",
@@ -106,6 +134,17 @@ fn kmain(info: BootInfo) -> ! {
     );
     println!("ichor: cmdline: {:?}", info.cmdline());
     let cmdline = cmdline::Cmdline::new(info.cmdline());
+    let tsc = frame::time::tsc_at_entry();
+    println!(
+        "ichor: boot: TSC at frame's entry {}.{:03} ms (in a VM: since the vCPU was made)",
+        tsc.as_millis(),
+        tsc.as_micros() % 1000
+    );
+    if cmdline.flag("boot_timer") {
+        BOOT_TIMER.store(true, core::sync::atomic::Ordering::Relaxed);
+    }
+    let selftests = !cmdline.flag("no_selftests");
+    SELFTESTS.store(selftests, core::sync::atomic::Ordering::Relaxed);
     if let Some(pid) = cmdline.get("trace_pid").and_then(|v| v.parse().ok()) {
         linuxabi::TRACE_PID.store(pid, core::sync::atomic::Ordering::Relaxed);
     }
@@ -178,7 +217,12 @@ fn kmain(info: BootInfo) -> ! {
     selftest::breakpoint();
     selftest::install_timer_handler();
     let cpus = frame::smp::start_aps(ap_main);
-    selftest::timers_on_every_cpu(cpus);
+    if selftests {
+        selftest::timers_on_every_cpu(cpus);
+    } else {
+        println!("ichor: smp: {cpus} CPUs online");
+    }
+    boot_phase("every CPU online");
 
     random::init();
     match frame::cpu::xstate_features() {
@@ -200,21 +244,32 @@ fn kmain(info: BootInfo) -> ! {
     frame::task::inject_scheduler(&sched::SCHEDULER);
     drain_console();
     watch_power_button();
-    selftest::threads();
-    selftest::preemption();
-    selftest::timed_waits();
-    selftest::user_mode();
-    celltest::run();
-    proctest::run();
-    copytest::frame_race();
-    hugetest::run();
-    runtest::run();
+    boot_phase("scheduler");
+    // `no_selftests`: a production boot, timed as one (`docs/benchmarks.md`):
+    // the network comes up, and nothing else runs before the control plane.
+    // The disks are left alone too, so `autorun` finds no disk.
+    if selftests {
+        selftest::threads();
+        selftest::preemption();
+        selftest::timed_waits();
+        selftest::user_mode();
+        celltest::run();
+        proctest::run();
+        copytest::frame_race();
+        hugetest::run();
+        runtest::run();
+        boot_phase("self-tests before the network");
+    }
     // The network first: the disks' cell tests use its uplink.
     nettest::run();
-    netstack::accounting_selftest();
-    linuxabi::unix::accounting_selftest();
-    nativetest::run();
-    blktest::run();
+    boot_phase("network");
+    if selftests {
+        netstack::accounting_selftest();
+        linuxabi::unix::accounting_selftest();
+        nativetest::run();
+        blktest::run();
+        boot_phase("self-tests");
+    }
 
     if cmdline.flag("test_stack_overflow") {
         selftest::stack_overflow();
@@ -315,6 +370,11 @@ fn kmain(info: BootInfo) -> ! {
 
 /// Entry for every other CPU once frame has initialized it.
 fn ap_main(_cpu: CpuId) -> ! {
-    selftest::wait_for_ticks();
+    if SELFTESTS.load(core::sync::atomic::Ordering::Relaxed) {
+        selftest::wait_for_ticks();
+    }
     frame::task::become_idle()
 }
+
+/// Whether this boot runs the self-tests (not with `no_selftests`).
+static SELFTESTS: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);

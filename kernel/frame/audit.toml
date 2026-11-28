@@ -56,5 +56,8 @@
 # Step 23 (ADR-0004's second 2026-11-27 amendment: ITS, TSA, STIBP,
 # speculative store bypass by prctl; TAA, GDS and MMIO stale data tested as
 # Linux tests them): 8,350 / 325.
-max_code_lines = 8350
+# Step 24 (ADR-0024: boot timed from frame's entry, Firecracker's boot-timer
+# port, PCI enumeration through bridges, only the console task writing to
+# the port, APs started without the MP Specification's delays): 8,450 / 325.
+max_code_lines = 8450
 max_unsafe_sites = 325

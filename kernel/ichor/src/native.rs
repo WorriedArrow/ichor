@@ -219,6 +219,12 @@ pub(crate) fn call(cell: &Arc<Cell>, mm: &mut Mm, nr: u64, a: [u64; 6]) -> Resul
             let text = read_user(mm, a[0], io_len(a[1])?)?;
             let text = String::from_utf8_lossy(&text);
             println!("ichor: cell {}: {}", cell.id(), text.trim_end());
+            // The control plane says this once its API listener is up: the
+            // machine is ready for containers (boot-time measurements). It is
+            // the kernel's own service, in the system cell.
+            if crate::control::is_control_cell(cell.id()) && text.starts_with("control: serving ") {
+                crate::boot_ready();
+            }
             Ok(0)
         }
         sys::CLOCK => match a[0] {

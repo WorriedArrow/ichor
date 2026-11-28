@@ -96,6 +96,13 @@ pub fn power_off() -> ! {
     arch::halt_forever()
 }
 
+/// Tells Firecracker's boot timer (port 0x3F0) that the guest is ready, for
+/// boot-time measurements (`boot_timer` on the command line). Harmless
+/// elsewhere: the port is a floppy controller's read-only status, or nothing.
+pub fn signal_boot_complete() {
+    arch::vmm::boot_complete();
+}
+
 /// Set during boot when the command line contains `qemu_debug_exit`.
 static QEMU_DEBUG_EXIT: AtomicBool = AtomicBool::new(false);
 

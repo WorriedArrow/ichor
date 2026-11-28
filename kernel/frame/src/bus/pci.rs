@@ -278,11 +278,33 @@ fn probe_bars(bus: u8, dev: u8, func: u8, unplaced: &mut Vec<Unplaced>) -> [Bar;
     bars
 }
 
-/// Enumerates every bus, device and function. Runs once at boot.
-pub(crate) fn init() -> usize {
+/// Enumerates the buses reachable from bus 0 (through the host bridge's
+/// functions and every PCI-to-PCI bridge's secondary bus, as Linux scans a
+/// root bus), or with `all`, every one of the 256 (ADR-0005's 2026-11-28
+/// amendment: each probe of an absent bus is two VM exits, which made the
+/// whole scan 140 ms of a boot under Hyper-V). Runs once at boot.
+pub(crate) fn init(all: bool) -> usize {
     let mut found = Vec::new();
     let mut unplaced = Vec::new();
-    for bus in 0..=255u8 {
+    let mut queued = [false; 256];
+    let mut buses: Vec<u8> = if all {
+        (0..=255).collect()
+    } else {
+        alloc::vec![0]
+    };
+    queued[0] = true;
+    // A multi-function host bridge at 0:0: function N is the bridge of bus N.
+    if !all && read32(0, 0, 0, 0) & 0xffff != 0xffff && (read32(0, 0, 0, 0x0c) >> 16) & 0x80 != 0 {
+        for func in 1..8u8 {
+            if read32(0, 0, func, 0) & 0xffff != 0xffff && !queued[usize::from(func)] {
+                queued[usize::from(func)] = true;
+                buses.push(func);
+            }
+        }
+    }
+    let mut next = 0;
+    while let Some(&bus) = buses.get(next) {
+        next += 1;
         for dev in 0..32u8 {
             if read32(bus, dev, 0, 0) & 0xffff == 0xffff {
                 continue;
@@ -300,6 +322,15 @@ pub(crate) fn init() -> usize {
                 } else {
                     [Bar::None; 6]
                 };
+                // A PCI-to-PCI bridge: scan its secondary bus too (the
+                // number the firmware or VMM gave it; 0 means none).
+                if header_type == 1 && !all {
+                    let secondary = (read32(bus, dev, func, 0x18) >> 8) as u8;
+                    if secondary != 0 && !queued[usize::from(secondary)] {
+                        queued[usize::from(secondary)] = true;
+                        buses.push(secondary);
+                    }
+                }
                 found.push(PciDevice {
                     bus,
                     device: dev,

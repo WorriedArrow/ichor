@@ -209,11 +209,13 @@ pub(crate) extern "sysv64" fn kernel_space_entry() -> ! {
         fatal("higher-half entry reached twice");
     };
     mm::kspace::finish_switch();
+    crate::time::record_step(crate::time::BootStep::HigherHalf);
     crate::cpu::init_boot_cpu_block();
     let mut early = core::mem::replace(&mut state.early, EarlyAlloc::EMPTY);
     if let Err(e) = mm::init(state.regions(), &mut early) {
         fatal(e);
     }
+    crate::time::record_step(crate::time::BootStep::Memory);
     let state: &'static BootState = state;
     *MEMORY_MAP.lock() = state.regions();
     *ACPI_RSDP.lock() = state.acpi_rsdp;
@@ -226,6 +228,7 @@ pub(crate) extern "sysv64" fn kernel_space_entry() -> ! {
     let Some((hz, source)) = arch::apic::init_tsc() else {
         fatal("cannot determine the TSC frequency (no CPUID leaf, PM timer or PIT)");
     };
+    crate::time::record_step(crate::time::BootStep::Tsc);
     init_cpu(CpuId::BOOT);
     println!(
         "ichor: frame: cpu0 ready ({} id {}, TSC {} MHz from {source}, {} timer)",
@@ -242,7 +245,17 @@ pub(crate) extern "sysv64" fn kernel_space_entry() -> ! {
             "one-shot"
         }
     );
-    println!("ichor: frame: pci: {} functions", crate::bus::pci::init());
+    let all = cmdline::Cmdline::new(state.cmdline()).flag("pci_scan_all");
+    println!(
+        "ichor: frame: pci: {} functions ({})",
+        crate::bus::pci::init(all),
+        if all {
+            "every bus scanned"
+        } else {
+            "buses reachable from bus 0"
+        }
+    );
+    crate::time::record_step(crate::time::BootStep::Pci);
     let acpi_power = match power::init_acpi() {
         Some(true) => "power button and S5 from the FADT and DSDT",
         Some(false) => "power button, but no S5 in the DSDT or an SSDT (cannot turn off)",
@@ -377,6 +390,24 @@ pub(crate) extern "sysv64" fn kernel_space_entry() -> ! {
     if v.mmio {
         println!(
             "ichor: frame: MMIO stale data applies; no cell is given MMIO, so it calls for no VERW (ADR-0004)"
+        );
+    }
+    {
+        use crate::time::{BootStep::*, record_step, step_time};
+        record_step(Done);
+        let ms = |s| {
+            let t: core::time::Duration = step_time(s);
+            alloc::format!("{}.{:03}", t.as_millis(), t.as_micros() % 1000)
+        };
+        println!(
+            "ichor: frame: boot steps (ms after entry): files {}, boot services exited {}, higher half {}, memory {}, TSC {}, PCI {}, mitigations {}",
+            ms(Files),
+            ms(Exited),
+            ms(HigherHalf),
+            ms(Memory),
+            ms(Tsc),
+            ms(Pci),
+            ms(Done)
         );
     }
     enter_kernel(BootInfo {

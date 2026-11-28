@@ -17,6 +17,66 @@ static WALL_NANOS: AtomicU32 = AtomicU32::new(0);
 static WALL_TSC: AtomicU64 = AtomicU64::new(0);
 static WALL_VALID: AtomicBool = AtomicBool::new(false);
 
+/// The TSC when the firmware (or a PVH loader) entered frame.
+static ENTRY_TSC: AtomicU64 = AtomicU64::new(0);
+
+/// Records the TSC at frame's entry point: the first thing it does.
+pub(crate) fn record_entry() {
+    ENTRY_TSC.store(crate::arch::regs::rdtsc(), Ordering::Relaxed);
+}
+
+/// Time since the firmware (or a PVH loader) entered frame, by the TSC.
+pub fn since_entry() -> Duration {
+    let ticks = crate::arch::regs::rdtsc().wrapping_sub(ENTRY_TSC.load(Ordering::Relaxed));
+    ticks_to_duration(ticks)
+}
+
+/// The TSC's count at frame's entry, as time. A vCPU's TSC starts at 0
+/// when the hypervisor makes it (KVM's and Hyper-V's do), so in a VM this
+/// is about how long the VMM and the firmware took before the kernel.
+pub fn tsc_at_entry() -> Duration {
+    ticks_to_duration(ENTRY_TSC.load(Ordering::Relaxed))
+}
+
+/// Frame's boot steps, timed for the boot log (`ichor: frame: boot steps`).
+#[derive(Clone, Copy)]
+pub(crate) enum BootStep {
+    /// The firmware's files read (or the PVH loader's modules).
+    Files,
+    /// Boot services exited.
+    Exited,
+    /// The higher half reached.
+    HigherHalf,
+    /// The page allocator and heap ready.
+    Memory,
+    /// The TSC's frequency known.
+    Tsc,
+    /// PCI enumerated.
+    Pci,
+    /// Mitigations enabled: the kernel is about to start.
+    Done,
+}
+
+const STEPS: usize = 7;
+static STEP_TSC: [AtomicU64; STEPS] = [const { AtomicU64::new(0) }; STEPS];
+
+/// Records the TSC as boot reaches `step`.
+pub(crate) fn record_step(step: BootStep) {
+    STEP_TSC[step as usize].store(crate::arch::regs::rdtsc(), Ordering::Relaxed);
+}
+
+/// Time from frame's entry to `step` (zero if it was not recorded).
+pub(crate) fn step_time(step: BootStep) -> Duration {
+    let entry = ENTRY_TSC.load(Ordering::Relaxed);
+    let at = STEP_TSC[step as usize].load(Ordering::Relaxed);
+    ticks_to_duration(at.saturating_sub(entry))
+}
+
+fn ticks_to_duration(ticks: u64) -> Duration {
+    let hz = u128::from(tsc_hz().max(1));
+    Duration::from_nanos(u64::try_from(u128::from(ticks) * 1_000_000_000 / hz).unwrap_or(u64::MAX))
+}
+
 /// Records the firmware clock reading (boot, before ExitBootServices).
 pub(crate) fn set_boot_wall_clock(secs: u64, nanos: u32, tsc: u64) {
     WALL_SECS.store(secs, Ordering::Relaxed);

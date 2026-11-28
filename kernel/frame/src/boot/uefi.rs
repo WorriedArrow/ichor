@@ -609,6 +609,7 @@ fn fatal(what: &str, status: Status) -> ! {
 
 #[unsafe(export_name = "efi_main")]
 extern "efiapi" fn efi_main(image: Handle, system_table: *const SystemTable) -> Status {
+    crate::time::record_entry();
     let (Some(state), Some(map)) = (take_boot_state(Phase::Firmware), take_map_buf()) else {
         return ALREADY_STARTED;
     };
@@ -668,7 +669,11 @@ extern "efiapi" fn efi_main(image: Handle, system_table: *const SystemTable) -> 
     if cmdline::Cmdline::new(state.cmdline()).flag("qemu_debug_exit") {
         power::enable_qemu_debug_exit();
     }
+    if cmdline::Cmdline::new(state.cmdline()).flag("console_sync") {
+        crate::console::set_sync();
+    }
 
+    crate::time::record_step(crate::time::BootStep::Files);
     // The wall clock: read it while the runtime services are callable
     // without a virtual address map.
     match fw.wall_clock() {
@@ -685,6 +690,7 @@ extern "efiapi" fn efi_main(image: Handle, system_table: *const SystemTable) -> 
     // Boot services are gone. Mask interrupts until frame installs its own
     // IDT; firmware's handlers live in memory we will reclaim.
     arch::disable_local_interrupts();
+    crate::time::record_step(crate::time::BootStep::Exited);
     println!("ichor: frame: boot services exited");
 
     if desc_size < MIN_DESCRIPTOR_SIZE {

@@ -60,6 +60,14 @@ pub(crate) fn options(c: &cmdline::Cmdline<'_>) -> Option<alloc::vec::Vec<alloc:
 
 /// Runs the control plane on the calling task until it exits; returns its
 /// exit code (`None`: it could not start or was killed).
+/// The id of the cell the control plane runs in (0 until it starts).
+static CONTROL_CELL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Whether `id` is the control plane's cell.
+pub(crate) fn is_control_cell(id: u64) -> bool {
+    id != 0 && id == CONTROL_CELL.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 pub(crate) fn run(
     roots: &'static [u8],
     suffixes: &'static [u8],
@@ -74,6 +82,7 @@ pub(crate) fn run(
     let pages = frame::mm::stats().free_pages as u64 * 3 / 4;
     let system = System::new(pages)?;
     let cell = system.cell.clone();
+    CONTROL_CELL.store(cell.id(), core::sync::atomic::Ordering::Relaxed);
     let me = cell.install(Cap::mint(Object::Cell(cell.clone()), Rights::ALL))?;
     let switch = cell.install(Cap::mint(Object::Switch, Rights::ALL))?;
     let blob = |bytes: &'static [u8]| {
