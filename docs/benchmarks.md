@@ -618,6 +618,61 @@ Reading it:
   the two then run side by side with different settings, so CPUs switch
   SSBD between them.
 
+## Round 20 (2026-11-27): 2 MiB pages charged once, and the same page-fault measure as Linux
+
+Ichor alone again, after ADR-0020's 2026-11-27 amendment: a 2 MiB page's
+512 pages are charged at once and entered in the `Mm` a chunk at a time.
+
+The page-fault row also changed what it measures. Until round 19, Ichor's
+figure was its whole-process row (`ichor: bench: page fault`): the
+difference between two runs of the program, which includes the process's
+exit and its freeing of every page. It touched 16 MiB from a mapping not
+aligned to 2 MiB, so 1 block in 8 took 4 KiB pages. Linux's figure is the
+program's own timing of the touch alone, over 64 MiB (`ichor-bench:
+page-fault n=16384`). Ichor's row now touches the same 64 MiB, aligned,
+and the table below compares the program's own timing on both sides.
+
+On round 18's logs, that like-for-like timing already had Ichor ahead on n2
+(478 against 660 ns), c3 (277 against 363) and Rome (282 against 325), and
+behind on Milan (272 against 247) and m7i (400 against 350), all with
+Ichor at 16 MiB.
+
+Linux 7.3's figures are round 18's, from the same machine types the same
+day. Medians of five rounds, Ichor / Linux 7.3.
+
+| Benchmark | n2 | c3 | Milan | Rome | AWS m7i |
+|---|---|---|---|---|---|
+| null syscall | **94** / 95 ns | 86 / 86 ns | **316** / 342 ns | **102** / 123 ns | 90 / **80** ns |
+| pipe round trip | **3.37** / 8.48 us | **3.82** / 8.18 us | **4.76** / 15.6 us | **3.76** / 13.3 us | **3.91** / 11.2 us |
+| page fault (the touch alone, 64 MiB) | **395** / 660 ns | 361 / 363 ns | **231** / 247 ns | **272** / 325 ns | 443 / **350** ns |
+| page fault with the exit (Ichor's row) | 462 ns | 432 ns | 277 ns | 327 ns | 529 ns |
+| fork + wait | **11** / 45 us | **11** / 39 us | **12** / 74 us | **12** / 61 us | **12** / 36 us |
+| fork + exec + wait | **57** / 133 us | **56** / 98 us | **63** / 218 us | **57** / 210 us | **58** / 89 us |
+
+Container start from a native caller: 114, 99, 128, 144 and 95 us; through
+the gRPC API 0.62, 0.53, 0.69, 0.71 and 1.22 ms (n2, c3, Milan, Rome,
+m7i).
+
+Reading it:
+
+- **Page faults.** Ichor is ahead on n2, Milan and Rome, and level with
+  Linux on c3 (361 against 363 ns).
+  - Milan went from 272 ns (round 18, 16 MiB) to 231 ns, and Rome from 282
+    to 272 ns.
+  - c3 went the other way, 277 to 361 ns. That machine type moves this much
+    between hosts: round 19 saw 407 → 558 ns on the whole-process row with
+    nothing on the path changed.
+- **The m7i drew a slow host.** Every row is 20-30% slower than in round 19
+  on the same instance type: null syscall 90 against 72 ns, pipe 3.91
+  against 3.13 us, fork + exec 58 against 45 us. Its page fault, 443
+  against Linux's 350 ns from another host, says little either way. Only
+  Ichor and Linux on one host, one after the other, would settle it.
+- **The exit.** With it, the page-fault row is 46-86 ns a page above the
+  touch alone. Freeing a page now costs 10-12 ns, against 26-40 locally
+  before. The rest is not broken down here; it includes unmapping, and
+  the buddy allocator taking its lock once for each 4 KiB page freed.
+- **The other rows** are within each machine's spread of round 19.
+
 ## Container start from the caller's side
 
 Linux's container starts above are timed by the caller: a shell starts

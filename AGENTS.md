@@ -793,7 +793,8 @@ compare minimums of several rounds.
 2 MiB anonymous pages (ADR-0020, 2026-11-26): a sequential fault reaching
 an empty aligned 2 MiB block of private anonymous memory maps it whole
 (`Mm::fault_huge`, `VmSpace::map_huge`, `UFrame::alloc_zeroed_huge`: 512
-ordinary pages, each with its own reference); fault-around stops at 2 MiB
+ordinary pages, each with its own reference, one charge for all,
+`page::Block`); fault-around stops at 2 MiB
 boundaries; `mmap` aligns private anonymous mappings a whole number of
 2 MiB long. Partial `unmap_range`/`protect`/`write_protect` split one into
 4 KiB leaves (no page for the table: it is unmapped whole and faults back).
@@ -902,6 +903,27 @@ Round 19 (`docs/benchmarks.md`) measured what they cost:
 
 `ichor_clear_bhb`'s `ret`s stay where they were: each is predicted from
 the return stack, and moving them behind jumps cost 5 ns.
+
+Page faults (round 20, 2026-11-27; ADR-0020's 2026-11-27 amendment):
+
+- A 2 MiB page is charged once. `page::Block` holds the charge and each
+  page's holder count, and the `Mm`'s entries are `page::Resident`.
+- `Block::settle` releases the charge of pages whose last holder went. It
+  runs from `free_range`, a copy-on-write copy and `Mm`'s drop, through
+  `page::Settle`.
+- Entries go in a chunk at a time (`PageMap::extend`).
+- `hugetest` checks the charge after each step.
+- Locally, the bookkeeping of a 2 MiB fault fell from about 18 us to 3.4
+  us, and the exit from 26-40 to 10-12 ns a page.
+- The bench row now touches 64 MiB, as Linux's program does. Compare the
+  program's own `ichor-bench: page-fault n=16384` line with Linux's. The
+  `ichor: bench: page fault` row includes the exit; through round 19 that
+  row, at 16 MiB, was what the tables compared.
+- Against Linux 7.3 the touch alone takes 395 / 660 ns on n2, 361 / 363
+  on c3, 231 / 247 on Milan and 272 / 325 on Rome. The m7i drew a host
+  20-30% slow on every row (443 / 350, unsettled).
+- Clearing a block backward in 256 KiB pieces, to leave its start in
+  cache, was slower locally and was dropped.
 
 Frame budget: ADR-0005 sets the milestone 3 ceiling at 8,500 lines / 380
 sites; ADR-0007 raises it to 9,500 / 420 for milestone 4 (TLB shootdown,
