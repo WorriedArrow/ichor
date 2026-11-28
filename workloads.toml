@@ -14,8 +14,10 @@ go = 990
 # 2026-11-21: 224 of 224 tests under TCG on 4 vCPUs.
 postgres = 980
 
-# 2026-11-22: 4398 of 4404 tests (99.8%) under TCG on 4 vCPUs.
-node = 985
+# 2026-11-28: 4406 of 4406 tests (100%) under OpenVMM on 4 vCPUs, the
+# cell's ip_unprivileged_port_start 1024 (2026-11-22: 4398 of 4404 under
+# TCG, whose CPU-profiler tests cannot keep up).
+node = 995
 
 # 2026-11-22: 2283 of 2376 tests (96.0%) on KVM with 4 vCPUs.
 jvm = 945

@@ -45,17 +45,9 @@ suite's own unit), passed / run. Floors are in `workloads.toml`.
 - Layer: `https://nodejs.org/dist/v24.22.3/node-v24.22.3.tar.gz` (sha256:4690edccae352134bbe31d844b37898f2a28b2c3d67901d0112fb6c4996d556a), `node-v24.22.3/deps/undici/` at `/usr/src/node/deps/undici/`
 - Layer: `https://nodejs.org/dist/v24.22.3/node-v24.22.3.tar.gz` (sha256:4690edccae352134bbe31d844b37898f2a28b2c3d67901d0112fb6c4996d556a), `node-v24.22.3/deps/v8/src/objects/` at `/usr/src/node/deps/v8/src/objects/`
 - Command: `sh -c chown -R node /usr/src/node && cd /usr/src/node && { [ $# -gt 0 ] || set -- parallel sequential; } && exec su node -c 'exec python3 tools/test.py -J --shell=/usr/local/bin/node -p tap --timeout 600 "$@"' -- "$0" "$@" node`
-- Result: 4398 of 4404 tests passed (99.8%), 338 skipped; floor 98.0%
-- Run time: 98 min (tcg, 4 vCPUs, the cell given 4 GiB)
-
-Failed:
-
-- `parallel/test-net-boundsocket`
-- `sequential/test-cpu-prof-dir-worker`
-- `sequential/test-cpu-prof-drained`
-- `sequential/test-cpu-prof-name`
-- `sequential/test-diagnostic-dir-cpu-prof`
-- `sequential/test-watch-mode`
+- Sysctl: `net.ipv4.ip_unprivileged_port_start=1024`
+- Result: 4406 of 4406 tests passed (100.0%), 336 skipped; floor 98.5%
+- Run time: 7 min (openvmm, Windows' hypervisor platform, 4 vCPUs, the cell given 4 GiB)
 
 ## uring
 

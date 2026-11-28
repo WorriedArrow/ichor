@@ -246,8 +246,8 @@ boot [done: VERW, IBPB, and page-table isolation (ADR-0004's second
   under TCG). The six: four CPU-profiler tests (V8 samples every 100 us,
   which TCG cannot keep up with), `net-boundsocket` (wants port 1 refused;
   any user may bind any port in a cell, as in Docker), and `watch-mode`.
-  Under OpenVMM (2026-11-28, 7 min) the profiler tests and `watch-mode`
-  pass. For `net-boundsocket`, cells have their own sysctls now:
+  Under OpenVMM (2026-11-28, 7 min): 4406 of 4406, the profiler tests and
+  `watch-mode` included. For `net-boundsocket`, cells have their own sysctls now:
   `CreateCell`'s `sysctls` map (OCI's `linux.sysctl`, a pod's), set by
   native `CELL_SYSCTL` before anything runs. The one known name is
   `net.ipv4.ip_unprivileged_port_start`: per stack, default 0 as in
