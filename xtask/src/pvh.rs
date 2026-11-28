@@ -72,6 +72,12 @@ pub fn elf(efi: &[u8]) -> Result<Vec<u8>> {
     field(&mut img, 16, LOAD_ADDRESS)?;
     field(&mut img, 20, total)?;
     field(&mut img, 24, LOAD_ADDRESS + size)?;
+    // The entry's first instruction, `mov $imm32, %esp` (0xbc): the stack's
+    // top, the scratch area's end (PVH gives the kernel no stack).
+    if img.get(sig + 32) != Some(&0xbc) {
+        return Err("the PVH entry stub does not start with `mov $imm32, %esp`".into());
+    }
+    field(&mut img, 33, LOAD_ADDRESS + total)?;
     let entry = LOAD_ADDRESS + sig as u64 + 32;
     Ok(wrap(&img, total, entry))
 }
@@ -188,6 +194,7 @@ mod tests {
         section(&mut f, 0, b".text", 0x1000, 0x200, 0x200);
         section(&mut f, 1, b".reloc", 0x2000, 0x200, 0x400);
         f[0x210..0x220].copy_from_slice(SIGNATURE);
+        f[0x230] = 0xbc; // the entry: `mov $imm32, %esp`
         f[0x240..0x248].copy_from_slice(&0x1_4000_1234u64.to_le_bytes());
         // One block: page 0x1000, a DIR64 at 0x40, padding.
         f[0x400..0x404].copy_from_slice(&0x1000u32.to_le_bytes());
@@ -231,6 +238,9 @@ mod tests {
         assert_eq!(u64::from(field(16)), LOAD_ADDRESS);
         assert_eq!(u64::from(field(20)), 0x3000 + SCRATCH);
         assert_eq!(u64::from(field(24)), LOAD_ADDRESS + 0x3000);
+        // The entry's stack pointer: the scratch area's end.
+        assert_eq!(img[0x1010 + 32], 0xbc);
+        assert_eq!(u64::from(field(33)), LOAD_ADDRESS + 0x3000 + SCRATCH);
     }
 
     #[test]

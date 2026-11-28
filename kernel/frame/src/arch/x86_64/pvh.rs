@@ -7,7 +7,9 @@
 //! address), wraps it in an ELF whose PVH note points at
 //! `ichor_pvh_start32`, and fills in the header below. The stub then:
 //!
-//! 1. finds its own address (`call`/`pop`: no relocation of 32-bit code),
+//! 1. loads the stack pointer xtask wrote into its first instruction (PVH
+//!    promises no stack), then finds its own address (`call`/`pop`: no
+//!    relocation of 32-bit code),
 //! 2. takes the scratch area past the image for a stack and records the TSC,
 //! 3. identity-maps the first 4 GiB with 2 MiB pages in six scratch pages,
 //! 4. enables PAE, OSFXSR/OSXMMEXCPT, long mode with NX, paging and WP,
@@ -24,7 +26,7 @@
 //! | 0x14 | length of the image region, scratch included (u32) |
 //! | 0x18 | physical address of the scratch area: six table pages, then a 64 KiB stack (u32) |
 //! | 0x1c | zero |
-//! | 0x20 | `ichor_pvh_start32` |
+//! | 0x20 | `ichor_pvh_start32`: `mov $imm32, %esp`, the stack's top (the scratch area's end) filled in at 0x21 |
 
 use core::arch::{asm, global_asm};
 
@@ -40,6 +42,10 @@ global_asm!(
     ".long 0",
     ".code32",
     "ichor_pvh_start32:",
+    // `mov $STACK, %esp`, the immediate filled in by xtask: PVH gives no
+    // stack (Firecracker enters with %esp 0), and `call` needs one.
+    ".byte 0xbc",
+    ".long 0",
     "cli",
     "cld",
     "call 1f",
